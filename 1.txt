@@ -1,0 +1,360 @@
+diff --git a/README.md b/README.md
+index 00f424c45b4583804d0421831c754c04dec258b5..365bc075cab597d3e0ca0d9412ad1a86dcab5a44 100644
+--- a/README.md
++++ b/README.md
+@@ -1,24 +1,50 @@
+ # Ядро генерации — Этап 1 (демо без UI)
+ 
+ ## Что это
+ Базовый модуль, который принимает параметры (тема, цель, ключевые слова, тон, структура, объём)
+ и собирает системный промпт для модели.
+ 
+ ## Файлы
+ - `config.py` — дефолтные настройки.
+ - `helpers.py` — утилиты форматирования.
+ - `rules_engine.py` — сборка промпта (`build_prompt(data)`).
+ - `base_prompt.txt` — шаблон промпта.
+ - `input_example.json` — пример входных данных.
+ - `run_demo.py` — проверка без UI.
+ 
+ ## Быстрый старт
+ ```bash
+ python3 -m venv venv
+ # macOS/Linux:
+ source venv/bin/activate
+ # Windows (PowerShell):
+ # venv\Scripts\activate
+ 
+ python run_demo.py
+ 
++```
++
++## RAG-ready (Stage 1)
++
++### Profiles layout
++- `profiles/<theme>/exemplars/` — тематические фрагменты по 200–700 слов (одно ключевое сообщение на файл, нейтральный Markdown). Пример: `profiles/finance/exemplars/{001_intro.md, 002_benefits.md, 003_faq.md}`.
++- `profiles/<theme>/glossary.txt` — короткие термины и определения одной строкой.
++- `profiles/<theme>/style_guide.md` — тон, do/don't, политика заголовков и локализации.
++
++### Оркестрация без LLM
++- `assemble_messages.py` — собирает системный промпт и добавляет `CONTEXT`, когда `retrieve_exemplars()` начнёт возвращать фрагменты.
++- `retrieve_exemplars(theme_slug, query, k=3)` — контракт Stage 2: должен отдавать список словарей вида `{ "path": str, "text": str, "score": float }`, подобранных под токен-бюджет (~500–700 токенов суммарно).
++- Итоговый формат сообщений: `[{"role": "system", ...}, опциональный CONTEXT, {"role": "user", "content": "Сгенерируй текст по указанным параметрам."}]`.
++
++### Тестирование Stage 1
++- `python run_demo.py` — базовый поток (без изменений).
++- `python validate_prompt.py` — проверка наличия секций и ключевых слов в промпте.
++- `python assemble_messages.py` — печатает предпросмотр system и CONTEXT (пока пусто).
++- `python prompt_to_file.py` — сохраняет промпт в `./artifacts/prompt_<timestamp>.txt`.
++
++### Ready for Stage 2, когда
++- Структура профилей создана минимум для одной темы с 2–3 заготовками.
++- `base_prompt.txt` знает про блок CONTEXT.
++- Существуют стабы `retrieve_exemplars` и `assemble_messages` без внешних зависимостей.
++- В проект не добавлены внешние библиотеки и сетевые вызовы.
++
+diff --git a/assemble_messages.py b/assemble_messages.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1720e687d42973dbefa16588344e1f64259f451
+--- /dev/null
++++ b/assemble_messages.py
+@@ -0,0 +1,83 @@
++# -*- coding: utf-8 -*-
++"""Stage 1 orchestration helpers for future RAG integration."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Dict, List
++
++from rules_engine import build_prompt
++
++
++def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str, object]]:
++    """Stub for exemplar retrieval.
++
++    Stage 2 will plug in embedding-powered search here. The contract should
++    return the top-``k`` items as dictionaries with the following shape::
++
++        {"path": str, "text": str, "score": float}
++
++    ``path`` is the source file, ``text`` is the fragment content (already
++    trimmed to fit downstream token budgets), and ``score`` is a ranking weight
++    where higher means more relevant.
++    """
++
++    # TODO: Implement retrieval that respects token budgets (~500-700 tokens per
++    # call) and filters exemplars by ``theme_slug`` once embeddings are ready.
++    return []
++
++
++def assemble_messages(data_path: str = "input_example.json", theme_slug: str = "finance") -> List[Dict[str, str]]:
++    """Prepare chat-style messages for an LLM call.
++
++    Parameters
++    ----------
++    data_path: str
++        Path to the JSON brief that mirrors ``input_example.json``.
++    theme_slug: str
++        Directory name under ``profiles/`` whose exemplars should be considered.
++    """
++
++    payload_path = Path(data_path)
++    data = json.loads(payload_path.read_text(encoding="utf-8"))
++    system_prompt = build_prompt(data)
++
++    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
++
++    exemplars = retrieve_exemplars(theme_slug=theme_slug, query=data.get("theme", ""), k=3)
++    if exemplars:
++        fragments: List[str] = []
++        for idx, item in enumerate(exemplars, start=1):
++            path = str(item.get("path", "unknown"))
++            text = str(item.get("text", ""))
++            fragment = f"<<<EXEMPLAR #{idx} | {path}>>>\n{text.strip()}"
++            fragments.append(fragment.strip())
++        context_block = "\n\n".join(fragments)
++        messages.append({"role": "system", "content": f"CONTEXT\n{context_block}"})
++
++    messages.append({"role": "user", "content": "Сгенерируй текст по указанным параметрам."})
++    return messages
++
++
++def _preview(text: str, limit: int = 400) -> str:
++    if len(text) <= limit:
++        return text
++    return text[:limit].rstrip() + "…"
++
++
++if __name__ == "__main__":
++    assembled = assemble_messages()
++    system_message = assembled[0]["content"]
++    print("=== SYSTEM PROMPT PREVIEW ===")
++    print(_preview(system_message))
++
++    context_message = next(
++        (msg["content"] for msg in assembled[1:] if msg["role"] == "system" and msg["content"].startswith("CONTEXT")),
++        None,
++    )
++
++    if context_message:
++        print("\n=== CONTEXT PREVIEW ===")
++        print(_preview(context_message))
++    else:
++        print("\n(No CONTEXT exemplars attached. Retrieval stub currently returns 0 items.)")
+diff --git a/base_prompt.txt b/base_prompt.txt
+index ed2f3541314a2160da0887f7d1c3ec41c047fd82..b2a75c7f9852c64d29e07c3ab012b2198470c047 100644
+--- a/base_prompt.txt
++++ b/base_prompt.txt
+@@ -1,18 +1,20 @@
+ Ты — профессиональный SEO-редактор и копирайтер.
+ Пиши текст на русском языке.
+ Тема: {theme}
+ Цель: {goal}
+ Тон: {tone}
+ Объём: от {min_len} до {max_len} знаков.
+ 
+ Структура:
+ {structure_block}
+ 
+ SEO-ключевые слова (используй естественно, без переспама): {keywords}
+ 
+ Требования к качеству:
+ - Избегай воды и канцелярита.
+ - Поддерживай читабельные абзацы (2–5 предложений).
+ - Проверь логичность переходов между секциями.
+ - Добавь короткий вывод с CTA.
+ 
++Если предоставлен блок CONTEXT с выдержками из качественных материалов, используй их стиль и фактуру без дословного копирования; если CONTEXT отсутствует или фрагменты не покрывают запрос, пиши универсально, сохраняя заданную структуру.
++
+diff --git a/profiles/README_profiles.md b/profiles/README_profiles.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba3f8be20375d4f1720342f30d6cbaa91867016e
+--- /dev/null
++++ b/profiles/README_profiles.md
+@@ -0,0 +1,25 @@
++# Profiles Exemplars Guidelines
++
++Use this directory to organize retrieval-ready exemplars, glossaries, and style notes for each theme. Follow these rules to keep Stage 2 plug-and-play:
++
++1. **Chunk size**: each exemplar file should contain 200–700 words focused on a single idea. Avoid multi-topic dumps.
++2. **File naming**: use zero-padded numeric prefixes so ordering is explicit, e.g. `001_intro.md`, `002_benefits.md`, `003_faq.md`.
++3. **Content style**: prefer light Markdown (headings, lists) only when it improves clarity. Heavy formatting, tables, or embeds are discouraged.
++4. **PII policy**: do not store personally identifiable information or sensitive internal data.
++5. **Glossary**: include theme-specific terminology in `glossary.txt` with short definitions (one term per line: `term — description`).
++6. **Style guide**: describe tone, voice, and formatting do's/don'ts in `style_guide.md`. Mention heading usage, bullet preferences, and localization needs.
++7. **Quality check**: ensure language aligns with base prompt expectations (Russian by default) and that examples are factual and timeless.
++
++When adding new themes, copy this structure:
++
++```
++profiles/<theme>/
++  exemplars/
++    001_intro.md
++    002_benefits.md
++    003_faq.md
++  glossary.txt
++  style_guide.md
++```
++
++Keep exemplar content evergreen so it can safely influence future generations.
+diff --git a/profiles/finance/exemplars/001_intro.md b/profiles/finance/exemplars/001_intro.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..98918b152619c0256bb2de4df082d6716ece7990
+--- /dev/null
++++ b/profiles/finance/exemplars/001_intro.md
+@@ -0,0 +1,3 @@
++# Финансовая экспертиза: вводный обзор
++
++Этот файл зарезервирован для краткого введения в тему. Опишите миссию продукта, целевую аудиторию и ключевую ценность, которую предоставляет финансовый сервис. Сфокусируйтесь на устойчивых фактах, которые останутся актуальными через год.
+diff --git a/profiles/finance/exemplars/002_benefits.md b/profiles/finance/exemplars/002_benefits.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..704433bd7baf83b705f33c9c85a5c4764b95115b
+--- /dev/null
++++ b/profiles/finance/exemplars/002_benefits.md
+@@ -0,0 +1,3 @@
++# Ключевые преимущества
++
++Здесь перечислите 2–3 сильных аргумента в пользу продукта или услуги. Для каждого аргумента добавьте пояснение, цифры или короткий пример применения в жизни клиента.
+diff --git a/profiles/finance/exemplars/003_faq.md b/profiles/finance/exemplars/003_faq.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..07b06b5db65b2a0137027cf6407aadbf3e689cf9
+--- /dev/null
++++ b/profiles/finance/exemplars/003_faq.md
+@@ -0,0 +1,3 @@
++# Ответы на частые вопросы
++
++В этом файле подготовьте короткие ответы на типовые возражения клиентов. Сохраняйте дружелюбный тон и предлагайте практические шаги, которые пользователь может сделать сразу.
+diff --git a/profiles/finance/glossary.txt b/profiles/finance/glossary.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f671d515675e2ef4288fd2fa7047f5efc2c5a06
+--- /dev/null
++++ b/profiles/finance/glossary.txt
+@@ -0,0 +1,5 @@
++APY — годовая процентная доходность, учитывающая капитализацию.
++Диверсификация — распределение активов для снижения рисков.
++Ликвидность — способность быстро превратить актив в наличные без потерь стоимости.
++Подушка безопасности — резервный фонд на 3–6 месяцев расходов.
++Риск-профиль — совокупность характеристик инвестора, определяющих допустимый уровень риска.
+diff --git a/profiles/finance/style_guide.md b/profiles/finance/style_guide.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..24d4840d87968c34e7a76161594a2522d5c9df23
+--- /dev/null
++++ b/profiles/finance/style_guide.md
+@@ -0,0 +1,19 @@
++# Стиль и тон для финансовой темы
++
++## Тональность
++- Уверенный и спокойный, избегайте алармизма.
++- Разъясняющий: поясняйте термины простыми словами.
++
++## Делайте
++- Добавляйте краткие примеры или сценарии для каждого совета.
++- Используйте подзаголовки второго уровня максимум, без избыточных вложений.
++- Заканчивайте материалы чётким CTA с предложением следующего шага.
++
++## Не делайте
++- Не обещайте гарантированную доходность или «быстрое обогащение».
++- Не используйте жаргон без пояснений.
++- Не перегружайте текст длинными таблицами — используйте списки.
++
++## Локализация
++- Все суммы и валюты — в рублях, если не указано иначе.
++- Даты оформляйте в формате «10 марта 2024».
+diff --git a/prompt_to_file.py b/prompt_to_file.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c92fb6a2bed0ed4ecbec1e425cf5c30a5bb8afe4
+--- /dev/null
++++ b/prompt_to_file.py
+@@ -0,0 +1,31 @@
++# -*- coding: utf-8 -*-
++"""Utility to persist the assembled system prompt for manual review."""
++from __future__ import annotations
++
++import json
++from datetime import datetime
++from pathlib import Path
++
++from rules_engine import build_prompt
++
++
++def export_prompt(data_path: str = "input_example.json", artifacts_dir: str = "artifacts") -> Path:
++    payload_path = Path(data_path)
++    if not payload_path.exists():
++        raise FileNotFoundError(f"Input file not found: {payload_path}")
++
++    data = json.loads(payload_path.read_text(encoding="utf-8"))
++    prompt = build_prompt(data)
++
++    output_dir = Path(artifacts_dir)
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
++    file_path = output_dir / f"prompt_{timestamp}.txt"
++    file_path.write_text(prompt, encoding="utf-8")
++    return file_path
++
++
++if __name__ == "__main__":
++    path = export_prompt()
++    print(f"Prompt saved to {path}")
+diff --git a/validate_prompt.py b/validate_prompt.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed7192373230b60866f4c66f9a4502a42b3e7314
+--- /dev/null
++++ b/validate_prompt.py
+@@ -0,0 +1,53 @@
++# -*- coding: utf-8 -*-
++"""Minimal validator for Stage 1 prompt scaffolding."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import List
++
++from rules_engine import build_prompt
++
++
++def _load_input(path: Path) -> dict:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _preview(text: str, limit: int = 300) -> str:
++    if len(text) <= limit:
++        return text
++    return text[:limit].rstrip() + "…"
++
++
++def validate_prompt(data_path: str = "input_example.json") -> None:
++    payload_path = Path(data_path)
++    if not payload_path.exists():
++        raise FileNotFoundError(f"Input file not found: {payload_path}")
++
++    data = _load_input(payload_path)
++    prompt = build_prompt(data)
++
++    provided_sections: List[str] = data.get("structure", []) or []
++    missing_sections = [section for section in provided_sections if f"- {section}" not in prompt]
++
++    keywords: List[str] = [kw.strip() for kw in data.get("keywords", []) if isinstance(kw, str) and kw.strip()]
++    lower_prompt = prompt.lower()
++    missing_keywords = [kw for kw in keywords if kw.lower() not in lower_prompt]
++
++    print("=== Prompt Validation ===")
++    if missing_sections:
++        print(f"Warnings: missing sections in prompt -> {', '.join(missing_sections)}")
++    else:
++        print("Sections: OK — все заявленные блоки присутствуют.")
++
++    if missing_keywords:
++        print(f"Warnings: keywords not surfaced -> {', '.join(missing_keywords)}")
++    else:
++        print("Keywords: OK — все ключевые слова упомянуты в инструкциях.")
++
++    print("\nPreview:")
++    print(_preview(prompt))
++
++
++if __name__ == "__main__":
++    validate_prompt()
+
