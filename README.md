@@ -11,6 +11,7 @@
 - `base_prompt.txt` — шаблон промпта.
 - `input_example.json` — пример входных данных.
 - `run_demo.py` — проверка без UI.
+- `docs/implementation_overview.md` — техническая документация с обзором архитектуры и зависимостей.
 
 ## Быстрый старт
 ```bash
