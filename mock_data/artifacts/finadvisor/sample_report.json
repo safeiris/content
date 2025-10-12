@@ -1,0 +1,26 @@
+{
+  "artifact_id": "finadvisor-demo-1",
+  "pipe_id": "finadvisor",
+  "topic": "Как сформировать резервный фонд",
+  "tone": "дружелюбный",
+  "metrics": {
+    "keywords": {
+      "found": ["резервный фонд", "бюджет", "накопления"],
+      "missing": []
+    },
+    "length": {
+      "target": 2000,
+      "actual": 2050,
+      "unit": "символов"
+    },
+    "structure": {
+      "h1": 1,
+      "h2": 4,
+      "faq": 2,
+      "table": false
+    },
+    "jsonld": false
+  },
+  "generated_at": "2024-05-18T09:30:00+03:00",
+  "status": "Ready"
+}

@@ -1,0 +1,26 @@
+{
+  "artifact_id": "probankir-demo-1",
+  "pipe_id": "probankir",
+  "topic": "Лучшие кредитные карты с кэшбэком",
+  "tone": "экспертный",
+  "metrics": {
+    "keywords": {
+      "found": ["кэшбэк", "кредитная карта", "обслуживание"],
+      "missing": ["рассрочка"]
+    },
+    "length": {
+      "target": 1800,
+      "actual": 1650,
+      "unit": "символов"
+    },
+    "structure": {
+      "h1": 1,
+      "h2": 5,
+      "faq": 2,
+      "table": false
+    },
+    "jsonld": true
+  },
+  "generated_at": "2024-05-22T10:15:00+03:00",
+  "status": "Draft"
+}

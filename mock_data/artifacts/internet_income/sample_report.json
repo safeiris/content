@@ -1,0 +1,26 @@
+{
+  "artifact_id": "internet-income-demo-1",
+  "pipe_id": "internet_income",
+  "topic": "Как запустить онлайн-курс",
+  "tone": "строгий",
+  "metrics": {
+    "keywords": {
+      "found": ["онлайн-курс", "продажи", "платформа"],
+      "missing": ["маркетинг"]
+    },
+    "length": {
+      "target": 1900,
+      "actual": 1880,
+      "unit": "символов"
+    },
+    "structure": {
+      "h1": 1,
+      "h2": 4,
+      "faq": 2,
+      "table": true
+    },
+    "jsonld": true
+  },
+  "generated_at": "2024-05-12T14:10:00+03:00",
+  "status": "Draft"
+}

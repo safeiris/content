@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Фабрика контента — демо</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <h1>Фабрика контента</h1>
+        <p class="subtitle">Автономная демо-витрина</p>
+      </div>
+    </header>
+
+    <main class="app">
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="new-request" role="tab">Новый запрос</button>
+        <button class="tab" data-tab="materials" role="tab">Сгенерированные материалы</button>
+        <button class="tab" data-tab="pipes" role="tab">Тематики</button>
+        <button class="tab" data-tab="result" role="tab">Результат</button>
+      </nav>
+
+      <section class="tab-panel active" id="new-request" role="tabpanel">
+        <form id="brief-form" class="brief-form">
+          <div class="form-row">
+            <label for="pipe-select">Тематика</label>
+            <select id="pipe-select" required></select>
+          </div>
+          <div class="form-row">
+            <label for="topic-input">Тема</label>
+            <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
+          </div>
+          <div class="form-row">
+            <label for="tone-select">Тон</label>
+            <select id="tone-select">
+              <option value="экспертный">Экспертный</option>
+              <option value="дружелюбный">Дружелюбный</option>
+              <option value="строгий">Строгий</option>
+            </select>
+          </div>
+          <fieldset class="form-row">
+            <legend>Дополнительно</legend>
+            <label><input type="checkbox" id="include-faq" checked /> FAQ</label>
+            <label><input type="checkbox" id="include-table" /> Таблица</label>
+            <label><input type="checkbox" id="include-jsonld" checked /> JSON-LD</label>
+          </fieldset>
+          <button type="submit" class="primary">Сгенерировать</button>
+        </form>
+      </section>
+
+      <section class="tab-panel" id="materials" role="tabpanel">
+        <div id="artifacts-list" class="cards"></div>
+      </section>
+
+      <section class="tab-panel" id="pipes" role="tabpanel">
+        <div id="pipes-list" class="pipes"></div>
+      </section>
+
+      <section class="tab-panel" id="result" role="tabpanel">
+        <div class="result-layout">
+          <div class="result-main">
+            <div class="result-header">
+              <h2 id="result-title">Результат генерации</h2>
+              <p class="result-meta" id="result-meta"></p>
+            </div>
+            <article id="draft-view" class="draft-view"></article>
+          </div>
+          <aside class="result-aside">
+            <h3>Отчет о качестве</h3>
+            <div id="report-view" class="report-view"></div>
+            <div class="download-buttons">
+              <button id="download-md" class="secondary" disabled>Скачать .md</button>
+              <button id="download-report" class="secondary" disabled>Скачать отчёт .json</button>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <div id="progress-overlay" class="progress-overlay hidden">
+      <div class="progress-card">
+        <div class="spinner"></div>
+        <p>Генерируем материалы…</p>
+      </div>
+    </div>
+
+    <template id="artifact-card-template">
+      <article class="card">
+        <div class="card-header">
+          <h3 class="card-title"></h3>
+          <span class="status"></span>
+        </div>
+        <p class="card-topic"></p>
+        <p class="card-meta"></p>
+      </article>
+    </template>
+
+    <script src="script.js" type="module"></script>
+  </body>
+</html>

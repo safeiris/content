@@ -1,0 +1,7 @@
+{
+  "@context": "https://schema.org",
+  "@type": "FinancialProduct",
+  "name": "Обзор кредитных карт с кэшбэком",
+  "description": "Сравнение условий кэшбэка и бонусов по популярным картам",
+  "dateCreated": "2024-05-22"
+}

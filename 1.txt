@@ -1,45 +1,1325 @@
-diff --git a/README.md b/README.md
-index 365bc075cab597d3e0ca0d9412ad1a86dcab5a44..e20335a161e753a03379afc56e13ba00f7ec2250 100644
---- a/README.md
-+++ b/README.md
-@@ -1,38 +1,39 @@
- # Ядро генерации — Этап 1 (демо без UI)
+diff --git a/.gitignore b/.gitignore
+index 7aa58cd3df02e1fcdb3eabf4ab762affa219d5c7..fdfc8d870a8bc404785c14a6c590c04c03e47a03 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,7 +1,10 @@
+ __pycache__/
+ venv/
+ *.pyc
+ .DS_Store
+ .env
+ artifacts/
  
- ## Что это
- Базовый модуль, который принимает параметры (тема, цель, ключевые слова, тон, структура, объём)
- и собирает системный промпт для модели.
- 
- ## Файлы
- - `config.py` — дефолтные настройки.
- - `helpers.py` — утилиты форматирования.
- - `rules_engine.py` — сборка промпта (`build_prompt(data)`).
- - `base_prompt.txt` — шаблон промпта.
- - `input_example.json` — пример входных данных.
- - `run_demo.py` — проверка без UI.
-+- `docs/implementation_overview.md` — техническая документация с обзором архитектуры и зависимостей.
- 
- ## Быстрый старт
- ```bash
- python3 -m venv venv
- # macOS/Linux:
- source venv/bin/activate
- # Windows (PowerShell):
- # venv\Scripts\activate
- 
- python run_demo.py
- 
- ```
- 
- ## RAG-ready (Stage 1)
- 
- ### Profiles layout
- - `profiles/<theme>/exemplars/` — тематические фрагменты по 200–700 слов (одно ключевое сообщение на файл, нейтральный Markdown). Пример: `profiles/finance/exemplars/{001_intro.md, 002_benefits.md, 003_faq.md}`.
- - `profiles/<theme>/glossary.txt` — короткие термины и определения одной строкой.
- - `profiles/<theme>/style_guide.md` — тон, do/don't, политика заголовков и локализации.
- 
- ### Оркестрация без LLM
- - `assemble_messages.py` — собирает системный промпт и добавляет `CONTEXT`, когда `retrieve_exemplars()` начнёт возвращать фрагменты.
- - `retrieve_exemplars(theme_slug, query, k=3)` — контракт Stage 2: должен отдавать список словарей вида `{ "path": str, "text": str, "score": float }`, подобранных под токен-бюджет (~500–700 токенов суммарно).
- - Итоговый формат сообщений: `[{"role": "system", ...}, опциональный CONTEXT, {"role": "user", "content": "Сгенерируй текст по указанным параметрам."}]`.
- 
++!mock_data/
++!mock_data/artifacts/
++!mock_data/artifacts/**
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e07c61d72d55f89e4d6a4627a7e4c602a451876
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,13 @@
++.PHONY: demo clean
++
++PORT ?= 8000
++
++## Запуск SPA демо-витрины на локальном сервере
++demo:
++	@echo "Откройте http://localhost:$(PORT)/frontend_demo/"
++	python3 -m http.server $(PORT)
++
++## Очистка временных файлов
++clean:
++	find . -name '__pycache__' -type d -prune -exec rm -rf {} +
++	find . -name '*.pyc' -delete
+diff --git a/README_DEMO.md b/README_DEMO.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b1c52383e857f0898f07363b33e8b376a759f93
+--- /dev/null
++++ b/README_DEMO.md
+@@ -0,0 +1,58 @@
++# Фабрика контента — демо-витрина
++
++Одностраничная демо-витрина показывает, как устроена фабрика контента: от заполнения брифа до просмотра готового текста и отчета качества. Все данные берутся из локальных моков, подключений к моделям или бэкенду нет.
++
++## Структура проекта
++
++```
++frontend_demo/      # SPA-интерфейс
++mock_data/          # моки тематик и артефактов
++  pipes/            # профили тематик (JSON)
++  artifacts/        # материалы с текстами и отчетами
++README_DEMO.md      # этот файл с инструкциями
++Makefile            # сценарии запуска
++```
++
++## Запуск демо
++
++1. Установите зависимости (не требуются, нужен только Python 3).
++2. Запустите локальный сервер из корня репозитория:
++
++   ```bash
++   make demo
++   ```
++
++3. Откройте страницу [http://localhost:8000/frontend_demo/](http://localhost:8000/frontend_demo/).
++4. Если нужно остановить сервер, нажмите <kbd>Ctrl</kbd>+<kbd>C</kbd> в терминале.
++
++> ⚠️ Статический сервер поднимается из корня. Это необходимо, чтобы интерфейс имел доступ к файлам в каталоге `mock_data/`.
++
++## Добавление новой тематики
++
++1. Создайте файл `mock_data/pipes/<pipe_id>.json` и опишите профиль тематики:
++   ```json
++   {
++     "pipe_id": "my_pipe",
++     "name": "Название тематики",
++     "description": "Краткое описание",
++     "tone": "тональность",
++     "keywords": ["ключ", "слова"],
++     "sample_topics": ["пример темы"]
++   }
++   ```
++2. Добавьте идентификатор в список `mock_data/pipes/index.json`.
++3. Создайте папку `mock_data/artifacts/<pipe_id>/` и разместите в ней файлы:
++   - `sample_draft.md` — пример текста;
++   - `sample_report.json` — псевдо-отчет валидатора (структура аналогична существующим);
++   - `sample_jsonld.json` — пример JSON-LD (используется для скачивания).
++4. При необходимости добавьте карточку в `mock_data/artifacts/index.json`, чтобы тематика появилась во вкладке «Сгенерированные материалы».
++5. Перезагрузите страницу — данные подтянутся автоматически.
++
++## Очистка
++
++Команда `make clean` удаляет временные каталоги Python (`__pycache__`) и артефакты `*.pyc` в проекте.
++
++## Известные ограничения
++
++- Markdown конвертируется простым клиентским скриптом и поддерживает только базовые элементы (заголовки, списки, абзацы, выделение жирным).
++- Кнопки скачивания работают только при запуске через локальный сервер (не напрямую через `file://`).
+diff --git a/frontend_demo/index.html b/frontend_demo/index.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd0af67be8e1a172b2d5079a77e9aef63a07d4a4
+--- /dev/null
++++ b/frontend_demo/index.html
+@@ -0,0 +1,102 @@
++<!DOCTYPE html>
++<html lang="ru">
++  <head>
++    <meta charset="UTF-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    <title>Фабрика контента — демо</title>
++    <link rel="stylesheet" href="styles.css" />
++  </head>
++  <body>
++    <header class="app-header">
++      <div>
++        <h1>Фабрика контента</h1>
++        <p class="subtitle">Автономная демо-витрина</p>
++      </div>
++    </header>
++
++    <main class="app">
++      <nav class="tabs" role="tablist">
++        <button class="tab active" data-tab="new-request" role="tab">Новый запрос</button>
++        <button class="tab" data-tab="materials" role="tab">Сгенерированные материалы</button>
++        <button class="tab" data-tab="pipes" role="tab">Тематики</button>
++        <button class="tab" data-tab="result" role="tab">Результат</button>
++      </nav>
++
++      <section class="tab-panel active" id="new-request" role="tabpanel">
++        <form id="brief-form" class="brief-form">
++          <div class="form-row">
++            <label for="pipe-select">Тематика</label>
++            <select id="pipe-select" required></select>
++          </div>
++          <div class="form-row">
++            <label for="topic-input">Тема</label>
++            <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
++          </div>
++          <div class="form-row">
++            <label for="tone-select">Тон</label>
++            <select id="tone-select">
++              <option value="экспертный">Экспертный</option>
++              <option value="дружелюбный">Дружелюбный</option>
++              <option value="строгий">Строгий</option>
++            </select>
++          </div>
++          <fieldset class="form-row">
++            <legend>Дополнительно</legend>
++            <label><input type="checkbox" id="include-faq" checked /> FAQ</label>
++            <label><input type="checkbox" id="include-table" /> Таблица</label>
++            <label><input type="checkbox" id="include-jsonld" checked /> JSON-LD</label>
++          </fieldset>
++          <button type="submit" class="primary">Сгенерировать</button>
++        </form>
++      </section>
++
++      <section class="tab-panel" id="materials" role="tabpanel">
++        <div id="artifacts-list" class="cards"></div>
++      </section>
++
++      <section class="tab-panel" id="pipes" role="tabpanel">
++        <div id="pipes-list" class="pipes"></div>
++      </section>
++
++      <section class="tab-panel" id="result" role="tabpanel">
++        <div class="result-layout">
++          <div class="result-main">
++            <div class="result-header">
++              <h2 id="result-title">Результат генерации</h2>
++              <p class="result-meta" id="result-meta"></p>
++            </div>
++            <article id="draft-view" class="draft-view"></article>
++          </div>
++          <aside class="result-aside">
++            <h3>Отчет о качестве</h3>
++            <div id="report-view" class="report-view"></div>
++            <div class="download-buttons">
++              <button id="download-md" class="secondary" disabled>Скачать .md</button>
++              <button id="download-report" class="secondary" disabled>Скачать отчёт .json</button>
++            </div>
++          </aside>
++        </div>
++      </section>
++    </main>
++
++    <div id="progress-overlay" class="progress-overlay hidden">
++      <div class="progress-card">
++        <div class="spinner"></div>
++        <p>Генерируем материалы…</p>
++      </div>
++    </div>
++
++    <template id="artifact-card-template">
++      <article class="card">
++        <div class="card-header">
++          <h3 class="card-title"></h3>
++          <span class="status"></span>
++        </div>
++        <p class="card-topic"></p>
++        <p class="card-meta"></p>
++      </article>
++    </template>
++
++    <script src="script.js" type="module"></script>
++  </body>
++</html>
+diff --git a/frontend_demo/script.js b/frontend_demo/script.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a695b9784807ee36c52f44852e9dd07809c0791
+--- /dev/null
++++ b/frontend_demo/script.js
+@@ -0,0 +1,357 @@
++const PIPE_INDEX_PATH = "../mock_data/pipes/index.json";
++const PIPE_PATH = (id) => `../mock_data/pipes/${id}.json`;
++const ARTIFACT_INDEX_PATH = "../mock_data/artifacts/index.json";
++const ARTIFACT_DRAFT_PATH = (pipeId) => `../mock_data/artifacts/${pipeId}/sample_draft.md`;
++const ARTIFACT_REPORT_PATH = (pipeId) => `../mock_data/artifacts/${pipeId}/sample_report.json`;
++const ARTIFACT_JSONLD_PATH = (pipeId) => `../mock_data/artifacts/${pipeId}/sample_jsonld.json`;
++
++const tabs = document.querySelectorAll(".tab");
++const panels = document.querySelectorAll(".tab-panel");
++const pipeSelect = document.getElementById("pipe-select");
++const pipesList = document.getElementById("pipes-list");
++const artifactsList = document.getElementById("artifacts-list");
++const briefForm = document.getElementById("brief-form");
++const progressOverlay = document.getElementById("progress-overlay");
++const draftView = document.getElementById("draft-view");
++const reportView = document.getElementById("report-view");
++const resultTitle = document.getElementById("result-title");
++const resultMeta = document.getElementById("result-meta");
++const downloadMdBtn = document.getElementById("download-md");
++const downloadReportBtn = document.getElementById("download-report");
++
++const state = {
++  pipes: new Map(),
++  artifacts: [],
++  currentResult: null,
++};
++
++tabs.forEach((tab) => {
++  tab.addEventListener("click", () => switchTab(tab.dataset.tab));
++});
++
++function switchTab(tabId) {
++  tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === tabId));
++  panels.forEach((panel) => panel.classList.toggle("active", panel.id === tabId));
++}
++
++async function loadPipes() {
++  const response = await fetch(PIPE_INDEX_PATH);
++  const ids = await response.json();
++  const pipeEntries = await Promise.all(
++    ids.map(async (id) => {
++      const data = await fetch(PIPE_PATH(id)).then((res) => res.json());
++      return [id, data];
++    })
++  );
++  pipeEntries.forEach(([id, data], idx) => {
++    state.pipes.set(id, data);
++    const option = document.createElement("option");
++    option.value = id;
++    option.textContent = data.name;
++    if (idx === 0) {
++      option.selected = true;
++    }
++    pipeSelect.append(option);
++  });
++  renderPipeCards(pipeEntries.map(([, data]) => data));
++}
++
++function renderPipeCards(pipes) {
++  if (!pipes.length) {
++    pipesList.innerHTML = '<div class="empty-state">Тематики пока не добавлены.</div>';
++    return;
++  }
++
++  pipesList.innerHTML = "";
++  pipes.forEach((pipe) => {
++    const card = document.createElement("article");
++    card.className = "pipe-card";
++    card.innerHTML = `
++      <div>
++        <h3>${pipe.name}</h3>
++        <p>${pipe.description}</p>
++      </div>
++      <div class="pipe-meta">Тон: <strong>${pipe.tone}</strong></div>
++      <div class="pipe-keywords">
++        ${pipe.keywords.map((kw) => `<span>${kw}</span>`).join("")}
++      </div>
++    `;
++    pipesList.append(card);
++  });
++}
++
++async function loadArtifacts() {
++  const response = await fetch(ARTIFACT_INDEX_PATH);
++  state.artifacts = await response.json();
++  renderArtifacts();
++}
++
++function renderArtifacts() {
++  if (!state.artifacts.length) {
++    artifactsList.innerHTML = '<div class="empty-state">Пока нет сгенерированных материалов.</div>';
++    return;
++  }
++
++  const template = document.getElementById("artifact-card-template");
++  artifactsList.innerHTML = "";
++
++  state.artifacts.forEach((artifact) => {
++    const pipe = state.pipes.get(artifact.pipe_id);
++    const card = template.content.firstElementChild.cloneNode(true);
++    card.querySelector(".card-title").textContent = artifact.name;
++    card.querySelector(".status").textContent = artifact.status;
++    card.querySelector(".status").dataset.status = artifact.status;
++    card.querySelector(".card-topic").textContent = `${pipe?.name ?? artifact.pipe_id} · ${artifact.topic}`;
++    card.querySelector(".card-meta").textContent = `Обновлено ${artifact.updated_at}`;
++    card.addEventListener("click", () => {
++      showResult({
++        source: "artifact",
++        artifactId: artifact.id,
++        pipeId: artifact.pipe_id,
++        topic: artifact.topic,
++        tone: pipe?.tone ?? "",
++      });
++    });
++    artifactsList.append(card);
++  });
++}
++
++function markdownToHtml(markdown) {
++  const lines = markdown.split(/\r?\n/);
++  let html = "";
++  let inUl = false;
++  let inOl = false;
++
++  const closeLists = () => {
++    if (inUl) {
++      html += "</ul>";
++      inUl = false;
++    }
++    if (inOl) {
++      html += "</ol>";
++      inOl = false;
++    }
++  };
++
++  lines.forEach((rawLine) => {
++    const line = rawLine.trimEnd();
++    if (!line.trim()) {
++      closeLists();
++      html += "";
++      return;
++    }
++
++    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
++    if (headingMatch) {
++      closeLists();
++      const level = headingMatch[1].length;
++      const text = headingMatch[2];
++      html += `<h${level}>${inlineFormat(text)}</h${level}>`;
++      return;
++    }
++
++    const olMatch = line.match(/^\d+\.\s+(.*)$/);
++    if (olMatch) {
++      if (!inOl) {
++        closeLists();
++        html += "<ol>";
++        inOl = true;
++      }
++      html += `<li>${inlineFormat(olMatch[1])}</li>`;
++      return;
++    }
++
++    const ulMatch = line.match(/^[-*]\s+(.*)$/);
++    if (ulMatch) {
++      if (!inUl) {
++        closeLists();
++        html += "<ul>";
++        inUl = true;
++      }
++      html += `<li>${inlineFormat(ulMatch[1])}</li>`;
++      return;
++    }
++
++    closeLists();
++    html += `<p>${inlineFormat(line)}</p>`;
++  });
++
++  closeLists();
++  return html;
++}
++
++function inlineFormat(text) {
++  return text
++    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
++    .replace(/`([^`]+)`/g, "<code>$1</code>");
++}
++
++async function showResult({ source, pipeId, topic, tone }) {
++  const pipe = state.pipes.get(pipeId);
++  const draftPath = ARTIFACT_DRAFT_PATH(pipeId);
++  const reportPath = ARTIFACT_REPORT_PATH(pipeId);
++
++  const [draftContent, reportContent] = await Promise.all([
++    fetch(draftPath).then((res) => res.text()),
++    fetch(reportPath).then((res) => res.json()),
++  ]);
++
++  state.currentResult = {
++    pipeId,
++    topic: topic || reportContent.topic,
++    tone: tone || reportContent.tone || pipe?.tone,
++    draftPath,
++    reportPath,
++    jsonldPath: ARTIFACT_JSONLD_PATH(pipeId),
++    generatedAt: reportContent.generated_at,
++  };
++
++  resultTitle.textContent = state.currentResult.topic || "Результат генерации";
++  const metaParts = [];
++  if (pipe) metaParts.push(`Тематика: ${pipe.name}`);
++  if (state.currentResult.tone) metaParts.push(`Тон: ${state.currentResult.tone}`);
++  if (state.currentResult.generatedAt) metaParts.push(`Дата: ${formatDate(state.currentResult.generatedAt)}`);
++  resultMeta.textContent = metaParts.join(" • ");
++
++  draftView.innerHTML = markdownToHtml(draftContent);
++  renderReport(reportContent);
++
++  downloadMdBtn.disabled = false;
++  downloadReportBtn.disabled = false;
++  downloadMdBtn.onclick = () => downloadFile(draftPath, `${pipeId}.md`);
++  downloadReportBtn.onclick = () => downloadFile(reportPath, `${pipeId}-report.json`);
++
++  switchTab("result");
++}
++
++function renderReport(report) {
++  if (!report) {
++    reportView.innerHTML = '<div class="empty-state">Отчет отсутствует.</div>';
++    return;
++  }
++
++  const keywords = report.metrics?.keywords ?? { found: [], missing: [] };
++  const length = report.metrics?.length;
++  const structure = report.metrics?.structure ?? {};
++  const jsonld = report.metrics?.jsonld;
++
++  reportView.innerHTML = "";
++
++  const keywordsSection = document.createElement("div");
++  keywordsSection.className = "report-section";
++  keywordsSection.innerHTML = `
++    <h4>Ключевые слова</h4>
++    <div class="metric-row">
++      <span>Найдены</span>
++      <span class="badge ok">${keywords.found.length}</span>
++    </div>
++    <ul>${keywords.found.map((kw) => `<li>${kw}</li>`).join("") || "<li>—</li>"}</ul>
++    <div class="metric-row">
++      <span>Отсутствуют</span>
++      <span class="badge ${keywords.missing.length ? "missing" : "ok"}">${keywords.missing.length}</span>
++    </div>
++    <ul>${keywords.missing.map((kw) => `<li>${kw}</li>`).join("") || "<li>—</li>"}</ul>
++  `;
++
++  const lengthSection = document.createElement("div");
++  lengthSection.className = "report-section";
++  const lengthText = length
++    ? `${length.actual.toLocaleString()} ${length.unit} / цель ${length.target.toLocaleString()} ${length.unit}`
++    : "Нет данных";
++  lengthSection.innerHTML = `
++    <h4>Длина текста</h4>
++    <div class="metric-row">
++      <span>Фактическая</span>
++      <span>${length ? length.actual.toLocaleString() : "—"}</span>
++    </div>
++    <div class="metric-row">
++      <span>Цель</span>
++      <span>${length ? length.target.toLocaleString() : "—"}</span>
++    </div>
++    <p class="card-meta">${lengthText}</p>
++  `;
++
++  const structureSection = document.createElement("div");
++  structureSection.className = "report-section";
++  structureSection.innerHTML = `
++    <h4>Структура</h4>
++    <div class="metric-row"><span>H1</span><span>${structure.h1 ?? "—"}</span></div>
++    <div class="metric-row"><span>H2</span><span>${structure.h2 ?? "—"}</span></div>
++    <div class="metric-row"><span>FAQ</span><span>${structure.faq ?? "—"}</span></div>
++    <div class="metric-row"><span>Таблицы</span><span>${structure.table ? "Да" : "Нет"}</span></div>
++  `;
++
++  const jsonldSection = document.createElement("div");
++  jsonldSection.className = "report-section";
++  jsonldSection.innerHTML = `
++    <h4>JSON-LD</h4>
++    <span class="badge ${jsonld ? "ok" : "pending"}">${jsonld ? "Готово" : "Нужно доработать"}</span>
++  `;
++
++  reportView.append(keywordsSection, lengthSection, structureSection, jsonldSection);
++}
++
++async function downloadFile(path, suggestedName) {
++  const response = await fetch(path);
++  const blob = await response.blob();
++  const url = URL.createObjectURL(blob);
++  const a = document.createElement("a");
++  a.href = url;
++  a.download = suggestedName;
++  document.body.appendChild(a);
++  a.click();
++  document.body.removeChild(a);
++  URL.revokeObjectURL(url);
++}
++
++function formatDate(date) {
++  try {
++    const parsed = new Date(date);
++    return parsed.toLocaleString("ru-RU", {
++      year: "numeric",
++      month: "long",
++      day: "numeric",
++      hour: "2-digit",
++      minute: "2-digit",
++    });
++  } catch (e) {
++    return date;
++  }
++}
++
++briefForm.addEventListener("submit", async (event) => {
++  event.preventDefault();
++  if (!pipeSelect.value) return;
++
++  progressOverlay.classList.remove("hidden");
++
++  const formData = new FormData(briefForm);
++  const pipeId = formData.get("pipe-select") || pipeSelect.value;
++  const topic = document.getElementById("topic-input").value.trim();
++  const tone = document.getElementById("tone-select").value;
++
++  setTimeout(async () => {
++    progressOverlay.classList.add("hidden");
++    await showResult({
++      source: "brief",
++      pipeId,
++      topic: topic || state.pipes.get(pipeId)?.sample_topics?.[0],
++      tone,
++    });
++  }, 1200 + Math.random() * 500);
++});
++
++function initFormDefaults() {
++  pipeSelect.name = "pipe-select";
++  document.getElementById("tone-select").value = "экспертный";
++}
++
++async function bootstrap() {
++  initFormDefaults();
++  await loadPipes();
++  await loadArtifacts();
++}
++
++bootstrap().catch((error) => {
++  console.error("Не удалось инициализировать демо", error);
++});
+diff --git a/frontend_demo/styles.css b/frontend_demo/styles.css
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d28ae382a5e0c407aeef743af5c9c416af08a7b
+--- /dev/null
++++ b/frontend_demo/styles.css
+@@ -0,0 +1,434 @@
++:root {
++  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
++  color: #1d1d1f;
++  background-color: #ffffff;
++}
++
++body {
++  margin: 0;
++  min-height: 100vh;
++  display: flex;
++  flex-direction: column;
++  background-color: #f7f8fa;
++}
++
++.app-header {
++  background-color: #ffffff;
++  border-bottom: 1px solid #e4e7ec;
++  padding: 24px 48px;
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++}
++
++.app-header h1 {
++  margin: 0;
++  font-size: 28px;
++  font-weight: 600;
++}
++
++.subtitle {
++  margin: 4px 0 0;
++  color: #6b7280;
++  font-size: 15px;
++}
++
++.app {
++  flex: 1;
++  max-width: 1200px;
++  width: 100%;
++  margin: 0 auto;
++  padding: 32px 24px 48px;
++  box-sizing: border-box;
++}
++
++.tabs {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
++  gap: 8px;
++  margin-bottom: 24px;
++}
++
++.tab {
++  background: #ffffff;
++  border: 1px solid #d4d8dd;
++  border-radius: 12px;
++  padding: 12px 16px;
++  font-size: 15px;
++  cursor: pointer;
++  transition: border-color 0.2s ease, box-shadow 0.2s ease;
++}
++
++.tab:hover {
++  border-color: #8093ff;
++}
++
++.tab.active {
++  border-color: #4f46e5;
++  box-shadow: 0 6px 18px rgba(79, 70, 229, 0.12);
++}
++
++.tab-panel {
++  display: none;
++}
++
++.tab-panel.active {
++  display: block;
++}
++
++.brief-form {
++  background: #ffffff;
++  border-radius: 16px;
++  padding: 24px;
++  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
++  display: grid;
++  gap: 20px;
++  max-width: 560px;
++}
++
++.form-row {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++}
++
++.form-row input,
++.form-row select {
++  padding: 12px 14px;
++  border-radius: 10px;
++  border: 1px solid #d4d8dd;
++  font-size: 15px;
++}
++
++.form-row input:focus,
++.form-row select:focus {
++  outline: none;
++  border-color: #4f46e5;
++  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
++}
++
++fieldset {
++  border: 1px solid #e4e7ec;
++  border-radius: 12px;
++  padding: 12px 16px 16px;
++  display: flex;
++  flex-wrap: wrap;
++  gap: 16px;
++}
++
++legend {
++  padding: 0 4px;
++  color: #4b5563;
++}
++
++.primary {
++  background-color: #4f46e5;
++  color: #ffffff;
++  border: none;
++  border-radius: 12px;
++  padding: 12px 20px;
++  font-size: 16px;
++  cursor: pointer;
++  transition: background-color 0.2s ease, transform 0.2s ease;
++}
++
++.primary:hover {
++  background-color: #4338ca;
++  transform: translateY(-1px);
++}
++
++.secondary {
++  background: #ffffff;
++  color: #1d1d1f;
++  border: 1px solid #d4d8dd;
++  border-radius: 10px;
++  padding: 10px 18px;
++  cursor: pointer;
++  transition: border-color 0.2s ease;
++}
++
++.secondary:disabled {
++  cursor: not-allowed;
++  color: #9ca3af;
++  border-color: #e5e7eb;
++}
++
++.cards {
++  display: grid;
++  gap: 16px;
++}
++
++.card {
++  background: #ffffff;
++  border-radius: 16px;
++  padding: 20px;
++  box-shadow: 0 8px 30px rgba(15, 23, 42, 0.08);
++  cursor: pointer;
++  transition: transform 0.15s ease, box-shadow 0.15s ease;
++}
++
++.card:hover {
++  transform: translateY(-2px);
++  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.1);
++}
++
++.card-header {
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  gap: 12px;
++  margin-bottom: 12px;
++}
++
++.card-title {
++  margin: 0;
++  font-size: 18px;
++}
++
++.card-topic,
++.card-meta {
++  margin: 0;
++  color: #6b7280;
++  font-size: 14px;
++}
++
++.status {
++  font-size: 13px;
++  font-weight: 600;
++  padding: 4px 10px;
++  border-radius: 999px;
++  background-color: #eef2ff;
++  color: #4338ca;
++}
++
++.status[data-status="Ready"] {
++  background-color: #ecfdf5;
++  color: #047857;
++}
++
++.pipes {
++  display: grid;
++  gap: 16px;
++}
++
++.pipe-card {
++  background: #ffffff;
++  border-radius: 16px;
++  padding: 20px;
++  box-shadow: 0 6px 24px rgba(15, 23, 42, 0.08);
++  display: grid;
++  gap: 12px;
++}
++
++.pipe-card h3 {
++  margin: 0;
++  font-size: 18px;
++}
++
++.pipe-card p {
++  margin: 0;
++  color: #4b5563;
++  font-size: 14px;
++  line-height: 1.5;
++}
++
++.pipe-meta {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px;
++  font-size: 13px;
++  color: #6b7280;
++}
++
++.pipe-keywords {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px;
++}
++
++.pipe-keywords span {
++  padding: 4px 10px;
++  background-color: #eef2ff;
++  border-radius: 999px;
++  font-size: 12px;
++}
++
++.result-layout {
++  display: grid;
++  gap: 24px;
++  grid-template-columns: 1fr;
++}
++
++@media (min-width: 980px) {
++  .result-layout {
++    grid-template-columns: 2fr 1fr;
++  }
++}
++
++.result-main {
++  background: #ffffff;
++  border-radius: 16px;
++  padding: 24px 28px;
++  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
++}
++
++.result-header {
++  border-bottom: 1px solid #f1f5f9;
++  padding-bottom: 16px;
++  margin-bottom: 20px;
++}
++
++.result-header h2 {
++  margin: 0;
++}
++
++.result-meta {
++  margin: 8px 0 0;
++  color: #6b7280;
++  font-size: 14px;
++}
++
++.draft-view h1,
++.draft-view h2,
++.draft-view h3 {
++  margin-top: 24px;
++  margin-bottom: 12px;
++}
++
++.draft-view p {
++  line-height: 1.6;
++  margin-bottom: 16px;
++}
++
++.draft-view ul,
++.draft-view ol {
++  padding-left: 24px;
++  margin-bottom: 16px;
++}
++
++.draft-view li {
++  margin-bottom: 8px;
++}
++
++.result-aside {
++  background: #ffffff;
++  border-radius: 16px;
++  padding: 24px;
++  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
++  display: flex;
++  flex-direction: column;
++  gap: 16px;
++}
++
++.report-view {
++  display: grid;
++  gap: 16px;
++}
++
++.report-section {
++  border: 1px solid #e4e7ec;
++  border-radius: 12px;
++  padding: 12px 16px;
++}
++
++.report-section h4 {
++  margin: 0 0 8px;
++  font-size: 15px;
++}
++
++.report-section ul {
++  margin: 0;
++  padding-left: 18px;
++}
++
++.metric-row {
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  font-size: 14px;
++  margin-bottom: 8px;
++}
++
++.metric-row:last-child {
++  margin-bottom: 0;
++}
++
++.badge {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  font-size: 12px;
++  font-weight: 600;
++  padding: 4px 8px;
++  border-radius: 999px;
++}
++
++.badge.ok {
++  background: #ecfdf5;
++  color: #047857;
++}
++
++.badge.missing {
++  background: #fef2f2;
++  color: #b91c1c;
++}
++
++.badge.pending {
++  background: #f1f5f9;
++  color: #475569;
++}
++
++.download-buttons {
++  display: flex;
++  gap: 12px;
++}
++
++.progress-overlay {
++  position: fixed;
++  inset: 0;
++  background: rgba(15, 23, 42, 0.25);
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  z-index: 100;
++}
++
++.progress-overlay.hidden {
++  display: none;
++}
++
++.progress-card {
++  background: #ffffff;
++  padding: 32px 40px;
++  border-radius: 16px;
++  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.2);
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 16px;
++  font-size: 16px;
++}
++
++.spinner {
++  width: 48px;
++  height: 48px;
++  border-radius: 50%;
++  border: 4px solid #e5e7eb;
++  border-top-color: #4f46e5;
++  animation: spin 1s linear infinite;
++}
++
++@keyframes spin {
++  to {
++    transform: rotate(360deg);
++  }
++}
++
++.empty-state {
++  text-align: center;
++  color: #9ca3af;
++  padding: 40px;
++  border: 1px dashed #e2e8f0;
++  border-radius: 16px;
++  background: #ffffff;
++}
+diff --git a/mock_data/artifacts/finadvisor/sample_draft.md b/mock_data/artifacts/finadvisor/sample_draft.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..5395aff8d57d0798f1b2ccce3b2d6544f570f75b
+--- /dev/null
++++ b/mock_data/artifacts/finadvisor/sample_draft.md
+@@ -0,0 +1,26 @@
++# Как сформировать личный резервный фонд
++
++## Зачем нужен резерв
++Резервный фонд защищает от финансовых потрясений и помогает сохранять стабильность бюджета.
++
++## Определяем размер фонда
++- Минимум 3 ежемесячных расхода
++- Оптимально 6-9 месяцев
++- Учитываем кредиты и обязательства
++
++## Где хранить средства
++1. Высокодоходные накопительные счета
++2. Короткие облигационные фонды
++3. Депозиты с возможностью частичного снятия
++
++## План действий на 90 дней
++1. Проанализировать бюджет и сократить необязательные траты.
++2. Настроить автоматические переводы на отдельный счет.
++3. Отслеживать выполнение плана каждую неделю.
++
++## FAQ
++**Нужно ли страховать резерв?**
++Достаточно использовать банки с государственной системой страхования вкладов.
++
++**Что делать с резервом после использования?**
++Восстановить его в течение ближайших месяцев, увеличив ежемесячные отчисления.
+diff --git a/mock_data/artifacts/finadvisor/sample_jsonld.json b/mock_data/artifacts/finadvisor/sample_jsonld.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..e64b6bd83f37356661a31b7f93df8d39841e95be
+--- /dev/null
++++ b/mock_data/artifacts/finadvisor/sample_jsonld.json
+@@ -0,0 +1,7 @@
++{
++  "@context": "https://schema.org",
++  "@type": "HowTo",
++  "name": "Создание резервного фонда",
++  "description": "Пошаговый план по созданию финансовой подушки безопасности",
++  "totalTime": "P3M"
++}
+diff --git a/mock_data/artifacts/finadvisor/sample_report.json b/mock_data/artifacts/finadvisor/sample_report.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3c6c033f60041b78080a8ad6fa4457123b038f6
+--- /dev/null
++++ b/mock_data/artifacts/finadvisor/sample_report.json
+@@ -0,0 +1,26 @@
++{
++  "artifact_id": "finadvisor-demo-1",
++  "pipe_id": "finadvisor",
++  "topic": "Как сформировать резервный фонд",
++  "tone": "дружелюбный",
++  "metrics": {
++    "keywords": {
++      "found": ["резервный фонд", "бюджет", "накопления"],
++      "missing": []
++    },
++    "length": {
++      "target": 2000,
++      "actual": 2050,
++      "unit": "символов"
++    },
++    "structure": {
++      "h1": 1,
++      "h2": 4,
++      "faq": 2,
++      "table": false
++    },
++    "jsonld": false
++  },
++  "generated_at": "2024-05-18T09:30:00+03:00",
++  "status": "Ready"
++}
+diff --git a/mock_data/artifacts/index.json b/mock_data/artifacts/index.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a901b828963c348343c3ba57e84ded5f617eafc
+--- /dev/null
++++ b/mock_data/artifacts/index.json
+@@ -0,0 +1,26 @@
++[
++  {
++    "id": "probankir-demo-1",
++    "name": "Кэшбэк-карты — обзор",
++    "pipe_id": "probankir",
++    "topic": "Лучшие кредитные карты с кэшбэком",
++    "status": "Draft",
++    "updated_at": "2024-05-22"
++  },
++  {
++    "id": "finadvisor-demo-1",
++    "name": "Резервный фонд без стресса",
++    "pipe_id": "finadvisor",
++    "topic": "Как сформировать резервный фонд",
++    "status": "Ready",
++    "updated_at": "2024-05-18"
++  },
++  {
++    "id": "internet-income-demo-1",
++    "name": "Запуск онлайн-курса",
++    "pipe_id": "internet_income",
++    "topic": "Как запустить онлайн-курс",
++    "status": "Draft",
++    "updated_at": "2024-05-12"
++  }
++]
+diff --git a/mock_data/artifacts/internet_income/sample_draft.md b/mock_data/artifacts/internet_income/sample_draft.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4b0f838cd0c107fe64cb99ba18c511c1d0204d8
+--- /dev/null
++++ b/mock_data/artifacts/internet_income/sample_draft.md
+@@ -0,0 +1,24 @@
++# Как запустить онлайн-курс и заработать на экспертности
++
++## Оценка спроса
++Используйте опросы и анализ поисковых запросов, чтобы проверить интерес аудитории.
++
++## Подготовка контента
++- Разделите программу на короткие модули
++- Добавьте практические задания и чек-листы
++- Запишите демонстрационные видео
++
++## Платформа и продажи
++1. Тестируйте курс на закрытой группе.
++2. Настройте автоворонку через email и мессенджеры.
++3. Используйте партнерские программы для привлечения трафика.
++
++## Поддержка учеников
++Организуйте еженедельные вебинары и чат для вопросов, чтобы повысить удержание.
++
++## FAQ
++**Сколько времени занимает запуск курса?**
++В среднем 6–8 недель от исследования ниши до первой продажи.
++
++**Нужны ли рекламные бюджеты?**
++На старте достаточно партнерских интеграций и личного бренда.
+diff --git a/mock_data/artifacts/internet_income/sample_jsonld.json b/mock_data/artifacts/internet_income/sample_jsonld.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa9ebc4a14d604b7b3ba52b2d92ef810f9e65b8d
+--- /dev/null
++++ b/mock_data/artifacts/internet_income/sample_jsonld.json
+@@ -0,0 +1,10 @@
++{
++  "@context": "https://schema.org",
++  "@type": "Course",
++  "name": "Онлайн-курс по запуску цифрового продукта",
++  "description": "Методология проверки ниши, подготовки программы и вывода курса на рынок",
++  "provider": {
++    "@type": "Organization",
++    "name": "Фабрика контента"
++  }
++}
+diff --git a/mock_data/artifacts/internet_income/sample_report.json b/mock_data/artifacts/internet_income/sample_report.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..eaf25c7330569ee2eb611f9ea2b21f837b62379e
+--- /dev/null
++++ b/mock_data/artifacts/internet_income/sample_report.json
+@@ -0,0 +1,26 @@
++{
++  "artifact_id": "internet-income-demo-1",
++  "pipe_id": "internet_income",
++  "topic": "Как запустить онлайн-курс",
++  "tone": "строгий",
++  "metrics": {
++    "keywords": {
++      "found": ["онлайн-курс", "продажи", "платформа"],
++      "missing": ["маркетинг"]
++    },
++    "length": {
++      "target": 1900,
++      "actual": 1880,
++      "unit": "символов"
++    },
++    "structure": {
++      "h1": 1,
++      "h2": 4,
++      "faq": 2,
++      "table": true
++    },
++    "jsonld": true
++  },
++  "generated_at": "2024-05-12T14:10:00+03:00",
++  "status": "Draft"
++}
+diff --git a/mock_data/artifacts/probankir/sample_draft.md b/mock_data/artifacts/probankir/sample_draft.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..88c23f947408579fbfcb7d755f6ac75343f15fac
+--- /dev/null
++++ b/mock_data/artifacts/probankir/sample_draft.md
+@@ -0,0 +1,24 @@
++# Лучшие кредитные карты с кэшбэком в 2024 году
++
++## Почему важен размер кэшбэка
++Кэшбэк позволяет вернуть часть средств, потраченных по карте. Банки предлагают от 1% до 15% возврата в зависимости от категории.
++
++## Ключевые параметры выбора
++- Годовое обслуживание
++- Лимит кэшбэка
++- Дополнительные бонусы и акции
++
++## ТОП-3 предложения
++1. «Банк Платинум»: 5% на категорию «Путешествия», бесплатное обслуживание при тратах от 30 000 ₽.
++2. «Сити Финанс»: 7% на онлайн-покупки, бесплатное снятие наличных.
++3. «Капитал+»: 4% на продукты и 2% на остальные покупки, бесплатные страховки.
++
++## Советы по использованию
++Регулярно активируйте категории повышенного кэшбэка и следите за лимитами возврата, чтобы получать максимум выгоды.
++
++## FAQ
++**Можно ли вернуть кэшбэк наличными?**
++Да, но условия зависят от банка: где-то переводят на карту, где-то списывают в качестве бонусов.
++
++**Что делать, если не пришёл кэшбэк?**
++Проверить выполнение условий акции и обратиться в поддержку банка.
+diff --git a/mock_data/artifacts/probankir/sample_jsonld.json b/mock_data/artifacts/probankir/sample_jsonld.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..dfdebca662b427197e7018b2942c10813bc57b3f
+--- /dev/null
++++ b/mock_data/artifacts/probankir/sample_jsonld.json
+@@ -0,0 +1,7 @@
++{
++  "@context": "https://schema.org",
++  "@type": "FinancialProduct",
++  "name": "Обзор кредитных карт с кэшбэком",
++  "description": "Сравнение условий кэшбэка и бонусов по популярным картам",
++  "dateCreated": "2024-05-22"
++}
+diff --git a/mock_data/artifacts/probankir/sample_report.json b/mock_data/artifacts/probankir/sample_report.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..87c0273414787433e1bdfc1837b4f4b34e21ae8c
+--- /dev/null
++++ b/mock_data/artifacts/probankir/sample_report.json
+@@ -0,0 +1,26 @@
++{
++  "artifact_id": "probankir-demo-1",
++  "pipe_id": "probankir",
++  "topic": "Лучшие кредитные карты с кэшбэком",
++  "tone": "экспертный",
++  "metrics": {
++    "keywords": {
++      "found": ["кэшбэк", "кредитная карта", "обслуживание"],
++      "missing": ["рассрочка"]
++    },
++    "length": {
++      "target": 1800,
++      "actual": 1650,
++      "unit": "символов"
++    },
++    "structure": {
++      "h1": 1,
++      "h2": 5,
++      "faq": 2,
++      "table": false
++    },
++    "jsonld": true
++  },
++  "generated_at": "2024-05-22T10:15:00+03:00",
++  "status": "Draft"
++}
+diff --git a/mock_data/pipes/finadvisor.json b/mock_data/pipes/finadvisor.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..193f22143293db0abb4e72b6cec492d88a192351
+--- /dev/null
++++ b/mock_data/pipes/finadvisor.json
+@@ -0,0 +1,8 @@
++{
++  "pipe_id": "finadvisor",
++  "name": "Финансовый советник",
++  "description": "Персональные финансы, планирование бюджета и стратегия инвестиций для частных лиц.",
++  "tone": "дружелюбный",
++  "keywords": ["личный бюджет", "инвестиции", "накопления", "финансовые цели"],
++  "sample_topics": ["Как сформировать резервный фонд", "Первые шаги в инвестициях для новичков"]
++}
+diff --git a/mock_data/pipes/index.json b/mock_data/pipes/index.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a256ecb8648fedb18b87a27cd42e709b132808e
+--- /dev/null
++++ b/mock_data/pipes/index.json
+@@ -0,0 +1,5 @@
++[
++  "probankir",
++  "finadvisor",
++  "internet_income"
++]
+diff --git a/mock_data/pipes/internet_income.json b/mock_data/pipes/internet_income.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..9bf3adf128b68827087da299e984ffb01903ebac
+--- /dev/null
++++ b/mock_data/pipes/internet_income.json
+@@ -0,0 +1,8 @@
++{
++  "pipe_id": "internet_income",
++  "name": "Заработок в интернете",
++  "description": "Практики фриланса, создания цифровых продуктов и источников пассивного дохода онлайн.",
++  "tone": "строгий",
++  "keywords": ["фриланс", "онлайн-курсы", "пассивный доход", "маркетплейсы"],
++  "sample_topics": ["Как выбрать нишу для онлайн-курса", "Стратегия заработка на маркетплейсах"]
++}
+diff --git a/mock_data/pipes/probankir.json b/mock_data/pipes/probankir.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..323fb075efe37888935691f0174517a8d6a417b3
+--- /dev/null
++++ b/mock_data/pipes/probankir.json
+@@ -0,0 +1,8 @@
++{
++  "pipe_id": "probankir",
++  "name": "Банковские продукты",
++  "description": "Обзоры кредитных и дебетовых карт, условия кредитования и программы лояльности.",
++  "tone": "экспертный",
++  "keywords": ["кредитные карты", "дебетовые карты", "кэшбэк", "ставки"],
++  "sample_topics": ["Сравнение кредитных карт с кэшбэком", "Как выбрать вклад с высокой доходностью"]
++}
 

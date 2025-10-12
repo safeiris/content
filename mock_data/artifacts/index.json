@@ -1,0 +1,26 @@
+[
+  {
+    "id": "probankir-demo-1",
+    "name": "Кэшбэк-карты — обзор",
+    "pipe_id": "probankir",
+    "topic": "Лучшие кредитные карты с кэшбэком",
+    "status": "Draft",
+    "updated_at": "2024-05-22"
+  },
+  {
+    "id": "finadvisor-demo-1",
+    "name": "Резервный фонд без стресса",
+    "pipe_id": "finadvisor",
+    "topic": "Как сформировать резервный фонд",
+    "status": "Ready",
+    "updated_at": "2024-05-18"
+  },
+  {
+    "id": "internet-income-demo-1",
+    "name": "Запуск онлайн-курса",
+    "pipe_id": "internet_income",
+    "topic": "Как запустить онлайн-курс",
+    "status": "Draft",
+    "updated_at": "2024-05-12"
+  }
+]
