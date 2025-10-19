@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from rules_engine import build_prompt
+from retrieval import load_index, search_topk
 
 
 def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str, object]]:
@@ -22,9 +23,14 @@ def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str
     where higher means more relevant.
     """
 
-    # TODO: Implement retrieval that respects token budgets (~500-700 tokens per
-    # call) and filters exemplars by ``theme_slug`` once embeddings are ready.
-    return []
+    try:
+        index = load_index(theme_slug)
+    except FileNotFoundError:
+        return []
+
+    search_query = (query or "").strip() or theme_slug
+    results = search_topk(index=index, query=search_query, k=k)
+    return [{"path": item.get("path"), "text": item.get("text", ""), "score": item.get("score", 0.0)} for item in results]
 
 
 def assemble_messages(data_path: str = "input_example.json", theme_slug: str = "finance") -> List[Dict[str, str]]:
