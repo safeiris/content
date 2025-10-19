@@ -19,6 +19,11 @@ class ContextBundle:
     total_tokens_est: int
     index_missing: bool
     context_used: bool
+    token_budget_limit: int
+
+    @staticmethod
+    def token_budget_default() -> int:
+        return DEFAULT_CONTEXT_TOKEN_BUDGET
 
 
 def retrieve_context(
@@ -28,15 +33,29 @@ def retrieve_context(
     k: int = 3,
     token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
 ) -> ContextBundle:
+    budget_limit = token_budget if token_budget is not None else DEFAULT_CONTEXT_TOKEN_BUDGET
+
     try:
         index = load_index(theme_slug)
     except FileNotFoundError:
-        return ContextBundle(items=[], total_tokens_est=0, index_missing=True, context_used=False)
+        return ContextBundle(
+            items=[],
+            total_tokens_est=0,
+            index_missing=True,
+            context_used=False,
+            token_budget_limit=budget_limit,
+        )
 
     search_query = (query or "").strip() or theme_slug
     results = search_topk(index=index, query=search_query, k=k)
     if not results:
-        return ContextBundle(items=[], total_tokens_est=0, index_missing=False, context_used=False)
+        return ContextBundle(
+            items=[],
+            total_tokens_est=0,
+            index_missing=False,
+            context_used=False,
+            token_budget_limit=budget_limit,
+        )
 
     limited = list(results[:k]) if k > 0 else []
 
@@ -44,11 +63,18 @@ def retrieve_context(
         return sum(int(item.get("token_estimate", estimate_tokens(item.get("text", "")))) for item in items)
 
     if token_budget and limited:
+        limited.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
         while _token_sum(limited) > token_budget and len(limited) > 1:
             limited.pop()
 
     total = _token_sum(limited)
-    return ContextBundle(items=limited, total_tokens_est=total, index_missing=False, context_used=bool(limited))
+    return ContextBundle(
+        items=limited,
+        total_tokens_est=total,
+        index_missing=False,
+        context_used=bool(limited),
+        token_budget_limit=budget_limit,
+    )
 
 
 def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str, object]]:

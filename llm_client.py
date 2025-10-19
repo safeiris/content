@@ -37,6 +37,25 @@ def _ensure_api_key() -> str:
     return api_key
 
 
+def _resolve_backoff_schedule(override: Optional[List[float]]) -> List[float]:
+    if override:
+        return override
+    raw = os.getenv("LLM_RETRY_BACKOFF")
+    if raw:
+        values: List[float] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                values.append(float(part))
+            except ValueError:
+                continue
+        if values:
+            return values
+    return BACKOFF_SCHEDULE
+
+
 def _should_retry(exc: BaseException) -> bool:
     if isinstance(exc, RateLimitError):
         return True
@@ -67,6 +86,7 @@ def generate(
     temperature: float = 0.3,
     max_tokens: int = 1400,
     timeout_s: int = 60,
+    backoff_schedule: Optional[List[float]] = None,
 ) -> str:
     """Call the configured LLM and return the article text."""
 
@@ -81,6 +101,7 @@ def generate(
     client = OpenAI(api_key=api_key, http_client=http_client)
 
     last_error: Optional[BaseException] = None
+    schedule = _resolve_backoff_schedule(backoff_schedule)
     try:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -109,9 +130,9 @@ def generate(
                 should_retry = _should_retry(exc)
                 if attempt >= MAX_RETRIES or not should_retry:
                     break
-                sleep_for = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
+                sleep_for = schedule[min(attempt - 1, len(schedule) - 1)]
                 reason = _describe_error(exc)
-                print(f"[llm_client] retry {attempt} reason: {reason}; sleeping {sleep_for}s", file=sys.stderr)
+                print(f"[llm_client] retry #{attempt} reason: {reason}; sleeping {sleep_for}s", file=sys.stderr)
                 time.sleep(sleep_for)
         if last_error:
             if isinstance(last_error, RateLimitError):

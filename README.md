@@ -48,6 +48,52 @@ python run_demo.py
 2. Запусти генерацию: `python orchestrate.py --theme finance --data input_example.json --k 3`
 3. Результат смотри в `artifacts/*.md` и соседнем `.json` с метаданными.
 
+#### Пример пакетного запуска
+
+Создайте `batch.json` с массивом заданий (можно использовать YAML с теми же полями):
+
+```json
+[
+  {
+    "theme": "finance",
+    "data": "input_example.json",
+    "k": 0,
+    "outfile": "artifacts/finance_draft.md"
+  },
+  {
+    "theme": "finance",
+    "data": "input_example.json",
+    "k": 3,
+    "outfile": "artifacts/finance_context.md"
+  },
+  {
+    "theme": "mortgage",
+    "data": "mock_data/mortgage.json",
+    "k": 2,
+    "outfile": "artifacts/mortgage.md"
+  }
+]
+```
+
+Запустите генерацию для всех элементов одним вызовом:
+
+```bash
+python orchestrate.py --batch batch.json --mode draft
+```
+
+Каждое задание сохранит статью и метаданные в указанный `outfile` и соседний `.json`.
+
+#### A/B сравнение без и с контекстом
+
+Чтобы сравнить генерацию без CONTEXT и с выбранным `k`, используйте режим `--ab compare`:
+
+```bash
+python orchestrate.py --theme finance --data input_example.json --k 3 --ab compare
+```
+
+В каталоге `artifacts/` появятся файлы с суффиксами `__A` (без CONTEXT) и `__B` (с CONTEXT),
+а рядом с каждым — `.json` с метаданными. Команда выводит длины и длительность обоих прогонов для быстрого сравнения.
+
 ### Ready for Stage 2, когда
 - Структура профилей создана минимум для одной темы с 2–3 заготовками.
 - `base_prompt.txt` знает про блок CONTEXT.

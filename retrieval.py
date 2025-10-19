@@ -195,8 +195,7 @@ def build_index(theme_slug: str) -> Path:
     avg_length = sum(lengths) / len(lengths)
     avg_tokens = sum(token_lengths) / len(token_lengths)
     print(f"Indexed {len(items)} clips for theme '{theme_slug}'.")
-    print(f"Average truncated length: {avg_length:.1f} words.")
-    print(f"Average truncated length (est. tokens): {avg_tokens:.1f}.")
+    print(f"Average truncated length: {avg_length:.1f} words; {avg_tokens:.1f} est. tokens.")
     if cached:
         print(f"cached: {cached}")
     print(f"Index written to: {index_path}")

@@ -14,6 +14,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from assemble_messages import ContextBundle, assemble_messages, retrieve_context
 from llm_client import DEFAULT_MODEL, generate as llm_generate
 from plagiarism_guard import is_too_similar
@@ -42,6 +44,13 @@ def _get_cta_text() -> str:
     return cta or DEFAULT_CTA_TEXT
 
 
+def _resolve_cta_source(data: Dict[str, Any]) -> Tuple[str, bool]:
+    custom_cta = str(data.get("cta", "")).strip()
+    if custom_cta:
+        return custom_cta, False
+    return _get_cta_text(), True
+
+
 def _is_truncated(text: str) -> bool:
     stripped = text.rstrip()
     if not stripped:
@@ -55,13 +64,12 @@ def _is_truncated(text: str) -> bool:
     return not last_paragraph.endswith((".", "!", "?"))
 
 
-def _append_cta_if_needed(text: str) -> Tuple[str, bool]:
+def _append_cta_if_needed(text: str, *, cta_text: str, default_cta: bool) -> Tuple[str, bool, bool]:
     if not _is_truncated(text):
-        return text, False
-    cta = _get_cta_text()
+        return text, False, False
     if text.strip():
-        return text.rstrip() + "\n\n" + cta, True
-    return cta, True
+        return text.rstrip() + "\n\n" + cta_text, True, default_cta
+    return cta_text, True, default_cta
 
 
 def _choose_section_for_extension(data: Dict[str, Any]) -> str:
@@ -92,6 +100,7 @@ def _ensure_length(
     temperature: float,
     max_tokens: int,
     timeout: int,
+    backoff_schedule: Optional[List[float]] = None,
 ) -> Tuple[str, Optional[str], List[Dict[str, str]]]:
     length = len(text)
     if length < LENGTH_EXTEND_THRESHOLD:
@@ -105,6 +114,7 @@ def _ensure_length(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_s=timeout,
+            backoff_schedule=backoff_schedule,
         )
         return new_text, "extend", adjusted_messages
     if length > LENGTH_SHRINK_THRESHOLD:
@@ -117,6 +127,7 @@ def _ensure_length(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_s=timeout,
+            backoff_schedule=backoff_schedule,
         )
         return new_text, "shrink", adjusted_messages
     return text, None, messages
@@ -133,7 +144,14 @@ def _make_generation_context(
     k: int,
 ) -> GenerationContext:
     if k <= 0:
-        bundle = ContextBundle(items=[], total_tokens_est=0, index_missing=False, context_used=False)
+        print("[orchestrate] CONTEXT: disabled (k=0)")
+        bundle = ContextBundle(
+            items=[],
+            total_tokens_est=0,
+            index_missing=False,
+            context_used=False,
+            token_budget_limit=ContextBundle.token_budget_default(),
+        )
     else:
         bundle = retrieve_context(theme_slug=theme, query=data.get("theme", ""), k=k)
         if bundle.index_missing:
@@ -145,6 +163,17 @@ def _make_generation_context(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate an article using the configured LLM.")
+
+    env_mode = os.getenv("GEN_MODE", "final").strip().lower() or "final"
+    if env_mode not in {"draft", "final"}:
+        env_mode = "final"
+    env_timeout = os.getenv("LLM_TIMEOUT")
+    try:
+        default_timeout = int(env_timeout) if env_timeout is not None else 60
+    except ValueError:
+        default_timeout = 60
+    env_backoff = os.getenv("LLM_RETRY_BACKOFF")
+
     parser.add_argument("--theme", help="Theme slug (matches profiles/<theme>/...)")
     parser.add_argument("--data", help="Path to the JSON brief with generation parameters.")
     parser.add_argument(
@@ -161,12 +190,42 @@ def _parse_args() -> argparse.Namespace:
         dest="max_tokens",
         help="Max tokens for generation (default: 1400).",
     )
-    parser.add_argument("--timeout", type=int, default=60, help="Timeout per request in seconds (default: 60).")
-    parser.add_argument("--mode", choices=["draft", "final"], default="final", help="Execution mode for metadata tags.")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=default_timeout,
+        help="Timeout per request in seconds (default: 60 or LLM_TIMEOUT env).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["draft", "final"],
+        default=env_mode,
+        help="Execution mode for metadata tags (defaults to GEN_MODE env or 'final').",
+    )
     parser.add_argument("--ab", choices=["compare"], help="Run A/B comparison (compare: without vs with context).")
     parser.add_argument("--batch", help="Path to a JSON/YAML file describing batch generation payloads.")
     parser.add_argument("--check", action="store_true", help="Validate environment prerequisites and exit.")
+    parser.add_argument(
+        "--retry-backoff",
+        default=env_backoff,
+        help="Override retry backoff schedule in seconds, e.g. '0.5,1,2'.",
+    )
     return parser.parse_args()
+
+
+def _parse_backoff_schedule(raw: Optional[str]) -> Optional[List[float]]:
+    if raw is None:
+        return None
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        return None
+    schedule: List[float] = []
+    for part in parts:
+        try:
+            schedule.append(float(part))
+        except ValueError as exc:  # noqa: PERF203 - explicit feedback more helpful
+            raise ValueError(f"Invalid retry backoff value: '{part}'") from exc
+    return schedule
 
 
 def _load_input(path: str) -> Dict[str, Any]:
@@ -212,10 +271,12 @@ def _generate_variant(
     mode: str,
     output_path: Path,
     variant_label: Optional[str] = None,
+    backoff_schedule: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
     start_time = time.time()
     generation_context = _make_generation_context(theme=theme, data=data, k=k)
     active_messages = list(generation_context.messages)
+    cta_text, cta_is_default = _resolve_cta_source(data)
 
     article_text = llm_generate(
         active_messages,
@@ -223,11 +284,14 @@ def _generate_variant(
         temperature=temperature,
         max_tokens=max_tokens,
         timeout_s=timeout,
+        backoff_schedule=backoff_schedule,
     )
 
     retry_used = False
+    plagiarism_detected = False
     if generation_context.clip_texts and is_too_similar(article_text, generation_context.clip_texts):
         retry_used = True
+        plagiarism_detected = True
         active_messages = list(active_messages)
         active_messages.append(
             {
@@ -242,19 +306,44 @@ def _generate_variant(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_s=timeout,
+            backoff_schedule=backoff_schedule,
         )
 
-    article_text, length_adjustment, active_messages = _ensure_length(
-        article_text,
-        active_messages,
-        data=data,
-        model_name=model_name,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        timeout=timeout,
-    )
+    truncation_retry_used = False
+    while True:
+        article_text, length_adjustment, active_messages = _ensure_length(
+            article_text,
+            active_messages,
+            data=data,
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            backoff_schedule=backoff_schedule,
+        )
+        if not _is_truncated(article_text):
+            break
+        if truncation_retry_used:
+            break
+        truncation_retry_used = True
+        print("[orchestrate] Детектор усечённого вывода — запускаю повторную генерацию", file=sys.stderr)
+        article_text = llm_generate(
+            active_messages,
+            model=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_s=timeout,
+            backoff_schedule=backoff_schedule,
+        )
+        # повторяем цикл с новым текстом после перегенерации
 
-    article_text, postfix_appended = _append_cta_if_needed(article_text)
+    retry_used = retry_used or truncation_retry_used
+
+    article_text, postfix_appended, default_cta_used = _append_cta_if_needed(
+        article_text,
+        cta_text=cta_text,
+        default_cta=cta_is_default,
+    )
 
     duration = time.time() - start_time
     context_bundle = generation_context.context_bundle
@@ -277,7 +366,7 @@ def _generate_variant(
             }
             for item in context_bundle.items
         ],
-        "plagiarism_flagged": retry_used,
+        "plagiarism_detected": plagiarism_detected,
         "retry_used": retry_used,
         "generated_at": _local_now().isoformat(),
         "duration_seconds": round(duration, 3),
@@ -287,6 +376,7 @@ def _generate_variant(
         "context_used": context_used,
         "context_index_missing": context_bundle.index_missing,
         "context_budget_tokens_est": context_bundle.total_tokens_est,
+        "context_budget_tokens_limit": context_bundle.token_budget_limit,
         "postfix_appended": postfix_appended,
         "length_adjustment": length_adjustment,
         "length_range_target": {"min": TARGET_LENGTH_RANGE[0], "max": TARGET_LENGTH_RANGE[1]},
@@ -294,6 +384,8 @@ def _generate_variant(
         "model_used": model_name,
         "temperature_used": temperature,
         "max_tokens_used": max_tokens,
+        "default_cta_used": default_cta_used,
+        "truncation_retry_used": truncation_retry_used,
     }
     if variant_label:
         metadata["ab_variant"] = variant_label
@@ -329,6 +421,7 @@ def _run_ab_compare(
     model_name: str,
     args: argparse.Namespace,
     base_output_path: Path,
+    backoff_schedule: Optional[List[float]] = None,
 ) -> None:
     path_a = _suffix_output_path(base_output_path, "__A")
     path_b = _suffix_output_path(base_output_path, "__B")
@@ -345,6 +438,7 @@ def _run_ab_compare(
         mode=args.mode,
         output_path=path_a,
         variant_label="A",
+        backoff_schedule=backoff_schedule,
     )
 
     result_b = _generate_variant(
@@ -359,6 +453,7 @@ def _run_ab_compare(
         mode=args.mode,
         output_path=path_b,
         variant_label="B",
+        backoff_schedule=backoff_schedule,
     )
 
     len_a = len(result_a["text"])
@@ -436,6 +531,7 @@ def _run_batch(args: argparse.Namespace) -> None:
     start = time.time()
     report_rows: List[Dict[str, Any]] = []
     successes = 0
+    backoff_schedule = _parse_backoff_schedule(args.retry_backoff)
 
     for idx, entry in enumerate(batch_items, start=1):
         try:
@@ -478,6 +574,7 @@ def _run_batch(args: argparse.Namespace) -> None:
                 timeout=timeout,
                 mode=mode,
                 output_path=output_path,
+                backoff_schedule=backoff_schedule,
             )
 
             report_rows.append(
@@ -520,17 +617,39 @@ def _run_batch(args: argparse.Namespace) -> None:
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _run_checks() -> None:
+def _mask_api_key(api_key: str) -> str:
+    cleaned = api_key.strip()
+    if len(cleaned) <= 8:
+        return "*" * len(cleaned)
+    return f"{cleaned[:4]}{'*' * (len(cleaned) - 8)}{cleaned[-4:]}"
+
+
+def _run_checks(args: argparse.Namespace) -> None:
     ok = True
 
     python_version = sys.version.split()[0]
     print(f"✅ Python version: {python_version}")
 
-    if os.getenv("OPENAI_API_KEY"):
-        print("✅ OPENAI_API_KEY установлен")
-    else:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
         print("❌ OPENAI_API_KEY не найден")
         ok = False
+    else:
+        masked = _mask_api_key(api_key)
+        try:
+            response = httpx.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=5.0,
+            )
+            if response.status_code == 200:
+                print(f"✅ OPENAI_API_KEY проверен ({masked})")
+            else:
+                print(f"❌ OPENAI_API_KEY отклонён ({masked}): HTTP {response.status_code}")
+                ok = False
+        except httpx.HTTPError as exc:
+            print(f"❌ Не удалось проверить OPENAI_API_KEY ({masked}): {exc}")
+            ok = False
 
     artifacts_dir = Path("artifacts")
     try:
@@ -543,12 +662,22 @@ def _run_checks() -> None:
         print(f"❌ Нет доступа к artifacts/: {exc}")
         ok = False
 
-    index_paths = list(Path("profiles").glob("*/index.json"))
-    if index_paths:
-        print(f"✅ Найдено {len(index_paths)} индекс(ов) для CONTEXT")
-    else:
-        print("❌ Индексы CONTEXT не найдены")
+    theme = (args.theme or "").strip()
+    if not theme:
+        print("❌ Тема не указана (--theme), невозможно проверить индекс.")
         ok = False
+    else:
+        index_path = Path("profiles") / theme / "index.json"
+        if not index_path.exists():
+            print(f"❌ Индекс для темы '{theme}' не найден: {index_path}")
+            ok = False
+        else:
+            try:
+                json.loads(index_path.read_text(encoding="utf-8"))
+                print(f"✅ Индекс найден для темы '{theme}' ({index_path})")
+            except json.JSONDecodeError as exc:
+                print(f"❌ Индекс для темы '{theme}' повреждён: {exc}")
+                ok = False
 
     sys.exit(0 if ok else 1)
 
@@ -557,7 +686,7 @@ def main() -> None:
     args = _parse_args()
 
     if args.check:
-        _run_checks()
+        _run_checks(args)
         return
 
     if args.batch:
@@ -572,6 +701,8 @@ def main() -> None:
     model_name = _resolve_model(args.model)
     base_output_path = _make_output_path(args.theme, args.outfile)
 
+    backoff_schedule = _parse_backoff_schedule(args.retry_backoff)
+
     if args.ab == "compare":
         _run_ab_compare(
             theme=args.theme,
@@ -580,6 +711,7 @@ def main() -> None:
             model_name=model_name,
             args=args,
             base_output_path=base_output_path,
+            backoff_schedule=backoff_schedule,
         )
         return
 
@@ -594,6 +726,7 @@ def main() -> None:
         timeout=args.timeout,
         mode=args.mode,
         output_path=base_output_path,
+        backoff_schedule=backoff_schedule,
     )
     return result
 
