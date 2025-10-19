@@ -43,6 +43,11 @@ python run_demo.py
 - `python assemble_messages.py` — печатает предпросмотр system и CONTEXT (пока пусто).
 - `python prompt_to_file.py` — сохраняет промпт в `./artifacts/prompt_<timestamp>.txt`.
 
+### Сквозной прогон с генерацией статьи
+1. Собери индекс (один раз или при изменении клипов): `python -m retrieval index --theme finance`
+2. Запусти генерацию: `python orchestrate.py --theme finance --data input_example.json --k 3`
+3. Результат смотри в `artifacts/*.md` и соседнем `.json` с метаданными.
+
 ### Ready for Stage 2, когда
 - Структура профилей создана минимум для одной темы с 2–3 заготовками.
 - `base_prompt.txt` знает про блок CONTEXT.

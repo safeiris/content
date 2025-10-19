@@ -33,7 +33,12 @@ def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str
     return [{"path": item.get("path"), "text": item.get("text", ""), "score": item.get("score", 0.0)} for item in results]
 
 
-def assemble_messages(data_path: str = "input_example.json", theme_slug: str = "finance") -> List[Dict[str, str]]:
+def assemble_messages(
+    data_path: str = "input_example.json",
+    theme_slug: str = "finance",
+    *,
+    k: int = 3,
+) -> List[Dict[str, str]]:
     """Prepare chat-style messages for an LLM call.
 
     Parameters
@@ -42,6 +47,8 @@ def assemble_messages(data_path: str = "input_example.json", theme_slug: str = "
         Path to the JSON brief that mirrors ``input_example.json``.
     theme_slug: str
         Directory name under ``profiles/`` whose exemplars should be considered.
+    k: int
+        Number of exemplar clips to include in the CONTEXT block.
     """
 
     payload_path = Path(data_path)
@@ -50,7 +57,7 @@ def assemble_messages(data_path: str = "input_example.json", theme_slug: str = "
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
 
-    exemplars = retrieve_exemplars(theme_slug=theme_slug, query=data.get("theme", ""), k=3)
+    exemplars = retrieve_exemplars(theme_slug=theme_slug, query=data.get("theme", ""), k=k)
     if exemplars:
         fragments: List[str] = []
         for idx, item in enumerate(exemplars, start=1):
