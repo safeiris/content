@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from . import create_app
 
@@ -14,6 +15,10 @@ def main() -> None:
     args = parser.parse_args()
 
     app = create_app()
+
+    if not args.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        print(f"✅ Server running: UI + API on http://{args.host}:{args.port}", flush=True)
+
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 

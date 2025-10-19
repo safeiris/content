@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
 from assemble_messages import assemble_messages, retrieve_context
@@ -35,6 +35,9 @@ class ApiError(Exception):
 def create_app() -> Flask:
     app = Flask(__name__)
     CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+    frontend_root = (Path(__file__).resolve().parent.parent / "frontend_demo").resolve()
+    index_path = frontend_root / "index.html"
 
     @app.errorhandler(ApiError)
     def _handle_api_error(exc: ApiError):  # type: ignore[override]
@@ -192,6 +195,27 @@ def create_app() -> Flask:
         status = gather_health_status(theme)
         http_status = 200 if status.get("ok") else 503
         return jsonify(status), http_status
+
+    @app.get("/", defaults={"path": ""})
+    @app.get("/<path:path>")
+    def serve_frontend(path: str):
+        if path.startswith("api/"):
+            raise ApiError("Endpoint not found", status_code=404)
+
+        candidate = (frontend_root / path).resolve()
+        try:
+            candidate.relative_to(frontend_root)
+        except ValueError:
+            abort(404)
+
+        if candidate.is_file():
+            relative_path = candidate.relative_to(frontend_root)
+            return send_from_directory(frontend_root, relative_path.as_posix())
+
+        if index_path.exists():
+            return send_from_directory(frontend_root, index_path.name)
+
+        abort(404)
 
     return app
 

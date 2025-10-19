@@ -1,13 +1,12 @@
 .PHONY: ui api dev clean
 
-UI_PORT ?= 5173
 API_HOST ?= 127.0.0.1
 API_PORT ?= 8000
 
-## Запуск SPA демо-витрины (только фронтенд)
+## Запуск UI (SPA) вместе с API
 ui:
-	@echo "Откройте http://localhost:$(UI_PORT)/ для доступа к фронтенду"
-	python3 -m http.server $(UI_PORT) --directory frontend_demo
+	@echo "UI и API доступны на http://$(API_HOST):$(API_PORT)"
+	python3 -m server --host $(API_HOST) --port $(API_PORT)
 
 ## Запуск API сервера (Flask)
 api:
@@ -16,12 +15,8 @@ api:
 
 ## Одновременный запуск фронта и API (для локальной разработки)
 dev:
-	@echo "Запускаем API и статику..."
-	@bash -c 'python3 -m server --host $(API_HOST) --port $(API_PORT) --debug & \
-	API_PID=$$!; \
-	trap "kill $$API_PID" EXIT; \
-	echo "Фронт доступен на http://localhost:$(UI_PORT)/"; \
-	python3 -m http.server $(UI_PORT) --directory frontend_demo'
+	@echo "Запускаем Flask-сервер с UI и API..."
+	python3 -m server --host $(API_HOST) --port $(API_PORT) --debug
 
 ## Очистка временных файлов
 clean:
