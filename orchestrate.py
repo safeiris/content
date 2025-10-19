@@ -29,6 +29,9 @@ DEFAULT_CTA_TEXT = (
 LENGTH_EXTEND_THRESHOLD = 1800
 LENGTH_SHRINK_THRESHOLD = 4500
 TARGET_LENGTH_RANGE: Tuple[int, int] = (2000, 4000)
+DISCLAIMER_TEMPLATE = (
+    "⚠️ Дисклеймер: Материал носит информационный характер и не является финансовой рекомендацией. Прежде чем принимать решения, оцените риски и проконсультируйтесь со специалистом."
+)
 
 
 @dataclass
@@ -70,6 +73,21 @@ def _append_cta_if_needed(text: str, *, cta_text: str, default_cta: bool) -> Tup
     if text.strip():
         return text.rstrip() + "\n\n" + cta_text, True, default_cta
     return cta_text, True, default_cta
+
+
+def _append_disclaimer_if_requested(text: str, data: Dict[str, Any]) -> Tuple[str, bool]:
+    add_disclaimer = bool(data.get("add_disclaimer"))
+    template = str(data.get("disclaimer_template") or DISCLAIMER_TEMPLATE).strip()
+    if not add_disclaimer or not template:
+        return text, False
+
+    stripped = text.rstrip()
+    if stripped.endswith(template):
+        return text, False
+
+    if stripped:
+        return f"{stripped}\n\n{template}", True
+    return template, True
 
 
 def _choose_section_for_extension(data: Dict[str, Any]) -> str:
@@ -161,17 +179,21 @@ def _make_generation_context(
     return GenerationContext(data=data, context_bundle=bundle, messages=messages, clip_texts=clip_texts)
 
 
+def _default_timeout() -> int:
+    env_timeout = os.getenv("LLM_TIMEOUT")
+    try:
+        return int(env_timeout) if env_timeout is not None else 60
+    except ValueError:
+        return 60
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate an article using the configured LLM.")
 
     env_mode = os.getenv("GEN_MODE", "final").strip().lower() or "final"
     if env_mode not in {"draft", "final"}:
         env_mode = "final"
-    env_timeout = os.getenv("LLM_TIMEOUT")
-    try:
-        default_timeout = int(env_timeout) if env_timeout is not None else 60
-    except ValueError:
-        default_timeout = 60
+    default_timeout = _default_timeout()
     env_backoff = os.getenv("LLM_RETRY_BACKOFF")
 
     parser.add_argument("--theme", help="Theme slug (matches profiles/<theme>/...)")
@@ -278,6 +300,9 @@ def _generate_variant(
     active_messages = list(generation_context.messages)
     cta_text, cta_is_default = _resolve_cta_source(data)
 
+    system_prompt = next((msg.get("content") for msg in active_messages if msg.get("role") == "system"), "")
+    user_prompt = next((msg.get("content") for msg in reversed(active_messages) if msg.get("role") == "user"), "")
+
     article_text = llm_generate(
         active_messages,
         model=model_name,
@@ -345,6 +370,8 @@ def _generate_variant(
         default_cta=cta_is_default,
     )
 
+    article_text, disclaimer_appended = _append_disclaimer_if_requested(article_text, data)
+
     duration = time.time() - start_time
     context_bundle = generation_context.context_bundle
     context_used = bool(context_bundle.context_used and not context_bundle.index_missing and k > 0)
@@ -386,6 +413,11 @@ def _generate_variant(
         "max_tokens_used": max_tokens,
         "default_cta_used": default_cta_used,
         "truncation_retry_used": truncation_retry_used,
+        "disclaimer_appended": disclaimer_appended,
+        "facts_mode": data.get("facts_mode"),
+        "input_data": data,
+        "system_prompt_preview": system_prompt,
+        "user_prompt_preview": user_prompt,
     }
     if variant_label:
         metadata["ab_variant"] = variant_label
@@ -399,6 +431,63 @@ def _generate_variant(
         "output_path": output_path,
         "duration": duration,
         "variant": variant_label,
+    }
+
+
+def generate_article_from_payload(
+    *,
+    theme: str,
+    data: Dict[str, Any],
+    k: int,
+    model: Optional[str] = None,
+    temperature: float = 0.3,
+    max_tokens: int = 1400,
+    timeout: Optional[int] = None,
+    mode: Optional[str] = None,
+    backoff_schedule: Optional[List[float]] = None,
+    outfile: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Convenience wrapper for API usage.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary with text, metadata and resulting artifact paths.
+    """
+
+    resolved_mode = (mode or os.getenv("GEN_MODE") or "final").strip().lower() or "final"
+    if resolved_mode not in {"draft", "final"}:
+        resolved_mode = "final"
+
+    resolved_timeout = timeout if timeout is not None else _default_timeout()
+    resolved_model = _resolve_model(model)
+    if backoff_schedule is None:
+        backoff_schedule = _parse_backoff_schedule(os.getenv("LLM_RETRY_BACKOFF"))
+
+    output_path = _make_output_path(theme, outfile)
+    result = _generate_variant(
+        theme=theme,
+        data=data,
+        data_path="<inline>",
+        k=k,
+        model_name=resolved_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=resolved_timeout,
+        mode=resolved_mode,
+        output_path=output_path,
+        backoff_schedule=backoff_schedule,
+    )
+
+    markdown_path = result["output_path"]
+    metadata_path = markdown_path.with_suffix(".json")
+    return {
+        "text": result["text"],
+        "metadata": result["metadata"],
+        "artifact_paths": {
+            "markdown": markdown_path.as_posix(),
+            "metadata": metadata_path.as_posix(),
+        },
     }
 
 
@@ -622,6 +711,76 @@ def _mask_api_key(api_key: str) -> str:
     if len(cleaned) <= 8:
         return "*" * len(cleaned)
     return f"{cleaned[:4]}{'*' * (len(cleaned) - 8)}{cleaned[-4:]}"
+
+
+def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
+    """Programmatic variant of ``--check`` used by the API server."""
+
+    checks: Dict[str, Dict[str, object]] = {}
+    ok = True
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        checks["openai_key"] = {"ok": False, "message": "OPENAI_API_KEY не найден"}
+        ok = False
+    else:
+        masked = _mask_api_key(api_key)
+        try:
+            response = httpx.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=5.0,
+            )
+            if response.status_code == 200:
+                checks["openai_key"] = {"ok": True, "message": f"Ключ активен ({masked})"}
+            else:
+                ok = False
+                checks["openai_key"] = {
+                    "ok": False,
+                    "message": f"HTTP {response.status_code} при проверке ключа ({masked})",
+                }
+        except httpx.HTTPError as exc:
+            ok = False
+            checks["openai_key"] = {
+                "ok": False,
+                "message": f"Ошибка при обращении к OpenAI ({masked}): {exc}",
+            }
+
+    artifacts_dir = Path("artifacts")
+    try:
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        probe = artifacts_dir / ".write_check"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        checks["artifacts_writable"] = {"ok": True, "message": "Запись в artifacts/ доступна"}
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        checks["artifacts_writable"] = {"ok": False, "message": f"Нет доступа к artifacts/: {exc}"}
+
+    theme_slug = (theme or "").strip()
+    if not theme_slug:
+        checks["theme_index"] = {"ok": False, "message": "Тема не указана"}
+        ok = False
+    else:
+        index_path = Path("profiles") / theme_slug / "index.json"
+        if not index_path.exists():
+            checks["theme_index"] = {
+                "ok": False,
+                "message": f"Индекс для темы '{theme_slug}' не найден",
+            }
+            ok = False
+        else:
+            try:
+                json.loads(index_path.read_text(encoding="utf-8"))
+                checks["theme_index"] = {"ok": True, "message": f"Индекс найден ({index_path})"}
+            except json.JSONDecodeError as exc:
+                ok = False
+                checks["theme_index"] = {
+                    "ok": False,
+                    "message": f"Индекс повреждён: {exc}",
+                }
+
+    return {"ok": ok, "checks": checks}
 
 
 def _run_checks(args: argparse.Namespace) -> None:

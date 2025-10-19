@@ -23,31 +23,91 @@
       </nav>
 
       <section class="tab-panel active" id="new-request" role="tabpanel">
-        <form id="brief-form" class="brief-form">
-          <div class="form-row">
-            <label for="pipe-select">Тематика</label>
-            <select id="pipe-select" required></select>
-          </div>
-          <div class="form-row">
-            <label for="topic-input">Тема</label>
-            <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
-          </div>
-          <div class="form-row">
-            <label for="tone-select">Тон</label>
-            <select id="tone-select">
-              <option value="экспертный">Экспертный</option>
-              <option value="дружелюбный">Дружелюбный</option>
-              <option value="строгий">Строгий</option>
-            </select>
-          </div>
-          <fieldset class="form-row">
-            <legend>Дополнительно</legend>
-            <label><input type="checkbox" id="include-faq" checked /> FAQ</label>
-            <label><input type="checkbox" id="include-table" /> Таблица</label>
-            <label><input type="checkbox" id="include-jsonld" checked /> JSON-LD</label>
-          </fieldset>
-          <button type="submit" class="primary">Сгенерировать</button>
-        </form>
+        <div class="request-layout">
+          <form id="brief-form" class="brief-form">
+            <div class="form-row">
+              <label for="pipe-select">Тематика</label>
+              <select id="pipe-select" required></select>
+            </div>
+            <div class="form-row">
+              <label for="topic-input">Тема</label>
+              <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
+            </div>
+            <div class="form-row">
+              <label for="goal-input">Цель материала</label>
+              <input id="goal-input" type="text" value="SEO-статья" />
+            </div>
+            <div class="form-row">
+              <label for="tone-select">Тон</label>
+              <select id="tone-select">
+                <option value="экспертный">Экспертный</option>
+                <option value="дружелюбный">Дружелюбный</option>
+                <option value="строгий">Строгий</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label for="structure-preset">Пресет структуры</label>
+              <select id="structure-preset">
+                <option value="custom">Своя структура</option>
+                <option value="seo">SEO-гайд</option>
+                <option value="faq">FAQ-материал</option>
+                <option value="overview">Обзор/рецензия</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label for="structure-input">Структура материала</label>
+              <textarea id="structure-input" rows="4" placeholder="Каждый пункт с новой строки"></textarea>
+            </div>
+            <div class="form-row">
+              <label for="keywords-input">Ключевые слова</label>
+              <input id="keywords-input" type="text" placeholder="Через запятую" />
+            </div>
+            <fieldset class="form-row">
+              <legend>Дополнительно</legend>
+              <label><input type="checkbox" id="include-faq" checked /> FAQ</label>
+              <label><input type="checkbox" id="include-table" /> Таблица</label>
+              <label><input type="checkbox" id="include-jsonld" checked /> JSON-LD</label>
+              <label><input type="checkbox" id="facts-mode" /> Facts mode</label>
+              <label><input type="checkbox" id="add-disclaimer" /> Дисклеймер</label>
+            </fieldset>
+            <div class="form-row grouped">
+              <div class="field-col">
+                <label for="k-input">Контекст (k)</label>
+                <input id="k-input" type="number" min="0" max="10" value="3" />
+              </div>
+              <div class="field-col">
+                <label for="temperature-input">Temperature</label>
+                <input id="temperature-input" type="number" min="0" max="2" step="0.1" value="0.3" />
+              </div>
+              <div class="field-col">
+                <label for="max-tokens-input">Max tokens</label>
+                <input id="max-tokens-input" type="number" min="200" max="4000" value="1400" />
+              </div>
+            </div>
+            <div class="form-row">
+              <label for="model-input">Модель (опционально)</label>
+              <input id="model-input" type="text" placeholder="Например, gpt-4o-mini" />
+            </div>
+            <div class="form-actions">
+              <button type="button" class="secondary" id="preview-btn">Собрать промпт</button>
+              <button type="submit" class="primary">Сгенерировать</button>
+            </div>
+            <div class="form-actions muted">
+              <button type="button" class="ghost" id="reindex-btn">Reindex theme</button>
+              <button type="button" class="ghost" id="health-btn">Health check</button>
+            </div>
+          </form>
+          <aside class="request-status">
+            <section>
+              <h3>Health</h3>
+              <div id="health-status" class="status-grid"></div>
+            </section>
+            <section>
+              <h3>Reindex log</h3>
+              <pre id="reindex-log" class="status-log">Пока без запусков.</pre>
+            </section>
+          </aside>
+        </div>
       </section>
 
       <section class="tab-panel" id="materials" role="tabpanel">
@@ -63,8 +123,31 @@
           <div class="result-main">
             <div class="result-header">
               <h2 id="result-title">Результат генерации</h2>
-              <p class="result-meta" id="result-meta"></p>
+              <div class="result-meta">
+                <p id="result-meta"></p>
+                <div class="badges" id="result-badges"></div>
+              </div>
             </div>
+            <section class="prompt-preview" id="prompt-preview">
+              <h3>Предпросмотр промпта</h3>
+              <div class="prompt-grid">
+                <article>
+                  <header>SYSTEM</header>
+                  <pre id="preview-system" class="prompt-text">Нажмите «Собрать промпт», чтобы увидеть контент.</pre>
+                </article>
+                <article>
+                  <header>
+                    CONTEXT <span id="context-badge" class="badge neutral">не запрошен</span>
+                  </header>
+                  <ul id="context-list" class="context-list"></ul>
+                  <p id="context-summary" class="context-summary"></p>
+                </article>
+                <article>
+                  <header>USER</header>
+                  <pre id="preview-user" class="prompt-text"></pre>
+                </article>
+              </div>
+            </section>
             <article id="draft-view" class="draft-view"></article>
           </div>
           <aside class="result-aside">

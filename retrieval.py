@@ -115,8 +115,15 @@ def _collect_clips(theme_slug: str) -> List[Path]:
     return sorted(base_dir.rglob("*.md"))
 
 
-def build_index(theme_slug: str) -> Path:
-    """Build an embedding index for exemplar clips under ``profiles/<theme>/``."""
+def build_index(theme_slug: str) -> Dict[str, object]:
+    """Build an embedding index for exemplar clips under ``profiles/<theme>/``.
+
+    Returns
+    -------
+    Dict[str, object]
+        Aggregate information about the rebuilt index including statistics used by
+        the API layer (clip count and average lengths).
+    """
 
     clip_paths = _collect_clips(theme_slug)
     if not clip_paths:
@@ -192,15 +199,22 @@ def build_index(theme_slug: str) -> Path:
 
     index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    avg_length = sum(lengths) / len(lengths)
-    avg_tokens = sum(token_lengths) / len(token_lengths)
-    print(f"Indexed {len(items)} clips for theme '{theme_slug}'.")
+    clip_count = len(items)
+    avg_length = sum(lengths) / clip_count if clip_count else 0.0
+    avg_tokens = sum(token_lengths) / clip_count if clip_count else 0.0
+    print(f"Indexed {clip_count} clips for theme '{theme_slug}'.")
     print(f"Average truncated length: {avg_length:.1f} words; {avg_tokens:.1f} est. tokens.")
     if cached:
         print(f"cached: {cached}")
-    print(f"Index written to: {index_path}")
 
-    return index_path
+    return {
+        "theme": theme_slug,
+        "index_path": index_path.as_posix(),
+        "clips": clip_count,
+        "avg_truncated_words": round(avg_length, 1),
+        "avg_truncated_tokens_est": round(avg_tokens, 1),
+        "cached": cached,
+    }
 
 
 def load_index(theme_slug: str) -> Dict[str, object]:

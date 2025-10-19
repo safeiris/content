@@ -25,6 +25,19 @@ python run_demo.py
 
 ```
 
+## Локальный запуск API и фронтенда
+
+```bash
+# Отдельно поднять API на 127.0.0.1:8000
+make api
+
+# Отдельно отдать статический фронт (SPA)
+make ui
+
+# Совместный запуск (API + фронт) в одном терминале
+make dev
+```
+
 ## RAG-ready (Stage 1)
 
 ### Profiles layout

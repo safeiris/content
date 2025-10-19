@@ -84,6 +84,29 @@ def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str
     return bundle.items
 
 
+def _build_user_instruction(payload: Dict[str, Any]) -> str:
+    base_instruction = "Сгенерируй текст по указанным параметрам."
+    if not payload:
+        return base_instruction
+
+    hints: List[str] = []
+    facts_mode = str(payload.get("facts_mode", "")).strip().lower()
+    if facts_mode == "cautious":
+        hints.append(
+            "Работай в режиме fact-check: ссылаться только на проверенные данные, избегать категоричных утверждений и уточнять, что читателю следует перепроверять цифры."
+        )
+
+    if payload.get("include_faq"):
+        hints.append("Добавь блок FAQ с короткими ответами на типовые вопросы читателей.")
+    if payload.get("include_table"):
+        hints.append("Вставь краткую таблицу со сравнением ключевых параметров, если это уместно.")
+
+    if not hints:
+        return base_instruction
+
+    return base_instruction + " " + " ".join(hints)
+
+
 def assemble_messages(
     data_path: str = "input_example.json",
     theme_slug: str = "finance",
@@ -127,7 +150,8 @@ def assemble_messages(
         context_block = "\n\n".join(fragments)
         messages.append({"role": "system", "content": f"CONTEXT\n{context_block}"})
 
-    messages.append({"role": "user", "content": "Сгенерируй текст по указанным параметрам."})
+    user_instruction = _build_user_instruction(payload)
+    messages.append({"role": "user", "content": user_instruction})
     return messages
 
 
