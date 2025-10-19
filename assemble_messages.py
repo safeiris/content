@@ -4,33 +4,58 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from rules_engine import build_prompt
-from retrieval import load_index, search_topk
+from retrieval import estimate_tokens, load_index, search_topk
+
+DEFAULT_CONTEXT_TOKEN_BUDGET = 2000
 
 
-def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str, object]]:
-    """Stub for exemplar retrieval.
+@dataclass
+class ContextBundle:
+    items: List[Dict[str, object]]
+    total_tokens_est: int
+    index_missing: bool
+    context_used: bool
 
-    Stage 2 will plug in embedding-powered search here. The contract should
-    return the top-``k`` items as dictionaries with the following shape::
 
-        {"path": str, "text": str, "score": float}
-
-    ``path`` is the source file, ``text`` is the fragment content (already
-    trimmed to fit downstream token budgets), and ``score`` is a ranking weight
-    where higher means more relevant.
-    """
-
+def retrieve_context(
+    theme_slug: str,
+    query: str,
+    *,
+    k: int = 3,
+    token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+) -> ContextBundle:
     try:
         index = load_index(theme_slug)
     except FileNotFoundError:
-        return []
+        return ContextBundle(items=[], total_tokens_est=0, index_missing=True, context_used=False)
 
     search_query = (query or "").strip() or theme_slug
     results = search_topk(index=index, query=search_query, k=k)
-    return [{"path": item.get("path"), "text": item.get("text", ""), "score": item.get("score", 0.0)} for item in results]
+    if not results:
+        return ContextBundle(items=[], total_tokens_est=0, index_missing=False, context_used=False)
+
+    limited = list(results[:k]) if k > 0 else []
+
+    def _token_sum(items: List[Dict[str, object]]) -> int:
+        return sum(int(item.get("token_estimate", estimate_tokens(item.get("text", "")))) for item in items)
+
+    if token_budget and limited:
+        while _token_sum(limited) > token_budget and len(limited) > 1:
+            limited.pop()
+
+    total = _token_sum(limited)
+    return ContextBundle(items=limited, total_tokens_est=total, index_missing=False, context_used=bool(limited))
+
+
+def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str, object]]:
+    """Backward-compatible helper returning only exemplar items."""
+
+    bundle = retrieve_context(theme_slug=theme_slug, query=query, k=k)
+    return bundle.items
 
 
 def assemble_messages(
@@ -38,6 +63,8 @@ def assemble_messages(
     theme_slug: str = "finance",
     *,
     k: int = 3,
+    exemplars: Optional[List[Dict[str, object]]] = None,
+    data: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
     """Prepare chat-style messages for an LLM call.
 
@@ -51,16 +78,22 @@ def assemble_messages(
         Number of exemplar clips to include in the CONTEXT block.
     """
 
-    payload_path = Path(data_path)
-    data = json.loads(payload_path.read_text(encoding="utf-8"))
-    system_prompt = build_prompt(data)
+    payload: Dict[str, Any]
+    if data is not None:
+        payload = data
+    else:
+        payload_path = Path(data_path)
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    system_prompt = build_prompt(payload)
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
 
-    exemplars = retrieve_exemplars(theme_slug=theme_slug, query=data.get("theme", ""), k=k)
-    if exemplars:
+    exemplar_items = exemplars
+    if exemplar_items is None:
+        exemplar_items = retrieve_exemplars(theme_slug=theme_slug, query=payload.get("theme", ""), k=k)
+    if exemplar_items:
         fragments: List[str] = []
-        for idx, item in enumerate(exemplars, start=1):
+        for idx, item in enumerate(exemplar_items, start=1):
             path = str(item.get("path", "unknown"))
             text = str(item.get("text", ""))
             fragment = f"<<<EXEMPLAR #{idx} | {path}>>>\n{text.strip()}"

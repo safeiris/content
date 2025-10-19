@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from typing import Dict, List, Optional
 
@@ -18,6 +19,7 @@ from openai import (
 
 DEFAULT_MODEL = "gpt-4o-mini"
 MAX_RETRIES = 3
+BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 
 
 def _resolve_model_name(model: Optional[str]) -> str:
@@ -49,6 +51,15 @@ def _should_retry(exc: BaseException) -> bool:
     return False
 
 
+def _describe_error(exc: BaseException) -> str:
+    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    if status:
+        return str(status)
+    if isinstance(exc, httpx.HTTPStatusError):  # pragma: no cover - depends on response type
+        return str(exc.response.status_code)
+    return exc.__class__.__name__
+
+
 def generate(
     messages: List[Dict[str, str]],
     *,
@@ -71,7 +82,7 @@ def generate(
 
     last_error: Optional[BaseException] = None
     try:
-        for attempt in range(MAX_RETRIES + 1):
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
                 response = client.chat.completions.create(
                     model=model_name,
@@ -95,9 +106,12 @@ def generate(
                 if isinstance(exc, KeyboardInterrupt):  # pragma: no cover - respect interrupts
                     raise
                 last_error = exc
-                if attempt >= MAX_RETRIES or not _should_retry(exc):
+                should_retry = _should_retry(exc)
+                if attempt >= MAX_RETRIES or not should_retry:
                     break
-                sleep_for = 2 ** attempt
+                sleep_for = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
+                reason = _describe_error(exc)
+                print(f"[llm_client] retry {attempt} reason: {reason}; sleeping {sleep_for}s", file=sys.stderr)
                 time.sleep(sleep_for)
         if last_error:
             if isinstance(last_error, RateLimitError):

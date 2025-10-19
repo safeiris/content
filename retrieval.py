@@ -3,18 +3,35 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 from openai import OpenAI
 
 
 DEFAULT_MODEL = "text-embedding-3-small"
 MAX_TOKENS_PER_CLIP = 600
+
+_TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token length using a lightweight heuristic."""
+
+    if not text:
+        return 0
+    # Fallback to ASCII-aware splitting if the unicode class fails (older regex engines)
+    try:
+        tokens = _TOKEN_PATTERN.findall(text)
+    except re.error:
+        tokens = re.findall(r"\w+|[^\w\s]", text)
+    return len(tokens)
 
 
 @dataclass
@@ -24,9 +41,17 @@ class IndexedClip:
     path: str
     text: str
     embedding: Sequence[float]
+    content_hash: str = ""
+    token_estimate: int = 0
 
     def as_dict(self) -> Dict[str, object]:
-        return {"path": self.path, "text": self.text, "embedding": list(self.embedding)}
+        return {
+            "path": self.path,
+            "text": self.text,
+            "embedding": list(self.embedding),
+            "content_hash": self.content_hash,
+            "token_estimate": self.token_estimate,
+        }
 
 
 _client: OpenAI | None = None
@@ -48,31 +73,33 @@ def _strip_front_matter(text: str) -> str:
     return text
 
 
-def _truncate_text(text: str, max_tokens: int = MAX_TOKENS_PER_CLIP) -> str:
+def _truncate_text(text: str, max_tokens: int = MAX_TOKENS_PER_CLIP) -> Tuple[str, int]:
     if not text:
-        return ""
-    import re
+        return "", 0
 
-    tokens = re.split(r"(\s+)", text)
-    token_budget = max_tokens
+    parts = re.split(r"(\s+)", text)
     seen_tokens = 0
-    chunks: List[str] = []
+    acc: List[str] = []
 
-    for chunk in tokens:
-        if chunk.isspace():
-            chunks.append(chunk)
+    for part in parts:
+        if part.isspace():
+            if acc:
+                acc.append(part)
             continue
-        if not chunk:
+        if not part:
             continue
-        if seen_tokens >= token_budget:
+        if seen_tokens >= max_tokens:
             break
-        seen_tokens += 1
-        chunks.append(chunk)
+        seen_tokens += estimate_tokens(part)
+        if seen_tokens > max_tokens:
+            break
+        acc.append(part)
 
-    truncated = "".join(chunks).strip()
-    if truncated:
-        return truncated
-    return text.strip()
+    truncated = "".join(acc).strip()
+    if not truncated:
+        truncated = text.strip()
+    token_estimate = estimate_tokens(truncated)
+    return truncated, token_estimate
 
 
 def _embed_texts(texts: Sequence[str], model: str = DEFAULT_MODEL) -> List[List[float]]:
@@ -97,33 +124,84 @@ def build_index(theme_slug: str) -> Path:
 
     items: List[IndexedClip] = []
     lengths: List[int] = []
+    token_lengths: List[int] = []
+    cached = 0
+
+    index_path = Path("profiles") / theme_slug / "index.json"
+    existing_map: Dict[str, Dict[str, object]] = {}
+    if index_path.exists():
+        try:
+            existing_index = json.loads(index_path.read_text(encoding="utf-8"))
+            for clip in existing_index.get("clips", []):
+                path = clip.get("path")
+                if isinstance(path, str):
+                    existing_map[path] = clip
+        except json.JSONDecodeError:
+            existing_map = {}
+
+    embeddings_to_compute: List[str] = []
+    pending_indices: List[int] = []
+
     for clip_path in clip_paths:
         raw_text = clip_path.read_text(encoding="utf-8")
         stripped = _strip_front_matter(raw_text)
-        truncated = _truncate_text(stripped)
+        truncated, token_estimate = _truncate_text(stripped)
         lengths.append(len(truncated.split()))
+        token_lengths.append(token_estimate)
         relative_path = clip_path.relative_to(Path("profiles") / theme_slug)
-        items.append(IndexedClip(path=relative_path.as_posix(), text=truncated, embedding=[]))
+        rel_path = relative_path.as_posix()
+        content_hash = hashlib.md5(raw_text.encode("utf-8")).hexdigest()
 
-    embeddings = _embed_texts([item.text for item in items])
-    for item, embedding in zip(items, embeddings):
-        item.embedding = embedding
+        embedding: List[float] = []
+        existing = existing_map.get(rel_path)
+        if existing and existing.get("content_hash") == content_hash:
+            prev_embedding = existing.get("embedding")
+            if isinstance(prev_embedding, list) and prev_embedding:
+                embedding = prev_embedding
+                cached += 1
+        if not embedding:
+            embeddings_to_compute.append(truncated)
+            pending_indices.append(len(items))
+
+        clip = IndexedClip(
+            path=rel_path,
+            text=truncated,
+            embedding=embedding,
+            content_hash=content_hash,
+            token_estimate=token_estimate,
+        )
+        items.append(clip)
+
+    if embeddings_to_compute:
+        new_embeddings = _embed_texts(embeddings_to_compute)
+        for idx, vector in zip(pending_indices, new_embeddings):
+            items[idx].embedding = vector
 
     index = {
         "theme": theme_slug,
         "model": DEFAULT_MODEL,
-        "clips": [item.as_dict() for item in items],
+        "max_tokens_est": MAX_TOKENS_PER_CLIP,
+        "clips": [],
     }
 
-    output_path = Path("profiles") / theme_slug / "index.json"
-    output_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    for item in items:
+        clip_dict = item.as_dict()
+        clip_dict["content_hash"] = getattr(item, "content_hash", "")
+        clip_dict["token_estimate"] = getattr(item, "token_estimate", estimate_tokens(item.text))
+        index["clips"].append(clip_dict)
+
+    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
 
     avg_length = sum(lengths) / len(lengths)
+    avg_tokens = sum(token_lengths) / len(token_lengths)
     print(f"Indexed {len(items)} clips for theme '{theme_slug}'.")
-    print(f"Average truncated length: {avg_length:.1f} tokens.")
-    print(f"Index written to: {output_path}")
+    print(f"Average truncated length: {avg_length:.1f} words.")
+    print(f"Average truncated length (est. tokens): {avg_tokens:.1f}.")
+    if cached:
+        print(f"cached: {cached}")
+    print(f"Index written to: {index_path}")
 
-    return output_path
+    return index_path
 
 
 def load_index(theme_slug: str) -> Dict[str, object]:
@@ -166,7 +244,14 @@ def search_topk(index: Dict[str, object], query: str, k: int) -> List[Dict[str, 
             score = _cosine_similarity(query_embedding, list(embedding))
         except ValueError:
             continue
-        scored.append({"path": clip.get("path"), "text": clip.get("text", ""), "score": float(score)})
+        scored.append(
+            {
+                "path": clip.get("path"),
+                "text": clip.get("text", ""),
+                "score": float(score),
+                "token_estimate": int(clip.get("token_estimate") or estimate_tokens(clip.get("text", ""))),
+            }
+        )
 
     scored.sort(key=lambda item: item["score"], reverse=True)
     return scored[: min(k, len(scored))]
