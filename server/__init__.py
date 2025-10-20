@@ -86,6 +86,7 @@ def create_app() -> Flask:
 
         style_profile_applied = bool(system_payload.get("style_profile_applied"))
         style_profile_source = system_payload.get("style_profile_source") if style_profile_applied else None
+        style_profile_variant = system_payload.get("style_profile_variant") if style_profile_applied else None
 
         context_items = [
             {
@@ -111,6 +112,11 @@ def create_app() -> Flask:
                 **(
                     {"style_profile_source": style_profile_source}
                     if style_profile_applied and style_profile_source
+                    else {}
+                ),
+                **(
+                    {"style_profile_variant": style_profile_variant}
+                    if style_profile_applied and style_profile_variant
                     else {}
                 ),
             }
@@ -169,6 +175,8 @@ def create_app() -> Flask:
             response_payload["style_profile_applied"] = True
             if metadata.get("style_profile_source"):
                 response_payload["style_profile_source"] = metadata["style_profile_source"]
+            if metadata.get("style_profile_variant"):
+                response_payload["style_profile_variant"] = metadata["style_profile_variant"]
 
         return jsonify(response_payload)
 

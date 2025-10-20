@@ -42,6 +42,7 @@ class GenerationContext:
     clip_texts: List[str]
     style_profile_applied: bool = False
     style_profile_source: Optional[str] = None
+    style_profile_variant: Optional[str] = None
 
 
 def _get_cta_text() -> str:
@@ -188,10 +189,12 @@ def _make_generation_context(
     clip_texts = [str(item.get("text", "")) for item in bundle.items if item.get("text")]
     style_profile_applied = False
     style_profile_source: Optional[str] = None
+    style_profile_variant: Optional[str] = None
     for message in messages:
         if message.get("role") == "system" and message.get("style_profile_applied"):
             style_profile_applied = True
             style_profile_source = message.get("style_profile_source")
+            style_profile_variant = message.get("style_profile_variant")
             break
 
     return GenerationContext(
@@ -201,6 +204,7 @@ def _make_generation_context(
         clip_texts=clip_texts,
         style_profile_applied=style_profile_applied,
         style_profile_source=style_profile_source,
+        style_profile_variant=style_profile_variant,
     )
 
 
@@ -455,6 +459,8 @@ def _generate_variant(
         metadata["style_profile_applied"] = True
         if generation_context.style_profile_source:
             metadata["style_profile_source"] = generation_context.style_profile_source
+        if generation_context.style_profile_variant:
+            metadata["style_profile_variant"] = generation_context.style_profile_variant
     if variant_label:
         metadata["ab_variant"] = variant_label
 

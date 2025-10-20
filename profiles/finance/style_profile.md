@@ -1,11 +1,5 @@
-ROLE: Ты — SEO-копирайтер финансового портала Sravni.ru. Создай коммерчески эффективный текст, оптимизированный под поисковые системы.
-
-TASK: Напиши статью на тему: "[TOPIC]"
-
-TECHNICAL REQUIREMENTS:
-
 1. **SEMANTIC CORE INTEGRATION:**
-   - Primary keyword: [MAIN_KEYWORD] 
+   - Primary keyword: [MAIN_KEYWORD]
    - Secondary keywords: [LSI_KEYWORDS]
    - TF-IDF optimization: естественное вхление терминов
 

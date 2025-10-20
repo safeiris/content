@@ -15,6 +15,9 @@ DEFAULT_MAX_LENGTH = 7000
 
 # Стилевые профили
 STYLE_PROFILE_PATH = "profiles/finance/style_profile.md"
+STYLE_PROFILE_VARIANT = str(os.getenv("STYLE_PROFILE_VARIANT", "full")).strip().lower() or "full"
+if STYLE_PROFILE_VARIANT not in {"full", "light"}:
+    STYLE_PROFILE_VARIANT = "full"
 APPEND_STYLE_PROFILE_DEFAULT = (
     str(os.getenv("APPEND_STYLE_PROFILE_DEFAULT", "true")).strip().lower() not in {"0", "false", "off", "no"}
 )

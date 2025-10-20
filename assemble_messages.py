@@ -8,13 +8,28 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import APPEND_STYLE_PROFILE_DEFAULT, STYLE_PROFILE_PATH
+from config import (
+    APPEND_STYLE_PROFILE_DEFAULT,
+    STYLE_PROFILE_PATH,
+    STYLE_PROFILE_VARIANT,
+)
 from rules_engine import build_prompt
 from retrieval import estimate_tokens, load_index, search_topk
 
 DEFAULT_CONTEXT_TOKEN_BUDGET = 2000
 STYLE_PROFILE_INSERT_ANCHOR = "Если предоставлен блок CONTEXT"
-STYLE_PROFILE_FILE = Path(__file__).resolve().parent / STYLE_PROFILE_PATH
+STYLE_PROFILE_LIGHT_PATH = "profiles/finance/style_profile_light.md"
+_STYLE_PROFILE_VARIANT_PATHS = {
+    "full": STYLE_PROFILE_PATH,
+    "light": STYLE_PROFILE_LIGHT_PATH,
+}
+
+
+def _style_profile_file_for_variant(variant: str) -> Tuple[str, Path]:
+    variant_key = variant if variant in _STYLE_PROFILE_VARIANT_PATHS else "full"
+    relative_path = _STYLE_PROFILE_VARIANT_PATHS[variant_key]
+    absolute_path = Path(__file__).resolve().parent / relative_path
+    return relative_path, absolute_path
 
 
 @dataclass
@@ -54,12 +69,54 @@ def _should_apply_style_profile(
     return _style_profile_conditions_met(theme_slug, data)
 
 
-@lru_cache(maxsize=1)
-def _load_style_profile_text() -> str:
+@lru_cache(maxsize=None)
+def _read_style_profile_file(path: str) -> str:
     try:
-        return STYLE_PROFILE_FILE.read_text(encoding="utf-8").strip()
+        return Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
         return ""
+
+
+def _normalize_keywords(raw_keywords: Any) -> List[str]:
+    if isinstance(raw_keywords, str):
+        parts = [item.strip() for item in raw_keywords.split(",")]
+        return [item for item in parts if item]
+    if isinstance(raw_keywords, (list, tuple, set)):
+        normalized: List[str] = []
+        for item in raw_keywords:
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return normalized
+    return []
+
+
+def _apply_style_profile_placeholders(text: str, data: Dict[str, Any]) -> str:
+    topic = str(data.get("theme") or "").strip()
+    keywords = _normalize_keywords(data.get("keywords"))
+    main_keyword = keywords[0] if keywords else ""
+    lsi_keywords = ", ".join(keywords[1:]) if len(keywords) > 1 else ""
+
+    replacements = {
+        "[TOPIC]": topic,
+        "[MAIN_KEYWORD]": main_keyword,
+        "[LSI_KEYWORDS]": lsi_keywords,
+    }
+
+    result = text
+    for placeholder, value in replacements.items():
+        result = result.replace(placeholder, value)
+    return result
+
+
+def _load_style_profile_text(data: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
+    variant = STYLE_PROFILE_VARIANT if STYLE_PROFILE_VARIANT in _STYLE_PROFILE_VARIANT_PATHS else "full"
+    relative_path, absolute_path = _style_profile_file_for_variant(variant)
+    raw_text = _read_style_profile_file(str(absolute_path)).strip()
+    if not raw_text:
+        return "", None, None
+    rendered = _apply_style_profile_placeholders(raw_text, data).strip()
+    return rendered, relative_path, variant
 
 
 def _inject_style_profile(system_prompt: str, style_profile: str) -> Tuple[str, bool]:
@@ -190,16 +247,21 @@ def assemble_messages(
 
     style_profile_applied = False
     style_profile_source: Optional[str] = None
+    style_profile_variant_used: Optional[str] = None
     if _should_apply_style_profile(theme_slug, payload, override=append_style_profile):
-        system_prompt, style_profile_applied = _inject_style_profile(system_prompt, _load_style_profile_text())
+        profile_text, profile_source, profile_variant = _load_style_profile_text(payload)
+        system_prompt, style_profile_applied = _inject_style_profile(system_prompt, profile_text)
         if style_profile_applied:
-            style_profile_source = STYLE_PROFILE_PATH
+            style_profile_source = profile_source or STYLE_PROFILE_PATH
+            style_profile_variant_used = profile_variant or "full"
 
     system_message: Dict[str, Any] = {"role": "system", "content": system_prompt}
     if style_profile_applied:
         system_message["style_profile_applied"] = True
         if style_profile_source:
             system_message["style_profile_source"] = style_profile_source
+        if style_profile_variant_used:
+            system_message["style_profile_variant"] = style_profile_variant_used
 
     messages: List[Dict[str, Any]] = [system_message]
 
