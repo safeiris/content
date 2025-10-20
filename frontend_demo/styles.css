@@ -220,7 +220,71 @@ legend {
 .status-grid {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 12px;
+}
+
+.health-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  border-radius: 14px;
+  background: #f1f5f9;
+  color: #1f2937;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+  min-width: 200px;
+  flex: 1 1 220px;
+  opacity: 0;
+  transform: translateY(6px);
+  animation: healthFadeIn 0.35s ease forwards;
+}
+
+.health-card.success {
+  background: #ecfdf5;
+  color: #047857;
+}
+
+.health-card.error {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.health-card.offline {
+  background: #f4f4f5;
+  color: #4b5563;
+}
+
+.health-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.health-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.health-label {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.health-description {
+  font-size: 13px;
+  color: currentColor;
+  opacity: 0.85;
+}
+
+@keyframes healthFadeIn {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .status-log {

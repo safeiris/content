@@ -62,6 +62,24 @@ const contextList = document.getElementById("context-list");
 const contextSummary = document.getElementById("context-summary");
 const contextBadge = document.getElementById("context-badge");
 
+const HEALTH_STATUS_MESSAGES = {
+  openai_key: {
+    label: "OpenAI key",
+    ok: "активен",
+    fail: "не найден",
+  },
+  retrieval_index: {
+    label: "Retrieval index",
+    ok: "найден",
+    fail: "не найден",
+  },
+  artifacts_dir: {
+    label: "Каталог артефактов",
+    ok: "доступен",
+    fail: "недоступен",
+  },
+};
+
 const state = {
   pipes: new Map(),
   artifacts: [],
@@ -610,27 +628,119 @@ async function handleHealthCheck() {
   try {
     const theme = pipeSelect.value;
     const query = theme ? `?theme=${encodeURIComponent(theme)}` : "";
-    const status = await fetchJson(`/api/health${query}`);
-    renderHealthStatus(status);
+    const response = await fetch(`${API_BASE}/api/health${query}`);
+    const text = await response.text();
+
+    if (!response.ok) {
+      let message = text || `HTTP ${response.status}`;
+      try {
+        const data = JSON.parse(text);
+        message = data.error || message;
+      } catch (parseError) {
+        // keep original message
+      }
+      throw new Error(message);
+    }
+
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch (parseError) {
+      renderHealthError("Ошибка при запросе Health", "error");
+      return;
+    }
+
+    renderHealthStatus(data);
   } catch (error) {
     console.error(error);
-    healthStatus.innerHTML = `<span class="badge error">${error.message}</span>`;
+    if (error instanceof TypeError) {
+      renderHealthError("Сервер недоступен", "offline");
+      return;
+    }
+    renderHealthError(error.message || "Ошибка при запросе Health", "error");
   }
 }
 
 function renderHealthStatus(status) {
   healthStatus.innerHTML = "";
-  if (!status || !status.checks) {
-    healthStatus.innerHTML = '<span class="badge error">Нет данных</span>';
+  const checks = status?.checks;
+  if (!checks || typeof checks !== "object" || !Object.keys(checks).length) {
+    renderHealthError("Нет данных", "error");
     return;
   }
-  Object.entries(status.checks).forEach(([key, value]) => {
-    const info = value;
-    const badge = document.createElement("span");
-    badge.className = `badge ${info.ok ? "success" : "error"}`;
-    badge.textContent = `${key}: ${info.message}`;
-    healthStatus.append(badge);
+
+  Object.entries(checks).forEach(([key, value], index) => {
+    const normalized = normalizeHealthCheck(value);
+    const tone = normalized.ok ? "success" : "error";
+    const icon = normalized.ok ? "🟢" : "🔴";
+    const dictionary = HEALTH_STATUS_MESSAGES[key] || {};
+    const label = dictionary.label || key.replace(/_/g, " ");
+    const description =
+      normalized.message || (normalized.ok ? dictionary.ok : dictionary.fail) || (normalized.ok ? "активен" : "недоступен");
+
+    const card = createHealthCard({
+      tone,
+      icon,
+      label,
+      description,
+      delay: index * 80,
+    });
+    card.dataset.healthKey = key;
+    healthStatus.append(card);
   });
+}
+
+function normalizeHealthCheck(value) {
+  if (value && typeof value === "object") {
+    return {
+      ok: Boolean(value.ok),
+      message: value.message || value.status || "",
+    };
+  }
+  return {
+    ok: Boolean(value),
+    message: "",
+  };
+}
+
+function renderHealthError(message, tone = "error") {
+  healthStatus.innerHTML = "";
+  const icon = tone === "success" ? "🟢" : tone === "offline" ? "⚪" : "🔴";
+  const card = createHealthCard({
+    tone,
+    icon,
+    label: message,
+    description: tone === "offline" ? "Попробуйте обновить позже" : "",
+  });
+  healthStatus.append(card);
+}
+
+function createHealthCard({ tone, icon, label, description = "", delay = 0 }) {
+  const card = document.createElement("div");
+  card.className = `health-card ${tone}`;
+  card.style.animationDelay = `${delay}ms`;
+
+  const iconEl = document.createElement("span");
+  iconEl.className = "health-icon";
+  iconEl.textContent = icon;
+
+  const contentEl = document.createElement("div");
+  contentEl.className = "health-content";
+
+  const labelEl = document.createElement("div");
+  labelEl.className = "health-label";
+  labelEl.textContent = label;
+  contentEl.append(labelEl);
+
+  if (description) {
+    const descriptionEl = document.createElement("div");
+    descriptionEl.className = "health-description";
+    descriptionEl.textContent = description;
+    contentEl.append(descriptionEl);
+  }
+
+  card.append(iconEl, contentEl);
+  return card;
 }
 
 async function fetchJson(path, options = {}) {
