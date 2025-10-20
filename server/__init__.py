@@ -12,13 +12,13 @@ from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
-from assemble_messages import (
-    assemble_messages,
-    invalidate_style_profile_cache,
-    retrieve_context,
-)
+from assemble_messages import invalidate_style_profile_cache
 from config import DEFAULT_STRUCTURE
-from orchestrate import gather_health_status, generate_article_from_payload
+from orchestrate import (
+    gather_health_status,
+    generate_article_from_payload,
+    make_generation_context,
+)
 from retrieval import build_index
 from artifacts_store import (
     cleanup_index as cleanup_artifact_index,
@@ -80,24 +80,27 @@ def create_app() -> Flask:
             k = 0
 
         style_profile_override = _style_profile_override_from_request(request)
-        context_bundle = retrieve_context(theme_slug=theme, query=raw_data.get("theme", ""), k=k)
-        messages = assemble_messages(
-            data_path="",
-            theme_slug=theme,
-            k=k,
-            exemplars=context_bundle.items,
+        autopick_enabled = bool(payload.get("autopick_keywords", True))
+        generation_context = make_generation_context(
+            theme=theme,
             data=raw_data,
+            k=k,
             append_style_profile=style_profile_override,
+            autopick_keywords=autopick_enabled,
         )
 
-        system_payload = next((msg for msg in messages if msg.get("role") == "system"), {})
+        system_payload = next((msg for msg in generation_context.messages if msg.get("role") == "system"), {})
         system_message = str(system_payload.get("content", ""))
-        user_message = next((msg["content"] for msg in reversed(messages) if msg.get("role") == "user"), "")
+        user_message = next(
+            (msg["content"] for msg in reversed(generation_context.messages) if msg.get("role") == "user"),
+            "",
+        )
 
         style_profile_applied = bool(system_payload.get("style_profile_applied"))
         style_profile_source = system_payload.get("style_profile_source") if style_profile_applied else None
         style_profile_variant = system_payload.get("style_profile_variant") if style_profile_applied else None
 
+        context_bundle = generation_context.context_bundle
         context_items = [
             {
                 "path": item.get("path"),
@@ -108,29 +111,28 @@ def create_app() -> Flask:
             for item in context_bundle.items
         ]
 
-        return jsonify(
-            {
-                "system": system_message,
-                "context": context_items,
-                "user": user_message,
-                "context_used": bool(context_bundle.context_used and not context_bundle.index_missing and k > 0),
-                "context_index_missing": context_bundle.index_missing,
-                "context_budget_tokens_est": context_bundle.total_tokens_est,
-                "context_budget_tokens_limit": context_bundle.token_budget_limit,
-                "k": k,
-                "style_profile_applied": style_profile_applied,
-                **(
-                    {"style_profile_source": style_profile_source}
-                    if style_profile_applied and style_profile_source
-                    else {}
-                ),
-                **(
-                    {"style_profile_variant": style_profile_variant}
-                    if style_profile_applied and style_profile_variant
-                    else {}
-                ),
-            }
-        )
+        response_payload: Dict[str, Any] = {
+            "system": system_message,
+            "context": context_items,
+            "user": user_message,
+            "context_used": bool(context_bundle.context_used and not context_bundle.index_missing and k > 0),
+            "context_index_missing": context_bundle.index_missing,
+            "context_budget_tokens_est": context_bundle.total_tokens_est,
+            "context_budget_tokens_limit": context_bundle.token_budget_limit,
+            "k": k,
+            "style_profile_applied": style_profile_applied,
+            "autopick_keywords": bool(generation_context.autopick_enabled),
+            "keywords_final": generation_context.keywords_final,
+            "keywords_manual": generation_context.keywords_manual,
+            "keywords_auto": generation_context.keywords_auto,
+        }
+
+        if style_profile_applied and style_profile_source:
+            response_payload["style_profile_source"] = style_profile_source
+        if style_profile_applied and style_profile_variant:
+            response_payload["style_profile_variant"] = style_profile_variant
+
+        return jsonify(response_payload)
 
     @app.post("/api/generate")
     def generate():
@@ -156,6 +158,8 @@ def create_app() -> Flask:
         temperature = max(0.0, min(2.0, temperature))
         max_tokens = max(1, _safe_int(payload.get("max_tokens", 1400), default=1400))
 
+        autopick_enabled = bool(payload.get("autopick_keywords", True))
+
         try:
             result = generate_article_from_payload(
                 theme=theme,
@@ -165,6 +169,7 @@ def create_app() -> Flask:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 append_style_profile=style_profile_override,
+                autopick_keywords=autopick_enabled,
             )
         except ApiError:
             raise
@@ -188,6 +193,9 @@ def create_app() -> Flask:
                 response_payload["style_profile_source"] = metadata["style_profile_source"]
             if metadata.get("style_profile_variant"):
                 response_payload["style_profile_variant"] = metadata["style_profile_variant"]
+        if isinstance(metadata, dict) and metadata.get("keywords_final") is not None:
+            response_payload["keywords_final"] = metadata.get("keywords_final")
+            response_payload["autopick_keywords"] = metadata.get("autopick_keywords")
 
         return jsonify(response_payload)
 

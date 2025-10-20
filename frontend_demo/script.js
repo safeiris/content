@@ -49,6 +49,7 @@ const clearLogBtn = document.getElementById("clear-log");
 const structurePreset = document.getElementById("structure-preset");
 const structureInput = document.getElementById("structure-input");
 const keywordsInput = document.getElementById("keywords-input");
+const autopickCheckbox = document.getElementById("autopick-keywords");
 const goalInput = document.getElementById("goal-input");
 const kInput = document.getElementById("k-input");
 const temperatureInput = document.getElementById("temperature-input");
@@ -67,6 +68,9 @@ const contextBadge = document.getElementById("context-badge");
 const generateBtn = briefForm.querySelector("button[type='submit']");
 const advancedSettings = document.getElementById("advanced-settings");
 const advancedSupportSection = document.querySelector("[data-section='support']");
+const usedKeywordsSection = document.getElementById("used-keywords");
+const usedKeywordsList = document.getElementById("used-keywords-list");
+const usedKeywordsEmpty = document.getElementById("used-keywords-empty");
 
 const ADVANCED_SETTINGS_STORAGE_KEY = "content-demo:advanced-settings-open";
 
@@ -128,6 +132,9 @@ if (healthBtn) {
 }
 if (cleanupArtifactsBtn) {
   interactiveElements.push(cleanupArtifactsBtn);
+}
+if (autopickCheckbox) {
+  interactiveElements.push(autopickCheckbox);
 }
 
 tabs.forEach((tab) => {
@@ -669,7 +676,12 @@ async function handlePromptPreview() {
     showProgress(true, "Собираем промпт…");
     const preview = await fetchJson("/api/prompt/preview", {
       method: "POST",
-      body: JSON.stringify({ theme: payload.theme, data: payload.data, k: payload.k }),
+      body: JSON.stringify({
+        theme: payload.theme,
+        data: payload.data,
+        k: payload.k,
+        autopick_keywords: payload.autopickKeywords,
+      }),
     });
     updatePromptPreview(preview);
     switchTab("result");
@@ -691,6 +703,7 @@ async function handleGenerate(event) {
     setInteractiveBusy(true);
     setButtonLoading(generateBtn, true);
     showProgress(true, "Генерируем материалы…");
+    renderUsedKeywords(null);
     const response = await fetchJson("/api/generate", {
       method: "POST",
       body: JSON.stringify({
@@ -700,6 +713,7 @@ async function handleGenerate(event) {
         model: payload.model,
         temperature: payload.temperature,
         max_tokens: payload.maxTokens,
+        autopick_keywords: payload.autopickKeywords,
       }),
     });
     const markdown = response?.markdown ?? "";
@@ -718,6 +732,7 @@ async function handleGenerate(event) {
     metaParts.push(`Модель: ${meta.model_used ?? "—"}`);
     resultMeta.textContent = metaParts.join(" · ");
     renderMetadata(meta);
+    renderUsedKeywords(meta);
     updateResultBadges(meta);
     toggleRetryButton(!hasContent);
     updatePromptPreview({
@@ -791,6 +806,8 @@ function buildRequestPayload() {
     pipe_id: theme,
   };
 
+  const autopickKeywords = autopickCheckbox ? Boolean(autopickCheckbox.checked) : true;
+
   const kValue = String(kInput?.value ?? "").trim();
   let k = kValue === "" ? 3 : Number.parseInt(kValue, 10);
   if (!Number.isInteger(k) || k < 0 || k > 6) {
@@ -835,6 +852,7 @@ function buildRequestPayload() {
     temperature: temperatureLocked ? undefined : temperature,
     maxTokens,
     model,
+    autopickKeywords,
   };
 }
 
@@ -848,6 +866,55 @@ function renderMetadata(meta) {
     report.textContent = JSON.stringify(meta, null, 2);
   }
   reportView.append(report);
+}
+
+function renderUsedKeywords(meta) {
+  if (!usedKeywordsSection || !usedKeywordsList || !usedKeywordsEmpty) {
+    return;
+  }
+
+  if (!meta || typeof meta !== "object") {
+    usedKeywordsSection.hidden = true;
+    usedKeywordsList.innerHTML = "";
+    usedKeywordsEmpty.hidden = true;
+    return;
+  }
+
+  const finalKeywords = Array.isArray(meta.keywords_final) ? meta.keywords_final : [];
+  const manualSet = new Set(Array.isArray(meta.keywords_manual) ? meta.keywords_manual : []);
+  const autoSet = new Set(Array.isArray(meta.keywords_auto) ? meta.keywords_auto : []);
+  const autopickActive =
+    typeof meta.autopick_keywords === "boolean"
+      ? meta.autopick_keywords
+      : Boolean(autopickCheckbox?.checked);
+
+  usedKeywordsList.innerHTML = "";
+  usedKeywordsSection.hidden = false;
+
+  if (!finalKeywords.length) {
+    usedKeywordsList.style.display = "none";
+    usedKeywordsEmpty.hidden = false;
+    usedKeywordsEmpty.textContent = autopickActive
+      ? "Автоподбор ключевых слов не предложил варианты для этого запроса."
+      : "Ключевые слова не использовались (поле оставлено пустым).";
+    return;
+  }
+
+  usedKeywordsList.style.display = "flex";
+  usedKeywordsEmpty.hidden = true;
+
+  finalKeywords.forEach((keyword) => {
+    const item = document.createElement("li");
+    item.textContent = keyword;
+    if (manualSet.has(keyword)) {
+      item.dataset.source = "manual";
+      item.title = "Задано вручную";
+    } else if (autoSet.has(keyword)) {
+      item.dataset.source = "auto";
+      item.title = "Автоматический подбор";
+    }
+    usedKeywordsList.append(item);
+  });
 }
 
 function updateResultBadges(meta) {

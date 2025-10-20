@@ -9,7 +9,8 @@ import re
 import sys
 import time
 import unicodedata
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -18,11 +19,19 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from assemble_messages import ContextBundle, assemble_messages, retrieve_context
+from assemble_messages import (
+    ContextBundle,
+    assemble_messages,
+    retrieve_context,
+    _read_style_profile_file,
+    _should_apply_style_profile,
+    _style_profile_file_for_variant,
+)
 from llm_client import DEFAULT_MODEL, generate as llm_generate
 from plagiarism_guard import is_too_similar
 from artifacts_store import register_artifact
-from config import OPENAI_API_KEY
+from config import OPENAI_API_KEY, STYLE_PROFILE_VARIANT
+from keywords import merge_keywords, parse_manual_keywords, suggest_keywords
 
 
 BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
@@ -47,6 +56,10 @@ class GenerationContext:
     style_profile_applied: bool = False
     style_profile_source: Optional[str] = None
     style_profile_variant: Optional[str] = None
+    keywords_manual: List[str] = field(default_factory=list)
+    keywords_auto: List[str] = field(default_factory=list)
+    keywords_final: List[str] = field(default_factory=list)
+    autopick_enabled: bool = True
 
 
 def _get_cta_text() -> str:
@@ -181,13 +194,15 @@ def _local_now() -> datetime:
     return datetime.now(BELGRADE_TZ)
 
 
-def _make_generation_context(
+def make_generation_context(
     *,
     theme: str,
     data: Dict[str, Any],
     k: int,
     append_style_profile: Optional[bool] = None,
+    autopick_keywords: bool = True,
 ) -> GenerationContext:
+    payload = deepcopy(data)
     if k <= 0:
         print("[orchestrate] CONTEXT: disabled (k=0)")
         bundle = ContextBundle(
@@ -198,15 +213,50 @@ def _make_generation_context(
             token_budget_limit=ContextBundle.token_budget_default(),
         )
     else:
-        bundle = retrieve_context(theme_slug=theme, query=data.get("theme", ""), k=k)
+        bundle = retrieve_context(theme_slug=theme, query=payload.get("theme", ""), k=k)
         if bundle.index_missing:
             print("[orchestrate] CONTEXT: none (index missing)")
+
+    structure_source = payload.get("structure")
+    structure_list: List[str] = []
+    if isinstance(structure_source, (list, tuple)):
+        for item in structure_source:
+            text = str(item).strip()
+            if text:
+                structure_list.append(text)
+    elif isinstance(structure_source, str):
+        for line in structure_source.splitlines():
+            text = line.strip()
+            if text:
+                structure_list.append(text)
+
+    manual_keywords = parse_manual_keywords(payload.get("keywords"))
+
+    style_profile_text = ""
+    if _should_apply_style_profile(theme, payload, override=append_style_profile):
+        _, profile_path = _style_profile_file_for_variant(STYLE_PROFILE_VARIANT)
+        style_profile_text = _read_style_profile_file(str(profile_path))
+
+    auto_keywords: List[str] = []
+    if autopick_keywords:
+        auto_keywords = suggest_keywords(
+            title=str(payload.get("theme") or ""),
+            structure=structure_list,
+            tone=str(payload.get("tone", "")),
+            style_text=style_profile_text,
+            exemplars=bundle.items,
+        )
+
+    manual_used, auto_used, final_keywords = merge_keywords(manual_keywords, auto_keywords)
+    payload["keywords"] = final_keywords
+    payload["autopick_keywords"] = bool(autopick_keywords)
+
     messages = assemble_messages(
         data_path="",
         theme_slug=theme,
         k=k,
         exemplars=bundle.items,
-        data=data,
+        data=payload,
         append_style_profile=append_style_profile,
     )
     clip_texts = [str(item.get("text", "")) for item in bundle.items if item.get("text")]
@@ -221,13 +271,17 @@ def _make_generation_context(
             break
 
     return GenerationContext(
-        data=data,
+        data=payload,
         context_bundle=bundle,
         messages=messages,
         clip_texts=clip_texts,
         style_profile_applied=style_profile_applied,
         style_profile_source=style_profile_source,
         style_profile_variant=style_profile_variant,
+        keywords_manual=manual_used,
+        keywords_auto=auto_used,
+        keywords_final=final_keywords,
+        autopick_enabled=bool(autopick_keywords),
     )
 
 
@@ -357,16 +411,19 @@ def _generate_variant(
     variant_label: Optional[str] = None,
     backoff_schedule: Optional[List[float]] = None,
     append_style_profile: Optional[bool] = None,
+    autopick_keywords: bool = True,
 ) -> Dict[str, Any]:
     start_time = time.time()
-    generation_context = _make_generation_context(
+    generation_context = make_generation_context(
         theme=theme,
         data=data,
         k=k,
         append_style_profile=append_style_profile,
+        autopick_keywords=autopick_keywords,
     )
+    prepared_data = generation_context.data
     active_messages = list(generation_context.messages)
-    cta_text, cta_is_default = _resolve_cta_source(data)
+    cta_text, cta_is_default = _resolve_cta_source(prepared_data)
 
     system_prompt = next((msg.get("content") for msg in active_messages if msg.get("role") == "system"), "")
     user_prompt = next((msg.get("content") for msg in reversed(active_messages) if msg.get("role") == "user"), "")
@@ -407,7 +464,7 @@ def _generate_variant(
         article_text, length_adjustment, active_messages = _ensure_length(
             article_text,
             active_messages,
-            data=data,
+            data=prepared_data,
             model_name=model_name,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -438,7 +495,7 @@ def _generate_variant(
         default_cta=cta_is_default,
     )
 
-    article_text, disclaimer_appended = _append_disclaimer_if_requested(article_text, data)
+    article_text, disclaimer_appended = _append_disclaimer_if_requested(article_text, prepared_data)
 
     duration = time.time() - start_time
     context_bundle = generation_context.context_bundle
@@ -482,10 +539,14 @@ def _generate_variant(
         "default_cta_used": default_cta_used,
         "truncation_retry_used": truncation_retry_used,
         "disclaimer_appended": disclaimer_appended,
-        "facts_mode": data.get("facts_mode"),
-        "input_data": data,
+        "facts_mode": prepared_data.get("facts_mode"),
+        "input_data": prepared_data,
         "system_prompt_preview": system_prompt,
         "user_prompt_preview": user_prompt,
+        "autopick_keywords": bool(generation_context.autopick_enabled),
+        "keywords_manual": generation_context.keywords_manual,
+        "keywords_auto": generation_context.keywords_auto,
+        "keywords_final": generation_context.keywords_final,
     }
 
     if generation_context.style_profile_applied:
@@ -530,6 +591,7 @@ def generate_article_from_payload(
     backoff_schedule: Optional[List[float]] = None,
     outfile: Optional[str] = None,
     append_style_profile: Optional[bool] = None,
+    autopick_keywords: bool = True,
 ) -> Dict[str, Any]:
     """Convenience wrapper for API usage.
 
@@ -562,6 +624,7 @@ def generate_article_from_payload(
         output_path=output_path,
         backoff_schedule=backoff_schedule,
         append_style_profile=append_style_profile,
+        autopick_keywords=autopick_keywords,
     )
 
     artifact_files = result.get("artifact_files")

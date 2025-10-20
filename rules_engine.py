@@ -10,7 +10,8 @@ from config import (
     DEFAULT_MIN_LENGTH,
     DEFAULT_MAX_LENGTH,
 )
-from helpers import list_to_block, normalize_keywords
+from helpers import list_to_block
+from keywords import format_keywords_block
 
 # Шаблон промпта рядом с файлом
 PROMPT_PATH = Path(__file__).resolve().parent / "base_prompt.txt"
@@ -43,7 +44,7 @@ def build_prompt(data: Dict[str, Any]) -> str:
 
     tmpl = PROMPT_PATH.read_text(encoding="utf-8")
     structure_block = list_to_block(spec.structure)
-    keywords_text = normalize_keywords(spec.keywords)
+    keywords_block = format_keywords_block(spec.keywords)
 
     prompt = tmpl.format(
         theme=spec.theme,
@@ -52,7 +53,7 @@ def build_prompt(data: Dict[str, Any]) -> str:
         min_len=spec.min_len,
         max_len=spec.max_len,
         structure_block=structure_block,
-        keywords=keywords_text,
+        keywords_block=keywords_block,
     )
     return prompt
 

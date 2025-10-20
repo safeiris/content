@@ -800,6 +800,56 @@ button {
   overflow-wrap: anywhere;
 }
 
+.used-keywords {
+  margin: 20px 0;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.used-keywords h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.used-keywords__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.used-keywords__list li {
+  background: #eef2ff;
+  color: #3730a3;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.used-keywords__list li[data-source="auto"] {
+  background: #ecfdf5;
+  color: #047857;
+}
+
+.used-keywords__list li[data-source="manual"] {
+  background: #eef2ff;
+  color: #3730a3;
+}
+
+.used-keywords__empty {
+  margin: 0;
+  font-size: 14px;
+  color: #6b7280;
+}
+
 .badges {
   display: flex;
   flex-wrap: wrap;

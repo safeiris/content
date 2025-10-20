@@ -67,6 +67,18 @@
             <div class="form-row">
               <label for="keywords-input">Ключевые слова</label>
               <input id="keywords-input" type="text" placeholder="Через запятую" />
+              <p class="field-hint">
+                Можно оставить пустым — система подберёт ключи автоматически (опция ниже).
+              </p>
+            </div>
+            <div class="form-row">
+              <label class="checkbox-with-hint">
+                <input type="checkbox" id="autopick-keywords" checked />
+                <span>
+                  <span class="checkbox-title">Авто-подбор ключевых слов</span>
+                  <span class="checkbox-hint">При ручном вводе приоритет у ваших ключей, дубликаты очищаются.</span>
+                </span>
+              </label>
             </div>
             <details id="advanced-settings" class="advanced-settings">
               <summary>
@@ -207,6 +219,13 @@
                 <button type="button" class="secondary" id="retry-btn" hidden>Повторить</button>
               </div>
             </div>
+            <section class="used-keywords" id="used-keywords" hidden>
+              <h3>Использованные ключи</h3>
+              <ul id="used-keywords-list" class="used-keywords__list"></ul>
+              <p id="used-keywords-empty" class="used-keywords__empty" hidden>
+                Ключевые слова не использовались.
+              </p>
+            </section>
             <section class="prompt-preview" id="prompt-preview">
               <h3>Предпросмотр промпта</h3>
               <div class="prompt-grid">
