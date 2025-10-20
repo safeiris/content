@@ -28,7 +28,7 @@ python run_demo.py
 ## Локальный запуск API и фронтенда
 
 ```bash
-# UI и API в одном процессе
+# UI и API в одном процессе (Flask сервит фронт и REST API)
 python -m server
 
 # Только API (например, без UI)
@@ -38,7 +38,15 @@ make api
 make dev
 ```
 
-> UI теперь раздаётся тем же Flask-процессом, что и API — отдельный `python -m http.server` больше не нужен.
+### Быстрый smoke-тест API
+
+```bash
+make health                 # /api/health
+make reindex SMOKE_THEME=finance   # /api/reindex (тематика задаётся через SMOKE_THEME)
+make generate-dry SMOKE_THEME=finance  # /api/generate в dry-run режиме
+```
+
+> В `generate-dry` используется специальный ответ, который не вызывает модель — им удобно проверять, что фронтенд/бэкенд связаны корректно.
 
 ## RAG-ready (Stage 1)
 
@@ -114,4 +122,11 @@ python orchestrate.py --theme finance --data input_example.json --k 3 --ab compa
 - `base_prompt.txt` знает про блок CONTEXT.
 - Существуют стабы `retrieve_exemplars` и `assemble_messages` без внешних зависимостей.
 - В проект не добавлены внешние библиотеки и сетевые вызовы.
+
+## Troubleshooting
+
+- **OpenAI key** — убедитесь, что переменная окружения `OPENAI_API_KEY` доступна перед запуском `python -m server`. UI покажет статус «OpenAI key не найден», если ключ отсутствует.
+- **Индекс** — если карточка Health говорит `index missing`, соберите индекс: `python -m retrieval index --theme <slug>`. После переиндексации обновите статус кнопкой «Health check».
+- **Артефакты** — директория `artifacts/` должна существовать и быть доступной на запись. Создайте её вручную (`mkdir -p artifacts`), если запускаете проект впервые.
+- **CORS / удалённый доступ** — сервер уже отдаёт заголовки CORS для `/api/*`. При запуске на другом хосте используйте `python -m server --host 0.0.0.0 --port 8000` и открывайте UI по `http://<host>:<port>`.
 

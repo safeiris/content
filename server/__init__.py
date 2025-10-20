@@ -119,6 +119,9 @@ def create_app() -> Flask:
         if k < 0:
             k = 0
 
+        if payload.get("dry_run"):
+            return jsonify(_make_dry_run_response(theme=theme, data=raw_data, k=k))
+
         model = payload.get("model")
         temperature = _safe_float(payload.get("temperature", 0.3), default=0.3)
         temperature = max(0.0, min(2.0, temperature))
@@ -356,6 +359,46 @@ def _resolve_artifact_path(raw_path: str) -> Path:
     if artifacts_dir not in candidate.parents and candidate != artifacts_dir:
         raise ApiError("Запрошенный путь вне каталога artifacts", status_code=400)
     return candidate
+
+
+def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[str, Any]:
+    topic = str(data.get("theme") or data.get("goal") or theme).strip() or "Тема не указана"
+    markdown = (
+        f"# Черновик (dry run)\n\n"
+        f"Тематика: {theme}\n\n"
+        f"Запрошенная тема: {topic}\n\n"
+        "Этот ответ сформирован без обращения к модели."
+    )
+    generated_at = datetime.utcnow().isoformat()
+    metadata: Dict[str, Any] = {
+        "model_used": "dry-run",
+        "characters": len(markdown),
+        "generated_at": generated_at,
+        "theme": theme,
+        "retrieval_k": k,
+        "input_data": data,
+        "clips": [],
+        "context_used": False,
+        "context_index_missing": False,
+        "context_budget_tokens_est": 0,
+        "context_budget_tokens_limit": 0,
+        "system_prompt_preview": "",
+        "user_prompt_preview": "",
+        "retry_used": False,
+        "plagiarism_detected": False,
+        "postfix_appended": False,
+        "disclaimer_appended": False,
+        "length_adjustment": None,
+        "status": "dry-run",
+    }
+    return {
+        "markdown": markdown,
+        "meta_json": metadata,
+        "artifact_paths": {
+            "markdown": None,
+            "metadata": None,
+        },
+    }
 
 
 app = create_app()

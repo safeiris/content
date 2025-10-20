@@ -8,13 +8,15 @@
   </head>
   <body>
     <header class="app-header">
-      <div>
-        <h1>Фабрика контента</h1>
-        <p class="subtitle">Автономная демо-витрина</p>
+      <div class="app-shell header-inner">
+        <div>
+          <h1>Фабрика контента</h1>
+          <p class="subtitle">Автономная демо-витрина</p>
+        </div>
       </div>
     </header>
 
-    <main class="app">
+    <main class="app app-shell">
       <nav class="tabs" role="tablist">
         <button class="tab active" data-tab="new-request" role="tab">Новый запрос</button>
         <button class="tab" data-tab="materials" role="tab">Сгенерированные материалы</button>
@@ -89,8 +91,12 @@
               <input id="model-input" type="text" placeholder="Например, gpt-4o-mini" />
             </div>
             <div class="form-actions">
-              <button type="button" class="secondary" id="preview-btn">Собрать промпт</button>
-              <button type="submit" class="primary">Сгенерировать</button>
+              <button type="button" class="secondary" id="preview-btn">
+                <span class="btn-label">Собрать промпт</span>
+              </button>
+              <button type="submit" class="primary">
+                <span class="btn-label">Сгенерировать</span>
+              </button>
             </div>
             <div class="form-actions muted">
               <button type="button" class="ghost" id="reindex-btn">Reindex theme</button>
@@ -103,19 +109,24 @@
               <div id="health-status" class="status-grid"></div>
             </section>
             <section>
-              <h3>Reindex log</h3>
-              <pre id="reindex-log" class="status-log">Пока без запусков.</pre>
+              <div class="section-header">
+                <h3>Reindex log</h3>
+                <button type="button" class="ghost small" id="clear-log">Очистить</button>
+              </div>
+              <div id="reindex-log" class="console-log">
+                <div class="log-empty">Пока без запусков.</div>
+              </div>
             </section>
           </aside>
         </div>
       </section>
 
       <section class="tab-panel" id="materials" role="tabpanel">
-        <div id="artifacts-list" class="cards"></div>
+        <div id="artifacts-list" class="cards-grid"></div>
       </section>
 
       <section class="tab-panel" id="pipes" role="tabpanel">
-        <div id="pipes-list" class="pipes"></div>
+        <div id="pipes-list" class="pipes-grid"></div>
       </section>
 
       <section class="tab-panel" id="result" role="tabpanel">
@@ -162,10 +173,10 @@
       </section>
     </main>
 
-    <div id="progress-overlay" class="progress-overlay hidden">
+    <div id="progress-overlay" class="progress-overlay hidden" role="alert" aria-live="polite">
       <div class="progress-card">
         <div class="spinner"></div>
-        <p>Генерируем материалы…</p>
+        <p data-role="progress-message">Генерируем материалы…</p>
       </div>
     </div>
 
@@ -177,8 +188,18 @@
         </div>
         <p class="card-topic"></p>
         <p class="card-meta"></p>
+        <div class="card-actions">
+          <button type="button" class="secondary subtle open-btn">
+            <span class="btn-label">Открыть</span>
+          </button>
+          <button type="button" class="secondary subtle download-btn">
+            <span class="btn-label">Скачать</span>
+          </button>
+        </div>
       </article>
     </template>
+
+    <div id="toast-root" class="toast-root" aria-live="polite" aria-atomic="true"></div>
 
     <script src="script.js" type="module"></script>
   </body>

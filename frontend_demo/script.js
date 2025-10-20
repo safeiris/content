@@ -34,6 +34,8 @@ const previewBtn = document.getElementById("preview-btn");
 const reindexBtn = document.getElementById("reindex-btn");
 const healthBtn = document.getElementById("health-btn");
 const progressOverlay = document.getElementById("progress-overlay");
+const progressMessage = progressOverlay?.querySelector('[data-role="progress-message"]') || null;
+const toastRoot = document.getElementById("toast-root");
 const draftView = document.getElementById("draft-view");
 const reportView = document.getElementById("report-view");
 const resultTitle = document.getElementById("result-title");
@@ -41,6 +43,7 @@ const resultMeta = document.getElementById("result-meta");
 const resultBadges = document.getElementById("result-badges");
 const downloadMdBtn = document.getElementById("download-md");
 const downloadReportBtn = document.getElementById("download-report");
+const clearLogBtn = document.getElementById("clear-log");
 const structurePreset = document.getElementById("structure-preset");
 const structureInput = document.getElementById("structure-input");
 const keywordsInput = document.getElementById("keywords-input");
@@ -61,6 +64,17 @@ const previewUser = document.getElementById("preview-user");
 const contextList = document.getElementById("context-list");
 const contextSummary = document.getElementById("context-summary");
 const contextBadge = document.getElementById("context-badge");
+const generateBtn = briefForm.querySelector("button[type='submit']");
+
+const LOG_STATUS_LABELS = {
+  info: "INFO",
+  success: "SUCCESS",
+  warn: "WARN",
+  error: "ERROR",
+};
+
+const DEFAULT_PROGRESS_MESSAGE = progressMessage?.textContent?.trim() || "Готовим данные…";
+const MAX_TOASTS = 3;
 
 const HEALTH_STATUS_MESSAGES = {
   openai_key: {
@@ -98,6 +112,12 @@ reindexBtn.addEventListener("click", handleReindex);
 healthBtn.addEventListener("click", handleHealthCheck);
 downloadMdBtn.addEventListener("click", () => handleDownload("markdown"));
 downloadReportBtn.addEventListener("click", () => handleDownload("metadata"));
+if (clearLogBtn) {
+  clearLogBtn.addEventListener("click", () => {
+    clearReindexLog();
+    showToast({ message: "Журнал очищен", type: "info" });
+  });
+}
 
 init();
 
@@ -107,17 +127,45 @@ function switchTab(tabId) {
 }
 
 async function init() {
+  let pipesLoaded = false;
   try {
-    await Promise.all([loadPipes(), loadArtifacts()]);
-    applyStructurePreset(structurePreset.value);
+    await loadPipes();
+    pipesLoaded = true;
   } catch (error) {
     console.error(error);
-    alert(`Не удалось загрузить данные: ${error.message}`);
+    showToast({ message: `Не удалось загрузить тематики: ${getErrorMessage(error)}`, type: "error" });
   }
+
+  try {
+    await loadArtifacts();
+  } catch (error) {
+    console.error(error);
+    showToast({ message: `Не удалось загрузить материалы: ${getErrorMessage(error)}`, type: "error" });
+  }
+
+  if (pipesLoaded) {
+    applyStructurePreset(structurePreset.value);
+  }
+
+  await handleHealthCheck();
 }
 
 async function loadPipes() {
-  const pipes = await fetchJson("/api/pipes");
+  let pipes;
+  try {
+    pipes = await fetchJson("/api/pipes");
+  } catch (error) {
+    pipesList.innerHTML = '<div class="empty-state">Не удалось загрузить тематики.</div>';
+    pipeSelect.innerHTML = "";
+    state.pipes.clear();
+    throw error;
+  }
+  if (!Array.isArray(pipes)) {
+    pipesList.innerHTML = '<div class="empty-state">Некорректный ответ сервера.</div>';
+    pipeSelect.innerHTML = "";
+    state.pipes.clear();
+    throw new Error("Некорректный ответ сервера");
+  }
   pipesList.innerHTML = "";
   pipeSelect.innerHTML = "";
   state.pipes.clear();
@@ -154,22 +202,44 @@ function renderPipeCards(pipes) {
   pipes.forEach((pipe) => {
     const card = document.createElement("article");
     card.className = "pipe-card";
-    card.innerHTML = `
-      <div>
-        <h3>${pipe.name}</h3>
-        <p>${pipe.description}</p>
-      </div>
-      <div class="pipe-meta">Тон: <strong>${pipe.tone}</strong></div>
-      <div class="pipe-keywords">
-        ${(pipe.keywords || []).map((kw) => `<span>${kw}</span>`).join("")}
-      </div>
-    `;
+    const header = document.createElement("div");
+    const title = document.createElement("h3");
+    title.textContent = pipe.name;
+    const description = document.createElement("p");
+    description.textContent = pipe.description || `Тематика ${pipe.name}`;
+    header.append(title, description);
+
+    const meta = document.createElement("div");
+    meta.className = "pipe-meta";
+    meta.innerHTML = `Тон: <strong>${pipe.tone || "—"}</strong>`;
+
+    const keywordsWrapper = document.createElement("div");
+    keywordsWrapper.className = "pipe-keywords";
+    (pipe.keywords || []).slice(0, 8).forEach((keyword) => {
+      const badge = document.createElement("span");
+      badge.textContent = keyword;
+      keywordsWrapper.append(badge);
+    });
+
+    card.append(header, meta, keywordsWrapper);
     pipesList.append(card);
   });
 }
 
 async function loadArtifacts() {
-  const artifacts = await fetchJson("/api/artifacts");
+  let artifacts;
+  try {
+    artifacts = await fetchJson("/api/artifacts");
+  } catch (error) {
+    artifactsList.innerHTML = '<div class="empty-state">Не удалось загрузить материалы.</div>';
+    state.artifacts = [];
+    throw error;
+  }
+  if (!Array.isArray(artifacts)) {
+    artifactsList.innerHTML = '<div class="empty-state">Некорректный ответ сервера.</div>';
+    state.artifacts = [];
+    throw new Error("Некорректный ответ сервера");
+  }
   state.artifacts = artifacts;
   renderArtifacts();
 }
@@ -191,10 +261,33 @@ function renderArtifacts() {
     card.querySelector(".card-title").textContent = artifact.name;
     card.querySelector(".status").textContent = "Готов";
     card.querySelector(".status").dataset.status = "Ready";
-    card.querySelector(".card-topic").textContent = `${themeName ?? ""} · ${topic}`;
-    const updatedAt = new Date(artifact.modified_at);
-    card.querySelector(".card-meta").textContent = `Обновлено ${updatedAt.toLocaleString("ru-RU")}`;
+    const topicText = [themeName, topic].filter(Boolean).join(" · ") || topic;
+    card.querySelector(".card-topic").textContent = topicText;
+    const updatedAt = artifact.modified_at ? new Date(artifact.modified_at) : null;
+    card.querySelector(".card-meta").textContent = updatedAt
+      ? `Обновлено ${updatedAt.toLocaleString("ru-RU")}`
+      : "Дата обновления неизвестна";
+
     card.addEventListener("click", () => showArtifact(artifact));
+
+    const openBtn = card.querySelector(".open-btn");
+    const downloadBtn = card.querySelector(".download-btn");
+    if (openBtn) {
+      openBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        showArtifact(artifact);
+      });
+    }
+    if (downloadBtn) {
+      if (!artifact.path) {
+        downloadBtn.disabled = true;
+      }
+      downloadBtn.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        await downloadArtifactFile(artifact.path, artifact.name);
+      });
+    }
+
     artifactsList.append(card);
   });
 }
@@ -303,7 +396,8 @@ function applyPipeDefaults(pipeId) {
 async function handlePromptPreview() {
   try {
     const payload = buildRequestPayload();
-    showProgress(true);
+    setButtonLoading(previewBtn, true);
+    showProgress(true, "Собираем промпт…");
     const preview = await fetchJson("/api/prompt/preview", {
       method: "POST",
       body: JSON.stringify({ theme: payload.theme, data: payload.data, k: payload.k }),
@@ -312,8 +406,9 @@ async function handlePromptPreview() {
     switchTab("result");
   } catch (error) {
     console.error(error);
-    alert(`Не удалось собрать промпт: ${error.message}`);
+    showToast({ message: `Не удалось собрать промпт: ${getErrorMessage(error)}`, type: "error" });
   } finally {
+    setButtonLoading(previewBtn, false);
     showProgress(false);
   }
 }
@@ -322,7 +417,8 @@ async function handleGenerate(event) {
   event.preventDefault();
   try {
     const payload = buildRequestPayload();
-    showProgress(true);
+    setButtonLoading(generateBtn, true);
+    showProgress(true, "Генерируем материалы…");
     const response = await fetchJson("/api/generate", {
       method: "POST",
       body: JSON.stringify({
@@ -334,12 +430,14 @@ async function handleGenerate(event) {
         max_tokens: payload.maxTokens,
       }),
     });
-    const { markdown, meta_json: meta, artifact_paths: artifactPaths } = response;
+    const markdown = response?.markdown ?? "";
+    const meta = (response?.meta_json && typeof response.meta_json === "object") ? response.meta_json : {};
+    const artifactPaths = response?.artifact_paths;
     state.currentResult = { markdown, meta, artifactPaths };
     draftView.innerHTML = markdownToHtml(markdown);
     resultTitle.textContent = payload.data.theme || "Результат генерации";
     const characters = meta.characters ?? markdown.length;
-    resultMeta.textContent = `Символов: ${characters.toLocaleString("ru-RU")} · Модель: ${meta.model_used}`;
+    resultMeta.textContent = `Символов: ${characters.toLocaleString("ru-RU")} · Модель: ${meta.model_used ?? "—"}`;
     renderMetadata(meta);
     updateResultBadges(meta);
     updatePromptPreview({
@@ -353,12 +451,19 @@ async function handleGenerate(event) {
       k: payload.k,
     });
     enableDownloadButtons(artifactPaths);
-    await loadArtifacts();
+    try {
+      await loadArtifacts();
+    } catch (refreshError) {
+      console.error(refreshError);
+      showToast({ message: `Не удалось обновить список материалов: ${getErrorMessage(refreshError)}`, type: "warn" });
+    }
     switchTab("result");
+    showToast({ message: "Готово", type: "success" });
   } catch (error) {
     console.error(error);
-    alert(`Не удалось выполнить генерацию: ${error.message}`);
+    showToast({ message: `Не удалось выполнить генерацию: ${getErrorMessage(error)}`, type: "error" });
   } finally {
+    setButtonLoading(generateBtn, false);
     showProgress(false);
   }
 }
@@ -413,10 +518,14 @@ function buildRequestPayload() {
 }
 
 function renderMetadata(meta) {
-  const report = document.createElement("pre");
-  report.className = "status-log";
-  report.textContent = JSON.stringify(meta, null, 2);
   reportView.innerHTML = "";
+  const report = document.createElement("pre");
+  report.className = "metadata-view";
+  if (!meta || typeof meta !== "object" || !Object.keys(meta).length) {
+    report.textContent = "Метаданные недоступны.";
+  } else {
+    report.textContent = JSON.stringify(meta, null, 2);
+  }
   reportView.append(report);
 }
 
@@ -529,53 +638,54 @@ function updatePromptPreview(preview) {
 }
 
 function enableDownloadButtons(paths) {
-  if (!paths) {
+  const markdownPath = paths?.markdown;
+  const metadataPath = paths?.metadata;
+
+  if (markdownPath) {
+    downloadMdBtn.dataset.path = markdownPath;
+    downloadMdBtn.disabled = false;
+  } else {
     downloadMdBtn.disabled = true;
-    downloadReportBtn.disabled = true;
-    return;
+    delete downloadMdBtn.dataset.path;
   }
-  downloadMdBtn.dataset.path = paths.markdown;
-  downloadReportBtn.dataset.path = paths.metadata;
-  downloadMdBtn.disabled = false;
-  downloadReportBtn.disabled = false;
+
+  if (metadataPath) {
+    downloadReportBtn.dataset.path = metadataPath;
+    downloadReportBtn.disabled = false;
+  } else {
+    downloadReportBtn.disabled = true;
+    delete downloadReportBtn.dataset.path;
+  }
 }
 
 async function handleDownload(type) {
   const button = type === "markdown" ? downloadMdBtn : downloadReportBtn;
   const path = button.dataset.path;
   if (!path) {
+    showToast({ message: "Файл недоступен для скачивания", type: "warn" });
     return;
   }
-  try {
-    const response = await fetch(`${API_BASE}/api/artifacts/download?path=${encodeURIComponent(path)}`);
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(text || `HTTP ${response.status}`);
-    }
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = path.split("/").pop() || `artifact.${type === "markdown" ? "md" : "json"}`;
-    document.body.append(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
-  } catch (error) {
-    console.error(error);
-    alert(`Не удалось скачать файл: ${error.message}`);
-  }
+  await downloadArtifactFile(path, type === "markdown" ? "draft.md" : "report.json");
 }
 
 async function showArtifact(artifact) {
   try {
-    showProgress(true);
-    const markdown = await fetchText(`/api/artifacts/download?path=${encodeURIComponent(artifact.path)}`);
+    showProgress(true, "Загружаем артефакт…");
+    const markdownPath = artifact.path;
+    if (!markdownPath) {
+      throw new Error("Файл недоступен");
+    }
+    const markdown = await fetchText(`/api/artifacts/download?path=${encodeURIComponent(markdownPath)}`);
     const metadataPath = artifact.metadata_path;
     let metadata = artifact.metadata || {};
     if (!Object.keys(metadata).length && metadataPath) {
-      const jsonText = await fetchText(`/api/artifacts/download?path=${encodeURIComponent(metadataPath)}`);
-      metadata = JSON.parse(jsonText);
+      try {
+        const jsonText = await fetchText(`/api/artifacts/download?path=${encodeURIComponent(metadataPath)}`);
+        metadata = JSON.parse(jsonText);
+      } catch (parseError) {
+        console.warn("Не удалось разобрать метаданные", parseError);
+        metadata = {};
+      }
     }
     draftView.innerHTML = markdownToHtml(markdown);
     resultTitle.textContent = metadata.input_data?.theme || metadata.theme || artifact.name;
@@ -597,30 +707,42 @@ async function showArtifact(artifact) {
     switchTab("result");
   } catch (error) {
     console.error(error);
-    alert(`Не удалось открыть артефакт: ${error.message}`);
+    showToast({ message: `Не удалось открыть артефакт: ${getErrorMessage(error)}`, type: "error" });
   } finally {
     showProgress(false);
   }
 }
 
 async function handleReindex() {
+  const theme = pipeSelect.value;
+  if (!theme) {
+    showToast({ message: "Выберите тематику для переиндексации", type: "warn" });
+    return;
+  }
+
+  appendLogEntry("info", `Запрос на переиндексацию темы «${theme}»`);
   try {
-    const theme = pipeSelect.value;
-    if (!theme) {
-      throw new Error("Выберите тематику");
-    }
-    showProgress(true);
     const stats = await fetchJson("/api/reindex", {
       method: "POST",
       body: JSON.stringify({ theme }),
     });
-    reindexLog.textContent = `Индекс обновлён: ${stats.clips} клипов, средняя длина ${stats.avg_truncated_words} слов (~${stats.avg_truncated_tokens_est} токенов).`;
+    appendLogEntry("success", summariseReindexStats(stats));
+    if (typeof stats?.clips === "number" && typeof stats?.avg_truncated_words === "number") {
+      const details = [
+        `Клипы: ${stats.clips}`,
+        `средняя длина ~${Math.round(stats.avg_truncated_words)} слов`,
+      ];
+      if (typeof stats.avg_truncated_tokens_est === "number") {
+        details.push(`≈${Math.round(stats.avg_truncated_tokens_est)} токенов`);
+      }
+      appendLogEntry("info", details.join(", "));
+    }
+    showToast({ message: "Индекс обновлён", type: "success" });
     await handleHealthCheck();
   } catch (error) {
     console.error(error);
-    reindexLog.textContent = `Ошибка: ${error.message}`;
-  } finally {
-    showProgress(false);
+    appendLogEntry("error", getErrorMessage(error));
+    showToast({ message: `Переиндексация: ${getErrorMessage(error)}`, type: "error" });
   }
 }
 
@@ -748,31 +870,245 @@ async function fetchJson(path, options = {}) {
   if (options.method && options.method !== "GET") {
     headers["Content-Type"] = "application/json";
   }
-  const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
-  if (!response.ok) {
-    const text = await response.text();
-    try {
-      const data = JSON.parse(text);
-      throw new Error(data.error || text || `HTTP ${response.status}`);
-    } catch (error) {
-      if (error instanceof SyntaxError) {
-        throw new Error(text || `HTTP ${response.status}`);
-      }
-      throw error;
-    }
+
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  } catch (error) {
+    throw new Error("Сервер недоступен");
   }
-  return response.json();
+
+  let text;
+  try {
+    text = await response.text();
+  } catch (error) {
+    throw new Error("Не удалось прочитать ответ сервера");
+  }
+
+  if (!response.ok) {
+    if (text) {
+      try {
+        const data = JSON.parse(text);
+        const message = typeof data?.error === "string" && data.error.trim() ? data.error : text;
+        throw new Error(message || `HTTP ${response.status}`);
+      } catch (parseError) {
+        if (!(parseError instanceof Error) || parseError.name !== "SyntaxError") {
+          throw parseError;
+        }
+      }
+    }
+    throw new Error(text || `HTTP ${response.status}`);
+  }
+
+  if (!text.trim()) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error("Некорректный JSON в ответе сервера");
+  }
 }
 
 async function fetchText(path) {
-  const response = await fetch(`${API_BASE}${path}`);
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`);
+  } catch (error) {
+    throw new Error("Сервер недоступен");
+  }
+  const text = await response.text();
   if (!response.ok) {
-    const text = await response.text();
     throw new Error(text || `HTTP ${response.status}`);
   }
-  return response.text();
+  return text;
 }
 
-function showProgress(visible) {
-  progressOverlay.classList.toggle("hidden", !visible);
+function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
+  if (!progressOverlay) {
+    return;
+  }
+  if (visible) {
+    if (progressMessage) {
+      progressMessage.textContent = message;
+    }
+    progressOverlay.classList.remove("hidden");
+  } else {
+    progressOverlay.classList.add("hidden");
+    if (progressMessage) {
+      progressMessage.textContent = DEFAULT_PROGRESS_MESSAGE;
+    }
+  }
+}
+
+function setButtonLoading(button, isLoading) {
+  if (!button) {
+    return;
+  }
+  if (isLoading) {
+    if (!button.dataset.originalDisabled) {
+      button.dataset.originalDisabled = button.disabled ? "true" : "false";
+    }
+    button.disabled = true;
+    button.classList.add("loading");
+    if (!button.querySelector(".btn-spinner")) {
+      const spinner = document.createElement("span");
+      spinner.className = "btn-spinner";
+      button.prepend(spinner);
+    }
+  } else {
+    const spinner = button.querySelector(".btn-spinner");
+    if (spinner) {
+      spinner.remove();
+    }
+    button.classList.remove("loading");
+    const shouldRemainDisabled = button.dataset.originalDisabled === "true";
+    if (!shouldRemainDisabled) {
+      button.disabled = false;
+    }
+    delete button.dataset.originalDisabled;
+  }
+}
+
+function getErrorMessage(error, fallback = "Неизвестная ошибка") {
+  if (!error) {
+    return fallback;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  if (typeof error.message === "string" && error.message.trim()) {
+    return error.message;
+  }
+  return fallback;
+}
+
+async function downloadArtifactFile(path, fallbackName = "artifact.txt") {
+  if (!path) {
+    showToast({ message: "Файл недоступен", type: "warn" });
+    return false;
+  }
+  try {
+    const response = await fetch(`${API_BASE}/api/artifacts/download?path=${encodeURIComponent(path)}`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = path.split("/").pop() || fallbackName;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    return true;
+  } catch (error) {
+    console.error(error);
+    showToast({ message: `Не удалось скачать файл: ${getErrorMessage(error)}`, type: "error" });
+    return false;
+  }
+}
+
+function appendLogEntry(status, message) {
+  if (!reindexLog) {
+    return;
+  }
+  const tone = LOG_STATUS_LABELS[status] ? status : "info";
+  if (reindexLog.querySelector(".log-empty")) {
+    reindexLog.innerHTML = "";
+  }
+  const entry = document.createElement("div");
+  entry.className = `log-entry ${tone}`;
+
+  const timeEl = document.createElement("span");
+  timeEl.className = "log-time";
+  timeEl.textContent = formatLogTime(new Date());
+
+  const statusEl = document.createElement("span");
+  statusEl.className = "log-status";
+  statusEl.textContent = LOG_STATUS_LABELS[tone];
+
+  const messageEl = document.createElement("p");
+  messageEl.className = "log-message";
+  messageEl.textContent = message;
+
+  entry.append(timeEl, statusEl, messageEl);
+  reindexLog.append(entry);
+  reindexLog.scrollTop = reindexLog.scrollHeight;
+}
+
+function clearReindexLog() {
+  if (!reindexLog) {
+    return;
+  }
+  reindexLog.innerHTML = '<div class="log-empty">Журнал пуст.</div>';
+}
+
+function summariseReindexStats(stats) {
+  if (!stats || typeof stats !== "object") {
+    return "Индекс обновлён.";
+  }
+  const parts = [];
+  if (typeof stats.clips === "number") {
+    parts.push(`${stats.clips} клипов`);
+  }
+  if (typeof stats.avg_truncated_words === "number") {
+    parts.push(`~${Math.round(stats.avg_truncated_words)} слов`);
+  }
+  if (typeof stats.avg_truncated_tokens_est === "number") {
+    parts.push(`≈${Math.round(stats.avg_truncated_tokens_est)} токенов`);
+  }
+  return parts.length ? `Индекс обновлён: ${parts.join(", ")}` : "Индекс обновлён.";
+}
+
+function formatLogTime(date) {
+  return date.toLocaleTimeString("ru-RU", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function showToast({ message, type = "info", duration = 4000 } = {}) {
+  if (!toastRoot || !message) {
+    return;
+  }
+
+  const toast = document.createElement("div");
+  toast.className = type && type !== "info" ? `toast ${type}` : "toast";
+  const textNode = document.createElement("span");
+  textNode.textContent = message;
+  toast.append(textNode);
+
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "toast-close";
+  closeBtn.setAttribute("aria-label", "Закрыть уведомление");
+  closeBtn.textContent = "×";
+  closeBtn.addEventListener("click", () => removeToast(toast));
+  toast.append(closeBtn);
+
+  toastRoot.append(toast);
+  while (toastRoot.children.length > MAX_TOASTS) {
+    toastRoot.firstElementChild?.remove();
+  }
+
+  const timeoutId = window.setTimeout(() => removeToast(toast), duration);
+  toast.dataset.timeoutId = String(timeoutId);
+}
+
+function removeToast(toast) {
+  if (!toast) {
+    return;
+  }
+  const timeoutId = toast.dataset.timeoutId;
+  if (timeoutId) {
+    window.clearTimeout(Number(timeoutId));
+  }
+  if (toast.isConnected) {
+    toast.remove();
+  }
 }
