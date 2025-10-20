@@ -6,7 +6,7 @@ import logging
 import mimetypes
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
@@ -69,6 +69,7 @@ def create_app() -> Flask:
         if k < 0:
             k = 0
 
+        style_profile_override = _style_profile_override_from_request(request)
         context_bundle = retrieve_context(theme_slug=theme, query=raw_data.get("theme", ""), k=k)
         messages = assemble_messages(
             data_path="",
@@ -76,10 +77,15 @@ def create_app() -> Flask:
             k=k,
             exemplars=context_bundle.items,
             data=raw_data,
+            append_style_profile=style_profile_override,
         )
 
-        system_message = next((msg["content"] for msg in messages if msg.get("role") == "system"), "")
+        system_payload = next((msg for msg in messages if msg.get("role") == "system"), {})
+        system_message = str(system_payload.get("content", ""))
         user_message = next((msg["content"] for msg in reversed(messages) if msg.get("role") == "user"), "")
+
+        style_profile_applied = bool(system_payload.get("style_profile_applied"))
+        style_profile_source = system_payload.get("style_profile_source") if style_profile_applied else None
 
         context_items = [
             {
@@ -101,6 +107,12 @@ def create_app() -> Flask:
                 "context_budget_tokens_est": context_bundle.total_tokens_est,
                 "context_budget_tokens_limit": context_bundle.token_budget_limit,
                 "k": k,
+                "style_profile_applied": style_profile_applied,
+                **(
+                    {"style_profile_source": style_profile_source}
+                    if style_profile_applied and style_profile_source
+                    else {}
+                ),
             }
         )
 
@@ -119,6 +131,7 @@ def create_app() -> Flask:
         if k < 0:
             k = 0
 
+        style_profile_override = _style_profile_override_from_request(request)
         if payload.get("dry_run"):
             return jsonify(_make_dry_run_response(theme=theme, data=raw_data, k=k))
 
@@ -135,6 +148,7 @@ def create_app() -> Flask:
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                append_style_profile=style_profile_override,
             )
         except ApiError:
             raise
@@ -144,13 +158,19 @@ def create_app() -> Flask:
             LOGGER.exception("Generation failed")
             raise ApiError("Не удалось завершить генерацию", status_code=500) from exc
 
-        return jsonify(
-            {
-                "markdown": result["text"],
-                "meta_json": result["metadata"],
-                "artifact_paths": result["artifact_paths"],
-            }
-        )
+        response_payload: Dict[str, Any] = {
+            "markdown": result["text"],
+            "meta_json": result["metadata"],
+            "artifact_paths": result["artifact_paths"],
+        }
+
+        metadata = result.get("metadata") or {}
+        if isinstance(metadata, dict) and metadata.get("style_profile_applied"):
+            response_payload["style_profile_applied"] = True
+            if metadata.get("style_profile_source"):
+                response_payload["style_profile_source"] = metadata["style_profile_source"]
+
+        return jsonify(response_payload)
 
     @app.post("/api/reindex")
     def reindex():
@@ -245,6 +265,18 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _style_profile_override_from_request(req) -> Optional[bool]:
+    raw_value = req.args.get("style_profile") if hasattr(req, "args") else None
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip().lower()
+    if value in {"off", "false", "0"}:
+        return False
+    if value in {"on", "true", "1"}:
+        return True
+    return None
 
 
 def _collect_pipes() -> List[Dict[str, Any]]:

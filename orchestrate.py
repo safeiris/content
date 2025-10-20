@@ -38,8 +38,10 @@ DISCLAIMER_TEMPLATE = (
 class GenerationContext:
     data: Dict[str, Any]
     context_bundle: ContextBundle
-    messages: List[Dict[str, str]]
+    messages: List[Dict[str, Any]]
     clip_texts: List[str]
+    style_profile_applied: bool = False
+    style_profile_source: Optional[str] = None
 
 
 def _get_cta_text() -> str:
@@ -160,6 +162,7 @@ def _make_generation_context(
     theme: str,
     data: Dict[str, Any],
     k: int,
+    append_style_profile: Optional[bool] = None,
 ) -> GenerationContext:
     if k <= 0:
         print("[orchestrate] CONTEXT: disabled (k=0)")
@@ -174,9 +177,31 @@ def _make_generation_context(
         bundle = retrieve_context(theme_slug=theme, query=data.get("theme", ""), k=k)
         if bundle.index_missing:
             print("[orchestrate] CONTEXT: none (index missing)")
-    messages = assemble_messages(data_path="", theme_slug=theme, k=k, exemplars=bundle.items, data=data)
+    messages = assemble_messages(
+        data_path="",
+        theme_slug=theme,
+        k=k,
+        exemplars=bundle.items,
+        data=data,
+        append_style_profile=append_style_profile,
+    )
     clip_texts = [str(item.get("text", "")) for item in bundle.items if item.get("text")]
-    return GenerationContext(data=data, context_bundle=bundle, messages=messages, clip_texts=clip_texts)
+    style_profile_applied = False
+    style_profile_source: Optional[str] = None
+    for message in messages:
+        if message.get("role") == "system" and message.get("style_profile_applied"):
+            style_profile_applied = True
+            style_profile_source = message.get("style_profile_source")
+            break
+
+    return GenerationContext(
+        data=data,
+        context_bundle=bundle,
+        messages=messages,
+        clip_texts=clip_texts,
+        style_profile_applied=style_profile_applied,
+        style_profile_source=style_profile_source,
+    )
 
 
 def _default_timeout() -> int:
@@ -294,9 +319,15 @@ def _generate_variant(
     output_path: Path,
     variant_label: Optional[str] = None,
     backoff_schedule: Optional[List[float]] = None,
+    append_style_profile: Optional[bool] = None,
 ) -> Dict[str, Any]:
     start_time = time.time()
-    generation_context = _make_generation_context(theme=theme, data=data, k=k)
+    generation_context = _make_generation_context(
+        theme=theme,
+        data=data,
+        k=k,
+        append_style_profile=append_style_profile,
+    )
     active_messages = list(generation_context.messages)
     cta_text, cta_is_default = _resolve_cta_source(data)
 
@@ -419,6 +450,11 @@ def _generate_variant(
         "system_prompt_preview": system_prompt,
         "user_prompt_preview": user_prompt,
     }
+
+    if generation_context.style_profile_applied:
+        metadata["style_profile_applied"] = True
+        if generation_context.style_profile_source:
+            metadata["style_profile_source"] = generation_context.style_profile_source
     if variant_label:
         metadata["ab_variant"] = variant_label
 
@@ -446,6 +482,7 @@ def generate_article_from_payload(
     mode: Optional[str] = None,
     backoff_schedule: Optional[List[float]] = None,
     outfile: Optional[str] = None,
+    append_style_profile: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Convenience wrapper for API usage.
 
@@ -477,6 +514,7 @@ def generate_article_from_payload(
         mode=resolved_mode,
         output_path=output_path,
         backoff_schedule=backoff_schedule,
+        append_style_profile=append_style_profile,
     )
 
     markdown_path = result["output_path"]

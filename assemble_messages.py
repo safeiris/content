@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from config import APPEND_STYLE_PROFILE_DEFAULT, STYLE_PROFILE_PATH
 from rules_engine import build_prompt
 from retrieval import estimate_tokens, load_index, search_topk
 
 DEFAULT_CONTEXT_TOKEN_BUDGET = 2000
+STYLE_PROFILE_INSERT_ANCHOR = "Если предоставлен блок CONTEXT"
+STYLE_PROFILE_FILE = Path(__file__).resolve().parent / STYLE_PROFILE_PATH
 
 
 @dataclass
@@ -24,6 +28,54 @@ class ContextBundle:
     @staticmethod
     def token_budget_default() -> int:
         return DEFAULT_CONTEXT_TOKEN_BUDGET
+
+
+def _style_profile_conditions_met(theme_slug: str, data: Dict[str, Any]) -> bool:
+    if theme_slug.strip().lower() != "finance":
+        return False
+    goal = str(data.get("goal", "")).strip().lower()
+    tone = str(data.get("tone", "")).strip().lower()
+    if "seo" not in goal:
+        return False
+    if "эксперт" not in tone:
+        return False
+    return True
+
+
+def _should_apply_style_profile(
+    theme_slug: str,
+    data: Dict[str, Any],
+    *,
+    override: Optional[bool] = None,
+) -> bool:
+    allow = APPEND_STYLE_PROFILE_DEFAULT if override is None else bool(override)
+    if not allow:
+        return False
+    return _style_profile_conditions_met(theme_slug, data)
+
+
+@lru_cache(maxsize=1)
+def _load_style_profile_text() -> str:
+    try:
+        return STYLE_PROFILE_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+
+
+def _inject_style_profile(system_prompt: str, style_profile: str) -> Tuple[str, bool]:
+    profile_text = style_profile.strip()
+    if not profile_text:
+        return system_prompt, False
+
+    if STYLE_PROFILE_INSERT_ANCHOR in system_prompt:
+        updated_prompt = system_prompt.replace(
+            STYLE_PROFILE_INSERT_ANCHOR,
+            f"{profile_text}\n\n{STYLE_PROFILE_INSERT_ANCHOR}",
+            1,
+        )
+        return updated_prompt, True
+
+    return f"{system_prompt.rstrip()}\n\n{profile_text}", True
 
 
 def retrieve_context(
@@ -114,7 +166,8 @@ def assemble_messages(
     k: int = 3,
     exemplars: Optional[List[Dict[str, object]]] = None,
     data: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, str]]:
+    append_style_profile: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
     """Prepare chat-style messages for an LLM call.
 
     Parameters
@@ -135,7 +188,20 @@ def assemble_messages(
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
     system_prompt = build_prompt(payload)
 
-    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    style_profile_applied = False
+    style_profile_source: Optional[str] = None
+    if _should_apply_style_profile(theme_slug, payload, override=append_style_profile):
+        system_prompt, style_profile_applied = _inject_style_profile(system_prompt, _load_style_profile_text())
+        if style_profile_applied:
+            style_profile_source = STYLE_PROFILE_PATH
+
+    system_message: Dict[str, Any] = {"role": "system", "content": system_prompt}
+    if style_profile_applied:
+        system_message["style_profile_applied"] = True
+        if style_profile_source:
+            system_message["style_profile_source"] = style_profile_source
+
+    messages: List[Dict[str, Any]] = [system_message]
 
     exemplar_items = exemplars
     if exemplar_items is None:
@@ -163,9 +229,13 @@ def _preview(text: str, limit: int = 400) -> str:
 
 if __name__ == "__main__":
     assembled = assemble_messages()
-    system_message = assembled[0]["content"]
+    system_payload = assembled[0]
+    system_message = system_payload["content"]
     print("=== SYSTEM PROMPT PREVIEW ===")
     print(_preview(system_message))
+
+    if system_payload.get("style_profile_applied"):
+        print("\n[style profile applied from %s]" % system_payload.get("style_profile_source", STYLE_PROFILE_PATH))
 
     context_message = next(
         (msg["content"] for msg in assembled[1:] if msg["role"] == "system" and msg["content"].startswith("CONTEXT")),
