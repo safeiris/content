@@ -46,6 +46,10 @@
                 <option value="дружелюбный">Дружелюбный</option>
                 <option value="строгий">Строгий</option>
               </select>
+              <p class="field-hint">
+                Экспертный автоматически включает стилевые нормы портала (можно отключить параметром
+                <code>style_profile=off</code>).
+              </p>
             </div>
             <div class="form-row">
               <label for="structure-preset">Пресет структуры</label>
@@ -72,24 +76,81 @@
               <label><input type="checkbox" id="facts-mode" /> Facts mode</label>
               <label><input type="checkbox" id="add-disclaimer" /> Дисклеймер</label>
             </fieldset>
-            <div class="form-row grouped">
-              <div class="field-col">
-                <label for="k-input">Контекст (k)</label>
-                <input id="k-input" type="number" min="0" max="10" value="3" />
+            <details id="advanced-settings" class="advanced-settings">
+              <summary>Расширенные настройки</summary>
+              <div class="advanced-content">
+                <div class="advanced-section">
+                  <div class="advanced-grid">
+                    <div class="form-row">
+                      <label class="field-label" for="k-input">
+                        <span>Контекст (k)</span>
+                        <span
+                          class="info-icon"
+                          tabindex="0"
+                          role="img"
+                          aria-label="2–4 обычно оптимально"
+                          title="2–4 обычно оптимально"
+                          >🛈</span
+                        >
+                      </label>
+                      <input id="k-input" type="number" min="0" max="6" value="3" />
+                    </div>
+                    <div class="form-row">
+                      <label class="field-label" for="temperature-input">
+                        <span>Temperature</span>
+                        <span
+                          class="info-icon"
+                          tabindex="0"
+                          role="img"
+                          aria-label="0.2–0.5 — стабильнее"
+                          title="0.2–0.5 — стабильнее"
+                          >🛈</span
+                        >
+                      </label>
+                      <input id="temperature-input" type="number" min="0" max="1" step="0.1" value="0.3" />
+                    </div>
+                    <div class="form-row">
+                      <label class="field-label" for="max-tokens-input">
+                        <span>Max tokens</span>
+                        <span
+                          class="info-icon"
+                          tabindex="0"
+                          role="img"
+                          aria-label="Ограничивает длину ответа"
+                          title="Ограничивает длину ответа"
+                          >🛈</span
+                        >
+                      </label>
+                      <input id="max-tokens-input" type="number" min="1" value="1400" />
+                    </div>
+                    <div class="form-row">
+                      <label class="field-label" for="model-input">
+                        <span>Модель (опционально)</span>
+                        <span
+                          class="info-icon"
+                          tabindex="0"
+                          role="img"
+                          aria-label="Оставьте пустым для значения по умолчанию"
+                          title="Оставьте пустым для значения по умолчанию"
+                          >🛈</span
+                        >
+                      </label>
+                      <input id="model-input" type="text" placeholder="gpt-4o-mini" />
+                    </div>
+                  </div>
+                </div>
+                <div class="advanced-section" data-section="support">
+                  <div class="advanced-section-header">
+                    <h4 class="advanced-section-title">Служебное</h4>
+                    <span class="advanced-section-caption">Техподдержка</span>
+                  </div>
+                  <div class="advanced-actions">
+                    <button type="button" class="ghost" id="reindex-btn">Reindex theme</button>
+                    <button type="button" class="ghost" id="health-btn">Health check</button>
+                  </div>
+                </div>
               </div>
-              <div class="field-col">
-                <label for="temperature-input">Temperature</label>
-                <input id="temperature-input" type="number" min="0" max="2" step="0.1" value="0.3" />
-              </div>
-              <div class="field-col">
-                <label for="max-tokens-input">Max tokens</label>
-                <input id="max-tokens-input" type="number" min="200" max="4000" value="1400" />
-              </div>
-            </div>
-            <div class="form-row">
-              <label for="model-input">Модель (опционально)</label>
-              <input id="model-input" type="text" placeholder="Например, gpt-4o-mini" />
-            </div>
+            </details>
             <div class="form-actions">
               <button type="button" class="secondary" id="preview-btn">
                 <span class="btn-label">Собрать промпт</span>
@@ -97,10 +158,6 @@
               <button type="submit" class="primary">
                 <span class="btn-label">Сгенерировать</span>
               </button>
-            </div>
-            <div class="form-actions muted">
-              <button type="button" class="ghost" id="reindex-btn">Reindex theme</button>
-              <button type="button" class="ghost" id="health-btn">Health check</button>
             </div>
           </form>
           <aside class="request-status">

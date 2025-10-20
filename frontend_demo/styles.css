@@ -117,6 +117,46 @@ body {
   gap: 8px;
 }
 
+.field-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+
+.info-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  cursor: help;
+  color: #4338ca;
+  background-color: rgba(79, 70, 229, 0.08);
+}
+
+.info-icon:focus {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.2);
+}
+
+.field-hint {
+  margin: -4px 0 0;
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.field-hint code {
+  font-family: "JetBrains Mono", "Fira Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  background-color: rgba(15, 23, 42, 0.04);
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
 .form-row input,
 .form-row select,
 .form-row textarea {
@@ -159,6 +199,89 @@ fieldset {
 legend {
   padding: 0 4px;
   color: #4b5563;
+}
+
+.advanced-settings {
+  border: 1px solid #e4e7ec;
+  border-radius: 14px;
+  padding: 8px 16px 16px;
+  background: #f8f9ff;
+}
+
+.advanced-settings.is-disabled {
+  opacity: 0.75;
+  pointer-events: none;
+}
+
+.advanced-settings summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  list-style: none;
+  cursor: pointer;
+  padding: 8px 0;
+  font-weight: 600;
+}
+
+.advanced-settings summary:focus-visible {
+  outline: 3px solid rgba(79, 70, 229, 0.35);
+  border-radius: 10px;
+}
+
+.advanced-settings summary::-webkit-details-marker,
+.advanced-settings summary::marker {
+  display: none;
+}
+
+.advanced-settings summary::after {
+  content: "▾";
+  color: #4f46e5;
+  transition: transform 0.2s ease;
+}
+
+.advanced-settings[open] summary::after {
+  transform: rotate(180deg);
+}
+
+.advanced-content {
+  display: grid;
+  gap: 20px;
+  margin-top: 8px;
+}
+
+.advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+.advanced-section {
+  display: grid;
+  gap: 12px;
+}
+
+.advanced-section-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.advanced-section-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.advanced-section-caption {
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.advanced-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .form-actions {

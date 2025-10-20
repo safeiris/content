@@ -31,8 +31,8 @@ const pipesList = document.getElementById("pipes-list");
 const artifactsList = document.getElementById("artifacts-list");
 const briefForm = document.getElementById("brief-form");
 const previewBtn = document.getElementById("preview-btn");
-const reindexBtn = document.getElementById("reindex-btn");
-const healthBtn = document.getElementById("health-btn");
+let reindexBtn = document.getElementById("reindex-btn");
+let healthBtn = document.getElementById("health-btn");
 const progressOverlay = document.getElementById("progress-overlay");
 const progressMessage = progressOverlay?.querySelector('[data-role="progress-message"]') || null;
 const toastRoot = document.getElementById("toast-root");
@@ -65,6 +65,10 @@ const contextList = document.getElementById("context-list");
 const contextSummary = document.getElementById("context-summary");
 const contextBadge = document.getElementById("context-badge");
 const generateBtn = briefForm.querySelector("button[type='submit']");
+const advancedSettings = document.getElementById("advanced-settings");
+const advancedSupportSection = document.querySelector("[data-section='support']");
+
+const ADVANCED_SETTINGS_STORAGE_KEY = "content-demo:advanced-settings-open";
 
 const LOG_STATUS_LABELS = {
   info: "INFO",
@@ -100,6 +104,29 @@ const state = {
   currentResult: null,
 };
 
+const devActionsConfig = resolveDevActions();
+if (!devActionsConfig.show && advancedSupportSection) {
+  advancedSupportSection.remove();
+  reindexBtn = null;
+  healthBtn = null;
+}
+
+const interactiveElements = [
+  previewBtn,
+  generateBtn,
+  kInput,
+  temperatureInput,
+  maxTokensInput,
+  modelInput,
+];
+
+if (reindexBtn) {
+  interactiveElements.push(reindexBtn);
+}
+if (healthBtn) {
+  interactiveElements.push(healthBtn);
+}
+
 tabs.forEach((tab) => {
   tab.addEventListener("click", () => switchTab(tab.dataset.tab));
 });
@@ -108,8 +135,12 @@ structurePreset.addEventListener("change", () => applyStructurePreset(structureP
 pipeSelect.addEventListener("change", () => applyPipeDefaults(pipeSelect.value));
 previewBtn.addEventListener("click", handlePromptPreview);
 briefForm.addEventListener("submit", handleGenerate);
-reindexBtn.addEventListener("click", handleReindex);
-healthBtn.addEventListener("click", handleHealthCheck);
+if (reindexBtn) {
+  reindexBtn.addEventListener("click", handleReindex);
+}
+if (healthBtn) {
+  healthBtn.addEventListener("click", handleHealthCheck);
+}
 downloadMdBtn.addEventListener("click", () => handleDownload("markdown"));
 downloadReportBtn.addEventListener("click", () => handleDownload("metadata"));
 if (clearLogBtn) {
@@ -119,6 +150,7 @@ if (clearLogBtn) {
   });
 }
 
+setupAdvancedSettings();
 init();
 
 function switchTab(tabId) {
@@ -396,6 +428,7 @@ function applyPipeDefaults(pipeId) {
 async function handlePromptPreview() {
   try {
     const payload = buildRequestPayload();
+    setInteractiveBusy(true);
     setButtonLoading(previewBtn, true);
     showProgress(true, "Собираем промпт…");
     const preview = await fetchJson("/api/prompt/preview", {
@@ -409,6 +442,7 @@ async function handlePromptPreview() {
     showToast({ message: `Не удалось собрать промпт: ${getErrorMessage(error)}`, type: "error" });
   } finally {
     setButtonLoading(previewBtn, false);
+    setInteractiveBusy(false);
     showProgress(false);
   }
 }
@@ -417,6 +451,7 @@ async function handleGenerate(event) {
   event.preventDefault();
   try {
     const payload = buildRequestPayload();
+    setInteractiveBusy(true);
     setButtonLoading(generateBtn, true);
     showProgress(true, "Генерируем материалы…");
     const response = await fetchJson("/api/generate", {
@@ -464,6 +499,7 @@ async function handleGenerate(event) {
     showToast({ message: `Не удалось выполнить генерацию: ${getErrorMessage(error)}`, type: "error" });
   } finally {
     setButtonLoading(generateBtn, false);
+    setInteractiveBusy(false);
     showProgress(false);
   }
 }
@@ -502,17 +538,41 @@ function buildRequestPayload() {
     pipe_id: theme,
   };
 
-  const k = Number.parseInt(kInput.value, 10);
-  const temperature = Number.parseFloat(temperatureInput.value);
-  const maxTokens = Number.parseInt(maxTokensInput.value, 10);
+  const kValue = String(kInput?.value ?? "").trim();
+  let k = kValue === "" ? 3 : Number.parseInt(kValue, 10);
+  if (!Number.isInteger(k) || k < 0 || k > 6) {
+    throw new Error("Контекст (k) должен быть целым числом от 0 до 6");
+  }
+  if (kInput) {
+    kInput.value = String(k);
+  }
+
+  const temperatureValue = String(temperatureInput?.value ?? "").trim();
+  let temperature = temperatureValue === "" ? 0.3 : Number.parseFloat(temperatureValue);
+  if (Number.isNaN(temperature) || temperature < 0 || temperature > 1) {
+    throw new Error("Temperature должна быть числом от 0 до 1");
+  }
+  if (temperatureInput) {
+    temperatureInput.value = String(temperature);
+  }
+
+  const maxTokensValue = String(maxTokensInput?.value ?? "").trim();
+  let maxTokens = maxTokensValue === "" ? 1400 : Number.parseInt(maxTokensValue, 10);
+  if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
+    throw new Error("Max tokens должно быть положительным целым числом");
+  }
+  if (maxTokensInput) {
+    maxTokensInput.value = String(maxTokens);
+  }
+
   const model = modelInput.value.trim() || undefined;
 
   return {
     theme,
     data,
-    k: Number.isNaN(k) ? 3 : Math.max(0, k),
-    temperature: Number.isNaN(temperature) ? 0.3 : temperature,
-    maxTokens: Number.isNaN(maxTokens) ? 1400 : maxTokens,
+    k,
+    temperature,
+    maxTokens,
     model,
   };
 }
@@ -713,7 +773,10 @@ async function showArtifact(artifact) {
   }
 }
 
-async function handleReindex() {
+async function handleReindex(event) {
+  if (event) {
+    event.preventDefault();
+  }
   const theme = pipeSelect.value;
   if (!theme) {
     showToast({ message: "Выберите тематику для переиндексации", type: "warn" });
@@ -722,6 +785,8 @@ async function handleReindex() {
 
   appendLogEntry("info", `Запрос на переиндексацию темы «${theme}»`);
   try {
+    setInteractiveBusy(true);
+    setButtonLoading(reindexBtn, true);
     const stats = await fetchJson("/api/reindex", {
       method: "POST",
       body: JSON.stringify({ theme }),
@@ -743,10 +808,19 @@ async function handleReindex() {
     console.error(error);
     appendLogEntry("error", getErrorMessage(error));
     showToast({ message: `Переиндексация: ${getErrorMessage(error)}`, type: "error" });
+  } finally {
+    setButtonLoading(reindexBtn, false);
+    setInteractiveBusy(false);
   }
 }
 
-async function handleHealthCheck() {
+async function handleHealthCheck(event) {
+  const triggeredByUser = event instanceof Event;
+  if (triggeredByUser) {
+    event.preventDefault();
+    setInteractiveBusy(true);
+    setButtonLoading(healthBtn, true);
+  }
   try {
     const theme = pipeSelect.value;
     const query = theme ? `?theme=${encodeURIComponent(theme)}` : "";
@@ -780,6 +854,11 @@ async function handleHealthCheck() {
       return;
     }
     renderHealthError(error.message || "Ошибка при запросе Health", "error");
+  } finally {
+    if (triggeredByUser) {
+      setButtonLoading(healthBtn, false);
+      setInteractiveBusy(false);
+    }
   }
 }
 
@@ -925,6 +1004,45 @@ async function fetchText(path) {
   return text;
 }
 
+function setupAdvancedSettings() {
+  if (!advancedSettings) {
+    return;
+  }
+
+  if (advancedSupportSection && devActionsConfig.show && devActionsConfig.hasExplicit) {
+    const title = advancedSupportSection.querySelector(".advanced-section-title");
+    if (title) {
+      title.textContent = "Техподдержка";
+    }
+    const caption = advancedSupportSection.querySelector(".advanced-section-caption");
+    if (caption) {
+      caption.remove();
+    }
+  }
+
+  try {
+    const saved = window.localStorage.getItem(ADVANCED_SETTINGS_STORAGE_KEY);
+    if (saved === "open") {
+      advancedSettings.setAttribute("open", "");
+    } else if (saved === "closed") {
+      advancedSettings.removeAttribute("open");
+    }
+  } catch (error) {
+    console.debug("Не удалось восстановить состояние расширенных настроек", error);
+  }
+
+  advancedSettings.addEventListener("toggle", () => {
+    try {
+      window.localStorage.setItem(
+        ADVANCED_SETTINGS_STORAGE_KEY,
+        advancedSettings.open ? "open" : "closed"
+      );
+    } catch (error) {
+      console.debug("Не удалось сохранить состояние расширенных настроек", error);
+    }
+  });
+}
+
 function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
   if (!progressOverlay) {
     return;
@@ -939,6 +1057,30 @@ function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
     if (progressMessage) {
       progressMessage.textContent = DEFAULT_PROGRESS_MESSAGE;
     }
+  }
+}
+
+function setInteractiveBusy(isBusy) {
+  interactiveElements.forEach((element) => {
+    if (!element) {
+      return;
+    }
+    if (isBusy) {
+      if (typeof element.dataset.interactiveLocked === "undefined") {
+        element.dataset.interactiveLocked = element.disabled ? "true" : "false";
+      }
+      element.disabled = true;
+    } else if (typeof element.dataset.interactiveLocked !== "undefined") {
+      const shouldRemainDisabled = element.dataset.interactiveLocked === "true";
+      if (!shouldRemainDisabled) {
+        element.disabled = false;
+      }
+      delete element.dataset.interactiveLocked;
+    }
+  });
+
+  if (advancedSettings) {
+    advancedSettings.classList.toggle("is-disabled", isBusy);
   }
 }
 
@@ -969,6 +1111,31 @@ function setButtonLoading(button, isLoading) {
     }
     delete button.dataset.originalDisabled;
   }
+}
+
+function resolveDevActions() {
+  let rawValue;
+  if (typeof globalThis !== "undefined" && typeof globalThis.SHOW_DEV_ACTIONS !== "undefined") {
+    rawValue = globalThis.SHOW_DEV_ACTIONS;
+  } else if (typeof document !== "undefined" && document.body?.dataset?.showDevActions) {
+    rawValue = document.body.dataset.showDevActions;
+  }
+
+  const hasExplicit = typeof rawValue !== "undefined" && rawValue !== null;
+  let show = true;
+
+  if (hasExplicit) {
+    if (typeof rawValue === "string") {
+      const normalized = rawValue.trim().toLowerCase();
+      show = normalized === "true" || normalized === "1";
+    } else if (typeof rawValue === "boolean") {
+      show = rawValue;
+    } else {
+      show = Boolean(rawValue);
+    }
+  }
+
+  return { show, hasExplicit };
 }
 
 function getErrorMessage(error, fallback = "Неизвестная ошибка") {
