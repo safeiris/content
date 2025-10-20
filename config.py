@@ -6,12 +6,9 @@ import os
 _DEFAULT_OPENAI_API_KEY = (
     "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"
 )
-_DEFAULT_XAI_API_KEY = "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"
-
 OPENAI_API_KEY = (
     str(os.getenv("OPENAI_API_KEY", _DEFAULT_OPENAI_API_KEY)).strip() or _DEFAULT_OPENAI_API_KEY
 )
-XAI_API_KEY = str(os.getenv("XAI_API_KEY", _DEFAULT_XAI_API_KEY)).strip() or _DEFAULT_XAI_API_KEY
 
 # Дефолтные настройки ядра
 DEFAULT_TONE = "экспертный, дружелюбный"

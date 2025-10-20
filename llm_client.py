@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
-from config import OPENAI_API_KEY, XAI_API_KEY
+from config import OPENAI_API_KEY
 
 
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -19,12 +19,10 @@ BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 MODEL_PROVIDER_MAP = {
     "gpt-4o-mini": "openai",
     "gpt-4o": "openai",
-    "grok-2-latest": "xai",
 }
 
 PROVIDER_API_URLS = {
     "openai": "https://api.openai.com/v1/chat/completions",
-    "xai": "https://api.x.ai/v1/chat/completions",
 }
 
 
@@ -35,25 +33,10 @@ def _resolve_model_name(model: Optional[str]) -> str:
 
 
 def _resolve_provider(model_name: str) -> str:
-    provider = MODEL_PROVIDER_MAP.get(model_name)
-    if provider:
-        return provider
-    if model_name.startswith("grok"):
-        return "xai"
-    return "openai"
+    return MODEL_PROVIDER_MAP.get(model_name, "openai")
 
 
 def _resolve_api_key(provider: str) -> str:
-    if provider == "xai":
-        api_key = os.getenv("XAI_API_KEY") or XAI_API_KEY
-        if api_key:
-            api_key = api_key.strip()
-        if not api_key:
-            raise RuntimeError(
-                "Не задан API-ключ для xAI. Установите переменную окружения XAI_API_KEY."
-            )
-        return api_key
-
     api_key = os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY
     if api_key:
         api_key = api_key.strip()
@@ -179,7 +162,6 @@ def generate(
         if last_error:
             if isinstance(last_error, httpx.HTTPStatusError):
                 status_code = last_error.response.status_code
-                provider_name = "xAI Grok" if provider == "xai" else "OpenAI"
                 detail = ""
                 try:
                     payload = last_error.response.json()
@@ -191,7 +173,7 @@ def generate(
                         ) or ""
                 except ValueError:
                     detail = last_error.response.text.strip()
-                message = f"Ошибка сервиса {provider_name}: HTTP {status_code}"
+                message = f"Ошибка сервиса OpenAI: HTTP {status_code}"
                 if detail:
                     message = f"{message} — {detail}"
                 raise RuntimeError(message) from last_error

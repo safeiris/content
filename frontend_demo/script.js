@@ -86,11 +86,6 @@ const HEALTH_STATUS_MESSAGES = {
     ok: "активен",
     fail: "не найден",
   },
-  xai_key: {
-    label: "Grok",
-    ok: "активен",
-    fail: "не найден",
-  },
   retrieval_index: {
     label: "Retrieval index",
     ok: "найден",

@@ -15,12 +15,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
-import requests
 
 from assemble_messages import ContextBundle, assemble_messages, retrieve_context
 from llm_client import DEFAULT_MODEL, generate as llm_generate
 from plagiarism_guard import is_too_similar
-from config import OPENAI_API_KEY, XAI_API_KEY
+from config import OPENAI_API_KEY
 
 
 BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
@@ -759,22 +758,6 @@ def _mask_api_key(api_key: str) -> str:
     return f"{cleaned[:4]}{'*' * (len(cleaned) - 8)}{cleaned[-4:]}"
 
 
-def check_xai(api_key: Optional[str] = None) -> bool:
-    key = api_key if api_key is not None else (os.getenv("XAI_API_KEY") or XAI_API_KEY)
-    key = key.strip() if key else ""
-    if not key:
-        return False
-    try:
-        response = requests.get(
-            "https://api.x.ai/v1/models",
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=5.0,
-        )
-        return response.status_code == 200
-    except requests.RequestException:
-        return False
-
-
 def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
     """Programmatic variant of ``--check`` used by the API server."""
 
@@ -808,23 +791,6 @@ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
             checks["openai_key"] = {
                 "ok": False,
                 "message": f"Ошибка при обращении к OpenAI ({masked}): {exc}",
-            }
-
-    xai_api_key = (os.getenv("XAI_API_KEY") or XAI_API_KEY).strip()
-    xai_ok = False
-    if not xai_api_key:
-        checks["xai_key"] = {"ok": False, "message": "XAI_API_KEY не найден"}
-        ok = False
-    else:
-        masked_xai = _mask_api_key(xai_api_key)
-        if check_xai(xai_api_key):
-            xai_ok = True
-            checks["xai_key"] = {"ok": True, "message": f"Ключ активен ({masked_xai})"}
-        else:
-            ok = False
-            checks["xai_key"] = {
-                "ok": False,
-                "message": f"Не удалось проверить ключ ({masked_xai})",
             }
 
     artifacts_dir = Path("artifacts")
@@ -861,7 +827,7 @@ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
                     "message": f"Индекс повреждён: {exc}",
                 }
 
-    return {"ok": ok, "checks": checks, "openai_key": openai_ok, "xai_key": xai_ok}
+    return {"ok": ok, "checks": checks, "openai_key": openai_ok}
 
 
 def _run_checks(args: argparse.Namespace) -> None:
