@@ -19,6 +19,7 @@ import httpx
 from assemble_messages import ContextBundle, assemble_messages, retrieve_context
 from llm_client import DEFAULT_MODEL, generate as llm_generate
 from plagiarism_guard import is_too_similar
+from artifacts_store import register_artifact
 from config import OPENAI_API_KEY
 
 
@@ -308,6 +309,13 @@ def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> 
     markdown_path.write_text(text, encoding="utf-8")
     metadata_path = markdown_path.with_suffix(".json")
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        register_artifact(markdown_path, metadata)
+    except Exception as exc:  # noqa: BLE001 - index update failures should not abort generation
+        print(
+            f"[orchestrate] warning: не удалось обновить индекс артефактов для {markdown_path}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _generate_variant(

@@ -176,6 +176,10 @@
       </section>
 
       <section class="tab-panel" id="materials" role="tabpanel">
+        <div class="materials-toolbar">
+          <div class="materials-toolbar__spacer"></div>
+          <button type="button" class="ghost small" id="cleanup-artifacts">Очистить список</button>
+        </div>
         <div id="artifacts-list" class="cards-grid"></div>
       </section>
 
@@ -248,6 +252,9 @@
           </button>
           <button type="button" class="secondary subtle download-btn">
             <span class="btn-label">Скачать</span>
+          </button>
+          <button type="button" class="secondary danger delete-btn">
+            <span class="btn-label">Удалить</span>
           </button>
         </div>
       </article>

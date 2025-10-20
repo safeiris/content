@@ -20,6 +20,12 @@ from assemble_messages import (
 from config import DEFAULT_STRUCTURE
 from orchestrate import gather_health_status, generate_article_from_payload
 from retrieval import build_index
+from artifacts_store import (
+    cleanup_index as cleanup_artifact_index,
+    delete_artifact as delete_artifact_entry,
+    list_artifacts as list_artifact_cards,
+    resolve_artifact_path,
+)
 
 load_dotenv()
 
@@ -204,8 +210,38 @@ def create_app() -> Flask:
     @app.get("/api/artifacts")
     def list_artifacts():
         theme = request.args.get("theme")
-        items = _collect_artifacts(theme)
+        items = list_artifact_cards(theme, auto_cleanup=True)
         return jsonify(items)
+
+    @app.delete("/api/artifacts")
+    def delete_artifact():
+        payload = _require_json(request)
+        identifier = str(payload.get("id") or payload.get("path") or "").strip()
+        if not identifier:
+            raise ApiError("Не указан идентификатор артефакта", status_code=400)
+
+        result = delete_artifact_entry(identifier)
+        status_code = 200
+        if result.get("errors"):
+            status_code = 207
+
+        response_payload: Dict[str, Any] = {
+            "deleted": bool(result.get("deleted")),
+            "metadata_deleted": bool(result.get("metadata_deleted")),
+            "not_found": bool(result.get("not_found")),
+            "index_updated": bool(result.get("index_updated")),
+            "removed_id": result.get("removed_id"),
+            "removed_path": result.get("removed_path"),
+        }
+        if result.get("errors"):
+            response_payload["errors"] = list(result["errors"])
+        return jsonify(response_payload), status_code
+
+    @app.post("/api/artifacts/cleanup")
+    def cleanup_artifacts():
+        result = cleanup_artifact_index()
+        http_status = 200 if not result.get("errors") else 207
+        return jsonify(result), http_status
 
     @app.get("/api/artifacts/download")
     def download_artifact():
@@ -213,7 +249,10 @@ def create_app() -> Flask:
         if not raw_path:
             raise ApiError("Не указан путь к артефакту", status_code=400)
 
-        artifact_path = _resolve_artifact_path(raw_path)
+        try:
+            artifact_path = resolve_artifact_path(raw_path)
+        except ValueError as exc:
+            raise ApiError(str(exc), status_code=400) from exc
         if not artifact_path.exists() or not artifact_path.is_file():
             raise ApiError("Файл не найден", status_code=404)
 
@@ -354,56 +393,6 @@ def _extract_keywords(glossary_path: Path) -> List[str]:
         if len(keywords) >= 6:
             break
     return keywords
-
-
-def _collect_artifacts(theme: str | None) -> List[Dict[str, Any]]:
-    artifacts_dir = Path("artifacts")
-    if not artifacts_dir.exists():
-        return []
-
-    items: List[Dict[str, Any]] = []
-    for path in sorted(artifacts_dir.glob("*.md"), reverse=True):
-        metadata_path = path.with_suffix(".json")
-        metadata = _read_json(metadata_path)
-        theme_slug = metadata.get("theme") if isinstance(metadata, dict) else None
-        if theme:
-            if theme_slug and theme_slug != theme:
-                continue
-            if not theme_slug and f"__{theme}__" not in path.name:
-                continue
-        stat = path.stat()
-        items.append(
-            {
-                "name": path.name,
-                "path": path.as_posix(),
-                "size": stat.st_size,
-                "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                "metadata_path": metadata_path.as_posix(),
-                "metadata": metadata,
-            }
-        )
-    return items
-
-
-def _read_json(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-
-
-def _resolve_artifact_path(raw_path: str) -> Path:
-    artifacts_dir = Path("artifacts").resolve()
-    candidate = Path(raw_path)
-    if not candidate.is_absolute():
-        candidate = (artifacts_dir / candidate).resolve()
-    else:
-        candidate = candidate.resolve()
-    if artifacts_dir not in candidate.parents and candidate != artifacts_dir:
-        raise ApiError("Запрошенный путь вне каталога artifacts", status_code=400)
-    return candidate
 
 
 def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[str, Any]:

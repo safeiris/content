@@ -343,6 +343,24 @@ button {
   border-color: #cbd5f5;
 }
 
+.secondary.danger {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+
+.secondary.danger:hover {
+  border-color: #f87171;
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.secondary.danger:disabled {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #fca5a5;
+}
+
 .secondary:disabled {
   cursor: not-allowed;
   color: #9ca3af;
@@ -363,6 +381,16 @@ button {
   padding: 6px 12px;
   font-size: 13px;
   border-radius: 8px;
+}
+
+.ghost.attention {
+  color: #b91c1c;
+  border-color: #f87171;
+}
+
+.ghost.attention:hover {
+  color: #991b1b;
+  border-color: #dc2626;
 }
 
 .ghost:hover {
@@ -562,6 +590,18 @@ button {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 20px;
+}
+
+.materials-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.materials-toolbar__spacer {
+  flex: 1 1 auto;
 }
 
 .card {
