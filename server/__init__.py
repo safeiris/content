@@ -169,7 +169,8 @@ def create_app() -> Flask:
         except ApiError:
             raise
         except RuntimeError as exc:
-            raise ApiError(str(exc), status_code=503)
+            status_code = getattr(exc, "status_code", 503)
+            raise ApiError(str(exc), status_code=status_code)
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Generation failed")
             raise ApiError("Не удалось завершить генерацию", status_code=500) from exc
@@ -254,7 +255,7 @@ def create_app() -> Flask:
         except ValueError as exc:
             raise ApiError(str(exc), status_code=400) from exc
         if not artifact_path.exists() or not artifact_path.is_file():
-            raise ApiError("Файл не найден", status_code=404)
+            return jsonify({"error": "file_not_found"}), 404
 
         mime_type, _ = mimetypes.guess_type(artifact_path.name)
         return send_file(

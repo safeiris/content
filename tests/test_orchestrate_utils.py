@@ -132,4 +132,4 @@ def test_make_output_path_uses_belgrade_timezone(monkeypatch):
     fixed_now = datetime(2024, 1, 2, 9, 30, tzinfo=ZoneInfo("Europe/Belgrade"))
     monkeypatch.setattr("orchestrate._local_now", lambda: fixed_now)
     output_path = _make_output_path("finance", None)
-    assert output_path.name == "2024-01-02_0930__finance__article.md"
+    assert output_path.name == "2024-01-02_0930_finance_article.md"

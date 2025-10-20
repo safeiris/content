@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +52,25 @@ class GenerationContext:
 def _get_cta_text() -> str:
     cta = os.getenv("DEFAULT_CTA", DEFAULT_CTA_TEXT).strip()
     return cta or DEFAULT_CTA_TEXT
+
+
+def _ensure_artifacts_dir() -> Path:
+    base = Path("artifacts").resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _slugify(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "_", ascii_only)
+    sanitized = sanitized.strip("_")
+    sanitized = re.sub(r"_+", "_", sanitized)
+    if not sanitized:
+        return "article"
+    if len(sanitized) > 60:
+        sanitized = sanitized[:60].rstrip("_") or sanitized[:60]
+    return sanitized.lower()
 
 
 def _resolve_cta_source(data: Dict[str, Any]) -> Tuple[str, bool]:
@@ -300,11 +321,13 @@ def _make_output_path(theme: str, outfile: str | None) -> Path:
     if outfile:
         return Path(outfile)
     timestamp = _local_now().strftime("%Y-%m-%d_%H%M")
-    filename = f"{timestamp}__{theme}__article.md"
-    return Path("artifacts") / filename
+    slug = _slugify(theme)
+    filename = f"{timestamp}_{slug}_article.md"
+    base_dir = _ensure_artifacts_dir()
+    return base_dir / filename
 
 
-def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> None:
+def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> Dict[str, Path]:
     markdown_path.parent.mkdir(parents=True, exist_ok=True)
     markdown_path.write_text(text, encoding="utf-8")
     metadata_path = markdown_path.with_suffix(".json")
@@ -316,6 +339,7 @@ def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> 
             f"[orchestrate] warning: не удалось обновить индекс артефактов для {markdown_path}: {exc}",
             file=sys.stderr,
         )
+    return {"markdown": markdown_path, "metadata": metadata_path}
 
 
 def _generate_variant(
@@ -473,7 +497,14 @@ def _generate_variant(
     if variant_label:
         metadata["ab_variant"] = variant_label
 
-    _write_outputs(output_path, article_text, metadata)
+    artifact_files: Optional[Dict[str, Path]] = None
+    if article_text.strip():
+        artifact_files = _write_outputs(output_path, article_text, metadata)
+    else:
+        print(
+            f"[orchestrate] warning: пропускаю запись артефакта для {output_path.name} — пустой ответ",
+            file=sys.stderr,
+        )
     _summarise(theme, k, model_name, article_text, variant=variant_label)
 
     return {
@@ -482,6 +513,7 @@ def _generate_variant(
         "output_path": output_path,
         "duration": duration,
         "variant": variant_label,
+        "artifact_files": artifact_files,
     }
 
 
@@ -532,15 +564,17 @@ def generate_article_from_payload(
         append_style_profile=append_style_profile,
     )
 
-    markdown_path = result["output_path"]
-    metadata_path = markdown_path.with_suffix(".json")
+    artifact_files = result.get("artifact_files")
+    artifact_paths: Optional[Dict[str, str]] = None
+    if artifact_files:
+        artifact_paths = {
+            "markdown": artifact_files["markdown"].as_posix(),
+            "metadata": artifact_files["metadata"].as_posix(),
+        }
     return {
         "text": result["text"],
         "metadata": result["metadata"],
-        "artifact_paths": {
-            "markdown": markdown_path.as_posix(),
-            "metadata": metadata_path.as_posix(),
-        },
+        "artifact_paths": artifact_paths,
     }
 
 

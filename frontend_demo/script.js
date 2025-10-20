@@ -42,6 +42,7 @@ const reportView = document.getElementById("report-view");
 const resultTitle = document.getElementById("result-title");
 const resultMeta = document.getElementById("result-meta");
 const resultBadges = document.getElementById("result-badges");
+const retryBtn = document.getElementById("retry-btn");
 const downloadMdBtn = document.getElementById("download-md");
 const downloadReportBtn = document.getElementById("download-report");
 const clearLogBtn = document.getElementById("clear-log");
@@ -136,6 +137,9 @@ tabs.forEach((tab) => {
 structurePreset.addEventListener("change", () => applyStructurePreset(structurePreset.value));
 pipeSelect.addEventListener("change", () => applyPipeDefaults(pipeSelect.value));
 briefForm.addEventListener("submit", handleGenerate);
+if (retryBtn) {
+  retryBtn.addEventListener("click", handleRetryClick);
+}
 if (modelInput) {
   modelInput.addEventListener("change", () => updateTemperatureControlState(modelInput.value));
 }
@@ -448,8 +452,8 @@ async function handleArtifactDownload(artifact) {
     showToast({ message: "Файл недоступен для скачивания", type: "warn" });
     return false;
   }
-  const ok = await downloadArtifactFile(artifact.path, artifact.name || "artifact.txt", artifact);
-  return ok;
+  const result = await downloadArtifactFile(artifact.path, artifact.name || "artifact.txt", artifact);
+  return result === "ok";
 }
 
 async function handleDeleteArtifact(artifact, button) {
@@ -683,6 +687,7 @@ async function handleGenerate(event) {
   event.preventDefault();
   try {
     const payload = buildRequestPayload();
+    toggleRetryButton(false);
     setInteractiveBusy(true);
     setButtonLoading(generateBtn, true);
     showProgress(true, "Генерируем материалы…");
@@ -700,13 +705,21 @@ async function handleGenerate(event) {
     const markdown = response?.markdown ?? "";
     const meta = (response?.meta_json && typeof response.meta_json === "object") ? response.meta_json : {};
     const artifactPaths = response?.artifact_paths;
-    state.currentResult = { markdown, meta, artifactPaths };
+    const metadataCharacters = typeof meta.characters === "number" ? meta.characters : undefined;
+    const characters = typeof metadataCharacters === "number" ? metadataCharacters : markdown.trim().length;
+    const hasContent = characters > 0;
+    state.currentResult = { markdown, meta, artifactPaths, characters, hasContent };
     draftView.innerHTML = markdownToHtml(markdown);
     resultTitle.textContent = payload.data.theme || "Результат генерации";
-    const characters = meta.characters ?? markdown.length;
-    resultMeta.textContent = `Символов: ${characters.toLocaleString("ru-RU")} · Модель: ${meta.model_used ?? "—"}`;
+    const metaParts = [];
+    if (hasContent) {
+      metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
+    }
+    metaParts.push(`Модель: ${meta.model_used ?? "—"}`);
+    resultMeta.textContent = metaParts.join(" · ");
     renderMetadata(meta);
     updateResultBadges(meta);
+    toggleRetryButton(!hasContent);
     updatePromptPreview({
       system: meta.system_prompt_preview,
       context: meta.clips || [],
@@ -733,6 +746,17 @@ async function handleGenerate(event) {
     setButtonLoading(generateBtn, false);
     setInteractiveBusy(false);
     showProgress(false);
+  }
+}
+
+function handleRetryClick(event) {
+  event.preventDefault();
+  if (briefForm && typeof briefForm.requestSubmit === "function") {
+    briefForm.requestSubmit(generateBtn);
+    return;
+  }
+  if (generateBtn) {
+    generateBtn.click();
   }
 }
 
@@ -832,7 +856,24 @@ function updateResultBadges(meta) {
     return;
   }
 
+  const currentResult = state.currentResult;
+  const characters = typeof meta.characters === "number"
+    ? meta.characters
+    : currentResult?.characters ?? (currentResult?.markdown?.trim().length ?? 0);
+  const hasContent = Boolean(currentResult?.hasContent ?? (characters > 0));
+
+  const temperatureBadge = (() => {
+    const modelName = meta.model_used;
+    if (modelName && isTemperatureLocked(modelName)) {
+      return { text: "T: N/A", type: "neutral" };
+    }
+    return typeof meta.temperature_used === "number"
+      ? { text: `T=${meta.temperature_used}`, type: "neutral" }
+      : null;
+  })();
+
   const entries = [
+    ...(!hasContent ? [{ text: "Пустой ответ", type: "error" }] : []),
     badgeInfo("plagiarism_detected", meta.plagiarism_detected, {
       true: { text: "Plagiarism detected", type: "error" },
       false: { text: "Plagiarism clean", type: "success" },
@@ -853,9 +894,7 @@ function updateResultBadges(meta) {
       value ? `Length fix: ${value}` : "Length OK"
     ),
     meta.model_used ? { text: `Model: ${meta.model_used}`, type: "neutral" } : null,
-    typeof meta.temperature_used === "number"
-      ? { text: `T=${meta.temperature_used}`, type: "neutral" }
-      : null,
+    temperatureBadge,
     typeof meta.context_budget_tokens_est === "number"
       ? { text: `Context tokens ≈ ${meta.context_budget_tokens_est}` }
       : null,
@@ -934,6 +973,14 @@ function updatePromptPreview(preview) {
   }
 }
 
+function toggleRetryButton(show) {
+  if (!retryBtn) {
+    return;
+  }
+  retryBtn.hidden = !show;
+  retryBtn.disabled = !show;
+}
+
 function enableDownloadButtons(paths) {
   const markdownPath = paths?.markdown;
   const metadataPath = paths?.metadata;
@@ -962,7 +1009,14 @@ async function handleDownload(type) {
     showToast({ message: "Файл недоступен для скачивания", type: "warn" });
     return;
   }
-  await downloadArtifactFile(path, type === "markdown" ? "draft.md" : "report.json");
+  const result = await downloadArtifactFile(
+    path,
+    type === "markdown" ? "draft.md" : "report.json"
+  );
+  if (result === "not_found") {
+    button.disabled = true;
+    delete button.dataset.path;
+  }
 }
 
 async function showArtifact(artifact) {
@@ -1407,14 +1461,39 @@ function isNotFoundError(error) {
 async function downloadArtifactFile(path, fallbackName = "artifact.txt", artifact = null) {
   if (!path) {
     showToast({ message: "Файл недоступен", type: "warn" });
-    return false;
+    return "error";
   }
   try {
     const response = await fetch(`${API_BASE}/api/artifacts/download?path=${encodeURIComponent(path)}`);
     if (!response.ok) {
-      const text = await response.text();
-      const error = new Error(text || `HTTP ${response.status}`);
+      let message = `HTTP ${response.status}`;
+      let notFound = false;
+      let raw = "";
+      try {
+        raw = await response.text();
+      } catch (readError) {
+        raw = "";
+      }
+      if (raw) {
+        message = raw;
+        try {
+          const data = JSON.parse(raw);
+          if (data && typeof data.error === "string") {
+            message = data.error;
+            if (response.status === 404 && data.error === "file_not_found") {
+              notFound = true;
+              message = "Файл не найден";
+            }
+          }
+        } catch (parseError) {
+          // ignore JSON parse failures
+        }
+      }
+      const error = new Error(message || `HTTP ${response.status}`);
       error.status = response.status;
+      if (notFound) {
+        error.code = "file_not_found";
+      }
       throw error;
     }
     const blob = await response.blob();
@@ -1426,15 +1505,19 @@ async function downloadArtifactFile(path, fallbackName = "artifact.txt", artifac
     anchor.click();
     anchor.remove();
     URL.revokeObjectURL(url);
-    return true;
+    return "ok";
   } catch (error) {
     console.error(error);
-    if (isNotFoundError(error) && artifact) {
-      handleMissingArtifact(artifact);
-      return false;
+    if (isNotFoundError(error)) {
+      const message = error.code === "file_not_found" ? "Файл не найден" : getErrorMessage(error);
+      showToast({ message, type: "warn" });
+      if (artifact) {
+        handleMissingArtifact(artifact);
+      }
+      return error.code === "file_not_found" ? "not_found" : "error";
     }
     showToast({ message: `Не удалось скачать файл: ${getErrorMessage(error)}`, type: "error" });
-    return false;
+    return "error";
   }
 }
 

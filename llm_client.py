@@ -31,6 +31,46 @@ PROVIDER_API_URLS = {
 LOGGER = logging.getLogger(__name__)
 
 
+class EmptyCompletionError(RuntimeError):
+    """Raised when the model responds without any textual content."""
+
+    status_code = 502
+
+
+def _extract_choice_content(choice: Dict[str, object]) -> str:
+    """Return textual content from a completion choice."""
+
+    # Primary schema – chat message
+    message = choice.get("message") if isinstance(choice, dict) else None
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts: List[str] = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(str(part.get("text", "")))
+            if text_parts:
+                return "".join(text_parts)
+        # Some providers may nest plain text under the "text" key
+        alt_text = message.get("text")
+        if isinstance(alt_text, str):
+            return alt_text
+
+    # Alternate schemas – top-level text fields
+    for key in ("output_text", "text", "content"):
+        candidate = choice.get(key) if isinstance(choice, dict) else None
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+        if isinstance(candidate, list):
+            collected = [str(item) for item in candidate if isinstance(item, str)]
+            if collected:
+                return "".join(collected)
+
+    return ""
+
+
 def _resolve_model_name(model: Optional[str]) -> str:
     env_model = os.getenv("LLM_MODEL")
     candidate = (model or env_model or DEFAULT_MODEL).strip()
@@ -155,19 +195,15 @@ def generate(
                 if not isinstance(choices, list) or not choices:
                     raise RuntimeError("Модель не вернула варианты ответа.")
                 choice = choices[0]
-                message = choice.get("message") if isinstance(choice, dict) else None
-                content = None
-                if isinstance(message, dict):
-                    content = message.get("content")
-                if isinstance(content, list):
-                    text_parts = []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
-                    content = "".join(text_parts)
-                if not isinstance(content, str):
+                if not isinstance(choice, dict):
                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
-                return content.strip()
+
+                content = _extract_choice_content(choice)
+                cleaned = content.strip()
+                if not cleaned:
+                    LOGGER.warning("Пустой ответ модели %s", model_name)
+                    raise EmptyCompletionError("Модель вернула пустой ответ")
+                return cleaned
             except Exception as exc:  # noqa: BLE001
                 if isinstance(exc, KeyboardInterrupt):  # pragma: no cover - respect interrupts
                     raise
