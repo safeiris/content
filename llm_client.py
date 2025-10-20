@@ -117,6 +117,12 @@ def generate(
     try:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
+                lower_model = model_name.lower()
+                if "gpt-5" in lower_model:
+                    completion_param = {"max_completion_tokens": max_tokens}
+                else:
+                    completion_param = {"max_tokens": max_tokens}
+
                 response = http_client.post(
                     api_url,
                     headers={
@@ -127,7 +133,7 @@ def generate(
                         "model": model_name,
                         "messages": messages,
                         "temperature": temperature,
-                        "max_tokens": max_tokens,
+                        **completion_param,
                     },
                 )
                 response.raise_for_status()
