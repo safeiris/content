@@ -68,32 +68,41 @@
               <label for="keywords-input">Ключевые слова</label>
               <input id="keywords-input" type="text" placeholder="Через запятую" />
             </div>
-            <fieldset class="form-row">
-              <legend>Дополнительно</legend>
-              <label><input type="checkbox" id="include-faq" checked /> FAQ</label>
-              <label><input type="checkbox" id="include-table" /> Таблица</label>
-              <label><input type="checkbox" id="include-jsonld" checked /> JSON-LD</label>
-              <label><input type="checkbox" id="facts-mode" /> Facts mode</label>
-              <label><input type="checkbox" id="add-disclaimer" /> Дисклеймер</label>
-            </fieldset>
             <details id="advanced-settings" class="advanced-settings">
-              <summary>Расширенные настройки</summary>
+              <summary>
+                <span class="advanced-summary-text">Расширенные настройки</span>
+                <span class="advanced-summary-icon" aria-hidden="true"></span>
+              </summary>
               <div class="advanced-content">
+                <div class="advanced-options">
+                  <label class="checkbox-with-hint">
+                    <input type="checkbox" id="include-faq" checked />
+                    <span>
+                      <span class="checkbox-title">FAQ</span>
+                      <span class="checkbox-hint">Добавить блок часто задаваемых вопросов.</span>
+                    </span>
+                  </label>
+                  <label class="checkbox-with-hint">
+                    <input type="checkbox" id="include-jsonld" checked />
+                    <span>
+                      <span class="checkbox-title">JSON-LD</span>
+                      <span class="checkbox-hint">Добавить SEO-разметку для поисковиков.</span>
+                    </span>
+                  </label>
+                </div>
                 <div class="advanced-section">
+                  <h4 class="advanced-section-title">Параметры модели</h4>
                   <div class="advanced-grid">
                     <div class="form-row">
-                      <label class="field-label" for="k-input">
-                        <span>Контекст (k)</span>
-                        <span
-                          class="info-icon"
-                          tabindex="0"
-                          role="img"
-                          aria-label="2–4 обычно оптимально"
-                          title="2–4 обычно оптимально"
-                          >🛈</span
-                        >
+                      <label class="field-label" for="model-input">
+                        <span>Модель</span>
                       </label>
-                      <input id="k-input" type="number" min="0" max="6" value="3" />
+                      <select id="model-input">
+                        <option value="gpt-5" selected>GPT-5 — OpenAI (по умолчанию)</option>
+                        <option value="gpt-4o">GPT-4o — OpenAI</option>
+                        <option value="gpt-4o-mini">GPT-4o-mini — OpenAI</option>
+                      </select>
+                      <p class="field-hint">Выберите модель для генерации.</p>
                     </div>
                     <div class="form-row">
                       <label class="field-label" for="temperature-input">
@@ -124,23 +133,23 @@
                       <input id="max-tokens-input" type="number" min="1" value="1400" />
                     </div>
                     <div class="form-row">
-                      <label class="field-label" for="model-input">
-                        <span>Модель</span>
+                      <label class="field-label" for="k-input">
+                        <span>Контекст (k)</span>
+                        <span
+                          class="info-icon"
+                          tabindex="0"
+                          role="img"
+                          aria-label="2–4 обычно оптимально"
+                          title="2–4 обычно оптимально"
+                          >🛈</span
+                        >
                       </label>
-                      <select id="model-input">
-                        <option value="gpt-5" selected>GPT-5 — OpenAI (по умолчанию)</option>
-                        <option value="gpt-4o">GPT-4o — OpenAI</option>
-                        <option value="gpt-4o-mini">GPT-4o-mini — OpenAI</option>
-                      </select>
-                      <p class="field-hint">Выберите модель для генерации.</p>
+                      <input id="k-input" type="number" min="0" max="6" value="3" />
                     </div>
                   </div>
                 </div>
                 <div class="advanced-section" data-section="support">
-                  <div class="advanced-section-header">
-                    <h4 class="advanced-section-title">Служебное</h4>
-                    <span class="advanced-section-caption">Техподдержка</span>
-                  </div>
+                  <h4 class="advanced-section-title">Техподдержка</h4>
                   <div class="advanced-actions">
                     <button type="button" class="ghost" id="reindex-btn">Reindex theme</button>
                     <button type="button" class="ghost" id="health-btn">Health check</button>
@@ -149,9 +158,6 @@
               </div>
             </details>
             <div class="form-actions">
-              <button type="button" class="secondary" id="preview-btn">
-                <span class="btn-label">Собрать промпт</span>
-              </button>
               <button type="submit" class="primary">
                 <span class="btn-label">Сгенерировать</span>
               </button>
@@ -202,7 +208,7 @@
               <div class="prompt-grid">
                 <article>
                   <header>SYSTEM</header>
-                  <pre id="preview-system" class="prompt-text">Нажмите «Собрать промпт», чтобы увидеть контент.</pre>
+                  <pre id="preview-system" class="prompt-text">Нажмите «Сгенерировать», чтобы увидеть контент.</pre>
                 </article>
                 <article>
                   <header>

@@ -54,10 +54,7 @@ const temperatureInput = document.getElementById("temperature-input");
 const maxTokensInput = document.getElementById("max-tokens-input");
 const modelInput = document.getElementById("model-input");
 const includeFaq = document.getElementById("include-faq");
-const includeTable = document.getElementById("include-table");
 const includeJsonld = document.getElementById("include-jsonld");
-const factsMode = document.getElementById("facts-mode");
-const addDisclaimer = document.getElementById("add-disclaimer");
 const healthStatus = document.getElementById("health-status");
 const reindexLog = document.getElementById("reindex-log");
 const previewSystem = document.getElementById("preview-system");
@@ -114,7 +111,6 @@ if (!devActionsConfig.show && advancedSupportSection) {
 }
 
 const interactiveElements = [
-  previewBtn,
   generateBtn,
   kInput,
   temperatureInput,
@@ -138,7 +134,6 @@ tabs.forEach((tab) => {
 
 structurePreset.addEventListener("change", () => applyStructurePreset(structurePreset.value));
 pipeSelect.addEventListener("change", () => applyPipeDefaults(pipeSelect.value));
-previewBtn.addEventListener("click", handlePromptPreview);
 briefForm.addEventListener("submit", handleGenerate);
 if (reindexBtn) {
   reindexBtn.addEventListener("click", handleReindex);
@@ -745,10 +740,7 @@ function buildRequestPayload() {
     keywords,
     structure,
     include_faq: includeFaq.checked,
-    include_table: includeTable.checked,
     include_jsonld: includeJsonld.checked,
-    facts_mode: factsMode.checked ? "cautious" : undefined,
-    add_disclaimer: addDisclaimer.checked,
     structure_preset: structurePreset.value,
     pipe_id: theme,
   };
