@@ -12,7 +12,11 @@ from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
-from assemble_messages import assemble_messages, retrieve_context
+from assemble_messages import (
+    assemble_messages,
+    invalidate_style_profile_cache,
+    retrieve_context,
+)
 from config import DEFAULT_STRUCTURE
 from orchestrate import gather_health_status, generate_article_from_payload
 from retrieval import build_index
@@ -194,6 +198,7 @@ def create_app() -> Flask:
         except RuntimeError as exc:
             raise ApiError(str(exc), status_code=400) from exc
 
+        invalidate_style_profile_cache()
         return jsonify(stats)
 
     @app.get("/api/artifacts")

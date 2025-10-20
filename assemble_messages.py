@@ -46,15 +46,9 @@ class ContextBundle:
 
 
 def _style_profile_conditions_met(theme_slug: str, data: Dict[str, Any]) -> bool:
-    if theme_slug.strip().lower() != "finance":
-        return False
-    goal = str(data.get("goal", "")).strip().lower()
-    tone = str(data.get("tone", "")).strip().lower()
-    if "seo" not in goal:
-        return False
-    if "эксперт" not in tone:
-        return False
-    return True
+    """Return ``True`` when the Finance style profile must be injected."""
+
+    return theme_slug.strip().lower() == "finance"
 
 
 def _should_apply_style_profile(
@@ -184,6 +178,12 @@ def retrieve_context(
         context_used=bool(limited),
         token_budget_limit=budget_limit,
     )
+
+
+def invalidate_style_profile_cache() -> None:
+    """Reset cached style profile contents so that fresh edits are used."""
+
+    _read_style_profile_file.cache_clear()
 
 
 def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str, object]]:

@@ -12,13 +12,14 @@ import httpx
 from config import OPENAI_API_KEY
 
 
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-5"
 MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 
 MODEL_PROVIDER_MAP = {
-    "gpt-4o-mini": "openai",
+    "gpt-5": "openai",
     "gpt-4o": "openai",
+    "gpt-4o-mini": "openai",
 }
 
 PROVIDER_API_URLS = {
