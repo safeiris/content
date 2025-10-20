@@ -82,7 +82,12 @@ const MAX_TOASTS = 3;
 
 const HEALTH_STATUS_MESSAGES = {
   openai_key: {
-    label: "OpenAI key",
+    label: "OpenAI",
+    ok: "активен",
+    fail: "не найден",
+  },
+  xai_key: {
+    label: "Grok",
     ok: "активен",
     fail: "не найден",
   },
@@ -565,7 +570,7 @@ function buildRequestPayload() {
     maxTokensInput.value = String(maxTokens);
   }
 
-  const model = modelInput.value.trim() || undefined;
+  const model = modelInput.value || undefined;
 
   return {
     theme,

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Simple wrapper around the OpenAI client with retries and sane defaults."""
+"""Simple wrapper around chat completion providers with retries and sane defaults."""
 from __future__ import annotations
 
 import os
@@ -8,18 +8,24 @@ import time
 from typing import Dict, List, Optional
 
 import httpx
-from openai import (
-    APIConnectionError,
-    APIError,
-    APITimeoutError,
-    OpenAI,
-    RateLimitError,
-)
+
+from config import OPENAI_API_KEY, XAI_API_KEY
 
 
 DEFAULT_MODEL = "gpt-4o-mini"
 MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
+
+MODEL_PROVIDER_MAP = {
+    "gpt-4o-mini": "openai",
+    "gpt-4o": "openai",
+    "grok-2-latest": "xai",
+}
+
+PROVIDER_API_URLS = {
+    "openai": "https://api.openai.com/v1/chat/completions",
+    "xai": "https://api.x.ai/v1/chat/completions",
+}
 
 
 def _resolve_model_name(model: Optional[str]) -> str:
@@ -28,11 +34,32 @@ def _resolve_model_name(model: Optional[str]) -> str:
     return candidate or DEFAULT_MODEL
 
 
-def _ensure_api_key() -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
+def _resolve_provider(model_name: str) -> str:
+    provider = MODEL_PROVIDER_MAP.get(model_name)
+    if provider:
+        return provider
+    if model_name.startswith("grok"):
+        return "xai"
+    return "openai"
+
+
+def _resolve_api_key(provider: str) -> str:
+    if provider == "xai":
+        api_key = os.getenv("XAI_API_KEY") or XAI_API_KEY
+        if api_key:
+            api_key = api_key.strip()
+        if not api_key:
+            raise RuntimeError(
+                "Не задан API-ключ для xAI. Установите переменную окружения XAI_API_KEY."
+            )
+        return api_key
+
+    api_key = os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY
+    if api_key:
+        api_key = api_key.strip()
     if not api_key:
         raise RuntimeError(
-            "Не задан API-ключ. Установите переменную окружения OPENAI_API_KEY."
+            "Не задан API-ключ для OpenAI. Установите переменную окружения OPENAI_API_KEY."
         )
     return api_key
 
@@ -57,15 +84,13 @@ def _resolve_backoff_schedule(override: Optional[List[float]]) -> List[float]:
 
 
 def _should_retry(exc: BaseException) -> bool:
-    if isinstance(exc, RateLimitError):
-        return True
-    if isinstance(exc, (APIConnectionError, APITimeoutError)):
-        return True
-    if isinstance(exc, APIError):
-        status = getattr(exc, "status_code", None)
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
         if status in {408, 409, 425, 429, 500, 502, 503, 504}:
             return True
-    if isinstance(exc, httpx.HTTPError):
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.TransportError):
         return True
     return False
 
@@ -93,28 +118,45 @@ def generate(
     if not messages:
         raise ValueError("messages must not be empty")
 
-    api_key = _ensure_api_key()
     model_name = _resolve_model_name(model)
+    provider = _resolve_provider(model_name)
+    api_key = _resolve_api_key(provider)
+    api_url = PROVIDER_API_URLS.get(provider)
+    if not api_url:
+        raise RuntimeError(f"Неизвестный провайдер для модели '{model_name}'")
 
     timeout = httpx.Timeout(timeout_s)
     http_client = httpx.Client(timeout=timeout)
-    client = OpenAI(api_key=api_key, http_client=http_client)
 
     last_error: Optional[BaseException] = None
     schedule = _resolve_backoff_schedule(backoff_schedule)
     try:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
+                response = http_client.post(
+                    api_url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model_name,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    },
                 )
-                choice = response.choices[0].message
-                content = choice.get("content") if isinstance(choice, dict) else getattr(choice, "content", None)
+                response.raise_for_status()
+                data = response.json()
+                choices = data.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    raise RuntimeError("Модель не вернула варианты ответа.")
+                choice = choices[0]
+                message = choice.get("message") if isinstance(choice, dict) else None
+                content = None
+                if isinstance(message, dict):
+                    content = message.get("content")
                 if isinstance(content, list):
-                    # Newer SDKs may return list of content parts.
                     text_parts = []
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "text":
@@ -135,15 +177,32 @@ def generate(
                 print(f"[llm_client] retry #{attempt} reason: {reason}; sleeping {sleep_for}s", file=sys.stderr)
                 time.sleep(sleep_for)
         if last_error:
-            if isinstance(last_error, RateLimitError):
+            if isinstance(last_error, httpx.HTTPStatusError):
+                status_code = last_error.response.status_code
+                provider_name = "xAI Grok" if provider == "xai" else "OpenAI"
+                detail = ""
+                try:
+                    payload = last_error.response.json()
+                    if isinstance(payload, dict):
+                        detail = (
+                            payload.get("error", {}).get("message")
+                            if isinstance(payload.get("error"), dict)
+                            else payload.get("message", "")
+                        ) or ""
+                except ValueError:
+                    detail = last_error.response.text.strip()
+                message = f"Ошибка сервиса {provider_name}: HTTP {status_code}"
+                if detail:
+                    message = f"{message} — {detail}"
+                raise RuntimeError(message) from last_error
+            if isinstance(last_error, httpx.TimeoutException):
                 raise RuntimeError(
-                    "Превышен лимит запросов к модели. Попробуйте позже или уменьшите частоту обращений."
+                    "Сетевой таймаут при обращении к модели. Проверьте соединение и повторите попытку."
                 ) from last_error
-            if isinstance(last_error, (APIConnectionError, APITimeoutError, httpx.HTTPError)):
-                raise RuntimeError("Сетевой сбой при обращении к модели. Проверьте соединение и повторите попытку.") from last_error
-            if isinstance(last_error, APIError):
-                message = getattr(last_error, "message", str(last_error))
-                raise RuntimeError(f"Ошибка сервиса OpenAI: {message}") from last_error
+            if isinstance(last_error, httpx.TransportError):
+                raise RuntimeError(
+                    "Сетевой сбой при обращении к модели. Проверьте соединение и повторите попытку."
+                ) from last_error
             raise RuntimeError(f"Не удалось получить ответ модели: {last_error}") from last_error
         raise RuntimeError("Модель не вернула ответ.")
     finally:

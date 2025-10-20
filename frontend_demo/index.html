@@ -125,17 +125,14 @@
                     </div>
                     <div class="form-row">
                       <label class="field-label" for="model-input">
-                        <span>Модель (опционально)</span>
-                        <span
-                          class="info-icon"
-                          tabindex="0"
-                          role="img"
-                          aria-label="Оставьте пустым для значения по умолчанию"
-                          title="Оставьте пустым для значения по умолчанию"
-                          >🛈</span
-                        >
+                        <span>Модель</span>
                       </label>
-                      <input id="model-input" type="text" placeholder="gpt-4o-mini" />
+                      <select id="model-input">
+                        <option value="gpt-4o-mini" selected>gpt-4o-mini — OpenAI</option>
+                        <option value="gpt-4o">gpt-4o — OpenAI</option>
+                        <option value="grok-2-latest">grok-2-latest — Grok (xAI)</option>
+                      </select>
+                      <p class="field-hint">Выберите модель для генерации. Grok — альтернативный провайдер xAI.</p>
                     </div>
                   </div>
                 </div>
