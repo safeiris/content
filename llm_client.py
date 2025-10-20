@@ -2,6 +2,7 @@
 """Simple wrapper around chat completion providers with retries and sane defaults."""
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
@@ -25,6 +26,9 @@ MODEL_PROVIDER_MAP = {
 PROVIDER_API_URLS = {
     "openai": "https://api.openai.com/v1/chat/completions",
 }
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _resolve_model_name(model: Optional[str]) -> str:
@@ -115,13 +119,27 @@ def generate(
     last_error: Optional[BaseException] = None
     schedule = _resolve_backoff_schedule(backoff_schedule)
     try:
+        lower_model = model_name.lower()
+        is_gpt5_model = "gpt-5" in lower_model
+        has_logged_temperature_notice = False
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                lower_model = model_name.lower()
-                if "gpt-5" in lower_model:
+                if is_gpt5_model:
                     completion_param = {"max_completion_tokens": max_tokens}
                 else:
                     completion_param = {"max_tokens": max_tokens}
+
+                request_payload = {
+                    "model": model_name,
+                    "messages": messages,
+                    **completion_param,
+                }
+
+                if not is_gpt5_model:
+                    request_payload["temperature"] = temperature
+                elif not has_logged_temperature_notice:
+                    LOGGER.info("temperature is ignored for GPT-5; using default")
+                    has_logged_temperature_notice = True
 
                 response = http_client.post(
                     api_url,
@@ -129,12 +147,7 @@ def generate(
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": model_name,
-                        "messages": messages,
-                        "temperature": temperature,
-                        **completion_param,
-                    },
+                    json=request_payload,
                 )
                 response.raise_for_status()
                 data = response.json()
