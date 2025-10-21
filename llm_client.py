@@ -21,6 +21,8 @@ DEFAULT_MODEL = "gpt-5"
 MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 FALLBACK_MODEL = "gpt-4o"
+RESPONSES_API_URL = "https://api.openai.com/v1/responses"
+GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
 
 MODEL_PROVIDER_MAP = {
     "gpt-5": "openai",
@@ -111,6 +113,18 @@ def _describe_type(value: object) -> str:
     if value is None:
         return "none"
     return value.__class__.__name__
+
+
+def _categorize_schema(parse_flags: Dict[str, object]) -> str:
+    if parse_flags.get("parts"):
+        return "parts"
+    if (
+        parse_flags.get("content_str")
+        or parse_flags.get("choices_text")
+        or parse_flags.get("output_text")
+    ):
+        return "text"
+    return "none"
 
 
 def _extract_choice_content(choice: Dict[str, object]) -> Tuple[str, Dict[str, object], str]:
@@ -269,6 +283,62 @@ def _extract_choice_content(choice: Dict[str, object]) -> Tuple[str, Dict[str, o
     return "", parse_flags, schema_label
 
 
+def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, object], str]:
+    parse_flags: Dict[str, object] = {
+        "content_str": 0,
+        "parts": 0,
+        "content_dict": 0,
+        "choices_text": 0,
+        "output_text": 0,
+    }
+
+    outputs = data.get("output")
+    if not outputs:
+        outputs = data.get("outputs")
+
+    schema_label = f"responses.output:{_describe_type(outputs)}"
+
+    if isinstance(outputs, list) and outputs:
+        primary = outputs[0]
+        if isinstance(primary, dict):
+            content = primary.get("content")
+            schema_label = f"responses.output.content:{_describe_type(content)}"
+            if isinstance(content, list):
+                joined = _collect_text_parts(content)
+                if joined:
+                    parse_flags["output_text"] = 1
+                    parse_flags["parts"] = 1
+                    parse_flags["schema"] = schema_label
+                    return joined, parse_flags, schema_label
+            elif isinstance(content, dict):
+                joined = _collect_text_parts([content])
+                if joined:
+                    parse_flags["output_text"] = 1
+                    parse_flags["content_dict"] = 1
+                    parse_flags["schema"] = schema_label
+                    return joined, parse_flags, schema_label
+        elif isinstance(primary, str):
+            stripped = primary.strip()
+            if stripped:
+                parse_flags["output_text"] = 1
+                parse_flags["content_str"] = 1
+                parse_flags["schema"] = schema_label
+                return stripped, parse_flags, schema_label
+
+    aggregate_text = data.get("text")
+    schema_label = f"responses.text:{_describe_type(aggregate_text)}"
+    if isinstance(aggregate_text, str):
+        stripped = aggregate_text.strip()
+        if stripped:
+            parse_flags["output_text"] = 1
+            parse_flags["content_str"] = 1
+            parse_flags["schema"] = schema_label
+            return stripped, parse_flags, schema_label
+
+    parse_flags["schema"] = schema_label
+    return "", parse_flags, schema_label
+
+
 def _resolve_model_name(model: Optional[str]) -> str:
     env_model = os.getenv("LLM_MODEL")
     candidate = (model or env_model or DEFAULT_MODEL).strip()
@@ -402,6 +472,17 @@ def _should_retry_empty_gpt5(parse_flags: Dict[str, object]) -> bool:
     return True
 
 
+def _should_switch_to_responses(parse_flags: Dict[str, object]) -> bool:
+    schema = str(parse_flags.get("schema", "")).lower()
+    if not schema:
+        return False
+    if "choice.content:none" in schema:
+        return True
+    if "message.content:none" in schema:
+        return True
+    return False
+
+
 def _should_retry(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
@@ -529,14 +610,51 @@ def generate(
         "Content-Type": "application/json",
     }
 
+    def _augment_gpt5_messages(original: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        augmented: List[Dict[str, object]] = []
+        appended_suffix = False
+        for message in original:
+            cloned = dict(message)
+            if not appended_suffix and cloned.get("role") == "system":
+                content = str(cloned.get("content", ""))
+                if GPT5_TEXT_ONLY_SUFFIX not in content:
+                    content = f"{content.rstrip()}\n\n{GPT5_TEXT_ONLY_SUFFIX}".strip()
+                cloned["content"] = content
+                appended_suffix = True
+            augmented.append(cloned)
+        return augmented
+
+    gpt5_messages_cache: Optional[List[Dict[str, object]]] = None
+
+    def _messages_for_model(target_model: str) -> List[Dict[str, object]]:
+        nonlocal gpt5_messages_cache
+        if "gpt-5" in target_model.lower():
+            if gpt5_messages_cache is None:
+                gpt5_messages_cache = _augment_gpt5_messages(messages)
+            return gpt5_messages_cache
+        return messages
+
+    def _flatten_messages_for_responses(source_messages: List[Dict[str, object]]) -> str:
+        segments: List[str] = []
+        for item in source_messages:
+            role = str(item.get("role", "")).strip() or "unknown"
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            segments.append(f"{role.upper()}:\n{content}")
+        return "\n\n".join(segments)
+
     def _prepare_payload(target_model: str) -> Dict[str, object]:
         lower = target_model.lower()
+        payload_messages = _messages_for_model(target_model)
         payload: Dict[str, object] = {
             "model": target_model,
-            "messages": messages,
+            "messages": payload_messages,
         }
         if "gpt-5" in lower:
             payload["max_completion_tokens"] = max_tokens
+            payload["tool_choice"] = "none"
+            LOGGER.info("GPT-5 Chat Completions: tool_choice=none")
             LOGGER.info(
                 "GPT-5 Chat Completions: skipping response_format/modalities (unsupported)"
             )
@@ -565,6 +683,40 @@ def generate(
             LOGGER.warning("Пустой ответ модели %s (schema=%s)", target_model, schema_label)
             raise EmptyCompletionError(
                 "Модель вернула пустой ответ",
+                raw_response=data,
+                parse_flags=parse_flags,
+            )
+        return text, parse_flags, data, schema_label
+
+    def _call_responses_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
+        payload_messages = _messages_for_model(target_model)
+        input_text = _flatten_messages_for_responses(payload_messages)
+        payload = {
+            "model": target_model,
+            "modalities": ["text"],
+            "response_format": {"type": "text"},
+            "input": input_text,
+        }
+        LOGGER.info(
+            "dispatching request to GPT-5 Responses API with modalities=text and response_format=text"
+        )
+        LOGGER.debug("responses payload preview: %s", {"model": target_model, "input_preview": input_text[:120]})
+        data = _make_request(
+            http_client,
+            api_url=RESPONSES_API_URL,
+            headers=headers,
+            payload=payload,
+            schedule=schedule,
+        )
+        text, parse_flags, schema_label = _extract_responses_text(data)
+        if not text:
+            LOGGER.warning(
+                "Пустой ответ от Responses API %s (schema=%s)",
+                target_model,
+                schema_label,
+            )
+            raise EmptyCompletionError(
+                "Responses API вернул пустой ответ",
                 raw_response=data,
                 parse_flags=parse_flags,
             )
@@ -615,7 +767,12 @@ def generate(
                     _log_parse_chain(fallback_error.parse_flags, retry=0, fallback=fallback_used)
                     raise
 
-        text, _, _, _ = _call_model(model_name)
+        text, parse_flags_initial, _, schema_initial_call = _call_model(model_name)
+        LOGGER.info(
+            "completion schema category=%s (schema=%s)",
+            _categorize_schema(parse_flags_initial),
+            schema_initial_call,
+        )
         return GenerationResult(
             text=text,
             model_used=model_name,
@@ -637,15 +794,50 @@ def generate(
 
         retry_used = False
         error_for_fallback = initial_error
-        if _should_retry_empty_gpt5(initial_error.parse_flags):
+        if _should_switch_to_responses(initial_error.parse_flags):
+            LOGGER.info(
+                "gpt-5 empty completion triggers Responses fallback (schema=%s)",
+                schema_initial,
+            )
+            try:
+                text, parse_flags_responses, _, schema_responses = _call_responses_model(
+                    model_name
+                )
+                LOGGER.info(
+                    "Responses API resolved empty completion (schema=%s, category=%s)",
+                    schema_responses,
+                    _categorize_schema(parse_flags_responses),
+                )
+                return GenerationResult(
+                    text=text,
+                    model_used=model_name,
+                    retry_used=False,
+                    fallback_used=None,
+                    fallback_reason=None,
+                )
+            except EmptyCompletionError as responses_error:
+                _persist_raw_response(responses_error.raw_response)
+                _log_parse_chain(
+                    responses_error.parse_flags,
+                    retry=0,
+                    fallback="responses",
+                )
+                LOGGER.warning(
+                    "Responses API also returned empty payload (schema=%s)",
+                    responses_error.parse_flags.get("schema", "unknown"),
+                )
+                error_for_fallback = responses_error
+                fallback_reason = "empty_completion_gpt5"
+        elif _should_retry_empty_gpt5(initial_error.parse_flags):
             jitter = random.uniform(0.2, 0.4)
             time.sleep(jitter)
             retry_used = True
             try:
-                text, _, _, schema_retry = _call_model(model_name)
+                text, parse_flags_retry, _, schema_retry = _call_model(model_name)
                 LOGGER.info(
-                    "gpt-5 retry succeeded after empty completion (schema=%s)",
+                    "gpt-5 retry succeeded after empty completion (schema=%s, category=%s)",
                     schema_retry,
+                    _categorize_schema(parse_flags_retry),
                 )
                 return GenerationResult(
                     text=text,
@@ -663,15 +855,16 @@ def generate(
                     retry_error.parse_flags.get("schema", "unknown"),
                 )
                 error_for_fallback = retry_error
+                fallback_reason = "empty_completion_gpt5"
         else:
             LOGGER.info(
                 "Skipping GPT-5 retry because schema indicates no textual payload (schema=%s)",
                 schema_initial,
             )
             _log_parse_chain(initial_error.parse_flags, retry=0, fallback="gpt-4o")
+            fallback_reason = "empty_completion_gpt5"
 
         fallback_used = FALLBACK_MODEL
-        fallback_reason = "empty_completion"
         LOGGER.warning(
             "switching to fallback model %s (primary=%s, reason=%s, schema=%s, retry=%s)",
             fallback_used,
@@ -681,7 +874,12 @@ def generate(
             "yes" if retry_used else "no",
         )
         try:
-            text, _, _, _ = _call_model(fallback_used)
+            text, parse_flags_fallback, _, schema_fallback = _call_model(fallback_used)
+            LOGGER.info(
+                "fallback completion schema category=%s (schema=%s)",
+                _categorize_schema(parse_flags_fallback),
+                schema_fallback,
+            )
             return GenerationResult(
                 text=text,
                 model_used=fallback_used,
