@@ -537,8 +537,9 @@ def generate(
         }
         if "gpt-5" in lower:
             payload["max_completion_tokens"] = max_tokens
-            payload["response_format"] = {"type": "text"}
-            payload["modalities"] = ["text"]
+            LOGGER.info(
+                "GPT-5 Chat Completions: skipping response_format/modalities (unsupported)"
+            )
         else:
             payload["max_tokens"] = max_tokens
             payload["temperature"] = temperature

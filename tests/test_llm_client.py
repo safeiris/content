@@ -102,14 +102,10 @@ def test_generate_uses_max_completion_tokens_for_gpt5():
     assert request_payload["json"]["max_completion_tokens"] == 42
     assert "max_tokens" not in request_payload["json"]
     assert "temperature" not in request_payload["json"]
-    assert request_payload["json"]["response_format"] == {"type": "text"}
-    assert request_payload["json"]["modalities"] == ["text"]
     assert set(request_payload["json"].keys()) == {
         "model",
         "messages",
         "max_completion_tokens",
-        "response_format",
-        "modalities",
     }
 
 
@@ -127,10 +123,11 @@ def test_generate_logs_about_temperature_for_gpt5():
         "model": "gpt-5-super",
         "messages": "<1 messages>",
         "max_completion_tokens": 42,
-        "response_format": {"type": "text"},
-        "modalities": ["text"],
     }
     mock_logger.info.assert_any_call("openai payload blueprint: %s", summary)
+    mock_logger.info.assert_any_call(
+        "GPT-5 Chat Completions: skipping response_format/modalities (unsupported)"
+    )
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
 
 
@@ -141,8 +138,6 @@ def test_generate_sends_minimal_payload_for_gpt5():
         "model": "gpt-5-turbo",
         "messages": [{"role": "user", "content": "ping"}],
         "max_completion_tokens": 42,
-        "response_format": {"type": "text"},
-        "modalities": ["text"],
     }
 
 
