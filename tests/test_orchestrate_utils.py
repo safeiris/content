@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from llm_client import GenerationResult  # noqa: E402
 from orchestrate import (  # noqa: E402
     LENGTH_EXTEND_THRESHOLD,
     LENGTH_SHRINK_THRESHOLD,
@@ -75,7 +76,7 @@ def test_ensure_length_triggers_extend(monkeypatch):
 
     def fake_llm(messages, **kwargs):
         captured["prompt"] = messages[-1]["content"]
-        return "extended"
+        return GenerationResult(text="extended", model_used="model", retry_used=False, fallback_used=None)
 
     monkeypatch.setattr("orchestrate.llm_generate", fake_llm)
     short_text = "s"
@@ -83,8 +84,10 @@ def test_ensure_length_triggers_extend(monkeypatch):
     base_messages = [{"role": "system", "content": "base"}]
     data = {"structure": ["Введение", "Основная часть"]}
 
-    new_text, adjustment, new_messages = _ensure_length(
-        short_text,
+    base_result = GenerationResult(text=short_text, model_used="model", retry_used=False, fallback_used=None)
+
+    new_result, adjustment, new_messages = _ensure_length(
+        base_result,
         base_messages,
         data=data,
         model_name="model",
@@ -94,7 +97,7 @@ def test_ensure_length_triggers_extend(monkeypatch):
         backoff_schedule=[0.5],
     )
 
-    assert new_text == "extended"
+    assert new_result.text == "extended"
     assert adjustment == "extend"
     assert len(new_messages) == len(base_messages) + 1
     assert "Основная часть" in captured["prompt"]
@@ -105,14 +108,16 @@ def test_ensure_length_triggers_shrink(monkeypatch):
 
     def fake_llm(messages, **kwargs):
         captured["prompt"] = messages[-1]["content"]
-        return "shrunk"
+        return GenerationResult(text="shrunk", model_used="model", retry_used=False, fallback_used=None)
 
     monkeypatch.setattr("orchestrate.llm_generate", fake_llm)
     long_text = "x" * (LENGTH_SHRINK_THRESHOLD + 10)
     base_messages = [{"role": "system", "content": "base"}]
 
-    new_text, adjustment, new_messages = _ensure_length(
-        long_text,
+    base_result = GenerationResult(text=long_text, model_used="model", retry_used=False, fallback_used=None)
+
+    new_result, adjustment, new_messages = _ensure_length(
+        base_result,
         base_messages,
         data={},
         model_name="model",
@@ -122,7 +127,7 @@ def test_ensure_length_triggers_shrink(monkeypatch):
         backoff_schedule=[0.5],
     )
 
-    assert new_text == "shrunk"
+    assert new_result.text == "shrunk"
     assert adjustment == "shrink"
     assert len(new_messages) == len(base_messages) + 1
     assert "Сократи повторы" in captured["prompt"]

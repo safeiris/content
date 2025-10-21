@@ -2,11 +2,15 @@
 """Simple wrapper around chat completion providers with retries and sane defaults."""
 from __future__ import annotations
 
+import json
 import logging
 import os
+import random
 import sys
 import time
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -29,6 +33,17 @@ PROVIDER_API_URLS = {
 
 
 LOGGER = logging.getLogger(__name__)
+RAW_RESPONSE_PATH = Path("artifacts/debug/last_raw_response.json")
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    """Container describing the outcome of a text generation call."""
+
+    text: str
+    model_used: str
+    retry_used: bool
+    fallback_used: Optional[str]
 
 
 class EmptyCompletionError(RuntimeError):
@@ -36,39 +51,98 @@ class EmptyCompletionError(RuntimeError):
 
     status_code = 502
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_response: Optional[Dict[str, object]] = None,
+        parse_flags: Optional[Dict[str, int]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_response = raw_response or {}
+        self.parse_flags = parse_flags or {}
 
-def _extract_choice_content(choice: Dict[str, object]) -> str:
-    """Return textual content from a completion choice."""
+
+def _collect_text_parts(parts: List[object]) -> str:
+    collected: List[str] = []
+    for part in parts:
+        candidate: Optional[str] = None
+        if isinstance(part, dict):
+            text_value = part.get("text")
+            if isinstance(text_value, str):
+                candidate = text_value
+            elif part.get("type") == "text":
+                alt_value = part.get("content") or part.get("value")
+                if isinstance(alt_value, str):
+                    candidate = alt_value
+        elif isinstance(part, str):
+            candidate = part
+        if candidate:
+            stripped = candidate.strip()
+            if stripped:
+                collected.append(stripped)
+    return "\n\n".join(collected)
+
+
+def _extract_choice_content(choice: Dict[str, object]) -> Tuple[str, Dict[str, int]]:
+    """Return textual content from a completion choice along with parse statistics."""
+
+    parse_flags = {"content_str": 0, "parts": 0, "choices_text": 0, "output_text": 0}
 
     # Primary schema – chat message
     message = choice.get("message") if isinstance(choice, dict) else None
     if isinstance(message, dict):
         content = message.get("content")
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            text_parts: List[str] = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text_parts.append(str(part.get("text", "")))
-            if text_parts:
-                return "".join(text_parts)
-        # Some providers may nest plain text under the "text" key
+            stripped = content.strip()
+            if stripped:
+                parse_flags["content_str"] = 1
+                return stripped, parse_flags
+        elif isinstance(content, list):
+            joined = _collect_text_parts(content)
+            if joined:
+                parse_flags["parts"] = 1
+                return joined, parse_flags
         alt_text = message.get("text")
         if isinstance(alt_text, str):
-            return alt_text
+            stripped = alt_text.strip()
+            if stripped:
+                parse_flags["parts"] = 1
+                return stripped, parse_flags
 
     # Alternate schemas – top-level text fields
-    for key in ("output_text", "text", "content"):
-        candidate = choice.get(key) if isinstance(choice, dict) else None
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate
-        if isinstance(candidate, list):
-            collected = [str(item) for item in candidate if isinstance(item, str)]
-            if collected:
-                return "".join(collected)
+    candidate = choice.get("text") if isinstance(choice, dict) else None
+    if isinstance(candidate, str):
+        stripped = candidate.strip()
+        if stripped:
+            parse_flags["choices_text"] = 1
+            return stripped, parse_flags
+    elif isinstance(candidate, list):
+        joined = _collect_text_parts(candidate)
+        if joined:
+            parse_flags["choices_text"] = 1
+            return joined, parse_flags
 
-    return ""
+    output_candidate = choice.get("output_text") if isinstance(choice, dict) else None
+    if isinstance(output_candidate, str):
+        stripped = output_candidate.strip()
+        if stripped:
+            parse_flags["output_text"] = 1
+            return stripped, parse_flags
+    elif isinstance(output_candidate, list):
+        joined = _collect_text_parts(output_candidate)
+        if joined:
+            parse_flags["output_text"] = 1
+            return joined, parse_flags
+
+    exotic_content = choice.get("content") if isinstance(choice, dict) else None
+    if isinstance(exotic_content, list):
+        joined = _collect_text_parts(exotic_content)
+        if joined:
+            parse_flags["output_text"] = 1
+            return joined, parse_flags
+
+    return "", parse_flags
 
 
 def _resolve_model_name(model: Optional[str]) -> str:
@@ -111,6 +185,29 @@ def _resolve_backoff_schedule(override: Optional[List[float]]) -> List[float]:
     return BACKOFF_SCHEDULE
 
 
+def _persist_raw_response(payload: Dict[str, object]) -> None:
+    try:
+        RAW_RESPONSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RAW_RESPONSE_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # pragma: no cover - diagnostic helper
+        LOGGER.debug("failed to persist raw response: %s", exc)
+
+
+def _log_parse_chain(parse_flags: Dict[str, int], *, retry: int, fallback: str) -> None:
+    LOGGER.warning(
+        "parse_chain: content_str=%d; parts=%d; choices_text=%d; output_text=%d; retry=%d; fallback=%s",
+        parse_flags.get("content_str", 0),
+        parse_flags.get("parts", 0),
+        parse_flags.get("choices_text", 0),
+        parse_flags.get("output_text", 0),
+        retry,
+        fallback,
+    )
+
+
 def _should_retry(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
@@ -132,6 +229,82 @@ def _describe_error(exc: BaseException) -> str:
     return exc.__class__.__name__
 
 
+def _raise_for_last_error(last_error: BaseException) -> None:
+    if isinstance(last_error, httpx.HTTPStatusError):
+        status_code = last_error.response.status_code
+        detail = ""
+        try:
+            payload = last_error.response.json()
+            if isinstance(payload, dict):
+                detail = (
+                    payload.get("error", {}).get("message")
+                    if isinstance(payload.get("error"), dict)
+                    else payload.get("message", "")
+                ) or ""
+        except ValueError:
+            detail = last_error.response.text.strip()
+        message = f"Ошибка сервиса OpenAI: HTTP {status_code}"
+        if detail:
+            message = f"{message} — {detail}"
+        raise RuntimeError(message) from last_error
+    if isinstance(last_error, httpx.TimeoutException):
+        raise RuntimeError(
+            "Сетевой таймаут при обращении к модели. Проверьте соединение и повторите попытку."
+        ) from last_error
+    if isinstance(last_error, httpx.TransportError):
+        raise RuntimeError(
+            "Сетевой сбой при обращении к модели. Проверьте соединение и повторите попытку."
+        ) from last_error
+    raise RuntimeError(f"Не удалось получить ответ модели: {last_error}") from last_error
+
+
+def _make_request(
+    http_client: httpx.Client,
+    *,
+    api_url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, object],
+    schedule: List[float],
+) -> Dict[str, object]:
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = http_client.post(api_url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict):
+                return data
+            raise RuntimeError("Модель вернула неожиданный формат ответа.")
+        except EmptyCompletionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, KeyboardInterrupt):  # pragma: no cover - respect interrupts
+                raise
+            last_error = exc
+            if attempt >= MAX_RETRIES or not _should_retry(exc):
+                break
+            sleep_for = schedule[min(attempt - 1, len(schedule) - 1)]
+            reason = _describe_error(exc)
+            print(
+                f"[llm_client] retry #{attempt} reason: {reason}; sleeping {sleep_for}s",
+                file=sys.stderr,
+            )
+            time.sleep(sleep_for)
+    if last_error:
+        _raise_for_last_error(last_error)
+    raise RuntimeError("Модель не вернула ответ.")
+
+
+def _extract_response_text(data: Dict[str, object]) -> Tuple[str, Dict[str, int]]:
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("Модель не вернула варианты ответа.")
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise RuntimeError("Модель вернула неожиданный формат ответа.")
+    return _extract_choice_content(choice)
+
+
 def generate(
     messages: List[Dict[str, str]],
     *,
@@ -140,8 +313,8 @@ def generate(
     max_tokens: int = 1400,
     timeout_s: int = 60,
     backoff_schedule: Optional[List[float]] = None,
-) -> str:
-    """Call the configured LLM and return the article text."""
+    ) -> GenerationResult:
+    """Call the configured LLM and return a structured generation result."""
 
     if not messages:
         raise ValueError("messages must not be empty")
@@ -156,95 +329,88 @@ def generate(
     timeout = httpx.Timeout(timeout_s)
     http_client = httpx.Client(timeout=timeout)
 
-    last_error: Optional[BaseException] = None
     schedule = _resolve_backoff_schedule(backoff_schedule)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    def _prepare_payload(target_model: str) -> Dict[str, object]:
+        lower = target_model.lower()
+        payload: Dict[str, object] = {
+            "model": target_model,
+            "messages": messages,
+        }
+        if "gpt-5" in lower:
+            payload["max_completion_tokens"] = max_tokens
+            payload["tool_choice"] = "none"
+            payload["response_format"] = {"type": "text"}
+            payload["modalities"] = ["text"]
+        else:
+            payload["max_tokens"] = max_tokens
+            payload["temperature"] = temperature
+        return payload
+
+    def _call_model(target_model: str) -> Tuple[str, Dict[str, int], Dict[str, object]]:
+        payload = _prepare_payload(target_model)
+        data = _make_request(
+            http_client,
+            api_url=api_url,
+            headers=headers,
+            payload=payload,
+            schedule=schedule,
+        )
+        text, parse_flags = _extract_response_text(data)
+        if not text:
+            LOGGER.warning("Пустой ответ модели %s", target_model)
+            raise EmptyCompletionError(
+                "Модель вернула пустой ответ",
+                raw_response=data,
+                parse_flags=parse_flags,
+            )
+        return text, parse_flags, data
+
+    lower_model = model_name.lower()
+    is_gpt5_model = "gpt-5" in lower_model
+    if is_gpt5_model:
+        LOGGER.info("temperature is ignored for GPT-5; using default")
+
+    retry_used = False
+    fallback_used: Optional[str] = None
+
     try:
-        lower_model = model_name.lower()
-        is_gpt5_model = "gpt-5" in lower_model
-        has_logged_temperature_notice = False
-        for attempt in range(1, MAX_RETRIES + 1):
+        text, _, _ = _call_model(model_name)
+        return GenerationResult(text=text, model_used=model_name, retry_used=False, fallback_used=None)
+    except EmptyCompletionError as initial_error:
+        _persist_raw_response(initial_error.raw_response)
+        _log_parse_chain(initial_error.parse_flags, retry=0, fallback="none")
+        if not is_gpt5_model:
+            raise
+
+        jitter = random.uniform(0.2, 0.4)
+        time.sleep(jitter)
+        retry_used = True
+        try:
+            text, _, _ = _call_model(model_name)
+            return GenerationResult(text=text, model_used=model_name, retry_used=True, fallback_used=None)
+        except EmptyCompletionError as retry_error:
+            _persist_raw_response(retry_error.raw_response)
+            _log_parse_chain(retry_error.parse_flags, retry=1, fallback="gpt-4o")
+            fallback_used = "gpt-4o"
             try:
-                if is_gpt5_model:
-                    completion_param = {"max_completion_tokens": max_tokens}
-                else:
-                    completion_param = {"max_tokens": max_tokens}
-
-                request_payload = {
-                    "model": model_name,
-                    "messages": messages,
-                    **completion_param,
-                }
-
-                if not is_gpt5_model:
-                    request_payload["temperature"] = temperature
-                elif not has_logged_temperature_notice:
-                    LOGGER.info("temperature is ignored for GPT-5; using default")
-                    has_logged_temperature_notice = True
-
-                response = http_client.post(
-                    api_url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=request_payload,
+                text, _, _ = _call_model(fallback_used)
+                return GenerationResult(
+                    text=text,
+                    model_used=fallback_used,
+                    retry_used=True,
+                    fallback_used=fallback_used,
                 )
-                response.raise_for_status()
-                data = response.json()
-                choices = data.get("choices")
-                if not isinstance(choices, list) or not choices:
-                    raise RuntimeError("Модель не вернула варианты ответа.")
-                choice = choices[0]
-                if not isinstance(choice, dict):
-                    raise RuntimeError("Модель вернула неожиданный формат ответа.")
-
-                content = _extract_choice_content(choice)
-                cleaned = content.strip()
-                if not cleaned:
-                    LOGGER.warning("Пустой ответ модели %s", model_name)
-                    raise EmptyCompletionError("Модель вернула пустой ответ")
-                return cleaned
-            except Exception as exc:  # noqa: BLE001
-                if isinstance(exc, KeyboardInterrupt):  # pragma: no cover - respect interrupts
-                    raise
-                last_error = exc
-                should_retry = _should_retry(exc)
-                if attempt >= MAX_RETRIES or not should_retry:
-                    break
-                sleep_for = schedule[min(attempt - 1, len(schedule) - 1)]
-                reason = _describe_error(exc)
-                print(f"[llm_client] retry #{attempt} reason: {reason}; sleeping {sleep_for}s", file=sys.stderr)
-                time.sleep(sleep_for)
-        if last_error:
-            if isinstance(last_error, httpx.HTTPStatusError):
-                status_code = last_error.response.status_code
-                detail = ""
-                try:
-                    payload = last_error.response.json()
-                    if isinstance(payload, dict):
-                        detail = (
-                            payload.get("error", {}).get("message")
-                            if isinstance(payload.get("error"), dict)
-                            else payload.get("message", "")
-                        ) or ""
-                except ValueError:
-                    detail = last_error.response.text.strip()
-                message = f"Ошибка сервиса OpenAI: HTTP {status_code}"
-                if detail:
-                    message = f"{message} — {detail}"
-                raise RuntimeError(message) from last_error
-            if isinstance(last_error, httpx.TimeoutException):
-                raise RuntimeError(
-                    "Сетевой таймаут при обращении к модели. Проверьте соединение и повторите попытку."
-                ) from last_error
-            if isinstance(last_error, httpx.TransportError):
-                raise RuntimeError(
-                    "Сетевой сбой при обращении к модели. Проверьте соединение и повторите попытку."
-                ) from last_error
-            raise RuntimeError(f"Не удалось получить ответ модели: {last_error}") from last_error
-        raise RuntimeError("Модель не вернула ответ.")
+            except EmptyCompletionError as fallback_error:
+                _persist_raw_response(fallback_error.raw_response)
+                _log_parse_chain(fallback_error.parse_flags, retry=1, fallback=fallback_used)
+                raise
     finally:
         http_client.close()
 
 
-__all__ = ["generate", "DEFAULT_MODEL"]
+__all__ = ["generate", "DEFAULT_MODEL", "GenerationResult"]

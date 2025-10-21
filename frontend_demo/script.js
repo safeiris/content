@@ -939,6 +939,13 @@ function updateResultBadges(meta) {
       : null;
   })();
 
+  const fallbackBadge = meta.fallback_used
+    ? {
+        text: `Сгенерировано через запасную модель (${meta.fallback_used})`,
+        type: "warning",
+      }
+    : null;
+
   const entries = [
     ...(!hasContent ? [{ text: "Пустой ответ", type: "error" }] : []),
     badgeInfo("plagiarism_detected", meta.plagiarism_detected, {
@@ -960,6 +967,7 @@ function updateResultBadges(meta) {
     badgeInfo("length_adjustment", meta.length_adjustment, null, (value) =>
       value ? `Length fix: ${value}` : "Length OK"
     ),
+    fallbackBadge,
     meta.model_used ? { text: `Model: ${meta.model_used}`, type: "neutral" } : null,
     temperatureBadge,
     typeof meta.context_budget_tokens_est === "number"
@@ -1049,8 +1057,11 @@ function toggleRetryButton(show) {
 }
 
 function enableDownloadButtons(paths) {
-  const markdownPath = paths?.markdown;
-  const metadataPath = paths?.metadata;
+  const normalizePath = (value) =>
+    typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+
+  const markdownPath = normalizePath(paths?.markdown);
+  const metadataPath = normalizePath(paths?.metadata);
 
   if (markdownPath) {
     downloadMdBtn.dataset.path = markdownPath;

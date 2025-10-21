@@ -433,6 +433,7 @@ def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[
         "disclaimer_appended": False,
         "length_adjustment": None,
         "status": "dry-run",
+        "fallback_used": None,
     }
     return {
         "markdown": markdown,

@@ -27,7 +27,7 @@ from assemble_messages import (
     _should_apply_style_profile,
     _style_profile_file_for_variant,
 )
-from llm_client import DEFAULT_MODEL, generate as llm_generate
+from llm_client import DEFAULT_MODEL, GenerationResult, generate as llm_generate
 from plagiarism_guard import is_too_similar
 from artifacts_store import register_artifact
 from config import OPENAI_API_KEY, STYLE_PROFILE_VARIANT
@@ -149,7 +149,7 @@ def _build_shrink_prompt() -> str:
 
 
 def _ensure_length(
-    text: str,
+    result: GenerationResult,
     messages: List[Dict[str, str]],
     *,
     data: Dict[str, Any],
@@ -158,14 +158,15 @@ def _ensure_length(
     max_tokens: int,
     timeout: int,
     backoff_schedule: Optional[List[float]] = None,
-) -> Tuple[str, Optional[str], List[Dict[str, str]]]:
+) -> Tuple[GenerationResult, Optional[str], List[Dict[str, str]]]:
+    text = result.text
     length = len(text)
     if length < LENGTH_EXTEND_THRESHOLD:
         section = _choose_section_for_extension(data)
         prompt = _build_extend_prompt(section)
         adjusted_messages = list(messages)
         adjusted_messages.append({"role": "user", "content": prompt})
-        new_text = llm_generate(
+        new_result = llm_generate(
             adjusted_messages,
             model=model_name,
             temperature=temperature,
@@ -173,12 +174,12 @@ def _ensure_length(
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
-        return new_text, "extend", adjusted_messages
+        return new_result, "extend", adjusted_messages
     if length > LENGTH_SHRINK_THRESHOLD:
         prompt = _build_shrink_prompt()
         adjusted_messages = list(messages)
         adjusted_messages.append({"role": "user", "content": prompt})
-        new_text = llm_generate(
+        new_result = llm_generate(
             adjusted_messages,
             model=model_name,
             temperature=temperature,
@@ -186,8 +187,8 @@ def _ensure_length(
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
-        return new_text, "shrink", adjusted_messages
-    return text, None, messages
+        return new_result, "shrink", adjusted_messages
+    return result, None, messages
 
 
 def _local_now() -> datetime:
@@ -428,7 +429,7 @@ def _generate_variant(
     system_prompt = next((msg.get("content") for msg in active_messages if msg.get("role") == "system"), "")
     user_prompt = next((msg.get("content") for msg in reversed(active_messages) if msg.get("role") == "user"), "")
 
-    article_text = llm_generate(
+    llm_result = llm_generate(
         active_messages,
         model=model_name,
         temperature=temperature,
@@ -437,10 +438,12 @@ def _generate_variant(
         backoff_schedule=backoff_schedule,
     )
 
-    retry_used = False
+    article_text = llm_result.text
+    effective_model = llm_result.model_used
+    retry_used = llm_result.retry_used
+    fallback_used = llm_result.fallback_used
     plagiarism_detected = False
     if generation_context.clip_texts and is_too_similar(article_text, generation_context.clip_texts):
-        retry_used = True
         plagiarism_detected = True
         active_messages = list(active_messages)
         active_messages.append(
@@ -450,7 +453,7 @@ def _generate_variant(
             }
         )
         print("[orchestrate] Обнаружено совпадение с примерами, выполняю перегенерацию...", file=sys.stderr)
-        article_text = llm_generate(
+        llm_result = llm_generate(
             active_messages,
             model=model_name,
             temperature=temperature,
@@ -458,11 +461,15 @@ def _generate_variant(
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
+        article_text = llm_result.text
+        effective_model = llm_result.model_used
+        fallback_used = llm_result.fallback_used
+        retry_used = True
 
     truncation_retry_used = False
     while True:
-        article_text, length_adjustment, active_messages = _ensure_length(
-            article_text,
+        llm_result, length_adjustment, active_messages = _ensure_length(
+            llm_result,
             active_messages,
             data=prepared_data,
             model_name=model_name,
@@ -471,13 +478,16 @@ def _generate_variant(
             timeout=timeout,
             backoff_schedule=backoff_schedule,
         )
+        article_text = llm_result.text
+        effective_model = llm_result.model_used
+        fallback_used = llm_result.fallback_used
         if not _is_truncated(article_text):
             break
         if truncation_retry_used:
             break
         truncation_retry_used = True
         print("[orchestrate] Детектор усечённого вывода — запускаю повторную генерацию", file=sys.stderr)
-        article_text = llm_generate(
+        llm_result = llm_generate(
             active_messages,
             model=model_name,
             temperature=temperature,
@@ -485,9 +495,13 @@ def _generate_variant(
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
+        article_text = llm_result.text
+        effective_model = llm_result.model_used
+        fallback_used = llm_result.fallback_used
+        retry_used = True
         # повторяем цикл с новым текстом после перегенерации
 
-    retry_used = retry_used or truncation_retry_used
+    retry_used = retry_used or truncation_retry_used or llm_result.retry_used
 
     article_text, postfix_appended, default_cta_used = _append_cta_if_needed(
         article_text,
@@ -500,6 +514,10 @@ def _generate_variant(
     duration = time.time() - start_time
     context_bundle = generation_context.context_bundle
     context_used = bool(context_bundle.context_used and not context_bundle.index_missing and k > 0)
+
+    used_temperature = None
+    if effective_model and not effective_model.lower().startswith("gpt-5"):
+        used_temperature = temperature
 
     metadata: Dict[str, Any] = {
         "theme": theme,
@@ -533,8 +551,8 @@ def _generate_variant(
         "length_adjustment": length_adjustment,
         "length_range_target": {"min": TARGET_LENGTH_RANGE[0], "max": TARGET_LENGTH_RANGE[1]},
         "mode": mode,
-        "model_used": model_name,
-        "temperature_used": temperature,
+        "model_used": effective_model,
+        "temperature_used": used_temperature,
         "max_tokens_used": max_tokens,
         "default_cta_used": default_cta_used,
         "truncation_retry_used": truncation_retry_used,
@@ -547,6 +565,7 @@ def _generate_variant(
         "keywords_manual": generation_context.keywords_manual,
         "keywords_auto": generation_context.keywords_auto,
         "keywords_final": generation_context.keywords_final,
+        "fallback_used": fallback_used,
     }
 
     if generation_context.style_profile_applied:
@@ -566,7 +585,7 @@ def _generate_variant(
             f"[orchestrate] warning: пропускаю запись артефакта для {output_path.name} — пустой ответ",
             file=sys.stderr,
         )
-    _summarise(theme, k, model_name, article_text, variant=variant_label)
+    _summarise(theme, k, effective_model or model_name, article_text, variant=variant_label)
 
     return {
         "text": article_text,
