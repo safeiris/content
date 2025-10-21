@@ -49,7 +49,6 @@ const clearLogBtn = document.getElementById("clear-log");
 const structurePreset = document.getElementById("structure-preset");
 const structureInput = document.getElementById("structure-input");
 const keywordsInput = document.getElementById("keywords-input");
-const autopickCheckbox = document.getElementById("autopick-keywords");
 const goalInput = document.getElementById("goal-input");
 const kInput = document.getElementById("k-input");
 const temperatureInput = document.getElementById("temperature-input");
@@ -132,9 +131,6 @@ if (healthBtn) {
 }
 if (cleanupArtifactsBtn) {
   interactiveElements.push(cleanupArtifactsBtn);
-}
-if (autopickCheckbox) {
-  interactiveElements.push(autopickCheckbox);
 }
 
 tabs.forEach((tab) => {
@@ -680,7 +676,6 @@ async function handlePromptPreview() {
         theme: payload.theme,
         data: payload.data,
         k: payload.k,
-        autopick_keywords: payload.autopickKeywords,
       }),
     });
     updatePromptPreview(preview);
@@ -713,7 +708,6 @@ async function handleGenerate(event) {
         model: payload.model,
         temperature: payload.temperature,
         max_tokens: payload.maxTokens,
-        autopick_keywords: payload.autopickKeywords,
       }),
     });
     const markdown = response?.markdown ?? "";
@@ -806,8 +800,6 @@ function buildRequestPayload() {
     pipe_id: theme,
   };
 
-  const autopickKeywords = autopickCheckbox ? Boolean(autopickCheckbox.checked) : true;
-
   const kValue = String(kInput?.value ?? "").trim();
   let k = kValue === "" ? 3 : Number.parseInt(kValue, 10);
   if (!Number.isInteger(k) || k < 0 || k > 6) {
@@ -845,15 +837,16 @@ function buildRequestPayload() {
     maxTokensInput.value = String(maxTokens);
   }
 
-  return {
+  const payload = {
     theme,
     data,
     k,
     temperature: temperatureLocked ? undefined : temperature,
     maxTokens,
     model,
-    autopickKeywords,
   };
+
+  return payload;
 }
 
 function renderMetadata(meta) {
@@ -880,39 +873,26 @@ function renderUsedKeywords(meta) {
     return;
   }
 
-  const finalKeywords = Array.isArray(meta.keywords_final) ? meta.keywords_final : [];
-  const manualSet = new Set(Array.isArray(meta.keywords_manual) ? meta.keywords_manual : []);
-  const autoSet = new Set(Array.isArray(meta.keywords_auto) ? meta.keywords_auto : []);
-  const autopickActive =
-    typeof meta.autopick_keywords === "boolean"
-      ? meta.autopick_keywords
-      : Boolean(autopickCheckbox?.checked);
+  const manualKeywords = Array.isArray(meta.keywords_manual) ? meta.keywords_manual : [];
 
   usedKeywordsList.innerHTML = "";
   usedKeywordsSection.hidden = false;
 
-  if (!finalKeywords.length) {
+  if (!manualKeywords.length) {
     usedKeywordsList.style.display = "none";
     usedKeywordsEmpty.hidden = false;
-    usedKeywordsEmpty.textContent = autopickActive
-      ? "Автоподбор ключевых слов не предложил варианты для этого запроса."
-      : "Ключевые слова не использовались (поле оставлено пустым).";
+    usedKeywordsEmpty.textContent = "Ключевые слова не использовались.";
     return;
   }
 
   usedKeywordsList.style.display = "flex";
   usedKeywordsEmpty.hidden = true;
 
-  finalKeywords.forEach((keyword) => {
+  manualKeywords.forEach((keyword) => {
     const item = document.createElement("li");
     item.textContent = keyword;
-    if (manualSet.has(keyword)) {
-      item.dataset.source = "manual";
-      item.title = "Задано вручную";
-    } else if (autoSet.has(keyword)) {
-      item.dataset.source = "auto";
-      item.title = "Автоматический подбор";
-    }
+    item.dataset.source = "manual";
+    item.title = "Задано вручную";
     usedKeywordsList.append(item);
   });
 }

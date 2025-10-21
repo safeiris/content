@@ -80,13 +80,11 @@ def create_app() -> Flask:
             k = 0
 
         style_profile_override = _style_profile_override_from_request(request)
-        autopick_enabled = bool(payload.get("autopick_keywords", True))
         generation_context = make_generation_context(
             theme=theme,
             data=raw_data,
             k=k,
             append_style_profile=style_profile_override,
-            autopick_keywords=autopick_enabled,
         )
 
         system_payload = next((msg for msg in generation_context.messages if msg.get("role") == "system"), {})
@@ -121,10 +119,7 @@ def create_app() -> Flask:
             "context_budget_tokens_limit": context_bundle.token_budget_limit,
             "k": k,
             "style_profile_applied": style_profile_applied,
-            "autopick_keywords": bool(generation_context.autopick_enabled),
-            "keywords_final": generation_context.keywords_final,
             "keywords_manual": generation_context.keywords_manual,
-            "keywords_auto": generation_context.keywords_auto,
         }
 
         if style_profile_applied and style_profile_source:
@@ -158,8 +153,6 @@ def create_app() -> Flask:
         temperature = max(0.0, min(2.0, temperature))
         max_tokens = max(1, _safe_int(payload.get("max_tokens", 1400), default=1400))
 
-        autopick_enabled = bool(payload.get("autopick_keywords", True))
-
         try:
             result = generate_article_from_payload(
                 theme=theme,
@@ -169,7 +162,6 @@ def create_app() -> Flask:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 append_style_profile=style_profile_override,
-                autopick_keywords=autopick_enabled,
             )
         except ApiError:
             raise
@@ -193,9 +185,8 @@ def create_app() -> Flask:
                 response_payload["style_profile_source"] = metadata["style_profile_source"]
             if metadata.get("style_profile_variant"):
                 response_payload["style_profile_variant"] = metadata["style_profile_variant"]
-        if isinstance(metadata, dict) and metadata.get("keywords_final") is not None:
-            response_payload["keywords_final"] = metadata.get("keywords_final")
-            response_payload["autopick_keywords"] = metadata.get("autopick_keywords")
+        if isinstance(metadata, dict) and metadata.get("keywords_manual") is not None:
+            response_payload["keywords_manual"] = metadata.get("keywords_manual")
 
         return jsonify(response_payload)
 
