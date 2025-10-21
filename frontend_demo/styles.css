@@ -20,6 +20,7 @@ body {
   margin: 0 auto;
   padding: 0 24px;
   box-sizing: border-box;
+  overflow-x: hidden;
 }
 
 .app-header {
@@ -93,6 +94,7 @@ body {
 .request-layout {
   display: grid;
   gap: 32px;
+  width: 100%;
 }
 
 @media (min-width: 1080px) {
@@ -109,6 +111,13 @@ body {
   box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
   display: grid;
   gap: 20px;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 380px;
+}
+
+.brief-form * {
+  box-sizing: border-box;
 }
 
 .form-row {
@@ -165,6 +174,8 @@ body {
   border: 1px solid #d4d8dd;
   font-size: 15px;
   font-family: inherit;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .optional {
@@ -181,6 +192,7 @@ body {
 
 .length-range input {
   flex: 1;
+  width: auto;
 }
 
 .range-separator {
@@ -262,6 +274,7 @@ body {
 
 .inline-field input {
   max-width: 96px;
+  width: auto;
 }
 
 .form-row input:focus,
