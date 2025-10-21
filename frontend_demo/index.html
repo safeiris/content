@@ -25,228 +25,263 @@
       </nav>
 
       <section class="tab-panel active" id="new-request" role="tabpanel">
-        <div class="request-layout">
-          <form id="brief-form" class="brief-form">
-            <div class="form-row">
-              <label for="pipe-select">Тематика</label>
-              <select id="pipe-select" required></select>
-            </div>
-            <div class="form-row">
-              <label for="topic-input">Тема</label>
-              <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
-            </div>
-            <div class="form-row">
-              <label for="title-input">Название текста <span class="optional">(опционально)</span></label>
-              <input id="title-input" type="text" placeholder="Для внутреннего использования" />
-            </div>
-            <div class="form-row">
-              <label for="audience-input">Целевая аудитория</label>
-              <input id="audience-input" type="text" placeholder="Например, 'молодые семьи с детьми'" />
-            </div>
-            <div class="form-row">
-              <label for="goal-input">Цель текста</label>
-              <input id="goal-input" type="text" value="SEO-статья" />
-            </div>
-            <div class="form-row">
-              <label for="tone-select">Тон</label>
-              <select id="tone-select">
-                <option value="экспертный">Экспертный</option>
-                <option value="дружелюбный">Дружелюбный</option>
-                <option value="строгий">Строгий</option>
-              </select>
-              <p class="field-hint">Тон влияет на рекомендации в промпте и итоговом тексте.</p>
-            </div>
-            <div class="form-row">
-              <label for="style-profile-select">Стиль портала</label>
-              <select id="style-profile-select">
-                <option value="sravni.ru" selected>sravni.ru — экспертно, структурировано</option>
-                <option value="tinkoff.ru">tinkoff.ru — дружелюбно и с примерами</option>
-                <option value="banki.ru">banki.ru — аналитично и по делу</option>
-                <option value="off">off — без стилевого профиля</option>
-              </select>
-              <p class="field-hint" id="style-profile-hint">
-                Экспертный, структурный стиль: введение → основная часть → FAQ → вывод.
-              </p>
-            </div>
-            <div class="form-row">
-              <label class="field-label" for="min-chars-input">Объём текста (без пробелов)</label>
-              <div class="length-range">
-                <input id="min-chars-input" type="number" min="500" value="3500" />
-                <span class="range-separator">—</span>
-                <input id="max-chars-input" type="number" min="600" value="6000" />
-              </div>
-              <p class="field-hint">По умолчанию 3500–6000 символов, диапазон можно изменить.</p>
-            </div>
-            <div class="form-row">
-              <label for="structure-preset">Пресет структуры</label>
-              <select id="structure-preset">
-                <option value="custom">Своя структура</option>
-                <option value="seo">SEO-гайд</option>
-                <option value="faq">FAQ-материал</option>
-                <option value="overview">Обзор/рецензия</option>
-              </select>
-            </div>
-            <div class="form-row">
-              <label for="structure-input">Структура материала</label>
-              <textarea id="structure-input" rows="4" placeholder="Каждый пункт с новой строки"></textarea>
-            </div>
-            <div class="form-row">
-              <label for="keywords-input">Ключевые слова</label>
-              <textarea id="keywords-input" rows="4" placeholder="Каждый запрос с новой строки"></textarea>
-              <p class="field-hint">Можно оставить пустым — ключевые слова не будут добавлены.</p>
-              <div class="keyword-mode-group" role="group" aria-labelledby="keyword-mode-label">
-                <span id="keyword-mode-label" class="field-label-inline">Режим вхождений</span>
-                <label class="radio-option">
-                  <input type="radio" name="keywords-mode" value="soft" checked />
-                  <span>Мягкий — используем естественные формы и синонимы.</span>
-                </label>
-                <label class="radio-option">
-                  <input type="radio" name="keywords-mode" value="strict" />
-                  <span>Строгий — только точные вхождения.</span>
-                </label>
-                <label class="radio-option">
-                  <input type="radio" name="keywords-mode" value="anti_spam" />
-                  <span>Запрет переспама — не чаще 2 повторов на 1000 символов.</span>
-                </label>
-              </div>
-            </div>
-            <div class="form-row">
-              <label>Источники (референсы)</label>
-              <div class="sources-control">
-                <div id="sources-list" class="sources-list"></div>
-                <button type="button" class="ghost small" id="add-source-btn">Добавить источник</button>
-              </div>
-              <p class="field-hint">Используйте ссылки, ID или названия источников. Добавьте несколько строк при необходимости.</p>
-            </div>
-            <details id="advanced-settings" class="advanced-settings">
-              <summary>
-                <span class="advanced-summary-text">Расширенные настройки</span>
-                <span class="advanced-summary-icon" aria-hidden="true"></span>
-              </summary>
-              <div class="advanced-content">
-                <div class="advanced-options">
-                  <label class="checkbox-with-hint">
-                    <input type="checkbox" id="include-faq" checked />
-                    <span>
-                      <span class="checkbox-title">FAQ</span>
-                      <span class="checkbox-hint">Добавить блок часто задаваемых вопросов.</span>
-                    </span>
-                  </label>
-                  <div class="inline-field" id="faq-count-wrapper">
-                    <label for="faq-count-input">Количество вопросов</label>
-                    <input type="number" id="faq-count-input" min="1" max="20" value="5" />
+        <div class="request-shell">
+          <div class="request-grid">
+            <form id="brief-form" class="brief-form">
+              <section class="form-card">
+                <header class="form-card__header">
+                  <h2 class="form-card__title">Основные параметры</h2>
+                </header>
+                <div class="form-card__body">
+                  <div class="form-row">
+                    <label for="pipe-select">Тематика</label>
+                    <select id="pipe-select" required></select>
                   </div>
-                  <label class="checkbox-with-hint">
-                    <input type="checkbox" id="include-jsonld" checked />
-                    <span>
-                      <span class="checkbox-title">JSON-LD</span>
-                      <span class="checkbox-hint">Добавить SEO-разметку для поисковиков.</span>
-                    </span>
-                  </label>
-                </div>
-                <div class="advanced-section">
-                  <h4 class="advanced-section-title">Параметры модели</h4>
-                  <div class="advanced-grid">
-                    <div class="form-row">
-                      <label class="field-label" for="model-input">
-                        <span>Модель</span>
-                      </label>
-                      <select id="model-input">
-                        <option value="gpt-5" selected>GPT-5 — OpenAI (по умолчанию)</option>
-                        <option value="gpt-4o">GPT-4o — OpenAI</option>
-                        <option value="gpt-4o-mini">GPT-4o-mini — OpenAI</option>
-                      </select>
-                      <p class="field-hint">Выберите модель для генерации.</p>
-                    </div>
-                    <div class="form-row">
-                      <label class="field-label" for="temperature-input">
-                        <span>Temperature</span>
-                        <span
-                          class="info-icon"
-                          tabindex="0"
-                          role="img"
-                          aria-label="0.2–0.5 — стабильнее"
-                          title="0.2–0.5 — стабильнее"
-                          >🛈</span
-                        >
-                      </label>
-                      <input id="temperature-input" type="number" min="0" max="1" step="0.1" value="0.3" />
-                      <p class="field-hint" data-role="temperature-hint" hidden>
-                        Для GPT-5 температура фиксирована и не настраивается.
-                      </p>
-                    </div>
-                    <div class="form-row">
-                      <label class="field-label" for="max-tokens-input">
-                        <span>Max tokens</span>
-                        <span
-                          class="info-icon"
-                          tabindex="0"
-                          role="img"
-                          aria-label="Ограничивает длину ответа"
-                          title="Ограничивает длину ответа"
-                          >🛈</span
-                        >
-                      </label>
-                      <input id="max-tokens-input" type="number" min="1" value="1400" />
-                    </div>
-                    <div class="form-row">
-                      <label class="field-label" for="k-input">
-                        <span>Контекст (k)</span>
-                        <span
-                          class="info-icon"
-                          tabindex="0"
-                          role="img"
-                          aria-label="2–4 обычно оптимально"
-                          title="2–4 обычно оптимально"
-                          >🛈</span
-                        >
-                      </label>
-                      <input id="k-input" type="number" min="0" max="6" value="0" />
-                    </div>
-                    <div class="form-row">
-                      <label class="field-label" for="context-source-select">Источник контекста</label>
-                      <select id="context-source-select">
-                        <option value="index.json" selected>index.json (по умолчанию)</option>
-                        <option value="custom">custom</option>
-                        <option value="off">off</option>
-                      </select>
-                      <p class="field-hint">Выберите источник примеров для CONTEXT или отключите его.</p>
-                    </div>
+                  <div class="form-row">
+                    <label for="topic-input">Тема</label>
+                    <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
+                  </div>
+                  <div class="form-row">
+                    <label for="title-input">Название текста <span class="optional">(опционально)</span></label>
+                    <input id="title-input" type="text" placeholder="Для внутреннего использования" />
+                  </div>
+                  <div class="form-row">
+                    <label for="audience-input">Целевая аудитория</label>
+                    <input id="audience-input" type="text" placeholder="Например, 'молодые семьи с детьми'" />
+                  </div>
+                  <div class="form-row">
+                    <label for="goal-input">Цель текста</label>
+                    <input id="goal-input" type="text" value="SEO-статья" />
+                  </div>
+                  <div class="form-row">
+                    <label for="tone-select">Тон</label>
+                    <select id="tone-select">
+                      <option value="экспертный">Экспертный</option>
+                      <option value="дружелюбный">Дружелюбный</option>
+                      <option value="строгий">Строгий</option>
+                    </select>
+                    <p class="field-hint">Тон влияет на рекомендации в промпте и итоговом тексте.</p>
+                  </div>
+                  <div class="form-row">
+                    <label for="style-profile-select">Стиль портала</label>
+                    <select id="style-profile-select">
+                      <option value="sravni.ru" selected>sravni.ru — экспертно, структурировано</option>
+                      <option value="tinkoff.ru">tinkoff.ru — дружелюбно и с примерами</option>
+                      <option value="banki.ru">banki.ru — аналитично и по делу</option>
+                      <option value="off">off — без стилевого профиля</option>
+                    </select>
+                    <p class="field-hint" id="style-profile-hint">
+                      Экспертный, структурный стиль: введение → основная часть → FAQ → вывод.
+                    </p>
                   </div>
                 </div>
-                <div class="advanced-section" data-section="support">
-                  <h4 class="advanced-section-title">Техподдержка</h4>
-                  <div class="advanced-actions">
-                    <button type="button" class="ghost" id="reindex-btn">Reindex theme</button>
-                    <button type="button" class="ghost" id="health-btn">Health check</button>
+              </section>
+
+              <section class="form-card">
+                <header class="form-card__header">
+                  <h2 class="form-card__title">Объём и структура</h2>
+                </header>
+                <div class="form-card__body">
+                  <div class="form-row">
+                    <label class="field-label" for="min-chars-input">Объём текста (без пробелов)</label>
+                    <div class="length-range">
+                      <input id="min-chars-input" type="number" min="500" value="3500" />
+                      <span class="range-separator">—</span>
+                      <input id="max-chars-input" type="number" min="600" value="6000" />
+                    </div>
+                    <p class="field-hint">По умолчанию 3500–6000 символов, диапазон можно изменить.</p>
+                  </div>
+                  <div class="form-row">
+                    <label for="structure-preset">Пресет структуры</label>
+                    <select id="structure-preset">
+                      <option value="custom">Своя структура</option>
+                      <option value="seo">SEO-гайд</option>
+                      <option value="faq">FAQ-материал</option>
+                      <option value="overview">Обзор/рецензия</option>
+                    </select>
+                  </div>
+                  <div class="form-row">
+                    <label for="structure-input">Структура материала</label>
+                    <textarea id="structure-input" rows="4" placeholder="Каждый пункт с новой строки"></textarea>
                   </div>
                 </div>
-              </div>
-            </details>
-            <div class="form-actions">
-              <button type="submit" class="primary">
-                <span class="btn-label">Сгенерировать</span>
-              </button>
-            </div>
-          </form>
-          <aside class="request-status">
-            <section>
-              <h3>Health</h3>
-              <div id="health-status" class="status-grid"></div>
-            </section>
-            <section>
-              <div class="section-header">
-                <h3>Reindex log</h3>
-                <button type="button" class="ghost small" id="clear-log">Очистить</button>
-              </div>
-              <div id="reindex-log" class="console-log">
-                <div class="log-empty">Пока без запусков.</div>
-              </div>
-            </section>
-          </aside>
+              </section>
+
+              <section class="form-card">
+                <header class="form-card__header">
+                  <h2 class="form-card__title">Ключевые слова</h2>
+                </header>
+                <div class="form-card__body">
+                  <div class="form-row">
+                    <label for="keywords-input">Ключевые слова</label>
+                    <textarea id="keywords-input" rows="4" placeholder="Каждый запрос с новой строки"></textarea>
+                    <p class="field-hint">Можно оставить пустым — ключевые слова не будут добавлены.</p>
+                  </div>
+                  <div class="keyword-mode-group" role="group" aria-labelledby="keyword-mode-label">
+                    <span id="keyword-mode-label" class="field-label-inline">Режим вхождений</span>
+                    <label class="radio-option">
+                      <input type="radio" name="keywords-mode" value="soft" checked />
+                      <span>Мягкий — используем естественные формы и синонимы.</span>
+                    </label>
+                    <label class="radio-option">
+                      <input type="radio" name="keywords-mode" value="strict" />
+                      <span>Строгий — только точные вхождения.</span>
+                    </label>
+                    <label class="radio-option">
+                      <input type="radio" name="keywords-mode" value="anti_spam" />
+                      <span>Запрет переспама — не чаще 2 повторов на 1000 символов.</span>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <section class="form-card">
+                <header class="form-card__header">
+                  <h2 class="form-card__title">Источники (референсы)</h2>
+                </header>
+                <div class="form-card__body">
+                  <div class="sources-control">
+                    <div id="sources-list" class="sources-list"></div>
+                    <button type="button" class="ghost small" id="add-source-btn">Добавить источник</button>
+                  </div>
+                  <p class="field-hint">Используйте ссылки, ID или названия источников. Добавьте несколько строк при необходимости.</p>
+                </div>
+              </section>
+
+              <section class="form-card">
+                <details id="advanced-settings" class="advanced-settings">
+                  <summary>
+                    <span class="advanced-summary-text">Расширенные настройки</span>
+                    <span class="advanced-summary-icon" aria-hidden="true"></span>
+                  </summary>
+                  <div class="advanced-content">
+                    <div class="advanced-options">
+                      <label class="checkbox-with-hint">
+                        <input type="checkbox" id="include-faq" checked />
+                        <span>
+                          <span class="checkbox-title">FAQ</span>
+                          <span class="checkbox-hint">Добавить блок часто задаваемых вопросов.</span>
+                        </span>
+                      </label>
+                      <div class="inline-field" id="faq-count-wrapper">
+                        <label for="faq-count-input">Количество вопросов</label>
+                        <input type="number" id="faq-count-input" min="1" max="20" value="5" />
+                      </div>
+                      <label class="checkbox-with-hint">
+                        <input type="checkbox" id="include-jsonld" checked />
+                        <span>
+                          <span class="checkbox-title">JSON-LD</span>
+                          <span class="checkbox-hint">Добавить SEO-разметку для поисковиков.</span>
+                        </span>
+                      </label>
+                    </div>
+                    <div class="advanced-section">
+                      <h4 class="advanced-section-title">Параметры модели</h4>
+                      <div class="advanced-grid">
+                        <div class="form-row">
+                          <label class="field-label" for="model-input">
+                            <span>Модель</span>
+                          </label>
+                          <select id="model-input">
+                            <option value="gpt-5" selected>GPT-5 — OpenAI (по умолчанию)</option>
+                            <option value="gpt-4o">GPT-4o — OpenAI</option>
+                            <option value="gpt-4o-mini">GPT-4o-mini — OpenAI</option>
+                          </select>
+                          <p class="field-hint">Выберите модель для генерации.</p>
+                        </div>
+                        <div class="form-row">
+                          <label class="field-label" for="temperature-input">
+                            <span>Temperature</span>
+                            <span
+                              class="info-icon"
+                              tabindex="0"
+                              role="img"
+                              aria-label="0.2–0.5 — стабильнее"
+                              title="0.2–0.5 — стабильнее"
+                              >🛈</span
+                            >
+                          </label>
+                          <input id="temperature-input" type="number" min="0" max="1" step="0.1" value="0.3" />
+                          <p class="field-hint" data-role="temperature-hint" hidden>
+                            Для GPT-5 температура фиксирована и не настраивается.
+                          </p>
+                        </div>
+                        <div class="form-row">
+                          <label class="field-label" for="max-tokens-input">
+                            <span>Max tokens</span>
+                            <span
+                              class="info-icon"
+                              tabindex="0"
+                              role="img"
+                              aria-label="Ограничивает длину ответа"
+                              title="Ограничивает длину ответа"
+                              >🛈</span
+                            >
+                          </label>
+                          <input id="max-tokens-input" type="number" min="1" value="1400" />
+                        </div>
+                        <div class="form-row">
+                          <label class="field-label" for="k-input">
+                            <span>Контекст (k)</span>
+                            <span
+                              class="info-icon"
+                              tabindex="0"
+                              role="img"
+                              aria-label="2–4 обычно оптимально"
+                              title="2–4 обычно оптимально"
+                              >🛈</span
+                            >
+                          </label>
+                          <input id="k-input" type="number" min="0" max="6" value="0" />
+                        </div>
+                        <div class="form-row">
+                          <label class="field-label" for="context-source-select">Источник контекста</label>
+                          <select id="context-source-select">
+                            <option value="index.json" selected>index.json (по умолчанию)</option>
+                            <option value="custom">custom</option>
+                            <option value="off">off</option>
+                          </select>
+                          <p class="field-hint">Выберите источник примеров для CONTEXT или отключите его.</p>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="advanced-section" data-section="support">
+                      <h4 class="advanced-section-title">Техподдержка</h4>
+                      <div class="advanced-actions">
+                        <button type="button" class="ghost" id="reindex-btn">Reindex theme</button>
+                        <button type="button" class="ghost" id="health-btn">Health check</button>
+                      </div>
+                    </div>
+                  </div>
+                </details>
+              </section>
+
+              <footer class="form-card form-card--actions">
+                <div class="form-actions">
+                  <button type="submit" class="primary">
+                    <span class="btn-label">Сгенерировать</span>
+                  </button>
+                </div>
+              </footer>
+            </form>
+            <aside class="status-panel">
+              <section class="status-card">
+                <h3>Health</h3>
+                <div id="health-status" class="status-grid"></div>
+              </section>
+              <section class="status-card">
+                <div class="section-header">
+                  <h3>Reindex log</h3>
+                  <button type="button" class="ghost small" id="clear-log">Очистить</button>
+                </div>
+                <div id="reindex-log" class="console-log">
+                  <div class="log-empty">Пока без запусков.</div>
+                </div>
+              </section>
+            </aside>
+          </div>
         </div>
       </section>
-
       <section class="tab-panel" id="materials" role="tabpanel">
         <div class="materials-toolbar">
           <div class="materials-toolbar__spacer"></div>
