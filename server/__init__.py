@@ -286,6 +286,10 @@ def create_app() -> Flask:
                 response_payload["style_profile_variant"] = metadata["style_profile_variant"]
         if isinstance(metadata, dict) and metadata.get("keywords_manual") is not None:
             response_payload["keywords_manual"] = metadata.get("keywords_manual")
+        if isinstance(metadata, dict):
+            response_payload["model_used"] = metadata.get("model_used")
+            response_payload["fallback_used"] = metadata.get("fallback_used")
+            response_payload["fallback_reason"] = metadata.get("fallback_reason")
 
         return jsonify(response_payload)
 
@@ -552,6 +556,7 @@ def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[
         "length_adjustment": None,
         "status": "dry-run",
         "fallback_used": None,
+        "fallback_reason": None,
     }
     return {
         "markdown": markdown,

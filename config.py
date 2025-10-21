@@ -10,6 +10,9 @@ OPENAI_API_KEY = (
     str(os.getenv("OPENAI_API_KEY", _DEFAULT_OPENAI_API_KEY)).strip() or _DEFAULT_OPENAI_API_KEY
 )
 
+_FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
+FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
+
 # Дефолтные настройки ядра
 DEFAULT_TONE = "экспертный, дружелюбный"
 DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "Вывод"]

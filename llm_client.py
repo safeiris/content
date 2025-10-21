@@ -14,12 +14,13 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from config import OPENAI_API_KEY
+from config import FORCE_MODEL, OPENAI_API_KEY
 
 
 DEFAULT_MODEL = "gpt-5"
 MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
+FALLBACK_MODEL = "gpt-4o"
 
 MODEL_PROVIDER_MAP = {
     "gpt-5": "openai",
@@ -44,6 +45,7 @@ class GenerationResult:
     model_used: str
     retry_used: bool
     fallback_used: Optional[str]
+    fallback_reason: Optional[str] = None
 
 
 class EmptyCompletionError(RuntimeError):
@@ -183,6 +185,51 @@ def _resolve_backoff_schedule(override: Optional[List[float]]) -> List[float]:
         if values:
             return values
     return BACKOFF_SCHEDULE
+
+
+def _check_model_availability(
+    http_client: httpx.Client,
+    *,
+    provider: str,
+    headers: Dict[str, str],
+    model_name: str,
+) -> bool:
+    """Return True if the requested model looks available for the current credentials."""
+
+    if provider != "openai":
+        return True
+
+    url = f"https://api.openai.com/v1/models/{model_name}"
+    try:
+        response = http_client.get(url, headers=headers)
+    except httpx.HTTPError as exc:  # pragma: no cover - network dependent
+        LOGGER.warning("model availability probe failed: %s", exc)
+        return True
+
+    if response.status_code == 200:
+        return True
+
+    if response.status_code in {401, 403, 404}:
+        LOGGER.error(
+            "model %s is not available for current credentials (HTTP %s)",
+            model_name,
+            response.status_code,
+        )
+        return False
+
+    if response.status_code >= 500:
+        LOGGER.warning(
+            "model availability endpoint temporary failure (HTTP %s) — proceeding",
+            response.status_code,
+        )
+        return True
+
+    LOGGER.warning(
+        "unexpected status from model availability endpoint for %s: HTTP %s",
+        model_name,
+        response.status_code,
+    )
+    return False
 
 
 def _persist_raw_response(payload: Dict[str, object]) -> None:
@@ -388,10 +435,50 @@ def generate(
 
     retry_used = False
     fallback_used: Optional[str] = None
+    fallback_reason: Optional[str] = None
 
     try:
+        if is_gpt5_model:
+            available = _check_model_availability(
+                http_client,
+                provider=provider,
+                headers=headers,
+                model_name=model_name,
+            )
+            if not available:
+                error_message = "Model GPT-5 not available for this key/plan"
+                LOGGER.warning("primary model %s unavailable — considering fallback", model_name)
+                if FORCE_MODEL:
+                    raise RuntimeError(error_message)
+                fallback_used = FALLBACK_MODEL
+                fallback_reason = "model_unavailable"
+                LOGGER.warning(
+                    "switching to fallback model %s because %s",
+                    fallback_used,
+                    error_message,
+                )
+                try:
+                    text, _, _ = _call_model(fallback_used)
+                    return GenerationResult(
+                        text=text,
+                        model_used=fallback_used,
+                        retry_used=False,
+                        fallback_used=fallback_used,
+                        fallback_reason=fallback_reason,
+                    )
+                except EmptyCompletionError as fallback_error:
+                    _persist_raw_response(fallback_error.raw_response)
+                    _log_parse_chain(fallback_error.parse_flags, retry=0, fallback=fallback_used)
+                    raise
+
         text, _, _ = _call_model(model_name)
-        return GenerationResult(text=text, model_used=model_name, retry_used=False, fallback_used=None)
+        return GenerationResult(
+            text=text,
+            model_used=model_name,
+            retry_used=False,
+            fallback_used=None,
+            fallback_reason=None,
+        )
     except EmptyCompletionError as initial_error:
         _persist_raw_response(initial_error.raw_response)
         _log_parse_chain(initial_error.parse_flags, retry=0, fallback="none")
@@ -403,11 +490,23 @@ def generate(
         retry_used = True
         try:
             text, _, _ = _call_model(model_name)
-            return GenerationResult(text=text, model_used=model_name, retry_used=True, fallback_used=None)
+            return GenerationResult(
+                text=text,
+                model_used=model_name,
+                retry_used=True,
+                fallback_used=None,
+                fallback_reason=None,
+            )
         except EmptyCompletionError as retry_error:
             _persist_raw_response(retry_error.raw_response)
             _log_parse_chain(retry_error.parse_flags, retry=1, fallback="gpt-4o")
-            fallback_used = "gpt-4o"
+            fallback_used = FALLBACK_MODEL
+            fallback_reason = "empty_completion"
+            LOGGER.warning(
+                "switching to fallback model %s due to empty completion from %s",
+                fallback_used,
+                model_name,
+            )
             try:
                 text, _, _ = _call_model(fallback_used)
                 return GenerationResult(
@@ -415,6 +514,7 @@ def generate(
                     model_used=fallback_used,
                     retry_used=True,
                     fallback_used=fallback_used,
+                    fallback_reason=fallback_reason,
                 )
             except EmptyCompletionError as fallback_error:
                 _persist_raw_response(fallback_error.raw_response)

@@ -717,6 +717,8 @@ async function handleGenerate(event) {
     const characters = typeof metadataCharacters === "number" ? metadataCharacters : markdown.trim().length;
     const hasContent = characters > 0;
     state.currentResult = { markdown, meta, artifactPaths, characters, hasContent };
+    const fallbackModel = response?.fallback_used ?? meta.fallback_used;
+    const fallbackReason = response?.fallback_reason ?? meta.fallback_reason;
     draftView.innerHTML = markdownToHtml(markdown);
     resultTitle.textContent = payload.data.theme || "Результат генерации";
     const metaParts = [];
@@ -739,6 +741,14 @@ async function handleGenerate(event) {
       context_budget_tokens_limit: meta.context_budget_tokens_limit,
       k: payload.k,
     });
+    if (fallbackModel) {
+      const reasonText = describeFallbackNotice(fallbackReason);
+      showToast({
+        message: `Использована резервная модель (${fallbackModel}). ${reasonText}`,
+        type: "warn",
+        duration: 6000,
+      });
+    }
     enableDownloadButtons(artifactPaths);
     try {
       await loadArtifacts();
@@ -961,6 +971,18 @@ function updateResultBadges(meta) {
     badge.textContent = entry.text;
     resultBadges.append(badge);
   });
+}
+
+const FALLBACK_REASON_MESSAGES = {
+  model_unavailable: "Основная модель недоступна для текущего ключа или тарифа.",
+  empty_completion: "Основная модель вернула пустой ответ.",
+};
+
+function describeFallbackNotice(reason) {
+  if (!reason) {
+    return "Причина не указана.";
+  }
+  return FALLBACK_REASON_MESSAGES[reason] ?? `Причина: ${reason}`;
 }
 
 function badgeInfo(key, value, mapping, fallbackFormatter) {

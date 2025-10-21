@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
 from unittest.mock import patch
+import pytest
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -9,7 +10,7 @@ from llm_client import GenerationResult, generate
 
 
 class DummyResponse:
-    def __init__(self, payload=None):
+    def __init__(self, payload=None, *, status_code=200, text=""):
         if payload is None:
             payload = {
                 "choices": [
@@ -21,6 +22,8 @@ class DummyResponse:
                 ]
             }
         self._json = payload
+        self.status_code = status_code
+        self.text = text
 
     def raise_for_status(self):
         return None
@@ -30,10 +33,13 @@ class DummyResponse:
 
 
 class DummyClient:
-    def __init__(self, payloads=None):
+    def __init__(self, payloads=None, availability=None):
         self.last_request = None
+        self.last_probe = None
         self.payloads = payloads or []
+        self.availability = availability or []
         self.call_count = 0
+        self.probe_count = 0
 
     def post(self, url, headers=None, json=None):
         self.last_request = {
@@ -48,12 +54,29 @@ class DummyClient:
         self.call_count += 1
         return DummyResponse(payload)
 
+    def get(self, url, headers=None):
+        self.last_probe = {
+            "url": url,
+            "headers": headers,
+        }
+        status_code = 200
+        text = ""
+        if self.availability:
+            entry = self.availability[min(self.probe_count, len(self.availability) - 1)]
+            if isinstance(entry, dict):
+                status_code = entry.get("status", 200)
+                text = entry.get("text", "")
+            else:
+                status_code = int(entry)
+        self.probe_count += 1
+        return DummyResponse({"object": "model"}, status_code=status_code, text=text)
+
     def close(self):
         return None
 
 
-def _run_and_capture_request(model_name: str, *, payloads=None):
-    dummy_client = DummyClient(payloads=payloads)
+def _run_and_capture_request(model_name: str, *, payloads=None, availability=None):
+    dummy_client = DummyClient(payloads=payloads, availability=availability)
     with patch("llm_client.httpx.Client", return_value=dummy_client):
         result = generate(
             messages=[{"role": "user", "content": "ping"}],
@@ -162,3 +185,46 @@ def test_generate_falls_back_to_gpt4_when_gpt5_empty():
     assert result.fallback_used == "gpt-4o"
     assert result.retry_used is True
     assert result.text == "from fallback"
+    assert result.fallback_reason == "empty_completion"
+
+
+def test_generate_falls_back_when_gpt5_unavailable(monkeypatch):
+    monkeypatch.setattr("llm_client.FORCE_MODEL", False)
+    fallback_payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": "fallback ok",
+                }
+            }
+        ]
+    }
+    client = DummyClient(payloads=[fallback_payload], availability=[403])
+    with patch("llm_client.httpx.Client", return_value=client):
+        result = generate(
+            messages=[{"role": "user", "content": "ping"}],
+            model="gpt-5",
+            temperature=0.2,
+            max_tokens=42,
+        )
+
+    assert result.model_used == "gpt-4o"
+    assert result.fallback_used == "gpt-4o"
+    assert result.retry_used is False
+    assert result.text == "fallback ok"
+    assert result.fallback_reason == "model_unavailable"
+
+
+def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):
+    monkeypatch.setattr("llm_client.FORCE_MODEL", True)
+    client = DummyClient(payloads=[], availability=[403])
+    with patch("llm_client.httpx.Client", return_value=client):
+        with pytest.raises(RuntimeError) as excinfo:
+            generate(
+                messages=[{"role": "user", "content": "ping"}],
+                model="gpt-5",
+                temperature=0.1,
+                max_tokens=42,
+            )
+
+    assert "Model GPT-5 not available for this key/plan" in str(excinfo.value)

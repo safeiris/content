@@ -398,6 +398,7 @@ def _generate_variant(
     effective_model = llm_result.model_used
     retry_used = llm_result.retry_used
     fallback_used = llm_result.fallback_used
+    fallback_reason = llm_result.fallback_reason
     plagiarism_detected = False
     if generation_context.clip_texts and is_too_similar(article_text, generation_context.clip_texts):
         plagiarism_detected = True
@@ -420,6 +421,7 @@ def _generate_variant(
         article_text = llm_result.text
         effective_model = llm_result.model_used
         fallback_used = llm_result.fallback_used
+        fallback_reason = llm_result.fallback_reason
         retry_used = True
 
     truncation_retry_used = False
@@ -437,6 +439,7 @@ def _generate_variant(
         article_text = llm_result.text
         effective_model = llm_result.model_used
         fallback_used = llm_result.fallback_used
+        fallback_reason = llm_result.fallback_reason
         if not _is_truncated(article_text):
             break
         if truncation_retry_used:
@@ -454,6 +457,7 @@ def _generate_variant(
         article_text = llm_result.text
         effective_model = llm_result.model_used
         fallback_used = llm_result.fallback_used
+        fallback_reason = llm_result.fallback_reason
         retry_used = True
         # повторяем цикл с новым текстом после перегенерации
 
@@ -519,6 +523,7 @@ def _generate_variant(
         "user_prompt_preview": user_prompt,
         "keywords_manual": generation_context.keywords_manual,
         "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
     }
 
     if generation_context.style_profile_applied:
