@@ -2,6 +2,39 @@
 
 import os
 
+
+def _env_int(name: str, default: int) -> int:
+    value = str(os.getenv(name, "")).strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float_list(name: str, default: str) -> tuple[float, ...]:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        raw = default
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    delays = []
+    for part in parts:
+        try:
+            delays.append(float(part))
+        except ValueError:
+            continue
+    if not delays:
+        delays = [float(value) for value in default.split(",") if value]
+    return tuple(delays)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "off", "no"}
+
 # Тестовые ключи для учебной лаборатории
 _DEFAULT_OPENAI_API_KEY = (
     "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"
@@ -12,6 +45,16 @@ OPENAI_API_KEY = (
 
 _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
 FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
+
+# GPT-5 Responses tuning
+G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1400)
+G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2048)
+G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 3072)
+G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 4096)
+_DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
+G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
+G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
+G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
 
 # Дефолтные настройки ядра
 DEFAULT_TONE = "экспертный, дружелюбный"

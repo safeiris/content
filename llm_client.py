@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -13,7 +14,17 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from config import FORCE_MODEL, OPENAI_API_KEY
+from config import (
+    FORCE_MODEL,
+    OPENAI_API_KEY,
+    G5_ENABLE_PREVIOUS_ID_FETCH,
+    G5_MAX_OUTPUT_TOKENS_BASE,
+    G5_MAX_OUTPUT_TOKENS_MAX,
+    G5_MAX_OUTPUT_TOKENS_STEP1,
+    G5_MAX_OUTPUT_TOKENS_STEP2,
+    G5_POLL_INTERVALS,
+    G5_POLL_MAX_ATTEMPTS,
+)
 
 
 DEFAULT_MODEL = "gpt-5"
@@ -22,7 +33,13 @@ BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 FALLBACK_MODEL = "gpt-4o"
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens")
-RESPONSES_POLL_SCHEDULE = (0.3, 0.6, 1.0, 1.5, 1.5)
+RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
+RESPONSES_MAX_ESCALATIONS = 2
+MAX_RESPONSES_POLL_ATTEMPTS = (
+    G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
+)
+if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
+    MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
 
 MODEL_PROVIDER_MAP = {
@@ -72,6 +89,30 @@ class EmptyCompletionError(RuntimeError):
         self.parse_flags = parse_flags or {}
 
 
+def _format_diagnostics(details: Dict[str, object]) -> str:
+    components: List[str] = []
+    for key, value in details.items():
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, dict)):
+            try:
+                value_repr = json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                value_repr = str(value)
+        else:
+            value_repr = str(value)
+        components.append(f"{key}={value_repr}")
+    return ", ".join(components)
+
+
+def _build_force_model_error(reason: str, details: Dict[str, object]) -> RuntimeError:
+    diagnostics = _format_diagnostics(details)
+    message = f"FORCE_MODEL active: {reason}"
+    if diagnostics:
+        message += f"; diagnostics: {diagnostics}"
+    return RuntimeError(message)
+
+
 def build_responses_payload(
     model: str,
     system_text: Optional[str],
@@ -84,13 +125,15 @@ def build_responses_payload(
 
     system_block = (system_text or "").strip()
     if system_block:
-        sections.append(f"SYSTEM\n{system_block}")
+        sections.append(system_block)
 
     user_block = (user_text or "").strip()
     if user_block:
-        sections.append(f"USER\n{user_block}")
+        sections.append(user_block)
 
     joined_input = "\n\n".join(section for section in sections if section)
+    joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
+    joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
 
     payload: Dict[str, object] = {
         "model": str(model).strip(),
@@ -884,6 +927,34 @@ def generate(
         payload = build_responses_payload(target_model, system_text, user_text, max_tokens)
         sanitized_payload, _ = sanitize_payload_for_responses(payload)
 
+        def _coerce_positive_int(value: object, fallback: int) -> int:
+            try:
+                coerced = int(value)
+            except (TypeError, ValueError):
+                coerced = fallback
+            if coerced <= 0:
+                coerced = fallback
+            return min(coerced, G5_MAX_OUTPUT_TOKENS_MAX)
+
+        base_max_output_tokens = _coerce_positive_int(
+            sanitized_payload.get("max_output_tokens"),
+            _coerce_positive_int(max_tokens, G5_MAX_OUTPUT_TOKENS_BASE),
+        )
+        sanitized_payload["max_output_tokens"] = base_max_output_tokens
+
+        escalation_candidates = [
+            value
+            for value in (
+                G5_MAX_OUTPUT_TOKENS_STEP1,
+                G5_MAX_OUTPUT_TOKENS_STEP2,
+                G5_MAX_OUTPUT_TOKENS_MAX,
+            )
+            if value > base_max_output_tokens
+        ]
+        max_escalations_allowed = min(RESPONSES_MAX_ESCALATIONS, len(escalation_candidates))
+        escalation_index = 0
+        escalations_used = 0
+
         LOGGER.info("dispatch route=responses model=%s", target_model)
 
         def _log_payload_state(payload_snapshot: Dict[str, object]) -> None:
@@ -892,6 +963,10 @@ def generate(
             input_candidate = payload_snapshot.get("input", "")
             length = len(input_candidate) if isinstance(input_candidate, str) else 0
             LOGGER.info("responses input_len=%d", length)
+            LOGGER.info(
+                "responses max_output_tokens=%s",
+                payload_snapshot.get("max_output_tokens"),
+            )
 
         def _search_finish_reason(container: object) -> Optional[str]:
             if isinstance(container, dict):
@@ -1082,9 +1157,17 @@ def generate(
                     )
                     if status == "completed" or ready_without_trunc:
                         break
-                    if poll_attempt >= len(RESPONSES_POLL_SCHEDULE) or not response_id:
+                    if poll_attempt >= MAX_RESPONSES_POLL_ATTEMPTS or not response_id:
                         break
-                    delay = RESPONSES_POLL_SCHEDULE[poll_attempt]
+                    delay_index = min(
+                        poll_attempt,
+                        len(RESPONSES_POLL_SCHEDULE) - 1,
+                    ) if RESPONSES_POLL_SCHEDULE else 0
+                    delay = (
+                        RESPONSES_POLL_SCHEDULE[delay_index]
+                        if RESPONSES_POLL_SCHEDULE
+                        else 0.5
+                    )
                     poll_attempt += 1
                     LOGGER.info(
                         "responses poll attempt=%d delay=%.3f id=%s",
@@ -1134,7 +1217,8 @@ def generate(
                     current_metadata.get("previous_response_id") if current_metadata else ""
                 )
                 if (
-                    previous_response_id
+                    G5_ENABLE_PREVIOUS_ID_FETCH
+                    and previous_response_id
                     and current_metadata.get("status") != "completed"
                     and not previous_fetch_done
                 ):
@@ -1185,11 +1269,56 @@ def generate(
                         best_record_no_trunc["segments"],
                     )
                 elif last_signals:
+                    signals_label = ",".join(last_signals)
                     LOGGER.warning(
                         "responses restart triggered signals=%s",
-                        ",".join(last_signals),
+                        signals_label,
                     )
-                    continue
+                    if selected_segments == 0:
+                        can_escalate = (
+                            escalation_index < max_escalations_allowed
+                            and escalation_index < len(escalation_candidates)
+                            and escalations_used < RESPONSES_MAX_ESCALATIONS
+                        )
+                        if can_escalate:
+                            current_max_value = _coerce_positive_int(
+                                current_payload.get("max_output_tokens"),
+                                base_max_output_tokens,
+                            )
+                            next_value = escalation_candidates[escalation_index]
+                            if next_value > current_max_value:
+                                LOGGER.info(
+                                    "escalate max_output_tokens: %s -> %s",
+                                    current_max_value,
+                                    next_value,
+                                )
+                                updated_payload = dict(current_payload)
+                                updated_payload["max_output_tokens"] = next_value
+                                current_payload, _ = sanitize_payload_for_responses(
+                                    updated_payload
+                                )
+                                base_payload = dict(current_payload)
+                                base_max_output_tokens = next_value
+                                escalation_index += 1
+                                escalations_used += 1
+                                retry_used = True
+                                continue
+                            LOGGER.info(
+                                "responses restart skipped reason=escalation_target_not_higher current=%s target=%s",
+                                current_max_value,
+                                next_value,
+                            )
+                        LOGGER.info(
+                            "responses restart skipped reason=max_output_tokens_exhausted segments=%d signals=%s",
+                            selected_segments,
+                            signals_label,
+                        )
+                    else:
+                        LOGGER.info(
+                            "responses restart skipped reason=segments_present segments=%d signals=%s",
+                            selected_segments,
+                            signals_label,
+                        )
                 else:
                     LOGGER.info(
                         "responses restart skipped reason=no_truncation_signals status=%s segments=%d",
@@ -1201,7 +1330,8 @@ def generate(
                     _store_responses_response_snapshot(record_to_use["data"])
 
                 text = record_to_use["text"]
-                parse_flags = record_to_use["parse_flags"]
+                parse_flags = dict(record_to_use["parse_flags"])
+                parse_flags.setdefault("metadata", record_to_use.get("metadata", {}))
                 schema_label = record_to_use["schema"]
 
                 if not text:
@@ -1375,17 +1505,50 @@ def generate(
                     model_name,
                     responses_empty.parse_flags.get("schema", "unknown"),
                 )
+                diagnostics: Dict[str, object] = {
+                    "reason": "empty_completion_gpt5_responses",
+                }
+                parse_flags = responses_empty.parse_flags or {}
+                diagnostics["schema"] = parse_flags.get("schema")
+                diagnostics["segments"] = parse_flags.get("segments")
+                metadata_block = parse_flags.get("metadata")
+                if isinstance(metadata_block, dict):
+                    diagnostics["status"] = metadata_block.get("status")
+                    diagnostics["incomplete_reason"] = metadata_block.get("incomplete_reason")
+                    diagnostics["usage_output_tokens"] = metadata_block.get("usage_output_tokens")
+                    diagnostics["finish_reason"] = metadata_block.get("finish_reason")
+                    diagnostics["previous_response_id"] = metadata_block.get("previous_response_id")
+                response_id = responses_empty.raw_response.get("id")
+                if isinstance(response_id, str) and response_id.strip():
+                    diagnostics["response_id"] = response_id.strip()
                 if FORCE_MODEL:
-                    raise RuntimeError(
-                        "Responses API вернул пустой ответ, а fallback отключён (FORCE_MODEL)"
-                    ) from responses_empty
+                    raise _build_force_model_error("responses_empty", diagnostics) from responses_empty
                 fallback_reason = "empty_completion_gpt5_responses"
             except Exception as responses_error:  # noqa: BLE001
                 LOGGER.warning("Responses API call failed: %s", responses_error)
                 if FORCE_MODEL:
-                    raise RuntimeError(
-                        "Responses API вернул ошибку, а fallback отключён (FORCE_MODEL)"
-                    ) from responses_error
+                    error_details: Dict[str, object] = {
+                        "reason": "api_error_gpt5_responses",
+                        "exception": str(responses_error),
+                    }
+                    if isinstance(responses_error, httpx.HTTPStatusError):
+                        status_code = (
+                            responses_error.response.status_code
+                            if responses_error.response is not None
+                            else None
+                        )
+                        error_details["status_code"] = status_code
+                        if responses_error.response is not None:
+                            try:
+                                payload_json = responses_error.response.json()
+                            except ValueError:
+                                payload_json = None
+                            if isinstance(payload_json, dict):
+                                error_block = payload_json.get("error")
+                                if isinstance(error_block, dict):
+                                    error_details["error_type"] = error_block.get("type")
+                                    error_details["error_message"] = error_block.get("message")
+                    raise _build_force_model_error("responses_error", error_details) from responses_error
                 fallback_reason = "api_error_gpt5_responses"
             fallback_used = FALLBACK_MODEL
             LOGGER.warning(

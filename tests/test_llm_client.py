@@ -155,7 +155,7 @@ def test_generate_uses_responses_payload_for_gpt5():
     assert "temperature" not in payload
     assert "messages" not in payload
     assert payload["model"] == "gpt-5-preview"
-    assert payload["input"].startswith("USER\n")
+    assert payload["input"] == "ping"
     assert set(payload.keys()) == {"input", "max_output_tokens", "model"}
     assert request_payload["url"].endswith("/responses")
 
@@ -175,7 +175,8 @@ def test_generate_logs_about_temperature_for_gpt5():
         "responses payload_keys=%s",
         ["input", "max_output_tokens", "model"],
     )
-    mock_logger.info.assert_any_call("responses input_len=%d", 9)
+    mock_logger.info.assert_any_call("responses input_len=%d", 4)
+    mock_logger.info.assert_any_call("responses max_output_tokens=%s", 42)
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
 
 
@@ -237,7 +238,7 @@ def test_generate_sends_minimal_payload_for_gpt5():
     assert payload["model"] == "gpt-5-turbo"
     assert "modalities" not in payload
     assert payload["max_output_tokens"] == 42
-    assert payload["input"].startswith("USER\n")
+    assert payload["input"] == "ping"
     assert set(payload.keys()) == {
         "model",
         "input",
@@ -396,6 +397,43 @@ def test_generate_falls_back_when_gpt5_unavailable(monkeypatch):
     assert result.retry_used is False
     assert result.text == "fallback ok"
     assert result.fallback_reason == "model_unavailable"
+
+
+def test_generate_escalates_max_tokens_when_truncated():
+    initial_payload = {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": ""},
+                ]
+            }
+        ],
+    }
+    final_payload = {
+        "status": "completed",
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "expanded"},
+                ]
+            }
+        ],
+    }
+    client = DummyClient(payloads=[initial_payload, final_payload])
+    with patch("llm_client.httpx.Client", return_value=client):
+        result = generate(
+            messages=[{"role": "user", "content": "ping"}],
+            model="gpt-5",
+            temperature=0.1,
+        )
+
+    assert isinstance(result, GenerationResult)
+    assert result.text == "expanded"
+    assert result.retry_used is True
+    assert client.call_count == 2
+    assert client.requests[1]["json"]["max_output_tokens"] == 2048
 
 
 def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):
