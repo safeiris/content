@@ -404,6 +404,8 @@ def _generate_variant(
     retry_used = llm_result.retry_used
     fallback_used = llm_result.fallback_used
     fallback_reason = llm_result.fallback_reason
+    api_route = llm_result.api_route
+    response_schema = llm_result.schema
     plagiarism_detected = False
     if generation_context.clip_texts and is_too_similar(article_text, generation_context.clip_texts):
         plagiarism_detected = True
@@ -428,6 +430,8 @@ def _generate_variant(
         fallback_used = llm_result.fallback_used
         fallback_reason = llm_result.fallback_reason
         retry_used = True
+        api_route = llm_result.api_route
+        response_schema = llm_result.schema
 
     truncation_retry_used = False
     while True:
@@ -445,6 +449,8 @@ def _generate_variant(
         effective_model = llm_result.model_used
         fallback_used = llm_result.fallback_used
         fallback_reason = llm_result.fallback_reason
+        api_route = llm_result.api_route
+        response_schema = llm_result.schema
         if not _is_truncated(article_text):
             break
         if truncation_retry_used:
@@ -464,6 +470,8 @@ def _generate_variant(
         fallback_used = llm_result.fallback_used
         fallback_reason = llm_result.fallback_reason
         retry_used = True
+        api_route = llm_result.api_route
+        response_schema = llm_result.schema
         # повторяем цикл с новым текстом после перегенерации
 
     retry_used = retry_used or truncation_retry_used or llm_result.retry_used
@@ -518,6 +526,8 @@ def _generate_variant(
         "mode": mode,
         "model_used": effective_model,
         "temperature_used": used_temperature,
+        "api_route": api_route,
+        "response_schema": response_schema,
         "max_tokens_used": max_tokens,
         "default_cta_used": default_cta_used,
         "truncation_retry_used": truncation_retry_used,

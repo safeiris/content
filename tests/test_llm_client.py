@@ -35,6 +35,7 @@ class DummyResponse:
 class DummyClient:
     def __init__(self, payloads=None, availability=None):
         self.last_request = None
+        self.requests = []
         self.last_probe = None
         self.payloads = payloads or []
         self.availability = availability or []
@@ -42,11 +43,13 @@ class DummyClient:
         self.probe_count = 0
 
     def post(self, url, headers=None, json=None):
-        self.last_request = {
+        request = {
             "url": url,
             "headers": headers,
             "json": json,
         }
+        self.last_request = request
+        self.requests.append(request)
         payload = None
         if self.payloads:
             index = min(self.call_count, len(self.payloads) - 1)
@@ -91,23 +94,38 @@ def test_generate_uses_max_tokens_for_non_gpt5():
     result, request_payload = _run_and_capture_request("gpt-4o")
     assert isinstance(result, GenerationResult)
     assert result.text == "ok"
+    assert result.api_route == "chat"
     assert request_payload["json"]["max_tokens"] == 42
     assert "max_completion_tokens" not in request_payload["json"]
     assert request_payload["json"]["temperature"] == 0
+    assert "tool_choice" not in request_payload["json"]
+    assert "modalities" not in request_payload["json"]
+    assert "response_format" not in request_payload["json"]
+    assert request_payload["url"].endswith("/chat/completions")
 
 
-def test_generate_uses_max_completion_tokens_for_gpt5():
-    result, request_payload = _run_and_capture_request("gpt-5-preview")
-    assert isinstance(result, GenerationResult)
-    assert request_payload["json"]["max_completion_tokens"] == 42
-    assert "max_tokens" not in request_payload["json"]
-    assert "temperature" not in request_payload["json"]
-    assert set(request_payload["json"].keys()) == {
-        "model",
-        "messages",
-        "max_completion_tokens",
-        "tool_choice",
+def test_generate_uses_responses_payload_for_gpt5():
+    responses_payload = {
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "ok"},
+                ]
+            }
+        ]
     }
+    result, request_payload = _run_and_capture_request("gpt-5-preview", payloads=[responses_payload])
+    assert isinstance(result, GenerationResult)
+    assert result.api_route == "responses"
+    payload = request_payload["json"]
+    assert payload["max_output_tokens"] == 42
+    assert payload["modalities"] == ["text"]
+    assert payload["response_format"] == {"type": "text"}
+    assert "temperature" not in payload
+    assert "messages" not in payload
+    assert payload["model"] == "gpt-5-preview"
+    assert "USER:" in payload["input"]
+    assert request_payload["url"].endswith("/responses")
 
 
 def test_generate_logs_about_temperature_for_gpt5():
@@ -120,27 +138,36 @@ def test_generate_logs_about_temperature_for_gpt5():
             max_tokens=42,
         )
 
-    summary = {
-        "model": "gpt-5-super",
-        "messages": "<1 messages>",
-        "max_completion_tokens": 42,
-        "tool_choice": "none",
-    }
-    mock_logger.info.assert_any_call("openai payload blueprint: %s", summary)
+    mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
     mock_logger.info.assert_any_call(
-        "GPT-5 Chat Completions: skipping response_format/modalities (unsupported)"
+        "Responses payload configured with modalities=['text'] and response_format='text'"
     )
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
 
 
 def test_generate_sends_minimal_payload_for_gpt5():
-    _, request_payload = _run_and_capture_request("gpt-5-turbo")
+    responses_payload = {
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "ok"},
+                ]
+            }
+        ]
+    }
+    _, request_payload = _run_and_capture_request("gpt-5-turbo", payloads=[responses_payload])
     payload = request_payload["json"]
-    assert payload == {
-        "model": "gpt-5-turbo",
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_completion_tokens": 42,
-        "tool_choice": "none",
+    assert payload["model"] == "gpt-5-turbo"
+    assert payload["modalities"] == ["text"]
+    assert payload["response_format"] == {"type": "text"}
+    assert payload["max_output_tokens"] == 42
+    assert payload["input"].strip().startswith("USER:")
+    assert set(payload.keys()) == {
+        "model",
+        "input",
+        "modalities",
+        "response_format",
+        "max_output_tokens",
     }
 
 
@@ -165,11 +192,11 @@ def test_generate_collects_text_from_content_parts():
 
 def test_generate_falls_back_to_gpt4_when_gpt5_empty():
     empty_payload = {
-        "choices": [
+        "output": [
             {
-                "message": {
-                    "content": "   ",
-                }
+                "content": [
+                    {"type": "text", "text": "   "},
+                ]
             }
         ]
     }
@@ -183,7 +210,7 @@ def test_generate_falls_back_to_gpt4_when_gpt5_empty():
         ]
     }
     client = DummyClient(payloads=[empty_payload, fallback_payload])
-    with patch("llm_client.httpx.Client", return_value=client), patch("llm_client.random.uniform", return_value=0.0), patch("llm_client.time.sleep", lambda _seconds: None):
+    with patch("llm_client.httpx.Client", return_value=client):
         result = generate(
             messages=[{"role": "user", "content": "ping"}],
             model="gpt-5-large",
@@ -195,7 +222,8 @@ def test_generate_falls_back_to_gpt4_when_gpt5_empty():
     assert result.fallback_used == "gpt-4o"
     assert result.retry_used is False
     assert result.text == "from fallback"
-    assert result.fallback_reason == "empty_completion_gpt5"
+    assert result.fallback_reason == "empty_completion_gpt5_responses"
+    assert result.api_route == "chat"
 
 
 def test_generate_falls_back_when_gpt5_unavailable(monkeypatch):

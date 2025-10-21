@@ -290,6 +290,7 @@ def create_app() -> Flask:
             response_payload["model_used"] = metadata.get("model_used")
             response_payload["fallback_used"] = metadata.get("fallback_used")
             response_payload["fallback_reason"] = metadata.get("fallback_reason")
+            response_payload["api_route"] = metadata.get("api_route")
 
         return jsonify(response_payload)
 

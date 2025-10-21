@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import random
 import sys
 import time
 from dataclasses import dataclass
@@ -48,6 +47,8 @@ class GenerationResult:
     retry_used: bool
     fallback_used: Optional[str]
     fallback_reason: Optional[str] = None
+    api_route: str = "chat"
+    schema: str = "none"
 
 
 class EmptyCompletionError(RuntimeError):
@@ -462,27 +463,6 @@ def _log_parse_chain(parse_flags: Dict[str, object], *, retry: int, fallback: st
     )
 
 
-def _should_retry_empty_gpt5(parse_flags: Dict[str, object]) -> bool:
-    schema = str(parse_flags.get("schema", ""))
-    if not schema:
-        return True
-    for marker in (":none", "len=0", "dict(empty)"):
-        if marker in schema:
-            return False
-    return True
-
-
-def _should_switch_to_responses(parse_flags: Dict[str, object]) -> bool:
-    schema = str(parse_flags.get("schema", "")).lower()
-    if not schema:
-        return False
-    if "choice.content:none" in schema:
-        return True
-    if "message.content:none" in schema:
-        return True
-    return False
-
-
 def _should_retry(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
@@ -588,7 +568,7 @@ def generate(
     max_tokens: int = 1400,
     timeout_s: int = 60,
     backoff_schedule: Optional[List[float]] = None,
-    ) -> GenerationResult:
+) -> GenerationResult:
     """Call the configured LLM and return a structured generation result."""
 
     if not messages:
@@ -628,7 +608,7 @@ def generate(
 
     def _messages_for_model(target_model: str) -> List[Dict[str, object]]:
         nonlocal gpt5_messages_cache
-        if "gpt-5" in target_model.lower():
+        if target_model.lower().startswith("gpt-5"):
             if gpt5_messages_cache is None:
                 gpt5_messages_cache = _augment_gpt5_messages(messages)
             return gpt5_messages_cache
@@ -644,31 +624,22 @@ def generate(
             segments.append(f"{role.upper()}:\n{content}")
         return "\n\n".join(segments)
 
-    def _prepare_payload(target_model: str) -> Dict[str, object]:
-        lower = target_model.lower()
+    def _prepare_chat_payload(target_model: str) -> Dict[str, object]:
         payload_messages = _messages_for_model(target_model)
         payload: Dict[str, object] = {
             "model": target_model,
             "messages": payload_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
         }
-        if "gpt-5" in lower:
-            payload["max_completion_tokens"] = max_tokens
-            payload["tool_choice"] = "none"
-            LOGGER.info("GPT-5 Chat Completions: tool_choice=none")
-            LOGGER.info(
-                "GPT-5 Chat Completions: skipping response_format/modalities (unsupported)"
-            )
-        else:
-            payload["max_tokens"] = max_tokens
-            payload["temperature"] = temperature
+        if "tools" not in payload:
+            LOGGER.info("chat payload: tool_choice omitted (no tools)")
         LOGGER.info("openai payload blueprint: %s", _summarize_payload(payload))
         return payload
 
-    def _call_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
-        lower_target = target_model.lower()
-        payload = _prepare_payload(target_model)
-        if "gpt-5" in lower_target:
-            LOGGER.info("dispatching request to GPT-5 model %s", target_model)
+    def _call_chat_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
+        payload = _prepare_chat_payload(target_model)
+        LOGGER.info("dispatch route=chat model=%s", target_model)
         data = _make_request(
             http_client,
             api_url=api_url,
@@ -677,8 +648,6 @@ def generate(
             schedule=schedule,
         )
         text, parse_flags, schema_label = _extract_response_text(data)
-        if "gpt-5" in lower_target:
-            LOGGER.info("gpt-5 response schema=%s", schema_label)
         if not text:
             LOGGER.warning("Пустой ответ модели %s (schema=%s)", target_model, schema_label)
             raise EmptyCompletionError(
@@ -693,14 +662,19 @@ def generate(
         input_text = _flatten_messages_for_responses(payload_messages)
         payload = {
             "model": target_model,
+            "input": input_text,
             "modalities": ["text"],
             "response_format": {"type": "text"},
-            "input": input_text,
+            "max_output_tokens": max_tokens,
         }
+        LOGGER.info("dispatch route=responses model=%s", target_model)
         LOGGER.info(
-            "dispatching request to GPT-5 Responses API with modalities=text and response_format=text"
+            "Responses payload configured with modalities=['text'] and response_format='text'"
         )
-        LOGGER.debug("responses payload preview: %s", {"model": target_model, "input_preview": input_text[:120]})
+        LOGGER.debug(
+            "responses payload preview: %s",
+            {"model": target_model, "input_preview": input_text[:120]},
+        )
         data = _make_request(
             http_client,
             api_url=RESPONSES_API_URL,
@@ -723,7 +697,7 @@ def generate(
         return text, parse_flags, data, schema_label
 
     lower_model = model_name.lower()
-    is_gpt5_model = "gpt-5" in lower_model
+    is_gpt5_model = lower_model.startswith("gpt-5")
     if is_gpt5_model:
         LOGGER.info("temperature is ignored for GPT-5; using default")
 
@@ -754,59 +728,38 @@ def generate(
                     error_message,
                 )
                 try:
-                    text, _, _, _ = _call_model(fallback_used)
+                    text, parse_flags_fallback, _, schema_fallback = _call_chat_model(
+                        fallback_used
+                    )
+                    schema_category = _categorize_schema(parse_flags_fallback)
+                    LOGGER.info(
+                        "completion schema category=%s (schema=%s, route=chat)",
+                        schema_category,
+                        schema_fallback,
+                    )
                     return GenerationResult(
                         text=text,
                         model_used=fallback_used,
                         retry_used=False,
                         fallback_used=fallback_used,
                         fallback_reason=fallback_reason,
+                        api_route="chat",
+                        schema=schema_category,
                     )
                 except EmptyCompletionError as fallback_error:
                     _persist_raw_response(fallback_error.raw_response)
                     _log_parse_chain(fallback_error.parse_flags, retry=0, fallback=fallback_used)
                     raise
 
-        text, parse_flags_initial, _, schema_initial_call = _call_model(model_name)
-        LOGGER.info(
-            "completion schema category=%s (schema=%s)",
-            _categorize_schema(parse_flags_initial),
-            schema_initial_call,
-        )
-        return GenerationResult(
-            text=text,
-            model_used=model_name,
-            retry_used=False,
-            fallback_used=None,
-            fallback_reason=None,
-        )
-    except EmptyCompletionError as initial_error:
-        _persist_raw_response(initial_error.raw_response)
-        _log_parse_chain(initial_error.parse_flags, retry=0, fallback="none")
-        schema_initial = str(initial_error.parse_flags.get("schema", "unknown"))
-        LOGGER.warning(
-            "empty completion from %s (schema=%s, attempt=initial)",
-            model_name,
-            schema_initial,
-        )
-        if not is_gpt5_model:
-            raise
-
-        retry_used = False
-        error_for_fallback = initial_error
-        if _should_switch_to_responses(initial_error.parse_flags):
-            LOGGER.info(
-                "gpt-5 empty completion triggers Responses fallback (schema=%s)",
-                schema_initial,
-            )
             try:
-                text, parse_flags_responses, _, schema_responses = _call_responses_model(
+                text, parse_flags_initial, _, schema_initial_call = _call_responses_model(
                     model_name
                 )
+                schema_category = _categorize_schema(parse_flags_initial)
                 LOGGER.info(
-                    "Responses API resolved empty completion (schema=%s, category=%s)",
-                    schema_responses,
-                    _categorize_schema(parse_flags_responses),
+                    "completion schema category=%s (schema=%s, route=responses)",
+                    schema_category,
+                    schema_initial_call,
                 )
                 return GenerationResult(
                     text=text,
@@ -814,70 +767,41 @@ def generate(
                     retry_used=False,
                     fallback_used=None,
                     fallback_reason=None,
+                    api_route="responses",
+                    schema=schema_category,
                 )
-            except EmptyCompletionError as responses_error:
-                _persist_raw_response(responses_error.raw_response)
-                _log_parse_chain(
-                    responses_error.parse_flags,
-                    retry=0,
-                    fallback="responses",
-                )
+            except EmptyCompletionError as responses_empty:
+                _persist_raw_response(responses_empty.raw_response)
+                _log_parse_chain(responses_empty.parse_flags, retry=0, fallback="responses")
                 LOGGER.warning(
-                    "Responses API also returned empty payload (schema=%s)",
-                    responses_error.parse_flags.get("schema", "unknown"),
-                )
-                error_for_fallback = responses_error
-                fallback_reason = "empty_completion_gpt5"
-        elif _should_retry_empty_gpt5(initial_error.parse_flags):
-            jitter = random.uniform(0.2, 0.4)
-            time.sleep(jitter)
-            retry_used = True
-            try:
-                text, parse_flags_retry, _, schema_retry = _call_model(model_name)
-                LOGGER.info(
-                    "gpt-5 retry succeeded after empty completion (schema=%s, category=%s)",
-                    schema_retry,
-                    _categorize_schema(parse_flags_retry),
-                )
-                return GenerationResult(
-                    text=text,
-                    model_used=model_name,
-                    retry_used=True,
-                    fallback_used=None,
-                    fallback_reason=None,
-                )
-            except EmptyCompletionError as retry_error:
-                _persist_raw_response(retry_error.raw_response)
-                _log_parse_chain(retry_error.parse_flags, retry=1, fallback="gpt-4o")
-                LOGGER.warning(
-                    "empty completion from %s (schema=%s, attempt=retry)",
+                    "empty completion from Responses API %s (schema=%s)",
                     model_name,
-                    retry_error.parse_flags.get("schema", "unknown"),
+                    responses_empty.parse_flags.get("schema", "unknown"),
                 )
-                error_for_fallback = retry_error
-                fallback_reason = "empty_completion_gpt5"
-        else:
-            LOGGER.info(
-                "Skipping GPT-5 retry because schema indicates no textual payload (schema=%s)",
-                schema_initial,
+                if FORCE_MODEL:
+                    raise RuntimeError(
+                        "Responses API вернул пустой ответ, а fallback отключён (FORCE_MODEL)"
+                    ) from responses_empty
+                fallback_reason = "empty_completion_gpt5_responses"
+            except Exception as responses_error:  # noqa: BLE001
+                LOGGER.warning("Responses API call failed: %s", responses_error)
+                if FORCE_MODEL:
+                    raise RuntimeError(
+                        "Responses API вернул ошибку, а fallback отключён (FORCE_MODEL)"
+                    ) from responses_error
+                fallback_reason = "api_error_gpt5_responses"
+            fallback_used = FALLBACK_MODEL
+            LOGGER.warning(
+                "switching to fallback model %s (primary=%s, reason=%s)",
+                fallback_used,
+                model_name,
+                fallback_reason,
             )
-            _log_parse_chain(initial_error.parse_flags, retry=0, fallback="gpt-4o")
-            fallback_reason = "empty_completion_gpt5"
-
-        fallback_used = FALLBACK_MODEL
-        LOGGER.warning(
-            "switching to fallback model %s (primary=%s, reason=%s, schema=%s, retry=%s)",
-            fallback_used,
-            model_name,
-            fallback_reason,
-            error_for_fallback.parse_flags.get("schema", "unknown"),
-            "yes" if retry_used else "no",
-        )
-        try:
-            text, parse_flags_fallback, _, schema_fallback = _call_model(fallback_used)
+            text, parse_flags_fallback, _, schema_fallback = _call_chat_model(fallback_used)
+            schema_category = _categorize_schema(parse_flags_fallback)
             LOGGER.info(
-                "fallback completion schema category=%s (schema=%s)",
-                _categorize_schema(parse_flags_fallback),
+                "fallback completion schema category=%s (schema=%s, route=chat)",
+                schema_category,
                 schema_fallback,
             )
             return GenerationResult(
@@ -886,15 +810,26 @@ def generate(
                 retry_used=retry_used,
                 fallback_used=fallback_used,
                 fallback_reason=fallback_reason,
+                api_route="chat",
+                schema=schema_category,
             )
-        except EmptyCompletionError as fallback_error:
-            _persist_raw_response(fallback_error.raw_response)
-            _log_parse_chain(
-                fallback_error.parse_flags,
-                retry=1 if retry_used else 0,
-                fallback=fallback_used,
-            )
-            raise
+
+        text, parse_flags_initial, _, schema_initial_call = _call_chat_model(model_name)
+        schema_category = _categorize_schema(parse_flags_initial)
+        LOGGER.info(
+            "completion schema category=%s (schema=%s, route=chat)",
+            schema_category,
+            schema_initial_call,
+        )
+        return GenerationResult(
+            text=text,
+            model_used=model_name,
+            retry_used=False,
+            fallback_used=None,
+            fallback_reason=None,
+            api_route="chat",
+            schema=schema_category,
+        )
     finally:
         http_client.close()
 
