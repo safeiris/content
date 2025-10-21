@@ -64,8 +64,8 @@ DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "
 DEFAULT_SEO_DENSITY = 2
 
 # Рекомендуемые границы объёма (знаков)
-DEFAULT_MIN_LENGTH = 1500
-DEFAULT_MAX_LENGTH = 7000
+DEFAULT_MIN_LENGTH = 3500
+DEFAULT_MAX_LENGTH = 6000
 
 # Стилевые профили
 STYLE_PROFILE_PATH = "profiles/finance/style_profile.md"

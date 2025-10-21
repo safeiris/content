@@ -196,14 +196,11 @@ def merge_keywords(
 
 
 def format_keywords_block(keywords: Sequence[str]) -> str:
-    """Render keywords for prompt inclusion."""
+    """Render keywords for prompt inclusion as a multi-line block."""
 
     items = [kw for kw in keywords if kw]
     if not items:
         return ""
-    return (
-        "SEO-ключевые слова (используй естественно, без переспама): "
-        + ", ".join(items)
-        + "\n\n"
-    )
+    bullet_list = "\n".join(f"- {kw}" for kw in items)
+    return "Ключевые слова (используй естественно):\n" + bullet_list + "\n\n"
 

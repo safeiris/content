@@ -23,8 +23,19 @@ from assemble_messages import ContextBundle, assemble_messages, retrieve_context
 from llm_client import DEFAULT_MODEL, GenerationResult, generate as llm_generate
 from plagiarism_guard import is_too_similar
 from artifacts_store import register_artifact
-from config import OPENAI_API_KEY
+from config import (
+    DEFAULT_MAX_LENGTH,
+    DEFAULT_MIN_LENGTH,
+    G5_MAX_OUTPUT_TOKENS_MAX,
+    OPENAI_API_KEY,
+)
 from keywords import parse_manual_keywords
+from post_analysis import (
+    PostAnalysisRequirements,
+    analyze as analyze_post,
+    build_retry_instruction,
+    should_retry as post_should_retry,
+)
 
 
 BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
@@ -32,9 +43,9 @@ DEFAULT_CTA_TEXT = (
     "Семейная ипотека помогает молодым семьям купить жильё на понятных условиях. "
     "Сравните программы банков и сделайте первый шаг к дому своей мечты уже сегодня."
 )
-LENGTH_EXTEND_THRESHOLD = 1800
-LENGTH_SHRINK_THRESHOLD = 4500
-TARGET_LENGTH_RANGE: Tuple[int, int] = (2000, 4000)
+TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
+LENGTH_EXTEND_THRESHOLD = DEFAULT_MIN_LENGTH
+LENGTH_SHRINK_THRESHOLD = DEFAULT_MAX_LENGTH
 DISCLAIMER_TEMPLATE = (
     "⚠️ Дисклеймер: Материал носит информационный характер и не является финансовой рекомендацией. Прежде чем принимать решения, оцените риски и проконсультируйтесь со специалистом."
 )
@@ -119,6 +130,58 @@ def _append_disclaimer_if_requested(text: str, data: Dict[str, Any]) -> Tuple[st
     return template, True
 
 
+def _safe_positive_int(value: Any, default: int) -> int:
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return default
+    if candidate <= 0:
+        return default
+    return candidate
+
+
+def _safe_optional_positive_int(value: Any) -> Optional[int]:
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return None
+    if candidate <= 0:
+        return None
+    return candidate
+
+
+def _extract_source_values(raw: Any) -> List[str]:
+    if not isinstance(raw, list):
+        return []
+    result: List[str] = []
+    for item in raw:
+        if isinstance(item, dict):
+            value = str(item.get("value", "")).strip()
+        else:
+            value = str(item).strip()
+        if value:
+            result.append(value)
+    return result
+
+
+def _resolve_max_tokens_for_model(model_name: str, requested: int, max_chars: int) -> int:
+    base = max(1, int(requested))
+    lower_model = model_name.lower()
+    if lower_model.startswith("gpt-5"):
+        dynamic = max(1, int(max_chars / 3.5)) if max_chars > 0 else base
+        base = dynamic
+    return max(1, min(base, G5_MAX_OUTPUT_TOKENS_MAX))
+
+
+def _should_expand_max_tokens(metadata: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    reason = metadata.get("incomplete_reason")
+    if isinstance(reason, str) and reason.strip().lower() == "max_output_tokens":
+        return True
+    return False
+
+
 def _choose_section_for_extension(data: Dict[str, Any]) -> str:
     structure = data.get("structure")
     if isinstance(structure, Iterable):
@@ -130,12 +193,18 @@ def _choose_section_for_extension(data: Dict[str, Any]) -> str:
     return "основную часть"
 
 
-def _build_extend_prompt(section_name: str) -> str:
-    return f"Раскрой раздел «{section_name}» примерами и чек-листом, сохрани структуру материала."
+def _build_extend_prompt(section_name: str, *, min_target: int, max_target: int) -> str:
+    return (
+        f"Раскрой раздел «{section_name}», добавь факты и примеры, доведи объём до {min_target}\u2013{max_target} "
+        "символов без пробелов, избегай повторов."
+    )
 
 
-def _build_shrink_prompt() -> str:
-    return "Сократи повторы, оставь ключевые тезисы и сохрани исходную структуру текста."
+def _build_shrink_prompt(*, min_target: int, max_target: int) -> str:
+    return (
+        f"Сократи повторы и второстепенные детали, приведи текст к {min_target}\u2013{max_target} символам без пробелов, "
+        "сохрани исходную структуру."
+    )
 
 
 def _ensure_length(
@@ -147,13 +216,28 @@ def _ensure_length(
     temperature: float,
     max_tokens: int,
     timeout: int,
+    min_target: Optional[int] = None,
+    max_target: Optional[int] = None,
     backoff_schedule: Optional[List[float]] = None,
 ) -> Tuple[GenerationResult, Optional[str], List[Dict[str, str]]]:
     text = result.text
-    length = len(text)
-    if length < LENGTH_EXTEND_THRESHOLD:
+    length_no_spaces = len(re.sub(r"\s+", "", text))
+
+    try:
+        min_effective = int(min_target) if min_target is not None else LENGTH_EXTEND_THRESHOLD
+    except (TypeError, ValueError):
+        min_effective = LENGTH_EXTEND_THRESHOLD
+    try:
+        max_effective = int(max_target) if max_target is not None else LENGTH_SHRINK_THRESHOLD
+    except (TypeError, ValueError):
+        max_effective = LENGTH_SHRINK_THRESHOLD
+
+    if max_effective < min_effective:
+        max_effective = max(min_effective, LENGTH_SHRINK_THRESHOLD)
+
+    if length_no_spaces < max(min_effective, 1):
         section = _choose_section_for_extension(data)
-        prompt = _build_extend_prompt(section)
+        prompt = _build_extend_prompt(section, min_target=min_effective, max_target=max_effective)
         adjusted_messages = list(messages)
         adjusted_messages.append({"role": "user", "content": prompt})
         new_result = llm_generate(
@@ -165,8 +249,9 @@ def _ensure_length(
             backoff_schedule=backoff_schedule,
         )
         return new_result, "extend", adjusted_messages
-    if length > LENGTH_SHRINK_THRESHOLD:
-        prompt = _build_shrink_prompt()
+
+    if length_no_spaces > max_effective:
+        prompt = _build_shrink_prompt(min_target=min_effective, max_target=max_effective)
         adjusted_messages = list(messages)
         adjusted_messages.append({"role": "user", "content": prompt})
         new_result = llm_generate(
@@ -178,6 +263,7 @@ def _ensure_length(
             backoff_schedule=backoff_schedule,
         )
         return new_result, "shrink", adjusted_messages
+
     return result, None, messages
 
 
@@ -377,10 +463,17 @@ def _generate_variant(
     append_style_profile: Optional[bool] = None,
 ) -> Dict[str, Any]:
     start_time = time.time()
+    payload = deepcopy(data)
+    context_source = str(payload.get("context_source") or "index.json").strip().lower() or "index.json"
+    effective_k = k
+    if context_source == "off":
+        effective_k = 0
+    payload["context_source"] = context_source
+
     generation_context = make_generation_context(
         theme=theme,
-        data=data,
-        k=k,
+        data=payload,
+        k=effective_k,
         append_style_profile=append_style_profile,
     )
     prepared_data = generation_context.data
@@ -390,11 +483,41 @@ def _generate_variant(
     system_prompt = next((msg.get("content") for msg in active_messages if msg.get("role") == "system"), "")
     user_prompt = next((msg.get("content") for msg in reversed(active_messages) if msg.get("role") == "user"), "")
 
+    length_limits_data = prepared_data.get("length_limits") or {}
+    min_chars = _safe_positive_int(length_limits_data.get("min_chars"), DEFAULT_MIN_LENGTH)
+    max_chars = _safe_positive_int(length_limits_data.get("max_chars"), DEFAULT_MAX_LENGTH)
+    if max_chars < min_chars:
+        max_chars = max(min_chars + 500, DEFAULT_MAX_LENGTH)
+
+    keywords_required = [
+        str(kw).strip()
+        for kw in prepared_data.get("keywords", [])
+        if isinstance(kw, str) and str(kw).strip()
+    ]
+    keyword_mode = str(prepared_data.get("keywords_mode") or "soft").strip().lower() or "soft"
+    include_faq = bool(prepared_data.get("include_faq", True))
+    faq_questions_raw = prepared_data.get("faq_questions") if include_faq else None
+    faq_questions = _safe_optional_positive_int(faq_questions_raw)
+    sources_values = _extract_source_values(prepared_data.get("sources"))
+    requirements = PostAnalysisRequirements(
+        min_chars=min_chars,
+        max_chars=max_chars,
+        keywords=list(keywords_required),
+        keyword_mode=keyword_mode,
+        faq_questions=faq_questions,
+        sources=sources_values,
+        style_profile=str(prepared_data.get("style_profile", "")),
+    )
+
+    max_tokens_requested = max_tokens
+    max_tokens_current = _resolve_max_tokens_for_model(model_name, max_tokens_requested, max_chars)
+    tokens_escalated = False
+
     llm_result = llm_generate(
         active_messages,
         model=model_name,
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_tokens=max_tokens_current,
         timeout_s=timeout,
         backoff_schedule=backoff_schedule,
     )
@@ -406,6 +529,33 @@ def _generate_variant(
     fallback_reason = llm_result.fallback_reason
     api_route = llm_result.api_route
     response_schema = llm_result.schema
+
+    if model_name.lower().startswith("gpt-5"):
+        escalation_attempts = 0
+        while escalation_attempts < 2 and _should_expand_max_tokens(getattr(llm_result, "metadata", None)):
+            candidate_limit = min(int(max_tokens_current * 1.2), G5_MAX_OUTPUT_TOKENS_MAX)
+            if candidate_limit <= max_tokens_current:
+                break
+            max_tokens_current = candidate_limit
+            tokens_escalated = True
+            escalation_attempts += 1
+            retry_used = True
+            llm_result = llm_generate(
+                active_messages,
+                model=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens_current,
+                timeout_s=timeout,
+                backoff_schedule=backoff_schedule,
+            )
+            article_text = llm_result.text
+            effective_model = llm_result.model_used
+            fallback_used = llm_result.fallback_used
+            fallback_reason = llm_result.fallback_reason
+            api_route = llm_result.api_route
+            response_schema = llm_result.schema
+            retry_used = retry_used or llm_result.retry_used
+
     plagiarism_detected = False
     if generation_context.clip_texts and is_too_similar(article_text, generation_context.clip_texts):
         plagiarism_detected = True
@@ -421,7 +571,7 @@ def _generate_variant(
             active_messages,
             model=model_name,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens_current,
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
@@ -441,8 +591,10 @@ def _generate_variant(
             data=prepared_data,
             model_name=model_name,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens_current,
             timeout=timeout,
+            min_target=min_chars,
+            max_target=max_chars,
             backoff_schedule=backoff_schedule,
         )
         article_text = llm_result.text
@@ -461,7 +613,7 @@ def _generate_variant(
             active_messages,
             model=model_name,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens_current,
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
@@ -472,21 +624,51 @@ def _generate_variant(
         retry_used = True
         api_route = llm_result.api_route
         response_schema = llm_result.schema
-        # повторяем цикл с новым текстом после перегенерации
 
     retry_used = retry_used or truncation_retry_used or llm_result.retry_used
 
-    article_text, postfix_appended, default_cta_used = _append_cta_if_needed(
-        article_text,
-        cta_text=cta_text,
-        default_cta=cta_is_default,
-    )
+    post_retry_attempts = 0
+    post_analysis_report: Dict[str, object] = {}
+    while True:
+        article_text, postfix_appended, default_cta_used = _append_cta_if_needed(
+            article_text,
+            cta_text=cta_text,
+            default_cta=cta_is_default,
+        )
+        article_text, disclaimer_appended = _append_disclaimer_if_requested(article_text, prepared_data)
 
-    article_text, disclaimer_appended = _append_disclaimer_if_requested(article_text, prepared_data)
+        post_analysis_report = analyze_post(
+            article_text,
+            requirements=requirements,
+            model=effective_model or model_name,
+            retry_count=post_retry_attempts,
+            fallback_used=bool(fallback_used),
+        )
+        if not post_should_retry(post_analysis_report) or post_retry_attempts >= 2:
+            break
+        refinement_instruction = build_retry_instruction(post_analysis_report, requirements)
+        active_messages = list(active_messages)
+        active_messages.append({"role": "user", "content": refinement_instruction})
+        llm_result = llm_generate(
+            active_messages,
+            model=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens_current,
+            timeout_s=timeout,
+            backoff_schedule=backoff_schedule,
+        )
+        article_text = llm_result.text
+        effective_model = llm_result.model_used
+        fallback_used = llm_result.fallback_used
+        fallback_reason = llm_result.fallback_reason
+        api_route = llm_result.api_route
+        response_schema = llm_result.schema
+        retry_used = True
+        post_retry_attempts += 1
 
     duration = time.time() - start_time
     context_bundle = generation_context.context_bundle
-    context_used = bool(context_bundle.context_used and not context_bundle.index_missing and k > 0)
+    context_used = bool(context_bundle.context_used and not context_bundle.index_missing and effective_k > 0)
 
     used_temperature = None
     if effective_model and not effective_model.lower().startswith("gpt-5"):
@@ -497,9 +679,9 @@ def _generate_variant(
         "data_path": data_path,
         "model": model_name,
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_tokens": max_tokens_requested,
         "timeout_s": timeout,
-        "retrieval_k": k,
+        "retrieval_k": effective_k,
         "context_applied_k": len(context_bundle.items),
         "clips": [
             {
@@ -514,6 +696,7 @@ def _generate_variant(
         "generated_at": _local_now().isoformat(),
         "duration_seconds": round(duration, 3),
         "characters": len(article_text),
+        "characters_no_spaces": len(re.sub(r"\s+", "", article_text)),
         "words": len(article_text.split()) if article_text.strip() else 0,
         "messages_count": len(active_messages),
         "context_used": context_used,
@@ -522,13 +705,14 @@ def _generate_variant(
         "context_budget_tokens_limit": context_bundle.token_budget_limit,
         "postfix_appended": postfix_appended,
         "length_adjustment": length_adjustment,
-        "length_range_target": {"min": TARGET_LENGTH_RANGE[0], "max": TARGET_LENGTH_RANGE[1]},
+        "length_range_target": {"min": min_chars, "max": max_chars},
         "mode": mode,
         "model_used": effective_model,
         "temperature_used": used_temperature,
         "api_route": api_route,
         "response_schema": response_schema,
-        "max_tokens_used": max_tokens,
+        "max_tokens_used": max_tokens_current,
+        "max_tokens_escalated": tokens_escalated,
         "default_cta_used": default_cta_used,
         "truncation_retry_used": truncation_retry_used,
         "disclaimer_appended": disclaimer_appended,
@@ -539,6 +723,16 @@ def _generate_variant(
         "keywords_manual": generation_context.keywords_manual,
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
+        "length_limits": {"min_chars": min_chars, "max_chars": max_chars},
+        "keywords_mode": keyword_mode,
+        "sources_requested": prepared_data.get("sources"),
+        "context_source": context_source,
+        "include_faq": include_faq,
+        "faq_questions": faq_questions,
+        "include_jsonld": bool(prepared_data.get("include_jsonld", False)),
+        "style_profile": prepared_data.get("style_profile"),
+        "post_analysis": post_analysis_report,
+        "post_analysis_retry_count": post_retry_attempts,
     }
 
     if generation_context.style_profile_applied:
@@ -558,7 +752,7 @@ def _generate_variant(
             f"[orchestrate] warning: пропускаю запись артефакта для {output_path.name} — пустой ответ",
             file=sys.stderr,
         )
-    _summarise(theme, k, effective_model or model_name, article_text, variant=variant_label)
+    _summarise(theme, effective_k, effective_model or model_name, article_text, variant=variant_label)
 
     return {
         "text": article_text,

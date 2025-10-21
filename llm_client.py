@@ -70,6 +70,7 @@ class GenerationResult:
     fallback_reason: Optional[str] = None
     api_route: str = "chat"
     schema: str = "none"
+    metadata: Optional[Dict[str, object]] = None
 
 
 class EmptyCompletionError(RuntimeError):
@@ -1464,6 +1465,11 @@ def generate(
                         schema_category,
                         schema_fallback,
                     )
+                    metadata_block = None
+                    if isinstance(parse_flags_fallback, dict):
+                        meta_candidate = parse_flags_fallback.get("metadata")
+                        if isinstance(meta_candidate, dict):
+                            metadata_block = dict(meta_candidate)
                     return GenerationResult(
                         text=text,
                         model_used=fallback_used,
@@ -1472,6 +1478,7 @@ def generate(
                         fallback_reason=fallback_reason,
                         api_route="chat",
                         schema=schema_category,
+                        metadata=metadata_block,
                     )
                 except EmptyCompletionError as fallback_error:
                     _persist_raw_response(fallback_error.raw_response)
@@ -1488,6 +1495,11 @@ def generate(
                     schema_category,
                     schema_initial_call,
                 )
+                metadata_block = None
+                if isinstance(parse_flags_initial, dict):
+                    meta_candidate = parse_flags_initial.get("metadata")
+                    if isinstance(meta_candidate, dict):
+                        metadata_block = dict(meta_candidate)
                 return GenerationResult(
                     text=text,
                     model_used=model_name,
@@ -1496,6 +1508,7 @@ def generate(
                     fallback_reason=None,
                     api_route="responses",
                     schema=schema_category,
+                    metadata=metadata_block,
                 )
             except EmptyCompletionError as responses_empty:
                 _persist_raw_response(responses_empty.raw_response)
@@ -1564,6 +1577,11 @@ def generate(
                 schema_category,
                 schema_fallback,
             )
+            metadata_block = None
+            if isinstance(parse_flags_fallback, dict):
+                meta_candidate = parse_flags_fallback.get("metadata")
+                if isinstance(meta_candidate, dict):
+                    metadata_block = dict(meta_candidate)
             return GenerationResult(
                 text=text,
                 model_used=fallback_used,
@@ -1572,6 +1590,7 @@ def generate(
                 fallback_reason=fallback_reason,
                 api_route="chat",
                 schema=schema_category,
+                metadata=metadata_block,
             )
 
         text, parse_flags_initial, _, schema_initial_call = _call_chat_model(model_name)
@@ -1581,6 +1600,11 @@ def generate(
             schema_category,
             schema_initial_call,
         )
+        metadata_block = None
+        if isinstance(parse_flags_initial, dict):
+            meta_candidate = parse_flags_initial.get("metadata")
+            if isinstance(meta_candidate, dict):
+                metadata_block = dict(meta_candidate)
         return GenerationResult(
             text=text,
             model_used=model_name,
@@ -1589,6 +1613,7 @@ def generate(
             fallback_reason=None,
             api_route="chat",
             schema=schema_category,
+            metadata=metadata_block,
         )
     finally:
         http_client.close()

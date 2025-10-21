@@ -49,6 +49,8 @@ const clearLogBtn = document.getElementById("clear-log");
 const structurePreset = document.getElementById("structure-preset");
 const structureInput = document.getElementById("structure-input");
 const keywordsInput = document.getElementById("keywords-input");
+const titleInput = document.getElementById("title-input");
+const audienceInput = document.getElementById("audience-input");
 const goalInput = document.getElementById("goal-input");
 const kInput = document.getElementById("k-input");
 const temperatureInput = document.getElementById("temperature-input");
@@ -57,6 +59,16 @@ const maxTokensInput = document.getElementById("max-tokens-input");
 const modelInput = document.getElementById("model-input");
 const includeFaq = document.getElementById("include-faq");
 const includeJsonld = document.getElementById("include-jsonld");
+const minCharsInput = document.getElementById("min-chars-input");
+const maxCharsInput = document.getElementById("max-chars-input");
+const keywordModeInputs = document.querySelectorAll("input[name='keywords-mode']");
+const styleProfileSelect = document.getElementById("style-profile-select");
+const styleProfileHint = document.getElementById("style-profile-hint");
+const sourcesList = document.getElementById("sources-list");
+const addSourceBtn = document.getElementById("add-source-btn");
+const faqCountInput = document.getElementById("faq-count-input");
+const faqCountWrapper = document.getElementById("faq-count-wrapper");
+const contextSourceSelect = document.getElementById("context-source-select");
 const healthStatus = document.getElementById("health-status");
 const reindexLog = document.getElementById("reindex-log");
 const previewSystem = document.getElementById("preview-system");
@@ -99,6 +111,13 @@ const HEALTH_STATUS_MESSAGES = {
     ok: "доступен",
     fail: "недоступен",
   },
+};
+
+const STYLE_PROFILE_HINTS = {
+  "sravni.ru": "Экспертный, структурный стиль: введение → основная часть → FAQ → вывод.",
+  "tinkoff.ru": "Дружелюбный и прагматичный тон: объясняем шаги на примерах и даём советы.",
+  "banki.ru": "Аналитичный стиль: выделяем выгоды и риски, формулируем выводы по фактам.",
+  off: "Нейтральный деловой стиль без привязки к порталу.",
 };
 
 const state = {
@@ -146,6 +165,21 @@ if (retryBtn) {
 if (modelInput) {
   modelInput.addEventListener("change", () => updateTemperatureControlState(modelInput.value));
 }
+if (styleProfileSelect) {
+  styleProfileSelect.addEventListener("change", handleStyleProfileChange);
+}
+if (includeFaq) {
+  includeFaq.addEventListener("change", handleFaqToggle);
+}
+if (addSourceBtn) {
+  addSourceBtn.addEventListener("click", handleAddSource);
+}
+if (sourcesList) {
+  sourcesList.addEventListener("click", handleSourceListClick);
+}
+if (contextSourceSelect) {
+  contextSourceSelect.addEventListener("change", handleContextSourceChange);
+}
 if (reindexBtn) {
   reindexBtn.addEventListener("click", handleReindex);
 }
@@ -166,11 +200,108 @@ if (clearLogBtn) {
 
 setupAdvancedSettings();
 updateTemperatureControlState(modelInput?.value);
+handleStyleProfileChange();
+handleFaqToggle();
+handleContextSourceChange();
 init();
 
 function switchTab(tabId) {
   tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === tabId));
   panels.forEach((panel) => panel.classList.toggle("active", panel.id === tabId));
+}
+
+function handleStyleProfileChange() {
+  if (!styleProfileSelect || !styleProfileHint) {
+    return;
+  }
+  const value = styleProfileSelect.value || "off";
+  styleProfileHint.textContent = STYLE_PROFILE_HINTS[value] || STYLE_PROFILE_HINTS.off;
+}
+
+function handleFaqToggle() {
+  if (!faqCountWrapper || !faqCountInput || !includeFaq) {
+    return;
+  }
+  const enabled = includeFaq.checked;
+  faqCountWrapper.hidden = !enabled;
+  faqCountInput.disabled = !enabled;
+  if (enabled && !faqCountInput.value) {
+    faqCountInput.value = "5";
+  }
+}
+
+function handleAddSource(event) {
+  event.preventDefault();
+  addSourceRow();
+}
+
+function handleSourceListClick(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+  if (target.classList.contains("remove-source")) {
+    const row = target.closest(".source-row");
+    if (row) {
+      row.remove();
+    }
+  }
+}
+
+function handleContextSourceChange() {
+  if (!contextSourceSelect || !kInput) {
+    return;
+  }
+  const value = String(contextSourceSelect.value || "index.json").toLowerCase();
+  if (value === "off") {
+    kInput.value = "0";
+    kInput.disabled = true;
+  } else {
+    kInput.disabled = false;
+  }
+}
+
+function addSourceRow(value = "", usage = "quote") {
+  if (!sourcesList) {
+    return;
+  }
+  const template = document.getElementById("source-row-template");
+  if (!(template instanceof HTMLTemplateElement)) {
+    return;
+  }
+  const fragment = template.content.cloneNode(true);
+  const row = fragment.querySelector(".source-row");
+  if (!row) {
+    return;
+  }
+  const input = row.querySelector(".source-input");
+  const select = row.querySelector(".source-usage");
+  if (input instanceof HTMLInputElement) {
+    input.value = value;
+  }
+  if (select instanceof HTMLSelectElement) {
+    select.value = usage;
+  }
+  sourcesList.append(row);
+}
+
+function collectSources() {
+  if (!sourcesList) {
+    return [];
+  }
+  const rows = Array.from(sourcesList.querySelectorAll(".source-row"));
+  const items = [];
+  for (const row of rows) {
+    const input = row.querySelector(".source-input");
+    const select = row.querySelector(".source-usage");
+    const value = input instanceof HTMLInputElement ? input.value.trim() : "";
+    const usage = select instanceof HTMLSelectElement ? select.value : "quote";
+    if (!value) {
+      continue;
+    }
+    items.push({ value, usage });
+  }
+  return items;
 }
 
 async function init() {
@@ -192,6 +323,10 @@ async function init() {
 
   if (pipesLoaded) {
     applyStructurePreset(structurePreset.value);
+  }
+
+  if (sourcesList && sourcesList.childElementCount === 0) {
+    addSourceRow();
   }
 
   await handleHealthCheck();
@@ -790,7 +925,7 @@ function buildRequestPayload() {
   }
 
   const keywords = keywordsInput.value
-    .split(",")
+    .split(/\r?\n|,/)
     .map((item) => item.trim())
     .filter(Boolean);
   const structure = structureInput.value
@@ -798,22 +933,70 @@ function buildRequestPayload() {
     .map((item) => item.trim())
     .filter(Boolean);
 
+  const minCharsRaw = String(minCharsInput?.value ?? "").trim();
+  const maxCharsRaw = String(maxCharsInput?.value ?? "").trim();
+  const minChars = minCharsRaw === "" ? 3500 : Number.parseInt(minCharsRaw, 10);
+  const maxChars = maxCharsRaw === "" ? 6000 : Number.parseInt(maxCharsRaw, 10);
+  if (!Number.isInteger(minChars) || minChars <= 0) {
+    throw new Error("Минимальный объём должен быть положительным целым числом");
+  }
+  if (!Number.isInteger(maxChars) || maxChars <= 0) {
+    throw new Error("Максимальный объём должен быть положительным целым числом");
+  }
+  if (maxChars < minChars) {
+    throw new Error("Максимальный объём должен быть больше или равен минимальному");
+  }
+
+  const keywordMode = Array.from(keywordModeInputs).find((input) => input.checked)?.value || "soft";
+  const sources = collectSources();
+  const styleProfile = styleProfileSelect?.value || "sravni.ru";
+  const title = titleInput?.value.trim();
+  const audience = audienceInput?.value.trim();
+  const toneSelect = document.getElementById("tone-select");
+  const tone = toneSelect ? toneSelect.value : "экспертный";
+
   const data = {
     theme: topic,
     goal: goalInput.value.trim() || "SEO-статья",
-    tone: document.getElementById("tone-select").value,
+    tone,
     keywords,
+    keywords_mode: keywordMode,
     structure,
     include_faq: includeFaq.checked,
     include_jsonld: includeJsonld.checked,
     structure_preset: structurePreset.value,
     pipe_id: theme,
+    length_limits: { min_chars: minChars, max_chars: maxChars },
+    style_profile: styleProfile,
+    context_source: contextSourceSelect?.value || "index.json",
   };
+
+  if (title) {
+    data.title = title;
+  }
+  if (audience) {
+    data.target_audience = audience;
+  }
+  if (sources.length) {
+    data.sources = sources;
+  }
+  if (includeFaq.checked) {
+    const faqValue = String(faqCountInput?.value ?? "").trim();
+    let faqCount = faqValue === "" ? 5 : Number.parseInt(faqValue, 10);
+    if (!Number.isInteger(faqCount) || faqCount <= 0) {
+      faqCount = 5;
+    }
+    data.faq_questions = faqCount;
+  }
 
   const kValue = String(kInput?.value ?? "").trim();
   let k = kValue === "" ? 0 : Number.parseInt(kValue, 10);
   if (!Number.isInteger(k) || k < 0 || k > 6) {
     throw new Error("Контекст (k) должен быть целым числом от 0 до 6");
+  }
+  const contextSource = String(contextSourceSelect?.value || "index.json").toLowerCase();
+  if (contextSource === "off") {
+    k = 0;
   }
   if (kInput) {
     kInput.value = String(k);
@@ -861,6 +1044,10 @@ function buildRequestPayload() {
 
 function renderMetadata(meta) {
   reportView.innerHTML = "";
+  const summary = buildQualityReport(meta);
+  if (summary) {
+    reportView.append(summary);
+  }
   const report = document.createElement("pre");
   report.className = "metadata-view";
   if (!meta || typeof meta !== "object" || !Object.keys(meta).length) {
@@ -869,6 +1056,132 @@ function renderMetadata(meta) {
     report.textContent = JSON.stringify(meta, null, 2);
   }
   reportView.append(report);
+}
+
+function buildQualityReport(meta) {
+  if (!meta || typeof meta !== "object") {
+    return null;
+  }
+  const post = meta.post_analysis;
+  if (!post || typeof post !== "object") {
+    return null;
+  }
+  const list = document.createElement("ul");
+  list.className = "quality-report";
+
+  const lengthBlock = post.length;
+  if (lengthBlock && typeof lengthBlock === "object") {
+    const chars = Number(lengthBlock.chars_no_spaces) || 0;
+    const min = Number(lengthBlock.min ?? meta.length_limits?.min_chars ?? 0);
+    const max = Number(lengthBlock.max ?? meta.length_limits?.max_chars ?? 0);
+    const within = Boolean(lengthBlock.within_limits);
+    const label = within
+      ? `Объём: ${chars.toLocaleString("ru-RU")} зн. (в норме)`
+      : `Объём: ${chars.toLocaleString("ru-RU")} зн. (нужно ${min}–${max})`;
+    list.append(createQualityItem(within ? "success" : "warning", label));
+  }
+
+  const coverage = Array.isArray(post.keywords_coverage) ? post.keywords_coverage : [];
+  if (coverage.length > 0) {
+    const foundCount = coverage.filter((item) => item && item.found).length;
+    const missingItems = coverage.filter((item) => item && !item.found);
+    const total = coverage.length;
+    const label = missingItems.length
+      ? `Ключевые слова: ${foundCount}/${total} (нет: ${missingItems
+          .slice(0, 3)
+          .map((item) => item.term)
+          .join(", ")}${missingItems.length > 3 ? "…" : ""})`
+      : `Ключевые слова: ${foundCount}/${total} найдены`;
+    list.append(createQualityItem(missingItems.length ? "warning" : "success", label));
+  } else {
+    list.append(createQualityItem("info", "Ключевые слова: не заданы"));
+  }
+
+  if (meta.include_faq) {
+    const targetFaq = Number(meta.faq_questions) || null;
+    const actualFaq = Number(post.faq_count) || 0;
+    const matches = targetFaq ? actualFaq === targetFaq : actualFaq > 0;
+    const label = targetFaq
+      ? `FAQ: ${actualFaq} вопросов (ожидание ${targetFaq})`
+      : `FAQ: ${actualFaq} вопросов`;
+    list.append(createQualityItem(matches ? "success" : "warning", label));
+  } else {
+    list.append(createQualityItem("info", "FAQ: отключён"));
+  }
+
+  if (typeof meta.include_jsonld === "boolean") {
+    list.append(
+      createQualityItem(meta.include_jsonld ? "success" : "info", meta.include_jsonld ? "JSON-LD: включён" : "JSON-LD: отключён"),
+    );
+  }
+
+  const requestedSources = Array.isArray(meta.sources_requested)
+    ? meta.sources_requested.map((item) => item?.value || item)
+    : [];
+  const usedSourcesRaw = Array.isArray(post.sources_used) ? post.sources_used : [];
+  const usedSourcesClean = usedSourcesRaw
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean);
+  const usedSourcesUnique = Array.from(new Set(usedSourcesClean));
+  const usedSourcesLookup = new Set(usedSourcesUnique.map((value) => value.toLowerCase()));
+  if (requestedSources.length > 0) {
+    const missingSources = requestedSources
+      .map((source) => (typeof source === "string" ? source.trim() : ""))
+      .filter(Boolean)
+      .filter((source) => !usedSourcesLookup.has(source.toLowerCase()));
+    const label = missingSources.length
+      ? `Источники: ${usedSourcesUnique.length}/${requestedSources.length} (нет: ${missingSources.join(", ")})`
+      : `Источники: ${usedSourcesUnique.length}/${requestedSources.length} использованы`;
+    list.append(createQualityItem(missingSources.length ? "warning" : "success", label));
+    if (usedSourcesUnique.length) {
+      list.append(createQualityItem("info", `Использованы: ${usedSourcesUnique.join(", ")}`));
+    } else {
+      list.append(createQualityItem("warning", "Источники из брифа не использованы"));
+    }
+  } else if (usedSourcesUnique.length > 0) {
+    list.append(createQualityItem("info", `Источники: ${usedSourcesUnique.join(", ")}`));
+  }
+
+  if (meta.style_profile) {
+    list.append(createQualityItem("info", `Стиль: ${meta.style_profile}`));
+  }
+
+  if (meta.model_used) {
+    const route = meta.api_route ? `, ${meta.api_route}` : "";
+    list.append(createQualityItem("success", `Модель: ${meta.model_used}${route}`));
+  }
+
+  const fallbackUsed = Boolean(meta.fallback_used || post.fallback);
+  if (fallbackUsed) {
+    list.append(createQualityItem("warning", `Fallback: ${describeFallbackNotice(meta.fallback_reason)}`));
+  }
+
+  const retries = Number(meta.post_analysis_retry_count ?? post.retry_count ?? 0);
+  if (retries > 0) {
+    list.append(createQualityItem("info", `Повторов: ${retries}`));
+  }
+
+  return list;
+}
+
+function createQualityItem(status, text) {
+  const item = document.createElement("li");
+  item.className = "quality-report__item";
+  if (status === "warning") {
+    item.dataset.status = "warning";
+  } else if (status === "success") {
+    item.dataset.status = "success";
+  } else {
+    item.dataset.status = "info";
+  }
+  const icon = document.createElement("span");
+  icon.className = "quality-report__icon";
+  icon.textContent = status === "warning" ? "⚠️" : status === "success" ? "✅" : "ℹ️";
+  const label = document.createElement("span");
+  label.className = "quality-report__label";
+  label.textContent = text;
+  item.append(icon, label);
+  return item;
 }
 
 function renderUsedKeywords(meta) {
@@ -883,94 +1196,133 @@ function renderUsedKeywords(meta) {
     return;
   }
 
-  const manualKeywords = Array.isArray(meta.keywords_manual) ? meta.keywords_manual : [];
+  const coverage = Array.isArray(meta.post_analysis?.keywords_coverage)
+    ? meta.post_analysis.keywords_coverage
+    : [];
 
   usedKeywordsList.innerHTML = "";
-  usedKeywordsSection.hidden = false;
-
-  if (!manualKeywords.length) {
+  if (!coverage.length) {
+    usedKeywordsSection.hidden = false;
     usedKeywordsList.style.display = "none";
     usedKeywordsEmpty.hidden = false;
-    usedKeywordsEmpty.textContent = "Ключевые слова не использовались.";
+    usedKeywordsEmpty.textContent = "Ключевые слова не заданы.";
     return;
   }
 
+  usedKeywordsSection.hidden = false;
   usedKeywordsList.style.display = "flex";
   usedKeywordsEmpty.hidden = true;
 
-  manualKeywords.forEach((keyword) => {
-    const item = document.createElement("li");
-    item.textContent = keyword;
-    item.dataset.source = "manual";
-    item.title = "Задано вручную";
-    usedKeywordsList.append(item);
+  coverage.forEach((entry) => {
+    if (!entry || typeof entry.term !== "string") {
+      return;
+    }
+    const li = document.createElement("li");
+    const count = Number(entry.count) || 0;
+    li.textContent = count > 0 ? `${entry.term} (${count}\u00d7)` : `${entry.term} (нет)`;
+    li.dataset.status = entry.found ? "found" : "missing";
+    usedKeywordsList.append(li);
   });
 }
 
 function updateResultBadges(meta) {
   resultBadges.innerHTML = "";
-  if (!meta) {
+  if (!meta || typeof meta !== "object") {
     return;
   }
 
+  const appendBadge = (text, type = "neutral") => {
+    if (!text) {
+      return;
+    }
+    const badge = document.createElement("span");
+    badge.className = `badge ${type}`;
+    badge.textContent = text;
+    resultBadges.append(badge);
+  };
+
+  const post = meta.post_analysis && typeof meta.post_analysis === "object" ? meta.post_analysis : null;
   const currentResult = state.currentResult;
   const characters = typeof meta.characters === "number"
     ? meta.characters
     : currentResult?.characters ?? (currentResult?.markdown?.trim().length ?? 0);
   const hasContent = Boolean(currentResult?.hasContent ?? (characters > 0));
+  if (!hasContent) {
+    appendBadge("Пустой ответ", "warning");
+  }
+  const lengthInfo = post?.length && typeof post.length === "object" ? post.length : null;
+  if (lengthInfo) {
+    const chars = Number(lengthInfo.chars_no_spaces ?? meta.characters_no_spaces ?? meta.characters) || 0;
+    const within = Boolean(lengthInfo.within_limits);
+    const min = Number(lengthInfo.min ?? meta.length_limits?.min_chars ?? 0);
+    const max = Number(lengthInfo.max ?? meta.length_limits?.max_chars ?? 0);
+    const label = within
+      ? `Объём ${chars.toLocaleString("ru-RU")} зн.`
+      : `Объём ${chars.toLocaleString("ru-RU")} (нужно ${min}–${max})`;
+    appendBadge(label, within ? "success" : "warning");
+  }
 
-  const temperatureBadge = (() => {
-    const modelName = meta.model_used;
-    if (modelName && isTemperatureLocked(modelName)) {
-      return { text: "T: N/A", type: "neutral" };
-    }
-    return typeof meta.temperature_used === "number"
-      ? { text: `T=${meta.temperature_used}`, type: "neutral" }
-      : null;
-  })();
+  const coverage = Array.isArray(post?.keywords_coverage) ? post.keywords_coverage : [];
+  const hasKeywordsInBrief = Array.isArray(meta.input_data?.keywords) && meta.input_data.keywords.length > 0;
+  if (coverage.length > 0) {
+    const found = coverage.filter((item) => item && item.found).length;
+    const total = coverage.length;
+    const missing = total - found;
+    appendBadge(`Ключи ${found}/${total}`, missing > 0 ? "warning" : "success");
+  } else if (hasKeywordsInBrief) {
+    appendBadge("Ключи: нет данных", "warning");
+  } else {
+    appendBadge("Ключи: не заданы", "neutral");
+  }
 
-  const fallbackBadge = meta.fallback_used
-    ? {
-        text: `Сгенерировано через запасную модель (${meta.fallback_used})`,
-        type: "warning",
-      }
-    : null;
+  if (meta.include_faq) {
+    const actualFaq = Number(post?.faq_count) || 0;
+    const targetFaq = Number(meta.faq_questions) || null;
+    const ok = targetFaq ? actualFaq === targetFaq : actualFaq > 0;
+    const faqLabel = targetFaq ? `FAQ ${actualFaq}/${targetFaq}` : `FAQ ${actualFaq}`;
+    appendBadge(faqLabel, ok ? "success" : "warning");
+  } else if (Number(post?.faq_count) > 0) {
+    appendBadge(`FAQ ${post.faq_count}`, "neutral");
+  }
 
-  const entries = [
-    ...(!hasContent ? [{ text: "Пустой ответ", type: "error" }] : []),
-    badgeInfo("plagiarism_detected", meta.plagiarism_detected, {
-      true: { text: "Plagiarism detected", type: "error" },
-      false: { text: "Plagiarism clean", type: "success" },
-    }),
-    badgeInfo("retry_used", meta.retry_used, {
-      true: { text: "Retry used", type: "neutral" },
-      false: { text: "Single pass", type: "success" },
-    }),
-    badgeInfo("postfix_appended", meta.postfix_appended, {
-      true: { text: "CTA appended", type: "neutral" },
-      false: { text: "CTA not needed", type: "success" },
-    }),
-    badgeInfo("disclaimer_appended", meta.disclaimer_appended, {
-      true: { text: "Дисклеймер добавлен", type: "neutral" },
-      false: { text: "Без дисклеймера", type: "neutral" },
-    }),
-    badgeInfo("length_adjustment", meta.length_adjustment, null, (value) =>
-      value ? `Length fix: ${value}` : "Length OK"
-    ),
-    fallbackBadge,
-    meta.model_used ? { text: `Model: ${meta.model_used}`, type: "neutral" } : null,
-    temperatureBadge,
-    typeof meta.context_budget_tokens_est === "number"
-      ? { text: `Context tokens ≈ ${meta.context_budget_tokens_est}` }
-      : null,
-  ].filter(Boolean);
+  if (typeof meta.include_jsonld === "boolean") {
+    appendBadge(meta.include_jsonld ? "JSON-LD" : "Без JSON-LD", meta.include_jsonld ? "success" : "neutral");
+  }
 
-  entries.forEach((entry) => {
-    const badge = document.createElement("span");
-    badge.className = `badge ${entry.type ?? "neutral"}`;
-    badge.textContent = entry.text;
-    resultBadges.append(badge);
-  });
+  const requestedRaw = Array.isArray(meta.sources_requested) ? meta.sources_requested : [];
+  const requestedValues = requestedRaw
+    .map((item) => (typeof item === "string" ? item : item && item.value))
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean);
+  const requestedCount = requestedValues.length;
+  const usedSources = Array.isArray(post?.sources_used) ? post.sources_used : [];
+  if (requestedCount > 0) {
+    const normalizedUsed = Array.from(new Set(usedSources.map((source) => String(source).trim().toLowerCase()).filter(Boolean)));
+    const usedCount = normalizedUsed.length;
+    const missingCount = requestedValues.filter((value) => !normalizedUsed.includes(value.toLowerCase())).length;
+    appendBadge(`Источники ${usedCount}/${requestedCount}`, missingCount > 0 ? "warning" : "success");
+  } else if (usedSources.length > 0) {
+    appendBadge(`Источники: ${usedSources.length}`, "neutral");
+  }
+
+  const fallbackUsed = Boolean(meta.fallback_used || post?.fallback);
+  if (fallbackUsed) {
+    appendBadge(`Fallback: ${describeFallbackNotice(meta.fallback_reason)}`, "warning");
+  }
+
+  const modelLabel = meta.model_used || meta.model;
+  if (modelLabel) {
+    appendBadge(`Модель: ${modelLabel}`, fallbackUsed ? "warning" : "neutral");
+  }
+
+  const retries = Number(meta.post_analysis_retry_count ?? post?.retry_count ?? 0);
+  if (retries > 0) {
+    appendBadge(`Повторов: ${retries}`, "neutral");
+  }
+
+  if (meta.length_adjustment) {
+    appendBadge(`Коррекция длины: ${meta.length_adjustment}`, "neutral");
+  }
 }
 
 const FALLBACK_REASON_MESSAGES = {
@@ -983,18 +1335,6 @@ function describeFallbackNotice(reason) {
     return "Причина не указана.";
   }
   return FALLBACK_REASON_MESSAGES[reason] ?? `Причина: ${reason}`;
-}
-
-function badgeInfo(key, value, mapping, fallbackFormatter) {
-  if (mapping && Object.prototype.hasOwnProperty.call(mapping, value)) {
-    return mapping[value];
-  }
-  if (fallbackFormatter) {
-    return { text: fallbackFormatter(value), type: "neutral" };
-  }
-  return value
-    ? { text: `${key}: ${value}`, type: "neutral" }
-    : { text: `${key}: нет`, type: "neutral" };
 }
 
 function updatePromptPreview(preview) {

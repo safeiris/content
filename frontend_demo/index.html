@@ -36,7 +36,15 @@
               <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
             </div>
             <div class="form-row">
-              <label for="goal-input">Цель материала</label>
+              <label for="title-input">Название текста <span class="optional">(опционально)</span></label>
+              <input id="title-input" type="text" placeholder="Для внутреннего использования" />
+            </div>
+            <div class="form-row">
+              <label for="audience-input">Целевая аудитория</label>
+              <input id="audience-input" type="text" placeholder="Например, 'молодые семьи с детьми'" />
+            </div>
+            <div class="form-row">
+              <label for="goal-input">Цель текста</label>
               <input id="goal-input" type="text" value="SEO-статья" />
             </div>
             <div class="form-row">
@@ -46,10 +54,28 @@
                 <option value="дружелюбный">Дружелюбный</option>
                 <option value="строгий">Строгий</option>
               </select>
-              <p class="field-hint">
-                Экспертный автоматически включает стилевые нормы портала (можно отключить параметром
-                <code>style_profile=off</code>).
+              <p class="field-hint">Тон влияет на рекомендации в промпте и итоговом тексте.</p>
+            </div>
+            <div class="form-row">
+              <label for="style-profile-select">Стиль портала</label>
+              <select id="style-profile-select">
+                <option value="sravni.ru" selected>sravni.ru — экспертно, структурировано</option>
+                <option value="tinkoff.ru">tinkoff.ru — дружелюбно и с примерами</option>
+                <option value="banki.ru">banki.ru — аналитично и по делу</option>
+                <option value="off">off — без стилевого профиля</option>
+              </select>
+              <p class="field-hint" id="style-profile-hint">
+                Экспертный, структурный стиль: введение → основная часть → FAQ → вывод.
               </p>
+            </div>
+            <div class="form-row">
+              <label class="field-label" for="min-chars-input">Объём текста (без пробелов)</label>
+              <div class="length-range">
+                <input id="min-chars-input" type="number" min="500" value="3500" />
+                <span class="range-separator">—</span>
+                <input id="max-chars-input" type="number" min="600" value="6000" />
+              </div>
+              <p class="field-hint">По умолчанию 3500–6000 символов, диапазон можно изменить.</p>
             </div>
             <div class="form-row">
               <label for="structure-preset">Пресет структуры</label>
@@ -66,8 +92,31 @@
             </div>
             <div class="form-row">
               <label for="keywords-input">Ключевые слова</label>
-              <input id="keywords-input" type="text" placeholder="Через запятую" />
+              <textarea id="keywords-input" rows="4" placeholder="Каждый запрос с новой строки"></textarea>
               <p class="field-hint">Можно оставить пустым — ключевые слова не будут добавлены.</p>
+              <div class="keyword-mode-group" role="group" aria-labelledby="keyword-mode-label">
+                <span id="keyword-mode-label" class="field-label-inline">Режим вхождений</span>
+                <label class="radio-option">
+                  <input type="radio" name="keywords-mode" value="soft" checked />
+                  <span>Мягкий — используем естественные формы и синонимы.</span>
+                </label>
+                <label class="radio-option">
+                  <input type="radio" name="keywords-mode" value="strict" />
+                  <span>Строгий — только точные вхождения.</span>
+                </label>
+                <label class="radio-option">
+                  <input type="radio" name="keywords-mode" value="anti_spam" />
+                  <span>Запрет переспама — не чаще 2 повторов на 1000 символов.</span>
+                </label>
+              </div>
+            </div>
+            <div class="form-row">
+              <label>Источники (референсы)</label>
+              <div class="sources-control">
+                <div id="sources-list" class="sources-list"></div>
+                <button type="button" class="ghost small" id="add-source-btn">Добавить источник</button>
+              </div>
+              <p class="field-hint">Используйте ссылки, ID или названия источников. Добавьте несколько строк при необходимости.</p>
             </div>
             <details id="advanced-settings" class="advanced-settings">
               <summary>
@@ -83,6 +132,10 @@
                       <span class="checkbox-hint">Добавить блок часто задаваемых вопросов.</span>
                     </span>
                   </label>
+                  <div class="inline-field" id="faq-count-wrapper">
+                    <label for="faq-count-input">Количество вопросов</label>
+                    <input type="number" id="faq-count-input" min="1" max="20" value="5" />
+                  </div>
                   <label class="checkbox-with-hint">
                     <input type="checkbox" id="include-jsonld" checked />
                     <span>
@@ -149,6 +202,15 @@
                         >
                       </label>
                       <input id="k-input" type="number" min="0" max="6" value="0" />
+                    </div>
+                    <div class="form-row">
+                      <label class="field-label" for="context-source-select">Источник контекста</label>
+                      <select id="context-source-select">
+                        <option value="index.json" selected>index.json (по умолчанию)</option>
+                        <option value="custom">custom</option>
+                        <option value="off">off</option>
+                      </select>
+                      <p class="field-hint">Выберите источник примеров для CONTEXT или отключите его.</p>
                     </div>
                   </div>
                 </div>
@@ -255,6 +317,18 @@
         <p data-role="progress-message">Генерируем материалы…</p>
       </div>
     </div>
+
+    <template id="source-row-template">
+      <div class="source-row">
+        <input type="text" class="source-input" placeholder="https://example.com" />
+        <select class="source-usage">
+          <option value="quote" selected>цитата с атрибуцией</option>
+          <option value="summary">пересказ со ссылкой</option>
+          <option value="inspiration">вдохновение без ссылки</option>
+        </select>
+        <button type="button" class="icon-button remove-source" aria-label="Удалить источник">✕</button>
+      </div>
+    </template>
 
     <template id="artifact-card-template">
       <article class="card">
