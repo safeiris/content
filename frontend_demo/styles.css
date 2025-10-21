@@ -238,10 +238,10 @@ body {
 }
 
 .field-hint {
-  margin: 4px 0 0;
-  font-size: 13px;
-  line-height: 1.4;
+  margin-top: 6px;
   color: #6b7280;
+  font-size: 13px;
+  line-height: 1.35;
 }
 
 .field-hint code {

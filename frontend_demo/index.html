@@ -235,13 +235,15 @@
                           <input id="k-input" type="number" min="0" max="6" value="0" />
                         </div>
                         <div class="form-row">
-                          <label class="field-label" for="context-source-select">Источник контекста</label>
+                          <label class="field-label" for="context-source-select">🔧 Источник настроек генерации</label>
                           <select id="context-source-select">
-                            <option value="index.json" selected>index.json (по умолчанию)</option>
-                            <option value="custom">custom</option>
-                            <option value="off">off</option>
+                            <option value="index.json" selected>Предустановленные параметры проекта (по умолчанию)</option>
+                            <option value="custom">Мой текст или файл (custom)</option>
+                            <option value="off">Без контекста (off)</option>
                           </select>
-                          <p class="field-hint">Выберите источник примеров для CONTEXT или отключите его.</p>
+                          <div id="context-source-help" class="field-hint">
+                            Определяет, откуда система возьмёт стиль, тему и контекст текста.
+                          </div>
                           <div class="custom-context-block" id="custom-context-block" hidden>
                             <p class="field-hint custom-context-hint">
                               Можно вставить текст или загрузить .txt/.json. До 20 000 символов. При custom параметр «Контекст (k)» не используется.
