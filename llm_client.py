@@ -94,13 +94,12 @@ def build_responses_payload(
     payload: Dict[str, object] = {
         "model": str(model).strip(),
         "input": joined_input.strip(),
-        "text": {"format": "plain"},
         "max_output_tokens": int(max_tokens),
     }
     return payload
 
 
-def sanitize_payload_for_responses(payload: Dict[str, object]) -> Dict[str, object]:
+def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str, object], int]:
     """Restrict Responses payload to the documented whitelist and types."""
 
     sanitized: Dict[str, object] = {}
@@ -138,12 +137,17 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Dict[str, obje
         if key == "text":
             if isinstance(value, dict):
                 text_block = {}
-                if "format" in value and value["format"]:
-                    text_block["format"] = str(value["format"]).strip()
+                format_section = value.get("format")
+                if isinstance(format_section, dict):
+                    type_value = format_section.get("type")
+                    if type_value:
+                        text_block["format"] = {"type": str(type_value).strip()}
                 if text_block:
                     sanitized[key] = text_block
             continue
-    return sanitized
+    input_value = sanitized.get("input", "")
+    input_length = len(input_value) if isinstance(input_value, str) else 0
+    return sanitized, input_length
 
 
 def _store_responses_debug_artifacts(
@@ -198,7 +202,7 @@ def _handle_responses_http_error(
                 message = str(error_block.get("message", ""))
         if not message:
             message = response.text.strip()
-    truncated = (message or "")[:120]
+    truncated = (message or "")[:200]
     LOGGER.error(
         'Responses API error: status=%s type=%s message="%s"',
         status,
@@ -879,25 +883,30 @@ def generate(
         user_text = "\n\n".join(user_segments)
 
         payload = build_responses_payload(target_model, system_text, user_text, max_tokens)
-        sanitized_payload = sanitize_payload_for_responses(payload)
+        sanitized_payload, _ = sanitize_payload_for_responses(payload)
 
         LOGGER.info("dispatch route=responses model=%s", target_model)
-        LOGGER.info("Responses payload keys: %s", sorted(sanitized_payload.keys()))
-        if sanitized_payload.get("text", {}).get("format") == "plain":
-            LOGGER.info("text.format='plain'")
-        input_value = sanitized_payload.get("input", "")
-        input_length = len(input_value) if isinstance(input_value, str) else 0
-        LOGGER.info("responses input_len=%d", input_length)
+
+        def _log_payload_state(payload_snapshot: Dict[str, object]) -> None:
+            keys = sorted(payload_snapshot.keys())
+            LOGGER.info("payload keys: %s", keys)
+            input_candidate = payload_snapshot.get("input", "")
+            length = len(input_candidate) if isinstance(input_candidate, str) else 0
+            LOGGER.info("responses input_len=%d", length)
 
         current_payload = dict(sanitized_payload)
+        base_payload = dict(sanitized_payload)
         attempt_index = 0
         shimmed_param: Optional[str] = None
         last_error: Optional[BaseException] = None
+        hint_retry_used = False
+        text_format_retry_used = False
 
         while attempt_index < MAX_RETRIES:
             attempt_index += 1
             if attempt_index > 1:
                 retry_used = True
+            _log_payload_state(current_payload)
             try:
                 response = http_client.post(
                     RESPONSES_API_URL,
@@ -926,24 +935,60 @@ def generate(
                 raise
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else None
-                if (
-                    status_code == 400
-                    and shimmed_param is None
-                ):
-                    param_name = _extract_unknown_parameter_name(exc.response)
-                    if param_name:
-                        next_payload = dict(current_payload)
-                        if param_name in next_payload:
-                            next_payload.pop(param_name, None)
-                        current_payload = sanitize_payload_for_responses(next_payload)
-                        shimmed_param = param_name
-                        retry_used = True
-                        LOGGER.warning(
-                            "retry=shim_unknown_param stripped='%s'",
-                            param_name,
-                        )
-                        continue
+                error_message = ""
+                if exc.response is not None:
+                    try:
+                        payload_json = exc.response.json()
+                    except ValueError:
+                        payload_json = None
+                    if isinstance(payload_json, dict):
+                        error_block = payload_json.get("error")
+                        if isinstance(error_block, dict):
+                            error_message = str(error_block.get("message", ""))
+                    if not error_message:
+                        error_message = exc.response.text or ""
                 _handle_responses_http_error(exc, current_payload)
+                lowered_message = error_message.lower()
+                if status_code == 400:
+                    if shimmed_param is None:
+                        param_name = _extract_unknown_parameter_name(exc.response)
+                        if param_name:
+                            next_payload = dict(current_payload)
+                            if param_name in next_payload:
+                                next_payload.pop(param_name, None)
+                            current_payload, _ = sanitize_payload_for_responses(next_payload)
+                            shimmed_param = param_name
+                            retry_used = True
+                            LOGGER.warning(
+                                "retry=shim_unknown_param stripped='%s'",
+                                param_name,
+                            )
+                            continue
+                    if (
+                        not hint_retry_used
+                        and (
+                            "response_format" in lowered_message
+                            or "text.format" in lowered_message
+                        )
+                    ):
+                        current_payload = dict(base_payload)
+                        hint_retry_used = True
+                        LOGGER.warning("retry=shim_hint_response_format")
+                        continue
+                    if (
+                        not text_format_retry_used
+                        and (
+                            "must specify text.format" in lowered_message
+                            or "expected a text format" in lowered_message
+                            or "specify text.format" in lowered_message
+                        )
+                    ):
+                        next_payload = dict(base_payload)
+                        next_payload["text"] = {"format": {"type": "plain"}}
+                        current_payload, _ = sanitize_payload_for_responses(next_payload)
+                        text_format_retry_used = True
+                        LOGGER.warning("retry=shim_text_format_object")
+                        continue
                 last_error = exc
             except Exception as exc:  # noqa: BLE001
                 if isinstance(exc, KeyboardInterrupt):  # pragma: no cover - respect interrupts

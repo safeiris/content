@@ -132,12 +132,12 @@ def test_generate_uses_responses_payload_for_gpt5():
     assert result.schema == "responses.text"
     payload = request_payload["json"]
     assert payload["max_output_tokens"] == 42
-    assert payload["text"] == {"format": "plain"}
     assert "modalities" not in payload
     assert "temperature" not in payload
     assert "messages" not in payload
     assert payload["model"] == "gpt-5-preview"
     assert payload["input"].startswith("USER\n")
+    assert set(payload.keys()) == {"input", "max_output_tokens", "model"}
     assert request_payload["url"].endswith("/responses")
 
 
@@ -152,8 +152,7 @@ def test_generate_logs_about_temperature_for_gpt5():
         )
 
     mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
-    mock_logger.info.assert_any_call("Responses payload keys: %s", ["input", "max_output_tokens", "model", "text"])
-    mock_logger.info.assert_any_call("text.format='plain'")
+    mock_logger.info.assert_any_call("payload keys: %s", ["input", "max_output_tokens", "model"])
     mock_logger.info.assert_any_call("responses input_len=%d", 9)
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
 
@@ -172,13 +171,11 @@ def test_generate_sends_minimal_payload_for_gpt5():
     payload = request_payload["json"]
     assert payload["model"] == "gpt-5-turbo"
     assert "modalities" not in payload
-    assert payload["text"] == {"format": "plain"}
     assert payload["max_output_tokens"] == 42
     assert payload["input"].startswith("USER\n")
     assert set(payload.keys()) == {
         "model",
         "input",
-        "text",
         "max_output_tokens",
     }
 
