@@ -811,7 +811,7 @@ function buildRequestPayload() {
   };
 
   const kValue = String(kInput?.value ?? "").trim();
-  let k = kValue === "" ? 3 : Number.parseInt(kValue, 10);
+  let k = kValue === "" ? 0 : Number.parseInt(kValue, 10);
   if (!Number.isInteger(k) || k < 0 || k > 6) {
     throw new Error("Контекст (k) должен быть целым числом от 0 до 6");
   }

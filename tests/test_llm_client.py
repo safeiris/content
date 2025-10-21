@@ -102,7 +102,15 @@ def test_generate_uses_max_completion_tokens_for_gpt5():
     assert request_payload["json"]["max_completion_tokens"] == 42
     assert "max_tokens" not in request_payload["json"]
     assert "temperature" not in request_payload["json"]
-    assert set(request_payload["json"].keys()) == {"model", "messages", "max_completion_tokens"}
+    assert request_payload["json"]["response_format"] == {"type": "text"}
+    assert request_payload["json"]["modalities"] == ["text"]
+    assert set(request_payload["json"].keys()) == {
+        "model",
+        "messages",
+        "max_completion_tokens",
+        "response_format",
+        "modalities",
+    }
 
 
 def test_generate_logs_about_temperature_for_gpt5():
@@ -119,6 +127,8 @@ def test_generate_logs_about_temperature_for_gpt5():
         "model": "gpt-5-super",
         "messages": "<1 messages>",
         "max_completion_tokens": 42,
+        "response_format": {"type": "text"},
+        "modalities": ["text"],
     }
     mock_logger.info.assert_any_call("openai payload blueprint: %s", summary)
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
@@ -131,6 +141,8 @@ def test_generate_sends_minimal_payload_for_gpt5():
         "model": "gpt-5-turbo",
         "messages": [{"role": "user", "content": "ping"}],
         "max_completion_tokens": 42,
+        "response_format": {"type": "text"},
+        "modalities": ["text"],
     }
 
 
@@ -172,7 +184,7 @@ def test_generate_falls_back_to_gpt4_when_gpt5_empty():
             }
         ]
     }
-    client = DummyClient(payloads=[empty_payload, empty_payload, fallback_payload])
+    client = DummyClient(payloads=[empty_payload, fallback_payload])
     with patch("llm_client.httpx.Client", return_value=client), patch("llm_client.random.uniform", return_value=0.0), patch("llm_client.time.sleep", lambda _seconds: None):
         result = generate(
             messages=[{"role": "user", "content": "ping"}],
@@ -183,7 +195,7 @@ def test_generate_falls_back_to_gpt4_when_gpt5_empty():
 
     assert result.model_used == "gpt-4o"
     assert result.fallback_used == "gpt-4o"
-    assert result.retry_used is True
+    assert result.retry_used is False
     assert result.text == "from fallback"
     assert result.fallback_reason == "empty_completion"
 

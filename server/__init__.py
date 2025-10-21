@@ -174,7 +174,7 @@ def create_app() -> Flask:
         if not isinstance(raw_data, dict):
             raise ApiError("Поле data должно быть объектом")
 
-        k = _safe_int(payload.get("k", 3))
+        k = _safe_int(payload.get("k"))
         if k < 0:
             k = 0
 
@@ -239,7 +239,7 @@ def create_app() -> Flask:
         if not isinstance(raw_data, dict):
             raise ApiError("Поле data должно быть объектом")
 
-        k = _safe_int(payload.get("k", 3))
+        k = _safe_int(payload.get("k"))
         if k < 0:
             k = 0
 

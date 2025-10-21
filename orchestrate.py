@@ -267,7 +267,12 @@ def _parse_args() -> argparse.Namespace:
         "--outfile",
         help="Optional path for the resulting markdown. Defaults to artifacts/<timestamp>__<theme>__article.md",
     )
-    parser.add_argument("--k", type=int, default=3, help="Number of exemplar clips to attach to CONTEXT (default: 3).")
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=0,
+        help="Number of exemplar clips to attach to CONTEXT (default: 0).",
+    )
     parser.add_argument("--model", help="Override model name (otherwise uses LLM_MODEL env or default).")
     parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature (default: 0.3).")
     parser.add_argument(
