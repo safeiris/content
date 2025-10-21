@@ -22,7 +22,7 @@ BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 FALLBACK_MODEL = "gpt-4o"
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens")
-RESPONSES_POLL_DELAY = 0.25
+RESPONSES_POLL_SCHEDULE = (0.3, 0.6, 1.0, 1.5, 1.5)
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
 
 MODEL_PROVIDER_MAP = {
@@ -893,6 +893,123 @@ def generate(
             length = len(input_candidate) if isinstance(input_candidate, str) else 0
             LOGGER.info("responses input_len=%d", length)
 
+        def _search_finish_reason(container: object) -> Optional[str]:
+            if isinstance(container, dict):
+                finish_value = container.get("finish_reason")
+                if isinstance(finish_value, str) and finish_value.strip():
+                    return finish_value.strip()
+                for value in container.values():
+                    found = _search_finish_reason(value)
+                    if found:
+                        return found
+            elif isinstance(container, list):
+                for item in container:
+                    found = _search_finish_reason(item)
+                    if found:
+                        return found
+            return None
+
+        def _extract_responses_metadata(payload: Dict[str, object]) -> Dict[str, object]:
+            status_value = payload.get("status")
+            status = str(status_value).strip().lower() if isinstance(status_value, str) else ""
+            incomplete_details = payload.get("incomplete_details")
+            incomplete_reason = ""
+            if isinstance(incomplete_details, dict):
+                reason = incomplete_details.get("reason")
+                if isinstance(reason, str):
+                    incomplete_reason = reason.strip().lower()
+            usage_output_tokens: Optional[float] = None
+            usage_block = payload.get("usage")
+            if isinstance(usage_block, dict):
+                output_tokens = usage_block.get("output_tokens")
+                if isinstance(output_tokens, (int, float)):
+                    usage_output_tokens = float(output_tokens)
+                elif isinstance(output_tokens, dict):
+                    for value in output_tokens.values():
+                        if isinstance(value, (int, float)):
+                            usage_output_tokens = float(value)
+                            break
+            finish_reason_value = _search_finish_reason(payload)
+            finish_reason = (
+                finish_reason_value.strip().lower()
+                if isinstance(finish_reason_value, str)
+                else ""
+            )
+            previous_response_id = ""
+            candidate = payload.get("previous_response_id")
+            if isinstance(candidate, str) and candidate.strip():
+                previous_response_id = candidate.strip()
+            else:
+                metadata_block = payload.get("metadata")
+                if isinstance(metadata_block, dict):
+                    meta_candidate = metadata_block.get("previous_response_id")
+                    if isinstance(meta_candidate, str) and meta_candidate.strip():
+                        previous_response_id = meta_candidate.strip()
+            return {
+                "status": status,
+                "incomplete_reason": incomplete_reason,
+                "usage_output_tokens": usage_output_tokens,
+                "finish_reason": finish_reason,
+                "previous_response_id": previous_response_id,
+            }
+
+        def _detect_truncation_signals(
+            metadata: Dict[str, object],
+            *,
+            max_output_tokens_value: Optional[int],
+        ) -> List[str]:
+            signals: List[str] = []
+            if metadata.get("incomplete_reason") == "max_output_tokens":
+                signals.append("incomplete_reason=max_output_tokens")
+            usage_output_tokens = metadata.get("usage_output_tokens")
+            if (
+                isinstance(max_output_tokens_value, int)
+                and isinstance(usage_output_tokens, (int, float))
+                and max_output_tokens_value > 0
+                and usage_output_tokens >= max_output_tokens_value * 0.98
+            ):
+                signals.append("usage_output_tokens>=98pct")
+            if metadata.get("finish_reason") == "length":
+                signals.append("finish_reason=length")
+            return signals
+
+        def _process_responses_payload(
+            payload: Dict[str, object],
+            *,
+            max_output_tokens_value: Optional[int],
+            source: str,
+        ) -> Dict[str, object]:
+            text, parse_flags, schema_label = _extract_responses_text(payload)
+            segments = int(parse_flags.get("segments", 0) or 0)
+            metadata = _extract_responses_metadata(payload)
+            signals = _detect_truncation_signals(
+                metadata, max_output_tokens_value=max_output_tokens_value
+            )
+            LOGGER.info(
+                "responses meta status=%s incomplete_reason=%s usage_output_tokens=%s max_output_tokens=%s previous_response_id=%s",
+                metadata.get("status") or "",
+                metadata.get("incomplete_reason") or "",
+                metadata.get("usage_output_tokens"),
+                max_output_tokens_value,
+                metadata.get("previous_response_id") or "",
+            )
+            LOGGER.info(
+                "responses parse segments=%d signals=%s source=%s",
+                segments,
+                ",".join(signals) if signals else "none",
+                source,
+            )
+            return {
+                "data": payload,
+                "text": text,
+                "parse_flags": parse_flags,
+                "schema": schema_label,
+                "segments": segments,
+                "metadata": metadata,
+                "signals": signals,
+                "source": source,
+            }
+
         current_payload = dict(sanitized_payload)
         base_payload = dict(sanitized_payload)
         attempt_index = 0
@@ -917,46 +1034,176 @@ def generate(
                 data = response.json()
                 if not isinstance(data, dict):
                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
-                status_value = data.get("status")
+
+                try:
+                    max_output_tokens_value: Optional[int] = int(
+                        current_payload.get("max_output_tokens", 0)
+                    )
+                except (TypeError, ValueError):
+                    max_output_tokens_value = None
+
                 response_id = data.get("id") if isinstance(data.get("id"), str) else None
                 LOGGER.info(
                     "responses status=%s id=%s",
-                    status_value,
+                    data.get("status"),
                     response_id,
                 )
-                if isinstance(status_value, str) and status_value and status_value.lower() != "completed":
-                    if response_id:
+
+                records: List[Dict[str, object]] = []
+                best_record: Optional[Dict[str, object]] = None
+                best_record_no_trunc: Optional[Dict[str, object]] = None
+                last_record: Optional[Dict[str, object]] = None
+
+                def _consider_record(record: Dict[str, object]) -> None:
+                    nonlocal best_record, best_record_no_trunc, last_record
+                    last_record = record
+                    records.append(record)
+                    if record["segments"] > 0:
+                        if best_record is None or record["segments"] >= best_record["segments"]:
+                            best_record = record
+                        if not record["signals"] and best_record_no_trunc is None:
+                            best_record_no_trunc = record
+
+                initial_record = _process_responses_payload(
+                    data,
+                    max_output_tokens_value=max_output_tokens_value,
+                    source="initial",
+                )
+                _consider_record(initial_record)
+
+                poll_attempt = 0
+                previous_fetch_done = False
+                current_record = initial_record
+
+                while True:
+                    status = current_record["metadata"].get("status")
+                    ready_without_trunc = (
+                        current_record["segments"] > 0 and not current_record["signals"]
+                    )
+                    if status == "completed" or ready_without_trunc:
+                        break
+                    if poll_attempt >= len(RESPONSES_POLL_SCHEDULE) or not response_id:
+                        break
+                    delay = RESPONSES_POLL_SCHEDULE[poll_attempt]
+                    poll_attempt += 1
+                    LOGGER.info(
+                        "responses poll attempt=%d delay=%.3f id=%s",
+                        poll_attempt,
+                        delay,
+                        response_id,
+                    )
+                    time.sleep(delay)
+                    try:
+                        poll_response = http_client.get(
+                            f"{RESPONSES_API_URL}/{response_id}",
+                            headers=headers,
+                        )
+                        poll_response.raise_for_status()
+                        polled_data = poll_response.json()
+                        if not isinstance(polled_data, dict):
+                            LOGGER.warning(
+                                "responses poll unexpected payload id=%s", response_id
+                            )
+                            break
+                        response_id = (
+                            polled_data.get("id")
+                            if isinstance(polled_data.get("id"), str)
+                            else response_id
+                        )
                         LOGGER.info(
-                            "responses status=%s; polling id=%s",
-                            status_value,
+                            "responses status=%s id=%s (poll)",
+                            polled_data.get("status"),
                             response_id,
                         )
-                        time.sleep(RESPONSES_POLL_DELAY)
-                        try:
-                            poll_response = http_client.get(
-                                f"{RESPONSES_API_URL}/{response_id}",
-                                headers=headers,
+                        current_record = _process_responses_payload(
+                            polled_data,
+                            max_output_tokens_value=max_output_tokens_value,
+                            source=f"poll#{poll_attempt}",
+                        )
+                        _consider_record(current_record)
+                    except Exception as poll_error:  # noqa: BLE001
+                        LOGGER.warning(
+                            "responses poll failed id=%s error=%s",
+                            response_id,
+                            poll_error,
+                        )
+                        break
+
+                current_metadata = current_record["metadata"] if current_record else {}
+                previous_response_id = (
+                    current_metadata.get("previous_response_id") if current_metadata else ""
+                )
+                if (
+                    previous_response_id
+                    and current_metadata.get("status") != "completed"
+                    and not previous_fetch_done
+                ):
+                    LOGGER.info(
+                        "responses fetch previous_response_id=%s", previous_response_id
+                    )
+                    previous_fetch_done = True
+                    try:
+                        prev_response = http_client.get(
+                            f"{RESPONSES_API_URL}/{previous_response_id}",
+                            headers=headers,
+                        )
+                        prev_response.raise_for_status()
+                        prev_data = prev_response.json()
+                        if isinstance(prev_data, dict):
+                            current_record = _process_responses_payload(
+                                prev_data,
+                                max_output_tokens_value=max_output_tokens_value,
+                                source="previous_response",
                             )
-                            poll_response.raise_for_status()
-                            polled_data = poll_response.json()
-                            if isinstance(polled_data, dict):
-                                data = polled_data
-                                status_value = data.get("status")
-                                response_id = data.get("id") if isinstance(data.get("id"), str) else response_id
-                                LOGGER.info(
-                                    "responses status=%s id=%s (poll)",
-                                    status_value,
-                                    response_id,
-                                )
-                        except Exception as poll_error:  # noqa: BLE001
+                            _consider_record(current_record)
+                        else:
                             LOGGER.warning(
-                                "responses poll failed id=%s error=%s",
-                                response_id,
-                                poll_error,
+                                "responses previous_response unexpected payload id=%s",
+                                previous_response_id,
                             )
-                if isinstance(data, dict):
-                    _store_responses_response_snapshot(data)
-                text, parse_flags, schema_label = _extract_responses_text(data)
+                    except Exception as prev_error:  # noqa: BLE001
+                        LOGGER.warning(
+                            "responses previous_response fetch failed id=%s error=%s",
+                            previous_response_id,
+                            prev_error,
+                        )
+
+                record_to_use = best_record_no_trunc or best_record or current_record
+                if record_to_use is None:
+                    record_to_use = initial_record
+
+                if record_to_use["text"]:
+                    selected_segments = record_to_use["segments"]
+                else:
+                    selected_segments = 0
+
+                last_signals = current_record["signals"] if current_record else []
+
+                if best_record_no_trunc is not None:
+                    LOGGER.info(
+                        "responses restart skipped reason=segments_without_truncation segments=%d",
+                        best_record_no_trunc["segments"],
+                    )
+                elif last_signals:
+                    LOGGER.warning(
+                        "responses restart triggered signals=%s",
+                        ",".join(last_signals),
+                    )
+                    continue
+                else:
+                    LOGGER.info(
+                        "responses restart skipped reason=no_truncation_signals status=%s segments=%d",
+                        (current_record["metadata"].get("status") if current_record else ""),
+                        selected_segments,
+                    )
+
+                if isinstance(record_to_use.get("data"), dict):
+                    _store_responses_response_snapshot(record_to_use["data"])
+
+                text = record_to_use["text"]
+                parse_flags = record_to_use["parse_flags"]
+                schema_label = record_to_use["schema"]
+
                 if not text:
                     LOGGER.warning(
                         "Пустой ответ от Responses API %s (schema=%s)",
@@ -965,11 +1212,12 @@ def generate(
                     )
                     raise EmptyCompletionError(
                         "Responses API вернул пустой ответ",
-                        raw_response=data,
+                        raw_response=record_to_use.get("data", {}),
                         parse_flags=parse_flags,
                     )
-                _persist_raw_response(data)
-                return text, parse_flags, data, schema_label
+
+                _persist_raw_response(record_to_use.get("data", {}))
+                return text, parse_flags, record_to_use.get("data", {}), schema_label
             except EmptyCompletionError:
                 raise
             except httpx.HTTPStatusError as exc:
