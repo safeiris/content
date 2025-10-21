@@ -191,6 +191,25 @@ body {
   padding: 20px 24px;
 }
 
+.style-toggle-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+#styleSettings {
+  display: none;
+  flex-direction: column;
+  gap: 12px;
+}
+
+#styleSettings label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .brief-form * {
   box-sizing: border-box;
 }

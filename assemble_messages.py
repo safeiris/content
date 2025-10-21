@@ -24,6 +24,82 @@ _STYLE_PROFILE_VARIANT_PATHS = {
     "light": STYLE_PROFILE_LIGHT_PATH,
 }
 
+STYLES_DIR = Path(__file__).resolve().parent / "profiles/finance/styles"
+
+
+def _load_style_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def _normalize_style_tokens(raw: Any) -> List[str]:
+    if isinstance(raw, str):
+        text = raw.strip()
+        return [text] if text else []
+    if isinstance(raw, (list, tuple, set)):
+        normalized: List[str] = []
+        for item in raw:
+            token = str(item).strip()
+            if token:
+                normalized.append(token)
+        return normalized
+    return []
+
+
+def build_style_instruction(style_data: Dict[str, Any]) -> str:
+    if not isinstance(style_data, dict) or not style_data.get("enabled"):
+        return ""
+
+    style_slug = str(style_data.get("style", "sravni")).strip().lower() or "sravni"
+    strength_raw = style_data.get("strength", 0.6)
+    try:
+        strength = float(strength_raw)
+    except (TypeError, ValueError):
+        strength = 0.6
+
+    profile_path = STYLES_DIR / f"{style_slug}.json"
+    if not profile_path.exists():
+        return ""
+
+    try:
+        profile_payload = _load_style_json(profile_path)
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+    profile: Dict[str, Any]
+    if isinstance(profile_payload, dict):
+        profile = profile_payload
+    elif isinstance(profile_payload, list):
+        profile = next(
+            (
+                item
+                for item in profile_payload
+                if isinstance(item, dict)
+                and any(key in item for key in ("tone", "avg_sentence_len", "must_use", "avoid_words"))
+            ),
+            {},
+        )
+    else:
+        profile = {}
+
+    tone = str(profile.get("tone", "нейтральный")).strip() or "нейтральный"
+    parts = [f"Пиши в тоне: {tone}."]
+
+    if strength > 0.4:
+        avg_sentence_len = profile.get("avg_sentence_len", 15)
+        parts.append(f"Средняя длина предложений {avg_sentence_len} слов.")
+    if strength > 0.5:
+        parts.append("Используй структуру: определение → шаги → пример расчёта → вывод.")
+    if strength > 0.7:
+        must_tokens = _normalize_style_tokens(profile.get("must_use", []))
+        avoid_tokens = _normalize_style_tokens(profile.get("avoid_words", []))
+        if must_tokens:
+            parts.append(f"Используй слова: {', '.join(must_tokens)}.")
+        if avoid_tokens:
+            parts.append(f"Избегай слов: {', '.join(avoid_tokens)}.")
+
+    return " ".join(parts).strip()
+
 
 def _style_profile_file_for_variant(variant: str) -> Tuple[str, Path]:
     variant_key = variant if variant in _STYLE_PROFILE_VARIANT_PATHS else "full"
@@ -196,24 +272,29 @@ def retrieve_exemplars(theme_slug: str, query: str, k: int = 3) -> List[Dict[str
 def _build_user_instruction(payload: Dict[str, Any]) -> str:
     base_instruction = "Сгенерируй текст по указанным параметрам."
     if not payload:
-        return base_instruction
+        instruction = base_instruction
+    else:
+        hints: List[str] = []
+        facts_mode = str(payload.get("facts_mode", "")).strip().lower()
+        if facts_mode == "cautious":
+            hints.append(
+                "Работай в режиме fact-check: ссылаться только на проверенные данные, избегать категоричных утверждений и уточнять, что читателю следует перепроверять цифры."
+            )
 
-    hints: List[str] = []
-    facts_mode = str(payload.get("facts_mode", "")).strip().lower()
-    if facts_mode == "cautious":
-        hints.append(
-            "Работай в режиме fact-check: ссылаться только на проверенные данные, избегать категоричных утверждений и уточнять, что читателю следует перепроверять цифры."
-        )
+        if payload.get("include_faq"):
+            hints.append("Добавь блок FAQ с короткими ответами на типовые вопросы читателей.")
+        if payload.get("include_table"):
+            hints.append("Вставь краткую таблицу со сравнением ключевых параметров, если это уместно.")
 
-    if payload.get("include_faq"):
-        hints.append("Добавь блок FAQ с короткими ответами на типовые вопросы читателей.")
-    if payload.get("include_table"):
-        hints.append("Вставь краткую таблицу со сравнением ключевых параметров, если это уместно.")
+        if hints:
+            instruction = base_instruction + " " + " ".join(hints)
+        else:
+            instruction = base_instruction
 
-    if not hints:
-        return base_instruction
-
-    return base_instruction + " " + " ".join(hints)
+    style_instruction = build_style_instruction(payload.get("style", {})) if payload else ""
+    if style_instruction:
+        return f"{style_instruction}\n\n{instruction}".strip()
+    return instruction
 
 
 def assemble_messages(

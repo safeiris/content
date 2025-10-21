@@ -64,6 +64,10 @@ const maxCharsInput = document.getElementById("max-chars-input");
 const keywordModeInputs = document.querySelectorAll("input[name='keywords-mode']");
 const styleProfileSelect = document.getElementById("style-profile-select");
 const styleProfileHint = document.getElementById("style-profile-hint");
+const useStyleCheckbox = document.getElementById("useStyleCheckbox");
+const styleSettings = document.getElementById("styleSettings");
+const styleSelect = document.getElementById("styleSelect");
+const styleStrengthInput = document.getElementById("styleStrength");
 const sourcesList = document.getElementById("sources-list");
 const addSourceBtn = document.getElementById("add-source-btn");
 const faqCountInput = document.getElementById("faq-count-input");
@@ -195,6 +199,13 @@ if (modelInput) {
 }
 if (styleProfileSelect) {
   styleProfileSelect.addEventListener("change", handleStyleProfileChange);
+}
+if (useStyleCheckbox && styleSettings) {
+  const toggleStyleSettingsVisibility = () => {
+    styleSettings.style.display = useStyleCheckbox.checked ? "flex" : "none";
+  };
+  useStyleCheckbox.addEventListener("change", toggleStyleSettingsVisibility);
+  toggleStyleSettingsVisibility();
 }
 if (includeFaq) {
   includeFaq.addEventListener("change", handleFaqToggle);
@@ -1292,6 +1303,30 @@ function buildRequestPayload() {
     if (contextPayload.filename) {
       payload.context_filename = contextPayload.filename;
     }
+  }
+
+  let stylePayload;
+  if (useStyleCheckbox) {
+    if (useStyleCheckbox.checked) {
+      const selectedStyle = (styleSelect?.value || "sravni").trim() || "sravni";
+      const strengthRaw = String(styleStrengthInput?.value ?? "").trim();
+      let strength = Number.parseFloat(strengthRaw || "0.6");
+      if (Number.isNaN(strength)) {
+        strength = 0.6;
+      }
+      stylePayload = {
+        enabled: true,
+        style: selectedStyle,
+        strength,
+      };
+    } else {
+      stylePayload = { enabled: false };
+    }
+    data.style = stylePayload;
+  }
+
+  if (stylePayload) {
+    payload.style = stylePayload;
   }
 
   return payload;

@@ -275,6 +275,24 @@
               </section>
 
               <footer class="form-card form-card--actions">
+                <div class="style-toggle-block">
+                  <label>
+                    <input type="checkbox" id="useStyleCheckbox" />
+                    Использовать стиль бренда
+                  </label>
+
+                  <div id="styleSettings" style="display:none; margin-top:6px;">
+                    <label>Стиль:
+                      <select id="styleSelect">
+                        <option value="sravni">Сравни.ру</option>
+                        <option value="banki">Банки.ру</option>
+                      </select>
+                    </label>
+                    <label>Сила стиля:
+                      <input type="range" id="styleStrength" min="0" max="1" step="0.1" value="0.6" />
+                    </label>
+                  </div>
+                </div>
                 <div class="form-actions">
                   <button type="submit" class="primary">
                     <span class="btn-label">Сгенерировать</span>

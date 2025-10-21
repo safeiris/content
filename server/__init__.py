@@ -175,6 +175,10 @@ def create_app() -> Flask:
             raise ApiError("Поле data должно быть объектом")
         raw_data = dict(raw_data)
 
+        style_payload = payload.get("style")
+        if isinstance(style_payload, dict):
+            raw_data["style"] = style_payload
+
         k = _safe_int(payload.get("k"))
         if k < 0:
             k = 0
@@ -263,6 +267,10 @@ def create_app() -> Flask:
         if not isinstance(raw_data, dict):
             raise ApiError("Поле data должно быть объектом")
         raw_data = dict(raw_data)
+
+        style_payload = payload.get("style")
+        if isinstance(style_payload, dict):
+            raw_data["style"] = style_payload
 
         k = _safe_int(payload.get("k"))
         if k < 0:
