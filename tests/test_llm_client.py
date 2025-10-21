@@ -131,8 +131,8 @@ def test_generate_uses_responses_payload_for_gpt5():
     assert result.api_route == "responses"
     payload = request_payload["json"]
     assert payload["max_output_tokens"] == 42
-    assert payload["modalities"] == ["text"]
     assert payload["text"] == {"format": "plain"}
+    assert "modalities" not in payload
     assert "temperature" not in payload
     assert "messages" not in payload
     assert payload["model"] == "gpt-5-preview"
@@ -152,7 +152,7 @@ def test_generate_logs_about_temperature_for_gpt5():
 
     mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
     mock_logger.info.assert_any_call(
-        "Responses payload: modalities=['text'], text.format='plain'"
+        "Responses payload: text.format='plain' (no modalities)"
     )
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
 
@@ -170,24 +170,23 @@ def test_generate_sends_minimal_payload_for_gpt5():
     _, request_payload = _run_and_capture_request("gpt-5-turbo", payloads=[responses_payload])
     payload = request_payload["json"]
     assert payload["model"] == "gpt-5-turbo"
-    assert payload["modalities"] == ["text"]
+    assert "modalities" not in payload
     assert payload["text"] == {"format": "plain"}
     assert payload["max_output_tokens"] == 42
     assert payload["input"].strip().startswith("USER:")
     assert set(payload.keys()) == {
         "model",
         "input",
-        "modalities",
         "text",
         "max_output_tokens",
     }
 
 
-def test_generate_retries_when_response_format_unsupported():
+def test_generate_retries_when_unknown_parameter_reported():
     error_entry = {
         "__error__": "http",
         "status": 400,
-        "payload": {"error": {"message": "Unsupported parameter: 'response_format'"}},
+        "payload": {"error": {"message": "Unknown parameter: 'modalities'"}},
     }
     success_payload = {
         "output": [
@@ -213,8 +212,8 @@ def test_generate_retries_when_response_format_unsupported():
     assert result.retry_used is True
     assert dummy_client.call_count == 2
     mock_logger.warning.assert_any_call(
-        "retry=shim_response_format: Responses API reported unsupported response_format; "
-        "retrying with text.format='plain'",
+        "retry=shim_unknown_param: stripped '%s' from payload",
+        "modalities",
     )
 
 

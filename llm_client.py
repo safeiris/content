@@ -475,31 +475,6 @@ def _should_retry(exc: BaseException) -> bool:
     return False
 
 
-def _is_response_format_unsupported_error(exc: BaseException) -> bool:
-    message = str(exc)
-    cause = getattr(exc, "__cause__", None)
-    if isinstance(cause, httpx.HTTPStatusError):
-        response = cause.response
-        if response is not None and response.status_code == 400:
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = None
-            if isinstance(payload, dict):
-                error_block = payload.get("error")
-                if isinstance(error_block, dict):
-                    detail = error_block.get("message")
-                else:
-                    detail = payload.get("message")
-                if isinstance(detail, str):
-                    message = detail
-            elif isinstance(response.text, str) and response.text:
-                message = response.text
-        else:
-            return False
-    return "Unsupported parameter: 'response_format'" in message
-
-
 def _describe_error(exc: BaseException) -> str:
     status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
     if status:
@@ -538,6 +513,34 @@ def _raise_for_last_error(last_error: BaseException) -> None:
     raise RuntimeError(f"Не удалось получить ответ модели: {last_error}") from last_error
 
 
+def _extract_unknown_parameter_name(response: httpx.Response) -> Optional[str]:
+    message: str = ""
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error_block = payload.get("error")
+        if isinstance(error_block, dict):
+            message = str(error_block.get("message", ""))
+    if not message:
+        message = response.text or ""
+    message = message.strip()
+    if not message:
+        return None
+    lowered = message.lower()
+    if "unknown parameter" not in lowered and "unsupported parameter" not in lowered:
+        return None
+    marker = ":"
+    if marker in message:
+        remainder = message.split(marker, 1)[1].strip()
+    else:
+        remainder = message
+    if remainder.startswith("'") and "'" in remainder[1:]:
+        return remainder.split("'", 2)[1].strip()
+    return remainder.split()[0].strip("'\"") or None
+
+
 def _make_request(
     http_client: httpx.Client,
     *,
@@ -545,31 +548,60 @@ def _make_request(
     headers: Dict[str, str],
     payload: Dict[str, object],
     schedule: List[float],
-) -> Dict[str, object]:
+) -> Tuple[Dict[str, object], bool]:
     last_error: Optional[BaseException] = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    shimmed_param = False
+    stripped_param: Optional[str] = None
+    current_payload: Dict[str, object] = dict(payload)
+    attempt_index = 0
+    while attempt_index < MAX_RETRIES:
+        attempt_index += 1
         try:
-            response = http_client.post(api_url, headers=headers, json=payload)
+            response = http_client.post(api_url, headers=headers, json=current_payload)
             response.raise_for_status()
             data = response.json()
             if isinstance(data, dict):
-                return data
+                return data, shimmed_param
             raise RuntimeError("Модель вернула неожиданный формат ответа.")
         except EmptyCompletionError:
             raise
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if (
+                status == 400
+                and not shimmed_param
+                and exc.response is not None
+            ):
+                param_name = _extract_unknown_parameter_name(exc.response)
+                if param_name:
+                    if param_name in current_payload:
+                        current_payload = dict(current_payload)
+                        current_payload.pop(param_name, None)
+                    shimmed_param = True
+                    stripped_param = param_name
+                    LOGGER.warning(
+                        "retry=shim_unknown_param: stripped '%s' from payload",
+                        param_name,
+                    )
+                    continue
+            last_error = exc
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, KeyboardInterrupt):  # pragma: no cover - respect interrupts
                 raise
             last_error = exc
-            if attempt >= MAX_RETRIES or not _should_retry(exc):
-                break
-            sleep_for = schedule[min(attempt - 1, len(schedule) - 1)]
-            reason = _describe_error(exc)
-            print(
-                f"[llm_client] retry #{attempt} reason: {reason}; sleeping {sleep_for}s",
-                file=sys.stderr,
-            )
-            time.sleep(sleep_for)
+        if attempt_index >= MAX_RETRIES or not _should_retry(last_error):
+            break
+        sleep_for = schedule[min(attempt_index - 1, len(schedule) - 1)]
+        reason = _describe_error(last_error)
+        print(
+            f"[llm_client] retry #{attempt_index} reason: {reason}; sleeping {sleep_for}s",
+            file=sys.stderr,
+        )
+        time.sleep(sleep_for)
+    if stripped_param and last_error and isinstance(last_error, httpx.HTTPStatusError):
+        LOGGER.debug(
+            "param shim exhausted for '%s' with HTTP %s", stripped_param, last_error.response.status_code
+        )
     if last_error:
         _raise_for_last_error(last_error)
     raise RuntimeError("Модель не вернула ответ.")
@@ -663,15 +695,18 @@ def generate(
         return payload
 
     def _call_chat_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
+        nonlocal retry_used
         payload = _prepare_chat_payload(target_model)
         LOGGER.info("dispatch route=chat model=%s", target_model)
-        data = _make_request(
+        data, shimmed = _make_request(
             http_client,
             api_url=api_url,
             headers=headers,
             payload=payload,
             schedule=schedule,
         )
+        if shimmed:
+            retry_used = True
         text, parse_flags, schema_label = _extract_response_text(data)
         if not text:
             LOGGER.warning("Пустой ответ модели %s (schema=%s)", target_model, schema_label)
@@ -680,6 +715,7 @@ def generate(
                 raw_response=data,
                 parse_flags=parse_flags,
             )
+        _persist_raw_response(data)
         return text, parse_flags, data, schema_label
 
     def _call_responses_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
@@ -690,43 +726,24 @@ def generate(
         payload: Dict[str, object] = {
             "model": target_model,
             "input": input_text,
-            "modalities": ["text"],
             "text": {"format": "plain"},
             "max_output_tokens": max_tokens,
         }
         LOGGER.info("dispatch route=responses model=%s", target_model)
-        LOGGER.info("Responses payload: modalities=['text'], text.format='plain'")
+        LOGGER.info("Responses payload: text.format='plain' (no modalities)")
         LOGGER.debug(
             "responses payload preview: %s",
             {"model": target_model, "input_preview": input_text[:120]},
         )
-        try:
-            data = _make_request(
-                http_client,
-                api_url=RESPONSES_API_URL,
-                headers=headers,
-                payload=payload,
-                schedule=schedule,
-            )
-        except RuntimeError as exc:
-            if _is_response_format_unsupported_error(exc):
-                LOGGER.warning(
-                    "retry=shim_response_format: Responses API reported unsupported response_format; "
-                    "retrying with text.format='plain'",
-                )
-                retry_used = True
-                shim_payload = dict(payload)
-                shim_payload.pop("response_format", None)
-                shim_payload["text"] = {"format": "plain"}
-                data = _make_request(
-                    http_client,
-                    api_url=RESPONSES_API_URL,
-                    headers=headers,
-                    payload=shim_payload,
-                    schedule=schedule,
-                )
-            else:
-                raise
+        data, shimmed = _make_request(
+            http_client,
+            api_url=RESPONSES_API_URL,
+            headers=headers,
+            payload=payload,
+            schedule=schedule,
+        )
+        if shimmed:
+            retry_used = True
         text, parse_flags, schema_label = _extract_responses_text(data)
         if not text:
             LOGGER.warning(
@@ -739,6 +756,7 @@ def generate(
                 raw_response=data,
                 parse_flags=parse_flags,
             )
+        _persist_raw_response(data)
         return text, parse_flags, data, schema_label
 
     lower_model = model_name.lower()
