@@ -21,6 +21,7 @@ MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 FALLBACK_MODEL = "gpt-4o"
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
+RESPONSES_ALLOWED_KEYS = ("model", "input", "text", "max_output_tokens")
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
 
 MODEL_PROVIDER_MAP = {
@@ -36,6 +37,8 @@ PROVIDER_API_URLS = {
 
 LOGGER = logging.getLogger(__name__)
 RAW_RESPONSE_PATH = Path("artifacts/debug/last_raw_response.json")
+RESPONSES_ERROR_PATH = Path("artifacts/debug/last_gpt5_responses_error.json")
+RESPONSES_REQUEST_PATH = Path("artifacts/debug/last_gpt5_responses_request.json")
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,152 @@ class EmptyCompletionError(RuntimeError):
         super().__init__(message)
         self.raw_response = raw_response or {}
         self.parse_flags = parse_flags or {}
+
+
+def build_responses_payload(
+    model: str,
+    system_text: Optional[str],
+    user_text: Optional[str],
+    max_tokens: int,
+) -> Dict[str, object]:
+    """Construct a minimal Responses API payload for GPT-5 models."""
+
+    sections: List[str] = []
+
+    system_block = (system_text or "").strip()
+    if system_block:
+        sections.append(f"SYSTEM\n{system_block}")
+
+    user_block = (user_text or "").strip()
+    if user_block:
+        sections.append(f"USER\n{user_block}")
+
+    joined_input = "\n\n".join(section for section in sections if section)
+
+    payload: Dict[str, object] = {
+        "model": str(model).strip(),
+        "input": joined_input.strip(),
+        "text": {"format": "plain"},
+        "max_output_tokens": int(max_tokens),
+    }
+    return payload
+
+
+def sanitize_payload_for_responses(payload: Dict[str, object]) -> Dict[str, object]:
+    """Restrict Responses payload to the documented whitelist and types."""
+
+    sanitized: Dict[str, object] = {}
+    for key in RESPONSES_ALLOWED_KEYS:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if not trimmed:
+                continue
+            if key == "model":
+                sanitized[key] = trimmed
+                continue
+            if key == "input":
+                sanitized[key] = trimmed
+                continue
+        if key == "input" and not isinstance(value, str):
+            if isinstance(value, (list, dict)):
+                converted = json.dumps(value, ensure_ascii=False)
+            else:
+                converted = str(value)
+            converted = converted.strip()
+            if converted:
+                sanitized[key] = converted
+            continue
+        if key == "max_output_tokens":
+            try:
+                sanitized[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+            continue
+        if key == "text":
+            if isinstance(value, dict):
+                text_block = {}
+                if "format" in value and value["format"]:
+                    text_block["format"] = str(value["format"]).strip()
+                if text_block:
+                    sanitized[key] = text_block
+            continue
+    return sanitized
+
+
+def _store_responses_debug_artifacts(
+    error_payload: Dict[str, object],
+    request_payload: Dict[str, object],
+) -> None:
+    """Persist diagnostic artifacts for Responses API failures."""
+
+    try:
+        RESPONSES_ERROR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RESPONSES_ERROR_PATH.write_text(
+            json.dumps(error_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        snapshot = dict(request_payload)
+        input_value = snapshot.pop("input", "")
+        if isinstance(input_value, str):
+            preview = input_value[:200]
+        else:
+            preview = str(input_value)[:200]
+        snapshot["input_preview"] = preview
+        RESPONSES_REQUEST_PATH.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        LOGGER.debug("failed to persist Responses debug artifacts: %s", exc)
+
+
+def _handle_responses_http_error(
+    error: httpx.HTTPStatusError,
+    payload_snapshot: Dict[str, object],
+) -> None:
+    """Log a concise message and persist diagnostics for Responses failures."""
+
+    response = error.response
+    status = response.status_code if response is not None else "unknown"
+    error_payload: Dict[str, object] = {}
+    error_type = ""
+    message = ""
+    if response is not None:
+        try:
+            parsed = response.json()
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            error_payload = parsed
+            error_block = parsed.get("error")
+            if isinstance(error_block, dict):
+                error_type = str(error_block.get("type", ""))
+                message = str(error_block.get("message", ""))
+        if not message:
+            message = response.text.strip()
+    truncated = (message or "")[:120]
+    LOGGER.error(
+        'Responses API error: status=%s type=%s message="%s"',
+        status,
+        error_type or "unknown",
+        truncated,
+    )
+    if not error_payload and response is not None:
+        # Ensure we persist at least the textual payload
+        error_payload = {
+            "status": status,
+            "error": {
+                "type": error_type or "unknown",
+                "message": message,
+            },
+        }
+    _store_responses_debug_artifacts(error_payload, payload_snapshot)
 
 
 def _collect_text_parts(parts: List[object]) -> str:
@@ -671,16 +820,6 @@ def generate(
             return gpt5_messages_cache
         return messages
 
-    def _flatten_messages_for_responses(source_messages: List[Dict[str, object]]) -> str:
-        segments: List[str] = []
-        for item in source_messages:
-            role = str(item.get("role", "")).strip() or "unknown"
-            content = str(item.get("content", "")).strip()
-            if not content:
-                continue
-            segments.append(f"{role.upper()}:\n{content}")
-        return "\n\n".join(segments)
-
     def _prepare_chat_payload(target_model: str) -> Dict[str, object]:
         payload_messages = _messages_for_model(target_model)
         payload: Dict[str, object] = {
@@ -722,42 +861,112 @@ def generate(
         nonlocal retry_used
 
         payload_messages = _messages_for_model(target_model)
-        input_text = _flatten_messages_for_responses(payload_messages)
-        payload: Dict[str, object] = {
-            "model": target_model,
-            "input": input_text,
-            "text": {"format": "plain"},
-            "max_output_tokens": max_tokens,
-        }
+        system_segments: List[str] = []
+        user_segments: List[str] = []
+        for item in payload_messages:
+            role = str(item.get("role", "")).strip().lower()
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "system":
+                system_segments.append(content)
+            elif role == "user":
+                user_segments.append(content)
+            else:
+                user_segments.append(f"{role.upper()}:\n{content}")
+
+        system_text = "\n\n".join(system_segments)
+        user_text = "\n\n".join(user_segments)
+
+        payload = build_responses_payload(target_model, system_text, user_text, max_tokens)
+        sanitized_payload = sanitize_payload_for_responses(payload)
+
         LOGGER.info("dispatch route=responses model=%s", target_model)
-        LOGGER.info("Responses payload: text.format='plain' (no modalities)")
-        LOGGER.debug(
-            "responses payload preview: %s",
-            {"model": target_model, "input_preview": input_text[:120]},
-        )
-        data, shimmed = _make_request(
-            http_client,
-            api_url=RESPONSES_API_URL,
-            headers=headers,
-            payload=payload,
-            schedule=schedule,
-        )
-        if shimmed:
-            retry_used = True
-        text, parse_flags, schema_label = _extract_responses_text(data)
-        if not text:
-            LOGGER.warning(
-                "Пустой ответ от Responses API %s (schema=%s)",
-                target_model,
-                schema_label,
+        LOGGER.info("Responses payload keys: %s", sorted(sanitized_payload.keys()))
+        if sanitized_payload.get("text", {}).get("format") == "plain":
+            LOGGER.info("text.format='plain'")
+        input_value = sanitized_payload.get("input", "")
+        input_length = len(input_value) if isinstance(input_value, str) else 0
+        LOGGER.info("responses input_len=%d", input_length)
+
+        current_payload = dict(sanitized_payload)
+        attempt_index = 0
+        shimmed_param: Optional[str] = None
+        last_error: Optional[BaseException] = None
+
+        while attempt_index < MAX_RETRIES:
+            attempt_index += 1
+            if attempt_index > 1:
+                retry_used = True
+            try:
+                response = http_client.post(
+                    RESPONSES_API_URL,
+                    headers=headers,
+                    json=current_payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise RuntimeError("Модель вернула неожиданный формат ответа.")
+                text, parse_flags, schema_label = _extract_responses_text(data)
+                if not text:
+                    LOGGER.warning(
+                        "Пустой ответ от Responses API %s (schema=%s)",
+                        target_model,
+                        schema_label,
+                    )
+                    raise EmptyCompletionError(
+                        "Responses API вернул пустой ответ",
+                        raw_response=data,
+                        parse_flags=parse_flags,
+                    )
+                _persist_raw_response(data)
+                return text, parse_flags, data, schema_label
+            except EmptyCompletionError:
+                raise
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if (
+                    status_code == 400
+                    and shimmed_param is None
+                ):
+                    param_name = _extract_unknown_parameter_name(exc.response)
+                    if param_name:
+                        next_payload = dict(current_payload)
+                        if param_name in next_payload:
+                            next_payload.pop(param_name, None)
+                        current_payload = sanitize_payload_for_responses(next_payload)
+                        shimmed_param = param_name
+                        retry_used = True
+                        LOGGER.warning(
+                            "retry=shim_unknown_param stripped='%s'",
+                            param_name,
+                        )
+                        continue
+                _handle_responses_http_error(exc, current_payload)
+                last_error = exc
+            except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, KeyboardInterrupt):  # pragma: no cover - respect interrupts
+                    raise
+                last_error = exc
+            if attempt_index >= MAX_RETRIES or not _should_retry(last_error):
+                break
+            sleep_for = schedule[min(attempt_index - 1, len(schedule) - 1)]
+            reason = _describe_error(last_error)
+            print(
+                f"[llm_client] retry #{attempt_index} reason: {reason}; sleeping {sleep_for}s",
+                file=sys.stderr,
             )
-            raise EmptyCompletionError(
-                "Responses API вернул пустой ответ",
-                raw_response=data,
-                parse_flags=parse_flags,
-            )
-        _persist_raw_response(data)
-        return text, parse_flags, data, schema_label
+            time.sleep(sleep_for)
+
+        if last_error:
+            if isinstance(last_error, httpx.HTTPStatusError):
+                _raise_for_last_error(last_error)
+            if isinstance(last_error, (httpx.TimeoutException, httpx.TransportError)):
+                _raise_for_last_error(last_error)
+            raise last_error
+
+        raise RuntimeError("Модель не вернула ответ.")
 
     lower_model = model_name.lower()
     is_gpt5_model = lower_model.startswith("gpt-5")
@@ -818,7 +1027,7 @@ def generate(
                 text, parse_flags_initial, _, schema_initial_call = _call_responses_model(
                     model_name
                 )
-                schema_category = _categorize_schema(parse_flags_initial)
+                schema_category = "responses.text" if text else "responses.none"
                 LOGGER.info(
                     "completion schema category=%s (schema=%s, route=responses)",
                     schema_category,

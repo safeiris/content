@@ -129,6 +129,7 @@ def test_generate_uses_responses_payload_for_gpt5():
     result, request_payload = _run_and_capture_request("gpt-5-preview", payloads=[responses_payload])
     assert isinstance(result, GenerationResult)
     assert result.api_route == "responses"
+    assert result.schema == "responses.text"
     payload = request_payload["json"]
     assert payload["max_output_tokens"] == 42
     assert payload["text"] == {"format": "plain"}
@@ -136,7 +137,7 @@ def test_generate_uses_responses_payload_for_gpt5():
     assert "temperature" not in payload
     assert "messages" not in payload
     assert payload["model"] == "gpt-5-preview"
-    assert "USER:" in payload["input"]
+    assert payload["input"].startswith("USER\n")
     assert request_payload["url"].endswith("/responses")
 
 
@@ -151,9 +152,9 @@ def test_generate_logs_about_temperature_for_gpt5():
         )
 
     mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
-    mock_logger.info.assert_any_call(
-        "Responses payload: text.format='plain' (no modalities)"
-    )
+    mock_logger.info.assert_any_call("Responses payload keys: %s", ["input", "max_output_tokens", "model", "text"])
+    mock_logger.info.assert_any_call("text.format='plain'")
+    mock_logger.info.assert_any_call("responses input_len=%d", 9)
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
 
 
@@ -173,7 +174,7 @@ def test_generate_sends_minimal_payload_for_gpt5():
     assert "modalities" not in payload
     assert payload["text"] == {"format": "plain"}
     assert payload["max_output_tokens"] == 42
-    assert payload["input"].strip().startswith("USER:")
+    assert payload["input"].startswith("USER\n")
     assert set(payload.keys()) == {
         "model",
         "input",
@@ -212,9 +213,42 @@ def test_generate_retries_when_unknown_parameter_reported():
     assert result.retry_used is True
     assert dummy_client.call_count == 2
     mock_logger.warning.assert_any_call(
-        "retry=shim_unknown_param: stripped '%s' from payload",
+        "retry=shim_unknown_param stripped='%s'",
         "modalities",
     )
+
+
+def test_generate_logs_responses_error_and_artifacts():
+    error_entry = {
+        "__error__": "http",
+        "status": 400,
+        "payload": {"error": {"type": "invalid_request_error", "message": "invalid field"}},
+    }
+    fallback_payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": "fallback ok",
+                }
+            }
+        ]
+    }
+    dummy_client = DummyClient(payloads=[error_entry, fallback_payload])
+    with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
+        "llm_client._store_responses_debug_artifacts"
+    ) as mock_store, patch("llm_client.LOGGER") as mock_logger:
+        result = generate(
+            messages=[{"role": "user", "content": "ping"}],
+            model="gpt-5",  # ensure Responses route
+            temperature=0.2,
+            max_tokens=42,
+        )
+
+    assert result.model_used == "gpt-4o"
+    assert result.fallback_reason == "api_error_gpt5_responses"
+    mock_store.assert_called()
+    logged_errors = [call for call in mock_logger.error.call_args_list if "Responses API error" in call[0][0]]
+    assert logged_errors, "Expected Responses API error log entry"
 
 
 def test_generate_collects_text_from_content_parts():
