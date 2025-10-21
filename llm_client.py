@@ -21,7 +21,7 @@ MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 FALLBACK_MODEL = "gpt-4o"
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
-RESPONSES_ALLOWED_KEYS = ("model", "input", "text", "max_output_tokens")
+RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens")
 RESPONSES_POLL_DELAY = 0.25
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
 
@@ -38,7 +38,7 @@ PROVIDER_API_URLS = {
 
 LOGGER = logging.getLogger(__name__)
 RAW_RESPONSE_PATH = Path("artifacts/debug/last_raw_response.json")
-RESPONSES_ERROR_PATH = Path("artifacts/debug/last_gpt5_responses_error.json")
+RESPONSES_RESPONSE_PATH = Path("artifacts/debug/last_gpt5_responses_response.json")
 RESPONSES_REQUEST_PATH = Path("artifacts/debug/last_gpt5_responses_request.json")
 
 
@@ -135,36 +135,17 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
             except (TypeError, ValueError):
                 continue
             continue
-        if key == "text":
-            if isinstance(value, dict):
-                text_block = {}
-                format_section = value.get("format")
-                if isinstance(format_section, dict):
-                    type_value = format_section.get("type")
-                    if type_value:
-                        text_block["format"] = {"type": str(type_value).strip()}
-                if text_block:
-                    sanitized[key] = text_block
-            continue
     input_value = sanitized.get("input", "")
     input_length = len(input_value) if isinstance(input_value, str) else 0
     return sanitized, input_length
 
 
-def _store_responses_debug_artifacts(
-    error_payload: Dict[str, object],
-    request_payload: Dict[str, object],
-) -> None:
-    """Persist diagnostic artifacts for Responses API failures."""
+def _store_responses_request_snapshot(payload: Dict[str, object]) -> None:
+    """Persist a sanitized snapshot of the latest Responses API request."""
 
     try:
-        RESPONSES_ERROR_PATH.parent.mkdir(parents=True, exist_ok=True)
-        RESPONSES_ERROR_PATH.write_text(
-            json.dumps(error_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        snapshot = dict(request_payload)
+        RESPONSES_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = dict(payload)
         input_value = snapshot.pop("input", "")
         if isinstance(input_value, str):
             preview = input_value[:200]
@@ -176,7 +157,20 @@ def _store_responses_debug_artifacts(
             encoding="utf-8",
         )
     except Exception as exc:  # pragma: no cover - diagnostics only
-        LOGGER.debug("failed to persist Responses debug artifacts: %s", exc)
+        LOGGER.debug("failed to persist Responses request snapshot: %s", exc)
+
+
+def _store_responses_response_snapshot(payload: Dict[str, object]) -> None:
+    """Persist the latest Responses API payload for diagnostics."""
+
+    try:
+        RESPONSES_RESPONSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RESPONSES_RESPONSE_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        LOGGER.debug("failed to persist Responses response snapshot: %s", exc)
 
 
 def _handle_responses_http_error(
@@ -205,7 +199,7 @@ def _handle_responses_http_error(
             message = response.text.strip()
     truncated = (message or "")[:200]
     LOGGER.error(
-        'Responses API error: status=%s type=%s message="%s"',
+        'Responses API error: status=%s error.type=%s error.message="%s"',
         status,
         error_type or "unknown",
         truncated,
@@ -219,7 +213,9 @@ def _handle_responses_http_error(
                 "message": message,
             },
         }
-    _store_responses_debug_artifacts(error_payload, payload_snapshot)
+    _store_responses_request_snapshot(payload_snapshot)
+    if error_payload:
+        _store_responses_response_snapshot(error_payload)
 
 
 def _collect_text_parts(parts: List[object]) -> str:
@@ -439,79 +435,58 @@ def _extract_choice_content(choice: Dict[str, object]) -> Tuple[str, Dict[str, o
 
 
 def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, object], str]:
-    parse_flags: Dict[str, object] = {
-        "content_str": 0,
-        "parts": 0,
-        "content_dict": 0,
-        "choices_text": 0,
-        "output_text": 0,
-    }
+    parse_flags: Dict[str, object] = {}
 
     resp_keys = sorted(str(key) for key in data.keys())
     parse_flags["resp_keys"] = resp_keys
 
-    def _collect_segments(container: object) -> List[str]:
-        segments: List[str] = []
+    def _iter_segments(container: object) -> List[str]:
+        collected: List[str] = []
         if isinstance(container, list):
             for item in container:
-                segments.extend(_collect_segments(item))
+                collected.extend(_iter_segments(item))
         elif isinstance(container, dict):
-            content_value = container.get("content")
-            if isinstance(content_value, list):
-                for part in content_value:
+            content = container.get("content")
+            if isinstance(content, list):
+                for part in content:
                     if not isinstance(part, dict):
                         continue
-                    part_type = str(part.get("type", ""))
-                    if part_type not in {"output_text", "text"}:
+                    part_type = str(part.get("type", "")).strip()
+                    if part_type not in {"text", "output_text"}:
                         continue
                     text_value = part.get("text")
                     if isinstance(text_value, str):
                         stripped = text_value.strip()
                         if stripped:
-                            segments.append(stripped)
-            for key in ("output", "outputs", "response", "message"):
-                nested_value = container.get(key)
-                if nested_value is not None:
-                    segments.extend(_collect_segments(nested_value))
-        return segments
+                            collected.append(stripped)
+            for key in ("output", "outputs"):
+                nested = container.get(key)
+                if nested is not None:
+                    collected.extend(_iter_segments(nested))
+        return collected
 
     segments: List[str] = []
     root_used: Optional[str] = None
-
     for root_key in ("output", "outputs"):
         root_value = data.get(root_key)
         if root_value is None:
             continue
-        candidate_segments = _collect_segments(root_value)
-        if candidate_segments:
-            segments.extend(candidate_segments)
+        extracted = _iter_segments(root_value)
+        if extracted:
+            segments.extend(extracted)
             root_used = root_key
-    if not segments:
-        for root_key in ("response", "message"):
-            root_value = data.get(root_key)
-            if root_value is None:
-                continue
-            candidate_segments = _collect_segments(root_value)
-            if candidate_segments:
-                segments.extend(candidate_segments)
-                root_used = root_key
-                break
 
     schema_label = "responses.output_text" if segments else "responses.none"
     parse_flags["schema"] = schema_label
     parse_flags["segments"] = len(segments)
-    if segments:
-        parse_flags["output_text"] = 1
-        parse_flags["parts"] = 1
 
     text = "\n\n".join(segments) if segments else ""
-    text_len = len(text)
     LOGGER.info(
         "responses parse resp_keys=%s root=%s segments=%d len=%d schema=%s",
         resp_keys,
         root_used,
         parse_flags.get("segments", 0),
-        text_len,
+        len(text),
         schema_label,
     )
     return text, parse_flags, schema_label
@@ -913,7 +888,7 @@ def generate(
 
         def _log_payload_state(payload_snapshot: Dict[str, object]) -> None:
             keys = sorted(payload_snapshot.keys())
-            LOGGER.info("payload keys: %s", keys)
+            LOGGER.info("responses payload_keys=%s", keys)
             input_candidate = payload_snapshot.get("input", "")
             length = len(input_candidate) if isinstance(input_candidate, str) else 0
             LOGGER.info("responses input_len=%d", length)
@@ -932,6 +907,7 @@ def generate(
                 retry_used = True
             _log_payload_state(current_payload)
             try:
+                _store_responses_request_snapshot(current_payload)
                 response = http_client.post(
                     RESPONSES_API_URL,
                     headers=headers,
@@ -942,9 +918,14 @@ def generate(
                 if not isinstance(data, dict):
                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
                 status_value = data.get("status")
+                response_id = data.get("id") if isinstance(data.get("id"), str) else None
+                LOGGER.info(
+                    "responses status=%s id=%s",
+                    status_value,
+                    response_id,
+                )
                 if isinstance(status_value, str) and status_value and status_value.lower() != "completed":
-                    response_id = data.get("id")
-                    if isinstance(response_id, str) and response_id:
+                    if response_id:
                         LOGGER.info(
                             "responses status=%s; polling id=%s",
                             status_value,
@@ -960,12 +941,21 @@ def generate(
                             polled_data = poll_response.json()
                             if isinstance(polled_data, dict):
                                 data = polled_data
+                                status_value = data.get("status")
+                                response_id = data.get("id") if isinstance(data.get("id"), str) else response_id
+                                LOGGER.info(
+                                    "responses status=%s id=%s (poll)",
+                                    status_value,
+                                    response_id,
+                                )
                         except Exception as poll_error:  # noqa: BLE001
                             LOGGER.warning(
                                 "responses poll failed id=%s error=%s",
                                 response_id,
                                 poll_error,
                             )
+                if isinstance(data, dict):
+                    _store_responses_response_snapshot(data)
                 text, parse_flags, schema_label = _extract_responses_text(data)
                 if not text:
                     LOGGER.warning(
@@ -1013,13 +1003,7 @@ def generate(
                                 param_name,
                             )
                             continue
-                    if (
-                        not hint_retry_used
-                        and (
-                            "response_format" in lowered_message
-                            or "text.format" in lowered_message
-                        )
-                    ):
+                    if not hint_retry_used and "response_format" in lowered_message:
                         current_payload = dict(base_payload)
                         hint_retry_used = True
                         LOGGER.warning("retry=shim_hint_response_format")
@@ -1027,16 +1011,15 @@ def generate(
                     if (
                         not text_format_retry_used
                         and (
-                            "must specify text.format" in lowered_message
+                            "invalid type for text.format" in lowered_message
+                            or "must specify text.format" in lowered_message
                             or "expected a text format" in lowered_message
                             or "specify text.format" in lowered_message
                         )
                     ):
-                        next_payload = dict(base_payload)
-                        next_payload["text"] = {"format": {"type": "plain"}}
-                        current_payload, _ = sanitize_payload_for_responses(next_payload)
+                        current_payload = dict(base_payload)
                         text_format_retry_used = True
-                        LOGGER.warning("retry=shim_text_format_object")
+                        LOGGER.warning("retry=shim_text_format")
                         continue
                 last_error = exc
             except Exception as exc:  # noqa: BLE001

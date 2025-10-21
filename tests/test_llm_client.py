@@ -171,7 +171,10 @@ def test_generate_logs_about_temperature_for_gpt5():
         )
 
     mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
-    mock_logger.info.assert_any_call("payload keys: %s", ["input", "max_output_tokens", "model"])
+    mock_logger.info.assert_any_call(
+        "responses payload_keys=%s",
+        ["input", "max_output_tokens", "model"],
+    )
     mock_logger.info.assert_any_call("responses input_len=%d", 9)
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
 
@@ -294,8 +297,10 @@ def test_generate_logs_responses_error_and_artifacts():
     }
     dummy_client = DummyClient(payloads=[error_entry, fallback_payload])
     with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
-        "llm_client._store_responses_debug_artifacts"
-    ) as mock_store, patch("llm_client.LOGGER") as mock_logger:
+        "llm_client._store_responses_request_snapshot"
+    ) as mock_store_request, patch(
+        "llm_client._store_responses_response_snapshot"
+    ) as mock_store_response, patch("llm_client.LOGGER") as mock_logger:
         result = generate(
             messages=[{"role": "user", "content": "ping"}],
             model="gpt-5",  # ensure Responses route
@@ -305,7 +310,8 @@ def test_generate_logs_responses_error_and_artifacts():
 
     assert result.model_used == "gpt-4o"
     assert result.fallback_reason == "api_error_gpt5_responses"
-    mock_store.assert_called()
+    mock_store_request.assert_called()
+    mock_store_response.assert_called()
     logged_errors = [call for call in mock_logger.error.call_args_list if "Responses API error" in call[0][0]]
     assert logged_errors, "Expected Responses API error log entry"
 
