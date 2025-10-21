@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
 from unittest.mock import patch
+import httpx
 import pytest
 import sys
 
@@ -10,7 +11,7 @@ from llm_client import GenerationResult, generate
 
 
 class DummyResponse:
-    def __init__(self, payload=None, *, status_code=200, text=""):
+    def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
         if payload is None:
             payload = {
                 "choices": [
@@ -24,8 +25,11 @@ class DummyResponse:
         self._json = payload
         self.status_code = status_code
         self.text = text
+        self._raise_for_status_exc = raise_for_status_exc
 
     def raise_for_status(self):
+        if self._raise_for_status_exc:
+            raise self._raise_for_status_exc
         return None
 
     def json(self):
@@ -55,6 +59,14 @@ class DummyClient:
             index = min(self.call_count, len(self.payloads) - 1)
             payload = self.payloads[index]
         self.call_count += 1
+        if isinstance(payload, dict) and payload.get("__error__") == "http":
+            status = int(payload.get("status", 400))
+            response_payload = payload.get("payload", {})
+            text = payload.get("text", "")
+            request_obj = httpx.Request("POST", url)
+            response_obj = httpx.Response(status, request=request_obj, json=response_payload)
+            error = httpx.HTTPStatusError("HTTP error", request=request_obj, response=response_obj)
+            return DummyResponse(response_payload, status_code=status, text=text, raise_for_status_exc=error)
         return DummyResponse(payload)
 
     def get(self, url, headers=None):
@@ -120,7 +132,7 @@ def test_generate_uses_responses_payload_for_gpt5():
     payload = request_payload["json"]
     assert payload["max_output_tokens"] == 42
     assert payload["modalities"] == ["text"]
-    assert payload["response_format"] == {"type": "text"}
+    assert payload["text"] == {"format": "plain"}
     assert "temperature" not in payload
     assert "messages" not in payload
     assert payload["model"] == "gpt-5-preview"
@@ -140,7 +152,7 @@ def test_generate_logs_about_temperature_for_gpt5():
 
     mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
     mock_logger.info.assert_any_call(
-        "Responses payload configured with modalities=['text'] and response_format='text'"
+        "Responses payload: modalities=['text'], text.format='plain'"
     )
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
 
@@ -159,16 +171,51 @@ def test_generate_sends_minimal_payload_for_gpt5():
     payload = request_payload["json"]
     assert payload["model"] == "gpt-5-turbo"
     assert payload["modalities"] == ["text"]
-    assert payload["response_format"] == {"type": "text"}
+    assert payload["text"] == {"format": "plain"}
     assert payload["max_output_tokens"] == 42
     assert payload["input"].strip().startswith("USER:")
     assert set(payload.keys()) == {
         "model",
         "input",
         "modalities",
-        "response_format",
+        "text",
         "max_output_tokens",
     }
+
+
+def test_generate_retries_when_response_format_unsupported():
+    error_entry = {
+        "__error__": "http",
+        "status": 400,
+        "payload": {"error": {"message": "Unsupported parameter: 'response_format'"}},
+    }
+    success_payload = {
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "ok"},
+                ]
+            }
+        ]
+    }
+    dummy_client = DummyClient(payloads=[error_entry, success_payload])
+    with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
+        "llm_client.LOGGER"
+    ) as mock_logger:
+        result = generate(
+            messages=[{"role": "user", "content": "ping"}],
+            model="gpt-5",  # ensure responses route
+            temperature=0.2,
+            max_tokens=42,
+        )
+
+    assert isinstance(result, GenerationResult)
+    assert result.retry_used is True
+    assert dummy_client.call_count == 2
+    mock_logger.warning.assert_any_call(
+        "retry=shim_response_format: Responses API reported unsupported response_format; "
+        "retrying with text.format='plain'",
+    )
 
 
 def test_generate_collects_text_from_content_parts():

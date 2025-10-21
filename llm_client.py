@@ -475,6 +475,31 @@ def _should_retry(exc: BaseException) -> bool:
     return False
 
 
+def _is_response_format_unsupported_error(exc: BaseException) -> bool:
+    message = str(exc)
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, httpx.HTTPStatusError):
+        response = cause.response
+        if response is not None and response.status_code == 400:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                error_block = payload.get("error")
+                if isinstance(error_block, dict):
+                    detail = error_block.get("message")
+                else:
+                    detail = payload.get("message")
+                if isinstance(detail, str):
+                    message = detail
+            elif isinstance(response.text, str) and response.text:
+                message = response.text
+        else:
+            return False
+    return "Unsupported parameter: 'response_format'" in message
+
+
 def _describe_error(exc: BaseException) -> str:
     status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
     if status:
@@ -658,30 +683,50 @@ def generate(
         return text, parse_flags, data, schema_label
 
     def _call_responses_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
+        nonlocal retry_used
+
         payload_messages = _messages_for_model(target_model)
         input_text = _flatten_messages_for_responses(payload_messages)
-        payload = {
+        payload: Dict[str, object] = {
             "model": target_model,
             "input": input_text,
             "modalities": ["text"],
-            "response_format": {"type": "text"},
+            "text": {"format": "plain"},
             "max_output_tokens": max_tokens,
         }
         LOGGER.info("dispatch route=responses model=%s", target_model)
-        LOGGER.info(
-            "Responses payload configured with modalities=['text'] and response_format='text'"
-        )
+        LOGGER.info("Responses payload: modalities=['text'], text.format='plain'")
         LOGGER.debug(
             "responses payload preview: %s",
             {"model": target_model, "input_preview": input_text[:120]},
         )
-        data = _make_request(
-            http_client,
-            api_url=RESPONSES_API_URL,
-            headers=headers,
-            payload=payload,
-            schedule=schedule,
-        )
+        try:
+            data = _make_request(
+                http_client,
+                api_url=RESPONSES_API_URL,
+                headers=headers,
+                payload=payload,
+                schedule=schedule,
+            )
+        except RuntimeError as exc:
+            if _is_response_format_unsupported_error(exc):
+                LOGGER.warning(
+                    "retry=shim_response_format: Responses API reported unsupported response_format; "
+                    "retrying with text.format='plain'",
+                )
+                retry_used = True
+                shim_payload = dict(payload)
+                shim_payload.pop("response_format", None)
+                shim_payload["text"] = {"format": "plain"}
+                data = _make_request(
+                    http_client,
+                    api_url=RESPONSES_API_URL,
+                    headers=headers,
+                    payload=shim_payload,
+                    schedule=schedule,
+                )
+            else:
+                raise
         text, parse_flags, schema_label = _extract_responses_text(data)
         if not text:
             LOGGER.warning(
@@ -764,7 +809,7 @@ def generate(
                 return GenerationResult(
                     text=text,
                     model_used=model_name,
-                    retry_used=False,
+                    retry_used=retry_used,
                     fallback_used=None,
                     fallback_reason=None,
                     api_route="responses",
