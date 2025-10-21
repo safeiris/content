@@ -196,6 +196,19 @@ def _persist_raw_response(payload: Dict[str, object]) -> None:
         LOGGER.debug("failed to persist raw response: %s", exc)
 
 
+def _summarize_payload(payload: Dict[str, object]) -> Dict[str, object]:
+    summary: Dict[str, object] = {}
+    for key, value in payload.items():
+        if key == "messages":
+            if isinstance(value, list):
+                summary[key] = f"<{len(value)} messages>"
+            else:
+                summary[key] = "<messages>"
+            continue
+        summary[key] = value
+    return summary
+
+
 def _log_parse_chain(parse_flags: Dict[str, int], *, retry: int, fallback: str) -> None:
     LOGGER.warning(
         "parse_chain: content_str=%d; parts=%d; choices_text=%d; output_text=%d; retry=%d; fallback=%s",
@@ -343,12 +356,10 @@ def generate(
         }
         if "gpt-5" in lower:
             payload["max_completion_tokens"] = max_tokens
-            payload["tool_choice"] = "none"
-            payload["response_format"] = {"type": "text"}
-            payload["modalities"] = ["text"]
         else:
             payload["max_tokens"] = max_tokens
             payload["temperature"] = temperature
+        LOGGER.info("openai payload blueprint: %s", _summarize_payload(payload))
         return payload
 
     def _call_model(target_model: str) -> Tuple[str, Dict[str, int], Dict[str, object]]:

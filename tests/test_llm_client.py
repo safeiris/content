@@ -79,6 +79,7 @@ def test_generate_uses_max_completion_tokens_for_gpt5():
     assert request_payload["json"]["max_completion_tokens"] == 42
     assert "max_tokens" not in request_payload["json"]
     assert "temperature" not in request_payload["json"]
+    assert set(request_payload["json"].keys()) == {"model", "messages", "max_completion_tokens"}
 
 
 def test_generate_logs_about_temperature_for_gpt5():
@@ -91,15 +92,23 @@ def test_generate_logs_about_temperature_for_gpt5():
             max_tokens=42,
         )
 
-    mock_logger.info.assert_called_once_with("temperature is ignored for GPT-5; using default")
+    summary = {
+        "model": "gpt-5-super",
+        "messages": "<1 messages>",
+        "max_completion_tokens": 42,
+    }
+    mock_logger.info.assert_any_call("openai payload blueprint: %s", summary)
+    mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
 
 
-def test_generate_disables_tools_for_gpt5():
+def test_generate_sends_minimal_payload_for_gpt5():
     _, request_payload = _run_and_capture_request("gpt-5-turbo")
     payload = request_payload["json"]
-    assert payload["tool_choice"] == "none"
-    assert payload["response_format"] == {"type": "text"}
-    assert payload["modalities"] == ["text"]
+    assert payload == {
+        "model": "gpt-5-turbo",
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_completion_tokens": 42,
+    }
 
 
 def test_generate_collects_text_from_content_parts():
