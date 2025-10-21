@@ -37,14 +37,17 @@ class DummyResponse:
 
 
 class DummyClient:
-    def __init__(self, payloads=None, availability=None):
+    def __init__(self, payloads=None, availability=None, poll_payloads=None):
         self.last_request = None
         self.requests = []
         self.last_probe = None
+        self.last_poll = None
         self.payloads = payloads or []
         self.availability = availability or []
+        self.poll_payloads = poll_payloads or []
         self.call_count = 0
         self.probe_count = 0
+        self.poll_count = 0
 
     def post(self, url, headers=None, json=None):
         request = {
@@ -70,6 +73,18 @@ class DummyClient:
         return DummyResponse(payload)
 
     def get(self, url, headers=None):
+        if url.startswith("https://api.openai.com/v1/responses"):
+            self.last_poll = {
+                "url": url,
+                "headers": headers,
+            }
+            payload = {}
+            if self.poll_payloads:
+                index = min(self.poll_count, len(self.poll_payloads) - 1)
+                payload = self.poll_payloads[index]
+            self.poll_count += 1
+            return DummyResponse(payload)
+
         self.last_probe = {
             "url": url,
             "headers": headers,
@@ -90,8 +105,12 @@ class DummyClient:
         return None
 
 
-def _run_and_capture_request(model_name: str, *, payloads=None, availability=None):
-    dummy_client = DummyClient(payloads=payloads, availability=availability)
+def _run_and_capture_request(model_name: str, *, payloads=None, availability=None, poll_payloads=None):
+    dummy_client = DummyClient(
+        payloads=payloads,
+        availability=availability,
+        poll_payloads=poll_payloads,
+    )
     with patch("llm_client.httpx.Client", return_value=dummy_client):
         result = generate(
             messages=[{"role": "user", "content": "ping"}],
@@ -129,7 +148,7 @@ def test_generate_uses_responses_payload_for_gpt5():
     result, request_payload = _run_and_capture_request("gpt-5-preview", payloads=[responses_payload])
     assert isinstance(result, GenerationResult)
     assert result.api_route == "responses"
-    assert result.schema == "responses.text"
+    assert result.schema == "responses.output_text"
     payload = request_payload["json"]
     assert payload["max_output_tokens"] == 42
     assert "modalities" not in payload
@@ -155,6 +174,49 @@ def test_generate_logs_about_temperature_for_gpt5():
     mock_logger.info.assert_any_call("payload keys: %s", ["input", "max_output_tokens", "model"])
     mock_logger.info.assert_any_call("responses input_len=%d", 9)
     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
+
+
+def test_generate_polls_for_incomplete_responses_status():
+    initial_payload = {
+        "status": "in_progress",
+        "id": "resp-123",
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": ""},
+                ]
+            }
+        ],
+    }
+    final_payload = {
+        "status": "completed",
+        "output": [
+            {
+                "content": [
+                    {"type": "output_text", "text": "done"},
+                ]
+            }
+        ],
+    }
+    dummy_client = DummyClient(payloads=[initial_payload], poll_payloads=[final_payload])
+    with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
+        "llm_client.time.sleep",
+        return_value=None,
+    ) as mock_sleep:
+        result = generate(
+            messages=[{"role": "user", "content": "ping"}],
+            model="gpt-5",
+            temperature=0.2,
+            max_tokens=42,
+        )
+
+    assert isinstance(result, GenerationResult)
+    assert result.text == "done"
+    assert result.api_route == "responses"
+    assert result.schema == "responses.output_text"
+    assert dummy_client.poll_count == 1
+    assert dummy_client.last_poll["url"].endswith("/responses/resp-123")
+    mock_sleep.assert_called()
 
 
 def test_generate_sends_minimal_payload_for_gpt5():

@@ -22,6 +22,7 @@ BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 FALLBACK_MODEL = "gpt-4o"
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 RESPONSES_ALLOWED_KEYS = ("model", "input", "text", "max_output_tokens")
+RESPONSES_POLL_DELAY = 0.25
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
 
 MODEL_PROVIDER_MAP = {
@@ -446,51 +447,74 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
         "output_text": 0,
     }
 
-    outputs = data.get("output")
-    if not outputs:
-        outputs = data.get("outputs")
+    resp_keys = sorted(str(key) for key in data.keys())
+    parse_flags["resp_keys"] = resp_keys
 
-    schema_label = f"responses.output:{_describe_type(outputs)}"
+    def _collect_segments(container: object) -> List[str]:
+        segments: List[str] = []
+        if isinstance(container, list):
+            for item in container:
+                segments.extend(_collect_segments(item))
+        elif isinstance(container, dict):
+            content_value = container.get("content")
+            if isinstance(content_value, list):
+                for part in content_value:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = str(part.get("type", ""))
+                    if part_type not in {"output_text", "text"}:
+                        continue
+                    text_value = part.get("text")
+                    if isinstance(text_value, str):
+                        stripped = text_value.strip()
+                        if stripped:
+                            segments.append(stripped)
+            for key in ("output", "outputs", "response", "message"):
+                nested_value = container.get(key)
+                if nested_value is not None:
+                    segments.extend(_collect_segments(nested_value))
+        return segments
 
-    if isinstance(outputs, list) and outputs:
-        primary = outputs[0]
-        if isinstance(primary, dict):
-            content = primary.get("content")
-            schema_label = f"responses.output.content:{_describe_type(content)}"
-            if isinstance(content, list):
-                joined = _collect_text_parts(content)
-                if joined:
-                    parse_flags["output_text"] = 1
-                    parse_flags["parts"] = 1
-                    parse_flags["schema"] = schema_label
-                    return joined, parse_flags, schema_label
-            elif isinstance(content, dict):
-                joined = _collect_text_parts([content])
-                if joined:
-                    parse_flags["output_text"] = 1
-                    parse_flags["content_dict"] = 1
-                    parse_flags["schema"] = schema_label
-                    return joined, parse_flags, schema_label
-        elif isinstance(primary, str):
-            stripped = primary.strip()
-            if stripped:
-                parse_flags["output_text"] = 1
-                parse_flags["content_str"] = 1
-                parse_flags["schema"] = schema_label
-                return stripped, parse_flags, schema_label
+    segments: List[str] = []
+    root_used: Optional[str] = None
 
-    aggregate_text = data.get("text")
-    schema_label = f"responses.text:{_describe_type(aggregate_text)}"
-    if isinstance(aggregate_text, str):
-        stripped = aggregate_text.strip()
-        if stripped:
-            parse_flags["output_text"] = 1
-            parse_flags["content_str"] = 1
-            parse_flags["schema"] = schema_label
-            return stripped, parse_flags, schema_label
+    for root_key in ("output", "outputs"):
+        root_value = data.get(root_key)
+        if root_value is None:
+            continue
+        candidate_segments = _collect_segments(root_value)
+        if candidate_segments:
+            segments.extend(candidate_segments)
+            root_used = root_key
+    if not segments:
+        for root_key in ("response", "message"):
+            root_value = data.get(root_key)
+            if root_value is None:
+                continue
+            candidate_segments = _collect_segments(root_value)
+            if candidate_segments:
+                segments.extend(candidate_segments)
+                root_used = root_key
+                break
 
+    schema_label = "responses.output_text" if segments else "responses.none"
     parse_flags["schema"] = schema_label
-    return "", parse_flags, schema_label
+    parse_flags["segments"] = len(segments)
+    if segments:
+        parse_flags["output_text"] = 1
+        parse_flags["parts"] = 1
+
+    text = "\n\n".join(segments) if segments else ""
+    text_len = len(text)
+    LOGGER.info(
+        "responses parse resp_keys=%s root=%s segments=%d len=%d schema=%s",
+        resp_keys,
+        root_used,
+        parse_flags.get("segments", 0),
+        text_len,
+        schema_label,
+    )
+    return text, parse_flags, schema_label
 
 
 def _resolve_model_name(model: Optional[str]) -> str:
@@ -917,6 +941,31 @@ def generate(
                 data = response.json()
                 if not isinstance(data, dict):
                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
+                status_value = data.get("status")
+                if isinstance(status_value, str) and status_value and status_value.lower() != "completed":
+                    response_id = data.get("id")
+                    if isinstance(response_id, str) and response_id:
+                        LOGGER.info(
+                            "responses status=%s; polling id=%s",
+                            status_value,
+                            response_id,
+                        )
+                        time.sleep(RESPONSES_POLL_DELAY)
+                        try:
+                            poll_response = http_client.get(
+                                f"{RESPONSES_API_URL}/{response_id}",
+                                headers=headers,
+                            )
+                            poll_response.raise_for_status()
+                            polled_data = poll_response.json()
+                            if isinstance(polled_data, dict):
+                                data = polled_data
+                        except Exception as poll_error:  # noqa: BLE001
+                            LOGGER.warning(
+                                "responses poll failed id=%s error=%s",
+                                response_id,
+                                poll_error,
+                            )
                 text, parse_flags, schema_label = _extract_responses_text(data)
                 if not text:
                     LOGGER.warning(
@@ -1072,7 +1121,7 @@ def generate(
                 text, parse_flags_initial, _, schema_initial_call = _call_responses_model(
                     model_name
                 )
-                schema_category = "responses.text" if text else "responses.none"
+                schema_category = schema_initial_call
                 LOGGER.info(
                     "completion schema category=%s (schema=%s, route=responses)",
                     schema_category,
