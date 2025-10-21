@@ -1,4 +1,13 @@
 {
+  "style_profiles": ["sravni", "banki"],
+  "default_style": "sravni",
+  "style_strength": 0.6,
+  "style_enabled_default": false
+}
+
+
+
+{
   "theme": "finance",
   "model": "text-embedding-3-small",
   "max_tokens_est": 600,
