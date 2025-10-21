@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <title>Вход в панель генерации контента</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+        background: #f3f4f6;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(180deg, rgba(15, 118, 110, 0.12), rgba(59, 130, 246, 0.12));
+      }
+
+      main {
+        width: min(420px, calc(100% - 2rem));
+        padding: 2.5rem 2rem;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 18px 45px rgba(15, 23, 42, 0.12);
+        backdrop-filter: blur(10px);
+      }
+
+      h1 {
+        margin-top: 0;
+        margin-bottom: 1.5rem;
+        font-size: 1.5rem;
+        color: #0f172a;
+        text-align: center;
+      }
+
+      p.hint {
+        margin-top: 0;
+        margin-bottom: 1.5rem;
+        color: #475569;
+        font-size: 0.95rem;
+        text-align: center;
+      }
+
+      form {
+        display: grid;
+        gap: 1rem;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 0.35rem;
+        font-weight: 600;
+        color: #1e293b;
+      }
+
+      input[type="text"],
+      input[type="password"] {
+        width: 100%;
+        padding: 0.75rem 0.85rem;
+        border-radius: 10px;
+        border: 1px solid #cbd5f5;
+        font-size: 1rem;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        background: rgba(255, 255, 255, 0.96);
+      }
+
+      input[type="text"]:focus,
+      input[type="password"]:focus {
+        outline: none;
+        border-color: #3b82f6;
+        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
+      }
+
+      button[type="submit"] {
+        margin-top: 0.5rem;
+        width: 100%;
+        padding: 0.85rem;
+        border: none;
+        border-radius: 999px;
+        font-size: 1rem;
+        font-weight: 600;
+        color: white;
+        background: linear-gradient(135deg, #2563eb, #0ea5e9);
+        cursor: pointer;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+      }
+
+      button[type="submit"]:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 12px 24px rgba(37, 99, 235, 0.25);
+      }
+
+      .messages {
+        margin-bottom: 1rem;
+      }
+
+      .flash {
+        padding: 0.75rem 0.9rem;
+        border-radius: 10px;
+        background: rgba(248, 113, 113, 0.15);
+        border: 1px solid rgba(248, 113, 113, 0.45);
+        color: #b91c1c;
+        font-weight: 500;
+        text-align: center;
+      }
+
+      footer {
+        margin-top: 2rem;
+        text-align: center;
+        font-size: 0.85rem;
+        color: #64748b;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          background: #0f172a;
+        }
+
+        body {
+          background: linear-gradient(180deg, rgba(13, 148, 136, 0.35), rgba(59, 130, 246, 0.25));
+        }
+
+        main {
+          background: rgba(15, 23, 42, 0.92);
+          box-shadow: 0 18px 45px rgba(2, 6, 23, 0.55);
+        }
+
+        h1 {
+          color: #e2e8f0;
+        }
+
+        p.hint {
+          color: #cbd5f5;
+        }
+
+        label {
+          color: #e2e8f0;
+        }
+
+        input[type="text"],
+        input[type="password"] {
+          background: rgba(15, 23, 42, 0.85);
+          border-color: rgba(148, 163, 184, 0.4);
+          color: #e2e8f0;
+        }
+
+        .flash {
+          background: rgba(248, 113, 113, 0.25);
+          border-color: rgba(248, 113, 113, 0.55);
+          color: #fecaca;
+        }
+
+        footer {
+          color: #94a3b8;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Контент-панель</h1>
+      <p class="hint">Войдите, используя учётную запись <strong>admin</strong> или <strong>dmitriy</strong>.</p>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="messages">
+            {% for category, message in messages %}
+              <div class="flash">{{ message }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+
+      <form method="post" novalidate>
+        <input type="hidden" name="next" value="{{ next or '' }}">
+        <div>
+          <label for="username">Имя пользователя</label>
+          <input id="username" name="username" type="text" value="{{ username or '' }}" autocomplete="username" required autofocus>
+        </div>
+        <div>
+          <label for="password">Пароль</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button type="submit">Войти</button>
+      </form>
+
+      <footer>
+        Сессия завершится автоматически при закрытии браузера.
+      </footer>
+    </main>
+  </body>
+</html>

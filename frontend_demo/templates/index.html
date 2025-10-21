@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <title>Панель генерации контента</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body {
+        margin: 0;
+        font-family: "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 2rem;
+      }
+
+      main {
+        text-align: center;
+        max-width: 520px;
+        background: rgba(15, 23, 42, 0.85);
+        padding: 2.5rem 2rem;
+        border-radius: 18px;
+        box-shadow: 0 25px 45px rgba(2, 6, 23, 0.35);
+        backdrop-filter: blur(8px);
+      }
+
+      h1 {
+        margin: 0 0 1rem;
+        font-size: 2rem;
+      }
+
+      p {
+        margin: 0 0 2rem;
+        line-height: 1.6;
+        color: #cbd5f5;
+      }
+
+      a.button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0.85rem 1.6rem;
+        border-radius: 999px;
+        background: linear-gradient(135deg, #2563eb, #0ea5e9);
+        color: white;
+        text-decoration: none;
+        font-weight: 600;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+      }
+
+      a.button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 12px 24px rgba(37, 99, 235, 0.25);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Здравствуйте, {{ current_user.display_name if current_user else 'гость' }}!</h1>
+      <p>Основной интерфейс панели пока недоступен. После авторизации вы можете открыть статический демо-интерфейс по адресу <code>/</code>.</p>
+      <a class="button" href="{{ url_for('logout') }}">Выйти</a>
+    </main>
+  </body>
+</html>

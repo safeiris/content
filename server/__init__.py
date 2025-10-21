@@ -4,13 +4,30 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import os
+import secrets
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 from dotenv import load_dotenv
-from flask import Flask, abort, jsonify, request, send_file, send_from_directory
+from flask import (
+    Flask,
+    abort,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    send_file,
+    send_from_directory,
+    url_for,
+)
 from flask_cors import CORS
+from werkzeug.security import check_password_hash
 
 from assemble_messages import invalidate_style_profile_cache
 from config import DEFAULT_STRUCTURE
@@ -32,6 +49,41 @@ load_dotenv()
 LOGGER = logging.getLogger("content_factory.api")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
+USERS: Dict[str, Dict[str, str]] = {
+    "admin": {
+        "display_name": "Admin",
+        "password_hash": (
+            "scrypt:32768:8:1$poFMhgLX1D2jug2W$724005a9a37b1f699ddda576ee89fb022c3bdcd28660826d1f9f5710c3116c6"
+            "b847ea20c926c9124fbcfa9fee55967a26d488e3d04a3b58e2776f002a124d003"
+        ),
+    },
+    "dmitriy": {
+        "display_name": "Dmitriy",
+        "password_hash": (
+            "scrypt:32768:8:1$FRtm9J7DjkoGICbY$4f859f2fecaf592d3cffdec70a6c8ddb598a97e4851aa2f7c80d17ef5d87c02"
+            "0b651cef85d9f82bf112f4ea46de4f25d17952a92c45c347000e3a413a0739af9"
+        ),
+    },
+}
+
+
+def login_required(view_func):
+    """Decorator ensuring that a user is authenticated before accessing a view."""
+
+    @wraps(view_func)
+    def wrapper(*args, **kwargs):
+        if not session.get("user"):
+            next_url = request.full_path if request.query_string else request.path
+            if next_url.endswith("?"):
+                next_url = next_url[:-1]
+            safe_next = _get_safe_redirect_target(next_url)
+            if safe_next:
+                return redirect(url_for("login", next=safe_next))
+            return redirect(url_for("login"))
+        return view_func(*args, **kwargs)
+
+    return wrapper
+
 
 class ApiError(Exception):
     """Exception translated into an HTTP error response."""
@@ -43,11 +95,25 @@ class ApiError(Exception):
 
 
 def create_app() -> Flask:
-    app = Flask(__name__)
+    frontend_root = (Path(__file__).resolve().parent.parent / "frontend_demo").resolve()
+    template_root = frontend_root / "templates"
+    app = Flask(__name__, template_folder=str(template_root))
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-    frontend_root = (Path(__file__).resolve().parent.parent / "frontend_demo").resolve()
+    secret_key = os.environ.get("FLASK_SECRET_KEY")
+    if not secret_key:
+        LOGGER.warning("FLASK_SECRET_KEY is not set; generating a temporary secret key")
+    app.secret_key = secret_key or secrets.token_hex(32)
+
     index_path = frontend_root / "index.html"
+
+    @app.context_processor
+    def inject_current_user():
+        username = session.get("user")
+        return {
+            "current_user": USERS.get(username),
+            "current_username": username,
+        }
 
     @app.errorhandler(ApiError)
     def _handle_api_error(exc: ApiError):  # type: ignore[override]
@@ -58,6 +124,39 @@ def create_app() -> Flask:
     def _handle_generic_error(exc: Exception):  # type: ignore[override]
         LOGGER.exception("Unhandled error")
         return jsonify({"error": "Внутренняя ошибка сервера"}), 500
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        next_param = _get_safe_redirect_target(
+            request.args.get("next") or request.form.get("next")
+        )
+
+        if session.get("user"):
+            if next_param:
+                return redirect(next_param)
+            return redirect(url_for("serve_frontend", path=""))
+
+        username = ""
+        if request.method == "POST":
+            username = str(request.form.get("username", "")).strip()
+            password = request.form.get("password", "")
+            user = USERS.get(username)
+
+            if user and check_password_hash(user["password_hash"], password):
+                session.clear()
+                session["user"] = username
+                session["authenticated_at"] = datetime.utcnow().isoformat()
+                redirect_target = next_param or url_for("serve_frontend", path="")
+                return redirect(redirect_target)
+
+            flash("Неверный логин или пароль", "error")
+
+        return render_template("login.html", next=next_param, username=username)
+
+    @app.get("/logout")
+    def logout():
+        session.clear()
+        return redirect(url_for("login"))
 
     @app.get("/api/pipes")
     def list_pipes():
@@ -273,6 +372,7 @@ def create_app() -> Flask:
 
     @app.get("/", defaults={"path": ""})
     @app.get("/<path:path>")
+    @login_required
     def serve_frontend(path: str):
         if path.startswith("api/"):
             raise ApiError("Endpoint not found", status_code=404)
@@ -290,9 +390,36 @@ def create_app() -> Flask:
         if index_path.exists():
             return send_from_directory(frontend_root, index_path.name)
 
+        if (template_root / "index.html").exists():
+            return render_template("index.html")
+
         abort(404)
 
     return app
+
+
+def _get_safe_redirect_target(target: Optional[str]) -> Optional[str]:
+    if not target:
+        return None
+    if target.startswith("//"):
+        return None
+
+    host_url = request.host_url
+    resolved_target = urljoin(host_url, target)
+    parsed_host = urlparse(host_url)
+    parsed_target = urlparse(resolved_target)
+
+    if parsed_target.scheme not in {"http", "https"}:
+        return None
+    if parsed_host.netloc != parsed_target.netloc:
+        return None
+
+    safe_path = parsed_target.path or "/"
+    if parsed_target.query:
+        safe_path = f"{safe_path}?{parsed_target.query}"
+    if parsed_target.fragment:
+        safe_path = f"{safe_path}#{parsed_target.fragment}"
+    return safe_path
 
 
 def _require_json(req) -> Dict[str, Any]:
