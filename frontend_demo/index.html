@@ -144,7 +144,9 @@
                     <div id="sources-list" class="sources-list"></div>
                     <button type="button" class="ghost small" id="add-source-btn">Добавить источник</button>
                   </div>
-                  <p class="field-hint">Используйте ссылки, ID или названия источников. Добавьте несколько строк при необходимости.</p>
+                  <p class="field-hint">
+                    Укажите ссылки или названия источников, на которые вы опираетесь. Можно добавить несколько строк.
+                  </p>
                 </div>
               </section>
 
@@ -371,12 +373,7 @@
 
     <template id="source-row-template">
       <div class="source-row">
-        <input type="text" class="source-input" placeholder="https://example.com" />
-        <select class="source-usage">
-          <option value="quote" selected>цитата с атрибуцией</option>
-          <option value="summary">пересказ со ссылкой</option>
-          <option value="inspiration">вдохновение без ссылки</option>
-        </select>
+        <textarea class="source-input" rows="2" placeholder="https://example.com"></textarea>
         <button type="button" class="icon-button remove-source" aria-label="Удалить источник">✕</button>
       </div>
     </template>

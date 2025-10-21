@@ -484,7 +484,7 @@ function resolveCustomContextPayload(contextSource) {
   return { text, filename: filename || null };
 }
 
-function addSourceRow(value = "", usage = "quote") {
+function addSourceRow(value = "") {
   if (!sourcesList) {
     return;
   }
@@ -498,12 +498,8 @@ function addSourceRow(value = "", usage = "quote") {
     return;
   }
   const input = row.querySelector(".source-input");
-  const select = row.querySelector(".source-usage");
-  if (input instanceof HTMLInputElement) {
+  if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
     input.value = value;
-  }
-  if (select instanceof HTMLSelectElement) {
-    select.value = usage;
   }
   sourcesList.append(row);
 }
@@ -516,13 +512,12 @@ function collectSources() {
   const items = [];
   for (const row of rows) {
     const input = row.querySelector(".source-input");
-    const select = row.querySelector(".source-usage");
-    const value = input instanceof HTMLInputElement ? input.value.trim() : "";
-    const usage = select instanceof HTMLSelectElement ? select.value : "quote";
+    const value =
+      input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement ? input.value.trim() : "";
     if (!value) {
       continue;
     }
-    items.push({ value, usage });
+    items.push(value);
   }
   return items;
 }

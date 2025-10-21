@@ -394,18 +394,16 @@ body {
   display: grid;
   gap: 12px;
   grid-template-columns: minmax(0, 1fr);
-  align-items: center;
-}
-
-.source-row .source-input,
-.source-row .source-usage {
-  width: 100%;
-  min-width: 0;
+  align-items: start;
 }
 
 .source-row .source-input {
+  width: 100%;
+  min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+  resize: vertical;
+  min-height: 48px;
 }
 
 .source-row .icon-button {
@@ -414,7 +412,7 @@ body {
 
 @media (min-width: 600px) {
   .source-row {
-    grid-template-columns: minmax(0, 1fr) minmax(160px, auto) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
 
   .source-row .icon-button {
