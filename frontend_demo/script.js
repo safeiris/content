@@ -76,6 +76,11 @@ const previewUser = document.getElementById("preview-user");
 const contextList = document.getElementById("context-list");
 const contextSummary = document.getElementById("context-summary");
 const contextBadge = document.getElementById("context-badge");
+const customContextBlock = document.getElementById("custom-context-block");
+const customContextTextarea = document.getElementById("customContext");
+const customContextCounter = document.getElementById("customContextCounter");
+const customContextFileInput = document.getElementById("customContextFile");
+const customContextClearBtn = document.getElementById("customContextClear");
 const generateBtn = briefForm.querySelector("button[type='submit']");
 const advancedSettings = document.getElementById("advanced-settings");
 const advancedSupportSection = document.querySelector("[data-section='support']");
@@ -94,6 +99,8 @@ const LOG_STATUS_LABELS = {
 
 const DEFAULT_PROGRESS_MESSAGE = progressMessage?.textContent?.trim() || "Готовим данные…";
 const MAX_TOASTS = 3;
+const MAX_CUSTOM_CONTEXT_CHARS = 20000;
+const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
 
 const HEALTH_STATUS_MESSAGES = {
   openai_key: {
@@ -126,6 +133,27 @@ const state = {
   hasMissingArtifacts: false,
   currentResult: null,
 };
+
+const customContextState = {
+  textareaText: "",
+  fileText: "",
+  fileName: "",
+  noticeShown: false,
+};
+
+function escapeHtml(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const map = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  };
+  return value.replace(/[&<>"']/g, (char) => map[char] || char);
+}
 
 const devActionsConfig = resolveDevActions();
 if (!devActionsConfig.show && advancedSupportSection) {
@@ -180,6 +208,15 @@ if (sourcesList) {
 if (contextSourceSelect) {
   contextSourceSelect.addEventListener("change", handleContextSourceChange);
 }
+if (customContextTextarea) {
+  customContextTextarea.addEventListener("input", handleCustomContextInput);
+}
+if (customContextFileInput) {
+  customContextFileInput.addEventListener("change", handleCustomContextFileChange);
+}
+if (customContextClearBtn) {
+  customContextClearBtn.addEventListener("click", handleCustomContextClear);
+}
 if (reindexBtn) {
   reindexBtn.addEventListener("click", handleReindex);
 }
@@ -203,6 +240,7 @@ updateTemperatureControlState(modelInput?.value);
 handleStyleProfileChange();
 handleFaqToggle();
 handleContextSourceChange();
+updateCustomContextCounter();
 init();
 
 function switchTab(tabId) {
@@ -249,16 +287,201 @@ function handleSourceListClick(event) {
 }
 
 function handleContextSourceChange() {
-  if (!contextSourceSelect || !kInput) {
+  if (!contextSourceSelect) {
     return;
   }
   const value = String(contextSourceSelect.value || "index.json").toLowerCase();
-  if (value === "off") {
-    kInput.value = "0";
-    kInput.disabled = true;
-  } else {
-    kInput.disabled = false;
+  const isCustom = value === "custom";
+  const isOff = value === "off";
+  if (customContextBlock) {
+    customContextBlock.hidden = !isCustom;
+    if (!isCustom) {
+      resetCustomContextState();
+    } else {
+      updateCustomContextCounter();
+    }
   }
+  if (kInput) {
+    if (isCustom || isOff) {
+      kInput.value = "0";
+      kInput.disabled = true;
+    } else {
+      kInput.disabled = false;
+    }
+  }
+}
+
+function resetCustomContextState() {
+  customContextState.textareaText = "";
+  customContextState.fileText = "";
+  customContextState.fileName = "";
+  customContextState.noticeShown = false;
+  if (customContextTextarea) {
+    customContextTextarea.value = "";
+  }
+  if (customContextFileInput) {
+    customContextFileInput.value = "";
+  }
+  updateCustomContextCounter();
+}
+
+function updateCustomContextCounter() {
+  if (!customContextCounter) {
+    return;
+  }
+  const activeText = customContextState.fileText || customContextState.textareaText;
+  const current = activeText.length;
+  customContextCounter.textContent = `${current.toLocaleString("ru-RU")} / ${MAX_CUSTOM_CONTEXT_LABEL} символов`;
+}
+
+function normalizeCustomContext(value) {
+  if (typeof value !== "string") {
+    return { text: "", truncated: false };
+  }
+  let normalized = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  normalized = normalized.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+  normalized = normalized.replace(/\t/g, " ");
+  const lines = normalized.split("\n").map((line) => line.replace(/\s+$/, ""));
+  const compact = [];
+  let blankPending = false;
+  for (const line of lines) {
+    if (line.trim()) {
+      compact.push(line);
+      blankPending = false;
+    } else if (!blankPending && compact.length) {
+      compact.push("");
+      blankPending = true;
+    }
+  }
+  normalized = compact.join("\n").trim();
+  let truncated = false;
+  if (normalized.length > MAX_CUSTOM_CONTEXT_CHARS) {
+    normalized = normalized.slice(0, MAX_CUSTOM_CONTEXT_CHARS);
+    truncated = true;
+  }
+  return { text: normalized, truncated };
+}
+
+function handleCustomContextInput() {
+  if (!customContextTextarea) {
+    return;
+  }
+  const { text, truncated } = normalizeCustomContext(customContextTextarea.value);
+  if (text !== customContextTextarea.value) {
+    customContextTextarea.value = text;
+  }
+  customContextState.textareaText = text;
+  const shouldNotify = truncated && !customContextState.noticeShown;
+  customContextState.noticeShown = truncated;
+  if (shouldNotify) {
+    showToast({ message: "Слишком длинный контекст: сокращён до 20 000 символов", type: "warn" });
+  }
+  if (!customContextState.fileText) {
+    updateCustomContextCounter();
+  } else if (!truncated) {
+    customContextState.noticeShown = false;
+  }
+}
+
+async function handleCustomContextFileChange(event) {
+  if (!customContextFileInput) {
+    return;
+  }
+  const file = customContextFileInput.files && customContextFileInput.files[0];
+  customContextState.fileText = "";
+  customContextState.fileName = "";
+  customContextState.noticeShown = false;
+  if (!file) {
+    updateCustomContextCounter();
+    return;
+  }
+  const dotIndex = file.name.lastIndexOf(".");
+  const extension = dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : "";
+  if (![".txt", ".json"].includes(extension)) {
+    showToast({ message: "Поддерживаются только .txt и .json", type: "error" });
+    customContextFileInput.value = "";
+    updateCustomContextCounter();
+    return;
+  }
+  try {
+    let rawText = await file.text();
+    if (extension === ".json") {
+      try {
+        const parsed = JSON.parse(rawText);
+        if (Array.isArray(parsed)) {
+          rawText = parsed.filter((item) => typeof item === "string").join("\n\n");
+        } else if (parsed && typeof parsed === "object") {
+          rawText = Object.values(parsed)
+            .filter((value) => typeof value === "string")
+            .join("\n\n");
+        } else if (typeof parsed === "string") {
+          rawText = parsed;
+        } else {
+          rawText = "";
+        }
+      } catch (error) {
+        showToast({ message: "Некорректный JSON", type: "error" });
+        customContextFileInput.value = "";
+        updateCustomContextCounter();
+        return;
+      }
+    }
+    const { text, truncated } = normalizeCustomContext(rawText);
+    customContextState.fileText = text;
+    customContextState.fileName = file.name;
+    customContextState.noticeShown = truncated;
+    if (customContextTextarea) {
+      customContextTextarea.value = text;
+    }
+    customContextState.textareaText = text;
+    if (truncated) {
+      showToast({ message: "Слишком длинный контекст: сокращён до 20 000 символов", type: "warn" });
+    }
+    updateCustomContextCounter();
+  } catch (error) {
+    showToast({ message: `Не удалось прочитать файл: ${getErrorMessage(error)}`, type: "error" });
+    customContextFileInput.value = "";
+    customContextState.fileText = "";
+    customContextState.fileName = "";
+    customContextState.noticeShown = false;
+    updateCustomContextCounter();
+  }
+}
+
+function handleCustomContextClear(event) {
+  if (event) {
+    event.preventDefault();
+  }
+  resetCustomContextState();
+}
+
+function resolveCustomContextPayload(contextSource) {
+  if (contextSource !== "custom") {
+    return { text: null, filename: null };
+  }
+  const sourceText = customContextState.fileText || customContextState.textareaText;
+  const { text, truncated } = normalizeCustomContext(sourceText);
+  if (!text) {
+    throw new Error("Добавьте текст для пользовательского контекста");
+  }
+  const shouldNotify = truncated && !customContextState.noticeShown;
+  customContextState.noticeShown = truncated;
+  if (shouldNotify) {
+    showToast({ message: "Слишком длинный контекст: сокращён до 20 000 символов", type: "warn" });
+  }
+  if (text !== sourceText) {
+    if (customContextState.fileText) {
+      customContextState.fileText = text;
+    } else {
+      customContextState.textareaText = text;
+    }
+    if (customContextTextarea) {
+      customContextTextarea.value = text;
+    }
+    updateCustomContextCounter();
+  }
+  const filename = customContextState.fileText ? customContextState.fileName : "";
+  return { text, filename: filename || null };
 }
 
 function addSourceRow(value = "", usage = "quote") {
@@ -805,13 +1028,21 @@ async function handlePromptPreview() {
     setInteractiveBusy(true);
     setButtonLoading(previewBtn, true);
     showProgress(true, "Собираем промпт…");
+    const previewRequest = {
+      theme: payload.theme,
+      data: payload.data,
+      k: payload.k,
+      context_source: payload.context_source,
+    };
+    if (payload.context_source === "custom") {
+      previewRequest.context_text = payload.context_text;
+      if (payload.context_filename) {
+        previewRequest.context_filename = payload.context_filename;
+      }
+    }
     const preview = await fetchJson("/api/prompt/preview", {
       method: "POST",
-      body: JSON.stringify({
-        theme: payload.theme,
-        data: payload.data,
-        k: payload.k,
-      }),
+      body: JSON.stringify(previewRequest),
     });
     updatePromptPreview(preview);
     switchTab("result");
@@ -834,16 +1065,24 @@ async function handleGenerate(event) {
     setButtonLoading(generateBtn, true);
     showProgress(true, "Генерируем материалы…");
     renderUsedKeywords(null);
+    const requestBody = {
+      theme: payload.theme,
+      data: payload.data,
+      k: payload.k,
+      model: payload.model,
+      temperature: payload.temperature,
+      max_tokens: payload.maxTokens,
+      context_source: payload.context_source,
+    };
+    if (payload.context_source === "custom") {
+      requestBody.context_text = payload.context_text;
+      if (payload.context_filename) {
+        requestBody.context_filename = payload.context_filename;
+      }
+    }
     const response = await fetchJson("/api/generate", {
       method: "POST",
-      body: JSON.stringify({
-        theme: payload.theme,
-        data: payload.data,
-        k: payload.k,
-        model: payload.model,
-        temperature: payload.temperature,
-        max_tokens: payload.maxTokens,
-      }),
+      body: JSON.stringify(requestBody),
     });
     const markdown = response?.markdown ?? "";
     const meta = (response?.meta_json && typeof response.meta_json === "object") ? response.meta_json : {};
@@ -955,6 +1194,8 @@ function buildRequestPayload() {
   const toneSelect = document.getElementById("tone-select");
   const tone = toneSelect ? toneSelect.value : "экспертный";
 
+  const contextSource = String(contextSourceSelect?.value || "index.json").toLowerCase();
+
   const data = {
     theme: topic,
     goal: goalInput.value.trim() || "SEO-статья",
@@ -968,7 +1209,7 @@ function buildRequestPayload() {
     pipe_id: theme,
     length_limits: { min_chars: minChars, max_chars: maxChars },
     style_profile: styleProfile,
-    context_source: contextSourceSelect?.value || "index.json",
+    context_source: contextSource,
   };
 
   if (title) {
@@ -994,12 +1235,23 @@ function buildRequestPayload() {
   if (!Number.isInteger(k) || k < 0 || k > 6) {
     throw new Error("Контекст (k) должен быть целым числом от 0 до 6");
   }
-  const contextSource = String(contextSourceSelect?.value || "index.json").toLowerCase();
-  if (contextSource === "off") {
+  if (contextSource === "off" || contextSource === "custom") {
     k = 0;
   }
   if (kInput) {
     kInput.value = String(k);
+  }
+
+  const contextPayload = resolveCustomContextPayload(contextSource);
+  if (contextSource === "custom") {
+    data.context_source = "custom";
+    if (contextPayload.filename) {
+      data.context_filename = contextPayload.filename;
+    } else {
+      delete data.context_filename;
+    }
+  } else {
+    delete data.context_filename;
   }
 
   const model = modelInput.value || undefined;
@@ -1037,7 +1289,15 @@ function buildRequestPayload() {
     temperature: temperatureLocked ? undefined : temperature,
     maxTokens,
     model,
+    context_source: contextSource,
   };
+
+  if (contextSource === "custom") {
+    payload.context_text = contextPayload.text;
+    if (contextPayload.filename) {
+      payload.context_filename = contextPayload.filename;
+    }
+  }
 
   return payload;
 }
@@ -1349,24 +1609,53 @@ function updatePromptPreview(preview) {
   }
   previewSystem.textContent = preview.system ?? "";
   previewUser.textContent = preview.user ?? "";
-  contextList.innerHTML = "";
-  (preview.context || []).forEach((item, idx) => {
-    const li = document.createElement("li");
-    const title = item.path || `Фрагмент #${idx + 1}`;
-    li.innerHTML = `<strong>${title}</strong><span>score: ${Number(item.score ?? 0).toFixed(2)}</span><br />${(item.text || "").slice(0, 320)}${
-      item.text && item.text.length > 320 ? "…" : ""
-    }`;
-    contextList.append(li);
-  });
-
-  if (!preview.context || !preview.context.length) {
-    contextList.innerHTML = '<li>Контекст не используется.</li>';
-  }
-
+  const contextSource = String(preview.context_source || "index.json").toLowerCase();
+  const isCustom = contextSource === "custom";
   const contextUsed = Boolean(preview.context_used);
   const indexMissing = Boolean(preview.context_index_missing);
   const k = preview.k ?? 0;
-  if (k === 0) {
+  contextList.innerHTML = "";
+
+  if (isCustom) {
+    const customText = typeof preview.context_text === "string" ? preview.context_text : "";
+    const filename = typeof preview.context_filename === "string" ? preview.context_filename : "";
+    if (customText) {
+      const li = document.createElement("li");
+      li.className = "context-custom";
+      const titleEl = document.createElement("strong");
+      titleEl.textContent = filename || "Пользовательский контекст";
+      const pre = document.createElement("pre");
+      pre.className = "context-custom__text";
+      pre.textContent = customText;
+      li.append(titleEl);
+      li.append(pre);
+      contextList.append(li);
+    } else {
+      contextList.innerHTML = '<li>Пользовательский контекст пуст.</li>';
+    }
+  } else {
+    (preview.context || []).forEach((item, idx) => {
+      const li = document.createElement("li");
+      const title = item.path || `Фрагмент #${idx + 1}`;
+      const score = Number(item.score ?? 0).toFixed(2);
+      const textFragment = typeof item.text === "string" ? item.text : "";
+      li.innerHTML = `<strong>${escapeHtml(title)}</strong><span>score: ${score}</span><br />${escapeHtml(
+        textFragment.slice(0, 320)
+      )}${textFragment.length > 320 ? "…" : ""}`;
+      contextList.append(li);
+    });
+    if (!preview.context || !preview.context.length) {
+      contextList.innerHTML = '<li>Контекст не используется.</li>';
+    }
+  }
+
+  if (isCustom) {
+    contextBadge.textContent = contextUsed ? "custom" : "custom (пустой)";
+    contextBadge.className = contextUsed ? "badge success" : "badge warning";
+  } else if (contextSource === "off") {
+    contextBadge.textContent = "off";
+    contextBadge.className = "badge neutral";
+  } else if (k === 0) {
     contextBadge.textContent = "disabled";
     contextBadge.className = "badge neutral";
   } else if (indexMissing) {
@@ -1380,7 +1669,12 @@ function updatePromptPreview(preview) {
     contextBadge.className = "badge success";
   }
 
-  if (typeof preview.context_budget_tokens_est === "number") {
+  if (isCustom) {
+    const lengthValue = Number(preview.context_len || 0);
+    contextSummary.textContent = lengthValue
+      ? `Пользовательский контекст: ${lengthValue.toLocaleString("ru-RU")} символов`
+      : "";
+  } else if (typeof preview.context_budget_tokens_est === "number") {
     const limit = preview.context_budget_tokens_limit;
     contextSummary.textContent = limit
       ? `Контекст: ~${preview.context_budget_tokens_est} токенов из лимита ${limit}`
@@ -1475,6 +1769,10 @@ async function showArtifact(artifact) {
       context_budget_tokens_est: metadata.context_budget_tokens_est,
       context_budget_tokens_limit: metadata.context_budget_tokens_limit,
       k: metadata.retrieval_k,
+      context_source: metadata.context_source,
+      context_text: metadata.custom_context_text,
+      context_len: metadata.context_len,
+      context_filename: metadata.context_filename,
     });
     switchTab("result");
   } catch (error) {

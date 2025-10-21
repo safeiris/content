@@ -242,6 +242,20 @@
                             <option value="off">off</option>
                           </select>
                           <p class="field-hint">Выберите источник примеров для CONTEXT или отключите его.</p>
+                          <div class="custom-context-block" id="custom-context-block" hidden>
+                            <p class="field-hint custom-context-hint">
+                              Можно вставить текст или загрузить .txt/.json. До 20 000 символов. При custom параметр «Контекст (k)» не используется.
+                            </p>
+                            <label class="field-label" for="customContext">Пользовательский контекст</label>
+                            <textarea id="customContext" placeholder="Вставьте сюда текст или JSON"></textarea>
+                            <div class="custom-context-meta">
+                              <span class="custom-context-counter" id="customContextCounter">0 / 20 000 символов</span>
+                              <div class="custom-context-file">
+                                <input type="file" id="customContextFile" accept=".txt,.json" />
+                                <button type="button" class="ghost small" id="customContextClear">Очистить</button>
+                              </div>
+                            </div>
+                          </div>
                         </div>
                       </div>
                     </div>

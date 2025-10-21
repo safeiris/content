@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -26,6 +27,7 @@ from artifacts_store import register_artifact
 from config import (
     DEFAULT_MAX_LENGTH,
     DEFAULT_MIN_LENGTH,
+    MAX_CUSTOM_CONTEXT_CHARS,
     G5_MAX_OUTPUT_TOKENS_MAX,
     OPENAI_API_KEY,
 )
@@ -36,6 +38,7 @@ from post_analysis import (
     build_retry_instruction,
     should_retry as post_should_retry,
 )
+from retrieval import estimate_tokens
 
 
 BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
@@ -61,6 +64,12 @@ class GenerationContext:
     style_profile_source: Optional[str] = None
     style_profile_variant: Optional[str] = None
     keywords_manual: List[str] = field(default_factory=list)
+    context_source: str = "index.json"
+    custom_context_text: Optional[str] = None
+    custom_context_len: int = 0
+    custom_context_filename: Optional[str] = None
+    custom_context_hash: Optional[str] = None
+    custom_context_truncated: bool = False
 
 
 def _get_cta_text() -> str:
@@ -92,6 +101,59 @@ def _resolve_cta_source(data: Dict[str, Any]) -> Tuple[str, bool]:
     if custom_cta:
         return custom_cta, False
     return _get_cta_text(), True
+
+
+def _strip_control_characters(text: str) -> str:
+    allowed_whitespace = {"\n", "\t"}
+    cleaned_chars: List[str] = []
+    for char in text:
+        if char == "\r":
+            cleaned_chars.append("\n")
+            continue
+        if char in allowed_whitespace:
+            cleaned_chars.append(" " if char == "\t" else char)
+            continue
+        if unicodedata.category(char).startswith("C"):
+            continue
+        cleaned_chars.append(char)
+    return "".join(cleaned_chars)
+
+
+def _collapse_blank_lines(text: str) -> str:
+    lines = text.split("\n")
+    collapsed: List[str] = []
+    blank_pending = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped:
+            collapsed.append(line.rstrip())
+            blank_pending = False
+            continue
+        if collapsed and not blank_pending:
+            collapsed.append("")
+        blank_pending = True
+    return "\n".join(collapsed).strip()
+
+
+def _normalize_custom_context_text(raw_text: Any, *, max_chars: int = MAX_CUSTOM_CONTEXT_CHARS) -> Tuple[str, bool]:
+    if not isinstance(raw_text, str):
+        return "", False
+    normalized = _strip_control_characters(raw_text.replace("\r\n", "\n").replace("\r", "\n"))
+    collapsed = _collapse_blank_lines(normalized)
+    truncated = False
+    if len(collapsed) > max_chars:
+        collapsed = collapsed[:max_chars]
+        truncated = True
+    return collapsed, truncated
+
+
+def _hash_context_snippet(text: str, *, byte_limit: int = 4096) -> Optional[str]:
+    if not text:
+        return None
+    snippet = text.encode("utf-8")[:byte_limit]
+    if not snippet:
+        return None
+    return hashlib.sha256(snippet).hexdigest()
 
 
 def _is_truncated(text: str) -> bool:
@@ -277,10 +339,64 @@ def make_generation_context(
     data: Dict[str, Any],
     k: int,
     append_style_profile: Optional[bool] = None,
+    context_source: Optional[str] = None,
+    custom_context_text: Optional[str] = None,
+    context_filename: Optional[str] = None,
 ) -> GenerationContext:
     payload = deepcopy(data)
-    if k <= 0:
-        print("[orchestrate] CONTEXT: disabled (k=0)")
+    requested_source = context_source if context_source is not None else payload.get("context_source")
+    normalized_source = str(requested_source or "index.json").strip().lower() or "index.json"
+    if normalized_source == "index":
+        normalized_source = "index.json"
+    payload["context_source"] = normalized_source
+
+    raw_custom_context = custom_context_text
+    if raw_custom_context is None and normalized_source == "custom":
+        raw_custom_context = payload.get("context_text")
+
+    filename = context_filename if context_filename is not None else payload.get("context_filename")
+    if isinstance(filename, str):
+        filename = filename.strip() or None
+    else:
+        filename = None
+
+    payload.pop("context_text", None)
+    if filename:
+        payload["context_filename"] = filename
+    else:
+        payload.pop("context_filename", None)
+
+    retrieval_k = k
+    if normalized_source in {"off", "custom"}:
+        retrieval_k = 0
+
+    custom_context_normalized = ""
+    custom_context_truncated = False
+    custom_context_hash: Optional[str] = None
+    custom_context_len = 0
+
+    if normalized_source == "custom":
+        custom_context_normalized, custom_context_truncated = _normalize_custom_context_text(
+            raw_custom_context,
+            max_chars=MAX_CUSTOM_CONTEXT_CHARS,
+        )
+        custom_context_len = len(custom_context_normalized)
+        custom_context_hash = _hash_context_snippet(custom_context_normalized)
+        tokens_est = estimate_tokens(custom_context_normalized) if custom_context_normalized else 0
+        if custom_context_truncated:
+            print(
+                f"[orchestrate] CONTEXT: custom truncated to {MAX_CUSTOM_CONTEXT_CHARS} chars"
+            )
+        bundle = ContextBundle(
+            items=[],
+            total_tokens_est=tokens_est,
+            index_missing=False,
+            context_used=bool(custom_context_normalized),
+            token_budget_limit=ContextBundle.token_budget_default(),
+        )
+    elif retrieval_k <= 0:
+        reason = "source=off" if normalized_source == "off" else "k=0"
+        print(f"[orchestrate] CONTEXT: disabled ({reason})")
         bundle = ContextBundle(
             items=[],
             total_tokens_est=0,
@@ -289,7 +405,7 @@ def make_generation_context(
             token_budget_limit=ContextBundle.token_budget_default(),
         )
     else:
-        bundle = retrieve_context(theme_slug=theme, query=payload.get("theme", ""), k=k)
+        bundle = retrieve_context(theme_slug=theme, query=payload.get("theme", ""), k=retrieval_k)
         if bundle.index_missing:
             print("[orchestrate] CONTEXT: none (index missing)")
 
@@ -302,10 +418,12 @@ def make_generation_context(
     messages = assemble_messages(
         data_path="",
         theme_slug=theme,
-        k=k,
+        k=retrieval_k,
         exemplars=bundle.items,
         data=payload,
         append_style_profile=append_style_profile,
+        context_source=normalized_source,
+        custom_context_text=custom_context_normalized,
     )
     clip_texts = [str(item.get("text", "")) for item in bundle.items if item.get("text")]
     style_profile_applied = False
@@ -327,6 +445,12 @@ def make_generation_context(
         style_profile_source=style_profile_source,
         style_profile_variant=style_profile_variant,
         keywords_manual=manual_keywords,
+        context_source=normalized_source,
+        custom_context_text=custom_context_normalized or None,
+        custom_context_len=custom_context_len,
+        custom_context_filename=filename,
+        custom_context_hash=custom_context_hash,
+        custom_context_truncated=custom_context_truncated,
     )
 
 
@@ -461,21 +585,48 @@ def _generate_variant(
     variant_label: Optional[str] = None,
     backoff_schedule: Optional[List[float]] = None,
     append_style_profile: Optional[bool] = None,
+    context_source: Optional[str] = None,
+    context_text: Optional[str] = None,
+    context_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     start_time = time.time()
     payload = deepcopy(data)
-    context_source = str(payload.get("context_source") or "index.json").strip().lower() or "index.json"
+    requested_source = context_source if context_source is not None else payload.get("context_source")
+    normalized_source = str(requested_source or "index.json").strip().lower() or "index.json"
+    if normalized_source == "index":
+        normalized_source = "index.json"
+    payload["context_source"] = normalized_source
+
+    filename = context_filename if context_filename is not None else payload.get("context_filename")
+    if isinstance(filename, str):
+        filename = filename.strip() or None
+    else:
+        filename = None
+    if filename:
+        payload["context_filename"] = filename
+    else:
+        payload.pop("context_filename", None)
+
+    raw_custom_context = context_text if context_text is not None else payload.get("context_text")
+    if normalized_source != "custom":
+        raw_custom_context = None
+
     effective_k = k
-    if context_source == "off":
+    if normalized_source in {"off", "custom"}:
+        if normalized_source == "custom" and k > 0:
+            print("[orchestrate] CONTEXT: parameter k ignored for custom source")
         effective_k = 0
-    payload["context_source"] = context_source
 
     generation_context = make_generation_context(
         theme=theme,
         data=payload,
         k=effective_k,
         append_style_profile=append_style_profile,
+        context_source=normalized_source,
+        custom_context_text=raw_custom_context,
+        context_filename=filename,
     )
+    normalized_source = generation_context.context_source or normalized_source
     prepared_data = generation_context.data
     active_messages = list(generation_context.messages)
     cta_text, cta_is_default = _resolve_cta_source(prepared_data)
@@ -668,7 +819,12 @@ def _generate_variant(
 
     duration = time.time() - start_time
     context_bundle = generation_context.context_bundle
-    context_used = bool(context_bundle.context_used and not context_bundle.index_missing and effective_k > 0)
+    if normalized_source == "custom":
+        context_used = bool(generation_context.custom_context_text)
+    else:
+        context_used = bool(
+            context_bundle.context_used and not context_bundle.index_missing and effective_k > 0
+        )
 
     used_temperature = None
     if effective_model and not effective_model.lower().startswith("gpt-5"):
@@ -726,7 +882,7 @@ def _generate_variant(
         "length_limits": {"min_chars": min_chars, "max_chars": max_chars},
         "keywords_mode": keyword_mode,
         "sources_requested": prepared_data.get("sources"),
-        "context_source": context_source,
+        "context_source": normalized_source,
         "include_faq": include_faq,
         "faq_questions": faq_questions,
         "include_jsonld": bool(prepared_data.get("include_jsonld", False)),
@@ -734,6 +890,17 @@ def _generate_variant(
         "post_analysis": post_analysis_report,
         "post_analysis_retry_count": post_retry_attempts,
     }
+
+    if normalized_source == "custom":
+        metadata["context_len"] = generation_context.custom_context_len
+        if generation_context.custom_context_filename:
+            metadata["context_filename"] = generation_context.custom_context_filename
+        if generation_context.custom_context_hash:
+            metadata["context_hash"] = generation_context.custom_context_hash
+        metadata["context_note"] = "k_ignored"
+        metadata["context_truncated"] = bool(generation_context.custom_context_truncated)
+        if generation_context.custom_context_text:
+            metadata["custom_context_text"] = generation_context.custom_context_text
 
     if generation_context.style_profile_applied:
         metadata["style_profile_applied"] = True
@@ -777,6 +944,9 @@ def generate_article_from_payload(
     backoff_schedule: Optional[List[float]] = None,
     outfile: Optional[str] = None,
     append_style_profile: Optional[bool] = None,
+    context_source: Optional[str] = None,
+    context_text: Optional[str] = None,
+    context_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Convenience wrapper for API usage.
 
@@ -809,6 +979,9 @@ def generate_article_from_payload(
         output_path=output_path,
         backoff_schedule=backoff_schedule,
         append_style_profile=append_style_profile,
+        context_source=context_source,
+        context_text=context_text,
+        context_filename=context_filename,
     )
 
     artifact_files = result.get("artifact_files")

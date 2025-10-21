@@ -173,17 +173,27 @@ def create_app() -> Flask:
         raw_data = payload.get("data") or {}
         if not isinstance(raw_data, dict):
             raise ApiError("Поле data должно быть объектом")
+        raw_data = dict(raw_data)
 
         k = _safe_int(payload.get("k"))
         if k < 0:
             k = 0
 
         style_profile_override = _style_profile_override_from_request(request)
+
+        context_source, context_text, context_filename = _extract_context_settings(payload, raw_data)
+        effective_k = k
+        if context_source in {"off", "custom"}:
+            effective_k = 0
+
         generation_context = make_generation_context(
             theme=theme,
             data=raw_data,
-            k=k,
+            k=effective_k,
             append_style_profile=style_profile_override,
+            context_source=context_source,
+            custom_context_text=context_text,
+            context_filename=context_filename,
         )
 
         system_payload = next((msg for msg in generation_context.messages if msg.get("role") == "system"), {})
@@ -208,18 +218,32 @@ def create_app() -> Flask:
             for item in context_bundle.items
         ]
 
+        if generation_context.context_source == "custom":
+            context_used = bool(generation_context.custom_context_text)
+        else:
+            context_used = bool(
+                context_bundle.context_used and not context_bundle.index_missing and effective_k > 0
+            )
+
         response_payload: Dict[str, Any] = {
             "system": system_message,
             "context": context_items,
             "user": user_message,
-            "context_used": bool(context_bundle.context_used and not context_bundle.index_missing and k > 0),
+            "context_used": context_used,
             "context_index_missing": context_bundle.index_missing,
             "context_budget_tokens_est": context_bundle.total_tokens_est,
             "context_budget_tokens_limit": context_bundle.token_budget_limit,
-            "k": k,
+            "k": effective_k,
+            "context_source": generation_context.context_source,
             "style_profile_applied": style_profile_applied,
             "keywords_manual": generation_context.keywords_manual,
         }
+
+        if generation_context.context_source == "custom":
+            response_payload["context_text"] = generation_context.custom_context_text or ""
+            response_payload["context_len"] = generation_context.custom_context_len
+            if generation_context.custom_context_filename:
+                response_payload["context_filename"] = generation_context.custom_context_filename
 
         if style_profile_applied and style_profile_source:
             response_payload["style_profile_source"] = style_profile_source
@@ -238,14 +262,20 @@ def create_app() -> Flask:
         raw_data = payload.get("data") or {}
         if not isinstance(raw_data, dict):
             raise ApiError("Поле data должно быть объектом")
+        raw_data = dict(raw_data)
 
         k = _safe_int(payload.get("k"))
         if k < 0:
             k = 0
 
+        context_source, context_text, context_filename = _extract_context_settings(payload, raw_data)
+        effective_k = k
+        if context_source in {"off", "custom"}:
+            effective_k = 0
+
         style_profile_override = _style_profile_override_from_request(request)
         if payload.get("dry_run"):
-            return jsonify(_make_dry_run_response(theme=theme, data=raw_data, k=k))
+            return jsonify(_make_dry_run_response(theme=theme, data=raw_data, k=effective_k))
 
         model = payload.get("model")
         temperature = _safe_float(payload.get("temperature", 0.3), default=0.3)
@@ -261,6 +291,9 @@ def create_app() -> Flask:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 append_style_profile=style_profile_override,
+                context_source=context_source,
+                context_text=context_text,
+                context_filename=context_filename,
             )
         except ApiError:
             raise
@@ -461,6 +494,51 @@ def _style_profile_override_from_request(req) -> Optional[bool]:
     if value in {"on", "true", "1"}:
         return True
     return None
+
+
+def _normalize_context_source(raw_value: Any) -> str:
+    value = str(raw_value or "").strip().lower()
+    if value in {"", "index", "index.json"}:
+        return "index.json"
+    if value == "custom":
+        return "custom"
+    if value == "off":
+        return "off"
+    return "index.json"
+
+
+def _is_allowed_context_file(filename: str) -> bool:
+    suffix = Path(filename).suffix.lower()
+    return suffix in {".txt", ".json"}
+
+
+def _extract_context_settings(payload: Dict[str, Any], raw_data: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
+    context_source = _normalize_context_source(
+        payload.get("context_source") or raw_data.get("context_source")
+    )
+
+    filename_raw = payload.get("context_filename")
+    if filename_raw is None and "context_filename" in raw_data:
+        filename_raw = raw_data.get("context_filename")
+    context_filename = (
+        str(filename_raw).strip() if isinstance(filename_raw, str) and filename_raw.strip() else None
+    )
+
+    context_text_raw = payload.get("context_text")
+    if context_text_raw is None and context_source == "custom":
+        context_text_raw = raw_data.get("context_text")
+
+    if context_source == "custom":
+        if not isinstance(context_text_raw, str):
+            raise ApiError("Поле context_text обязательно для custom")
+        context_text = context_text_raw
+        if not context_text.strip():
+            raise ApiError("Поле context_text обязательно для custom")
+        if context_filename and not _is_allowed_context_file(context_filename):
+            raise ApiError("Поддерживаются только .txt и .json")
+        return context_source, context_text, context_filename
+
+    return context_source, None, None
 
 
 def _collect_pipes() -> List[Dict[str, Any]]:

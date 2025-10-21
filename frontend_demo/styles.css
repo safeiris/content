@@ -253,6 +253,44 @@ body {
   border-radius: 4px;
 }
 
+.custom-context-block {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.custom-context-block textarea {
+  min-height: 200px;
+  resize: vertical;
+}
+
+.custom-context-hint {
+  margin-top: 0;
+}
+
+.custom-context-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.custom-context-counter {
+  font-size: 13px;
+  color: #475569;
+}
+
+.custom-context-file {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.custom-context-file input[type="file"] {
+  max-width: 260px;
+}
+
 .form-row input,
 .form-row select,
 .form-row textarea {
@@ -1382,6 +1420,17 @@ button {
 .context-list li strong {
   display: block;
   margin-bottom: 4px;
+  color: #1f2937;
+}
+
+.context-custom__text {
+  margin: 6px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 13px;
+  line-height: 1.5;
   color: #1f2937;
 }
 

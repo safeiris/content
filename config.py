@@ -67,6 +67,9 @@ DEFAULT_SEO_DENSITY = 2
 DEFAULT_MIN_LENGTH = 3500
 DEFAULT_MAX_LENGTH = 6000
 
+# Максимальный объём пользовательского контекста (символов)
+MAX_CUSTOM_CONTEXT_CHARS = 20_000
+
 # Стилевые профили
 STYLE_PROFILE_PATH = "profiles/finance/style_profile.md"
 STYLE_PROFILE_VARIANT = str(os.getenv("STYLE_PROFILE_VARIANT", "full")).strip().lower() or "full"

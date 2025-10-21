@@ -18,7 +18,11 @@ from orchestrate import (  # noqa: E402
     _ensure_length,
     _is_truncated,
     _make_output_path,
+    _normalize_custom_context_text,
+    generate_article_from_payload,
+    make_generation_context,
 )
+from config import MAX_CUSTOM_CONTEXT_CHARS  # noqa: E402
 
 
 def test_is_truncated_detects_comma():
@@ -138,3 +142,77 @@ def test_make_output_path_uses_belgrade_timezone(monkeypatch):
     monkeypatch.setattr("orchestrate._local_now", lambda: fixed_now)
     output_path = _make_output_path("finance", None)
     assert output_path.name == "2024-01-02_0930_finance_article.md"
+
+
+def test_make_generation_context_custom_includes_message():
+    raw_text = "Первый абзац\n\n\nВторой абзац"
+    context = make_generation_context(
+        theme="finance",
+        data={"theme": "Тест"},
+        k=3,
+        context_source="custom",
+        custom_context_text=raw_text,
+        context_filename="brief.json",
+    )
+
+    custom_messages = [
+        msg
+        for msg in context.messages
+        if msg.get("role") == "system" and str(msg.get("content", "")).startswith("CONTEXT (CUSTOM):")
+    ]
+    assert custom_messages, "Ожидался системный блок CONTEXT (CUSTOM)"
+    assert "Первый абзац" in custom_messages[0]["content"]
+    assert "Второй абзац" in custom_messages[0]["content"]
+    assert context.custom_context_len == len("Первый абзац\n\nВторой абзац")
+    assert context.custom_context_filename == "brief.json"
+    assert context.context_source == "custom"
+
+
+def test_make_generation_context_truncates_custom_text():
+    long_text = "x" * (MAX_CUSTOM_CONTEXT_CHARS + 100)
+    context = make_generation_context(
+        theme="finance",
+        data={"theme": "Тест"},
+        k=1,
+        context_source="custom",
+        custom_context_text=long_text,
+    )
+    assert context.custom_context_len == MAX_CUSTOM_CONTEXT_CHARS
+    assert context.custom_context_truncated
+
+
+def test_normalize_custom_context_text_strips_noise():
+    raw_text = "\x00Первый\r\nабзац\r\n\r\n\t\tВторой\tабзац\u0007\n\n\n"
+    normalized, truncated = _normalize_custom_context_text(raw_text)
+
+    assert "\x00" not in normalized
+    assert "\u0007" not in normalized
+    assert "\t" not in normalized
+    assert "\n\n\n" not in normalized
+    assert normalized.startswith("Первый")
+    assert normalized.rstrip().endswith("Второй абзац")
+    assert not truncated
+
+
+def test_generate_article_with_custom_context_metadata(monkeypatch):
+    def fake_llm(messages, **kwargs):
+        return GenerationResult(text="OK", model_used="model", retry_used=False, fallback_used=None)
+
+    monkeypatch.setattr("orchestrate.llm_generate", fake_llm)
+    monkeypatch.setattr("orchestrate._write_outputs", lambda path, text, metadata: {})
+
+    result = generate_article_from_payload(
+        theme="finance",
+        data={"theme": "Тест"},
+        k=2,
+        context_source="custom",
+        context_text="Параграф один\n\nПараграф два",
+        context_filename="notes.txt",
+    )
+
+    metadata = result["metadata"]
+    assert metadata["context_source"] == "custom"
+    assert metadata["context_len"] == len("Параграф один\n\nПараграф два")
+    assert metadata["context_filename"] == "notes.txt"
+    assert metadata["context_note"] == "k_ignored"
+    assert metadata["custom_context_text"].startswith("Параграф один")

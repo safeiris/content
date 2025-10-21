@@ -224,6 +224,8 @@ def assemble_messages(
     exemplars: Optional[List[Dict[str, object]]] = None,
     data: Optional[Dict[str, Any]] = None,
     append_style_profile: Optional[bool] = None,
+    context_source: str = "index.json",
+    custom_context_text: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Prepare chat-style messages for an LLM call.
 
@@ -265,18 +267,28 @@ def assemble_messages(
 
     messages: List[Dict[str, Any]] = [system_message]
 
+    context_mode = (context_source or "index.json").strip().lower() or "index.json"
     exemplar_items = exemplars
-    if exemplar_items is None:
-        exemplar_items = retrieve_exemplars(theme_slug=theme_slug, query=payload.get("theme", ""), k=k)
-    if exemplar_items:
-        fragments: List[str] = []
-        for idx, item in enumerate(exemplar_items, start=1):
-            path = str(item.get("path", "unknown"))
-            text = str(item.get("text", ""))
-            fragment = f"<<<EXEMPLAR #{idx} | {path}>>>\n{text.strip()}"
-            fragments.append(fragment.strip())
-        context_block = "\n\n".join(fragments)
-        messages.append({"role": "system", "content": f"CONTEXT\n{context_block}"})
+    if context_mode == "custom":
+        normalized_custom = (custom_context_text or "").strip()
+        if normalized_custom:
+            messages.append({"role": "system", "content": f"CONTEXT (CUSTOM):\n{normalized_custom}"})
+    elif context_mode != "off":
+        if exemplar_items is None:
+            exemplar_items = retrieve_exemplars(
+                theme_slug=theme_slug,
+                query=payload.get("theme", ""),
+                k=k,
+            )
+        if exemplar_items:
+            fragments: List[str] = []
+            for idx, item in enumerate(exemplar_items, start=1):
+                path = str(item.get("path", "unknown"))
+                text = str(item.get("text", ""))
+                fragment = f"<<<EXEMPLAR #{idx} | {path}>>>\n{text.strip()}"
+                fragments.append(fragment.strip())
+            context_block = "\n\n".join(fragments)
+            messages.append({"role": "system", "content": f"CONTEXT\n{context_block}"})
 
     user_instruction = _build_user_instruction(payload)
     messages.append({"role": "user", "content": user_instruction})
