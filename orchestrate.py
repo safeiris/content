@@ -53,8 +53,8 @@ QUALITY_EXTEND_MAX_TOKENS = 2800
 QUALITY_EXTEND_MIN_TOKENS = 2200
 KEYWORDS_ONLY_MIN_TOKENS = 600
 KEYWORDS_ONLY_MAX_TOKENS = 900
-FAQ_PASS_MIN_TOKENS = 900
-FAQ_PASS_MAX_TOKENS = 1200
+FAQ_PASS_MIN_TOKENS = 1100
+FAQ_PASS_MAX_TOKENS = 1300
 FAQ_PASS_MAX_ITERATIONS = 2
 TRIM_PASS_MIN_TOKENS = 500
 TRIM_PASS_MAX_TOKENS = 700
@@ -396,14 +396,16 @@ def _validate_snapshot(
     *,
     pass_name: str,
     enforce_keyword_superset: bool = False,
-) -> Tuple[bool, Optional[str], bool]:
+) -> Tuple[bool, Optional[str], bool, bool]:
     regression = False
     reason: Optional[str] = None
     keywords_regressed = False
+    length_regressed = False
     if before.chars_no_spaces > 0:
         threshold = before.chars_no_spaces * 0.9
         if after.chars_no_spaces < threshold:
             regression = True
+            length_regressed = True
             reason = "length_regression"
     if after.keywords_usage_percent + 0.05 < before.keywords_usage_percent:
         regression = True
@@ -415,7 +417,7 @@ def _validate_snapshot(
         regression = True
         keywords_regressed = True
         reason = reason or "keywords_removed"
-    return (not regression, reason, keywords_regressed)
+    return (not regression, reason, keywords_regressed, length_regressed)
 
 
 def _is_full_article(text: str) -> bool:
@@ -1476,6 +1478,7 @@ def _generate_variant(
     jsonld_deferred = False
     rollback_info: Dict[str, Any] = {"used": False, "reason": None, "pass": None}
     faq_added_pairs_total = 0
+    faq_patch_applied = False
     keywords_regress_prevented = False
     repair_pass_fallback_used = False
     repair_pass_rollback_used = False
@@ -1558,11 +1561,15 @@ def _generate_variant(
                 fallback_used=bool(fallback_used),
             )
             after_snapshot = _build_snapshot(candidate_text, after_report)
-            valid, rollback_reason, _ = _validate_snapshot(
+            valid, rollback_reason, _, length_regressed = _validate_snapshot(
                 before_snapshot,
                 after_snapshot,
                 pass_name="quality_extend",
             )
+            if length_regressed:
+                valid = False
+                rollback_reason = rollback_reason or "full_text_guard"
+                full_text_guard_triggered = True
             if not _is_full_article(candidate_text):
                 valid = False
                 rollback_reason = rollback_reason or "full_text_guard"
@@ -1712,12 +1719,16 @@ def _generate_variant(
             fallback_used=bool(fallback_used),
         )
         after_snapshot = _build_snapshot(candidate_text, after_report)
-        valid, rollback_reason, keywords_regressed = _validate_snapshot(
+        valid, rollback_reason, keywords_regressed, length_regressed = _validate_snapshot(
             before_snapshot,
             after_snapshot,
             pass_name="keywords_only",
             enforce_keyword_superset=True,
         )
+        if length_regressed:
+            valid = False
+            rollback_reason = rollback_reason or "full_text_guard"
+            full_text_guard_triggered = True
         if not _is_full_article(candidate_text):
             valid = False
             rollback_reason = rollback_reason or "full_text_guard"
@@ -1836,6 +1847,22 @@ def _generate_variant(
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
+        while (
+            _should_expand_max_tokens(getattr(faq_result, "metadata", None))
+            and faq_tokens < FAQ_PASS_MAX_TOKENS
+        ):
+            next_tokens = min(FAQ_PASS_MAX_TOKENS, max(faq_tokens + 100, FAQ_PASS_MIN_TOKENS))
+            if next_tokens <= faq_tokens:
+                break
+            faq_tokens = next_tokens
+            faq_result = llm_generate(
+                active_messages,
+                model=model_name,
+                temperature=temperature,
+                max_tokens=faq_tokens,
+                timeout_s=timeout,
+                backoff_schedule=backoff_schedule,
+            )
         before_chars = len(previous_text)
         before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
         article_candidate = faq_result.text
@@ -1847,6 +1874,7 @@ def _generate_variant(
         patch_applied = False
         added_pairs = 0
         if not _is_full_article(candidate_text):
+            full_text_guard_triggered = True
             merged_text, added_pairs_candidate, patched = _merge_faq_patch(
                 previous_text,
                 candidate_text,
@@ -1856,6 +1884,8 @@ def _generate_variant(
                 candidate_text = _clean_trailing_noise(merged_text)
                 patch_applied = True
                 added_pairs = added_pairs_candidate
+                if not faq_patch_applied:
+                    faq_patch_applied = True
             else:
                 candidate_text = previous_text
         effective_model = faq_result.model_used
@@ -1872,10 +1902,11 @@ def _generate_variant(
             fallback_used=bool(fallback_used),
         )
         after_snapshot = _build_snapshot(candidate_text, after_report)
-        valid, rollback_reason, _ = _validate_snapshot(
+        valid, rollback_reason, keywords_regressed, length_regressed = _validate_snapshot(
             before_snapshot,
             after_snapshot,
             pass_name="faq_only",
+            enforce_keyword_superset=True,
         )
         if candidate_text.strip() == previous_text.strip():
             valid = False
@@ -1884,9 +1915,16 @@ def _generate_variant(
         if not format_ok_after:
             valid = False
             rollback_reason = rollback_reason or "faq_format_invalid"
+        if length_regressed:
+            valid = False
+            rollback_reason = rollback_reason or "full_text_guard"
+            full_text_guard_triggered = True
         if not _is_full_article(candidate_text):
             valid = False
             rollback_reason = rollback_reason or "full_text_guard"
+            full_text_guard_triggered = True
+        if keywords_regressed:
+            keywords_regress_prevented = True
         after_chars = len(candidate_text)
         after_chars_no_spaces = len(re.sub(r"\s+", "", candidate_text))
         iteration_payload: Dict[str, Any] = {
@@ -1904,6 +1942,9 @@ def _generate_variant(
             "format_meta_after": format_meta_after,
             "patch_applied": patch_applied,
             "anchor_inserted": faq_anchor_inserted,
+            "tokens_used": faq_tokens,
+            "keywords_regressed": keywords_regressed,
+            "length_regressed": length_regressed,
         }
         if valid:
             article_text = candidate_text
@@ -2000,11 +2041,15 @@ def _generate_variant(
                 fallback_used=bool(candidate_fallback_used),
             )
             after_snapshot = _build_snapshot(candidate_text, after_report)
-            valid, rollback_reason, _ = _validate_snapshot(
+            valid, rollback_reason, _, length_regressed = _validate_snapshot(
                 before_snapshot,
                 after_snapshot,
                 pass_name="trim",
             )
+            if length_regressed:
+                valid = False
+                rollback_reason = rollback_reason or "full_text_guard"
+                full_text_guard_triggered = True
             if not _is_full_article(candidate_text):
                 valid = False
                 rollback_reason = rollback_reason or "full_text_guard"
@@ -2093,8 +2138,8 @@ def _generate_variant(
             if patched:
                 candidate_text = _clean_trailing_noise(merged_text)
                 patch_applied = True
-                if added_pairs_candidate > 0:
-                    faq_added_pairs_total += added_pairs_candidate
+                if not faq_patch_applied:
+                    faq_patch_applied = True
             else:
                 candidate_text = previous_text
 
@@ -2113,17 +2158,27 @@ def _generate_variant(
                 fallback_used=bool(fallback_used),
             )
             after_snapshot = _build_snapshot(candidate_text, after_report)
-            valid, rollback_reason, _ = _validate_snapshot(
+            valid, rollback_reason, keywords_regressed, length_regressed = _validate_snapshot(
                 before_snapshot,
                 after_snapshot,
                 pass_name="repair",
+                enforce_keyword_superset=True,
             )
+            if length_regressed:
+                valid = False
+                rollback_reason = rollback_reason or "full_text_guard"
+                full_text_guard_triggered = True
             if not _is_full_article(candidate_text):
                 valid = False
                 rollback_reason = rollback_reason or "full_text_guard"
+                full_text_guard_triggered = True
+            if keywords_regressed:
+                keywords_regress_prevented = True
         if valid:
             article_text = candidate_text
             post_analysis_report = after_report
+            if added_pairs_candidate > 0:
+                faq_added_pairs_total += added_pairs_candidate
             llm_result = GenerationResult(
                 text=article_text,
                 model_used=effective_model,
@@ -2199,6 +2254,7 @@ def _generate_variant(
         post_analysis_report["faq_only_iterations"] = faq_only_iterations
         post_analysis_report["faq_only_max_iterations"] = FAQ_PASS_MAX_ITERATIONS
         post_analysis_report["faq_anchor_inserted"] = faq_anchor_inserted
+        post_analysis_report["faq_patch_applied"] = faq_patch_applied
         post_analysis_report["trim_pass_used"] = trim_pass_used
         post_analysis_report["trim_pass_delta_chars"] = trim_pass_delta_chars
         post_analysis_report["rollback"] = rollback_info
@@ -2271,6 +2327,7 @@ def _generate_variant(
         "faq_only_iterations": faq_only_iterations,
         "faq_only_max_iterations": FAQ_PASS_MAX_ITERATIONS,
         "faq_anchor_inserted": faq_anchor_inserted,
+        "faq_patch_applied": faq_patch_applied,
         "trim_pass_used": trim_pass_used,
         "trim_pass_delta_chars": trim_pass_delta_chars,
         "rollback": rollback_info,
