@@ -56,7 +56,8 @@ KEYWORDS_ONLY_MAX_TOKENS = 900
 FAQ_PASS_MIN_TOKENS = 900
 FAQ_PASS_MAX_TOKENS = 1200
 FAQ_PASS_MAX_ITERATIONS = 2
-TRIM_PASS_MAX_TOKENS = 900
+TRIM_PASS_MIN_TOKENS = 500
+TRIM_PASS_MAX_TOKENS = 700
 LENGTH_SHRINK_THRESHOLD = DEFAULT_MAX_LENGTH
 JSONLD_MAX_TOKENS = 800
 FULL_TEXT_MIN_CHARS = 1200
@@ -625,7 +626,7 @@ def _build_quality_extend_prompt(
 def _extract_faq_block(text: str) -> Tuple[str, str, str]:
     if not text:
         return "", "", ""
-    pattern = re.compile(r"(?im)(^|\n)(##?\s*)?faq\s*\n")
+    pattern = re.compile(r"(?im)(^|\n)(##?\s*)?faq[:\s]*\n")
     match = pattern.search(text)
     if not match:
         return text, "", ""
@@ -638,6 +639,36 @@ def _extract_faq_block(text: str) -> Tuple[str, str, str]:
     block = text[start:block_end].strip()
     suffix = text[block_end:].lstrip("\n")
     return prefix, block, suffix
+
+
+def _ensure_faq_anchor(article_text: str) -> Tuple[str, bool]:
+    if not article_text or not article_text.strip():
+        return article_text, False
+    anchor_pattern = re.compile(r"(?im)^\s*(#+\s*)?faq[:\s]*$")
+    if anchor_pattern.search(article_text):
+        return article_text, False
+    lines = article_text.splitlines()
+    insert_index = len(lines)
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("#"):
+            heading_text = lowered.lstrip("#").strip()
+            if heading_text.startswith("faq"):
+                return article_text, False
+            if any(keyword in heading_text for keyword in ("вывод", "заключение", "итоги", "итог")):
+                insert_index = idx
+                break
+    anchor_lines: List[str] = []
+    if insert_index > 0 and lines[insert_index - 1].strip():
+        anchor_lines.append("")
+    anchor_lines.append("## FAQ")
+    anchor_lines.append("")
+    new_lines = lines[:insert_index] + anchor_lines + lines[insert_index:]
+    normalized = "\n".join(new_lines)
+    return _clean_trailing_noise(normalized), True
 
 
 def _parse_faq_pairs(block: str) -> List[Tuple[str, str]]:
@@ -1428,6 +1459,7 @@ def _generate_variant(
     last_missing_keywords: List[str] = []
     faq_only_passes = 0
     faq_only_iterations: List[Dict[str, Any]] = []
+    faq_anchor_inserted = False
     trim_pass_used = False
     trim_pass_delta_chars = 0
     postfix_appended = False
@@ -1448,6 +1480,8 @@ def _generate_variant(
     repair_pass_fallback_used = False
     repair_pass_rollback_used = False
     repair_pass_reason: Optional[str] = None
+    full_text_guard_triggered = False
+    repair_pass_run = False
 
     while True:
         article_text = _clean_trailing_noise(article_text)
@@ -1532,6 +1566,7 @@ def _generate_variant(
             if not _is_full_article(candidate_text):
                 valid = False
                 rollback_reason = rollback_reason or "full_text_guard"
+                full_text_guard_triggered = True
             applied = bool(valid and growth_detected)
             iteration_number = quality_extend_passes + 1
             if applied:
@@ -1686,6 +1721,7 @@ def _generate_variant(
         if not _is_full_article(candidate_text):
             valid = False
             rollback_reason = rollback_reason or "full_text_guard"
+            full_text_guard_triggered = True
         applied = bool(valid)
         iteration_number = quality_extend_passes + 1
         if applied:
@@ -1737,7 +1773,24 @@ def _generate_variant(
             }
         )
 
-    faq_target_pairs = requirements.faq_questions if isinstance(requirements.faq_questions, int) and requirements.faq_questions > 0 else 5
+    anchor_candidate, anchor_inserted = _ensure_faq_anchor(article_text)
+    if anchor_inserted:
+        faq_anchor_inserted = True
+        article_text = anchor_candidate
+        post_analysis_report = analyze_post(
+            article_text,
+            requirements=requirements,
+            model=effective_model or model_name,
+            retry_count=post_retry_attempts,
+            fallback_used=bool(fallback_used),
+        )
+        last_missing_keywords = [
+            str(term).strip()
+            for term in (post_analysis_report.get("missing_keywords") or [])
+            if isinstance(term, str) and str(term).strip()
+        ]
+
+    faq_target_pairs = 5
     faq_only_attempts = 0
     while faq_only_attempts < FAQ_PASS_MAX_ITERATIONS:
         faq_block = post_analysis_report.get("faq") if isinstance(post_analysis_report, dict) else {}
@@ -1746,7 +1799,7 @@ def _generate_variant(
             required_pairs = faq_block.get("required")
         if not isinstance(required_pairs, int) or required_pairs <= 0:
             required_pairs = faq_target_pairs
-        target_pairs = max(5, required_pairs)
+        target_pairs = min(5, max(5, required_pairs))
         format_ok, format_meta = _faq_block_format_valid(article_text, target_pairs)
         faq_count = None
         if isinstance(faq_block, dict):
@@ -1850,6 +1903,7 @@ def _generate_variant(
             "format_meta_before": format_meta,
             "format_meta_after": format_meta_after,
             "patch_applied": patch_applied,
+            "anchor_inserted": faq_anchor_inserted,
         }
         if valid:
             article_text = candidate_text
@@ -1906,6 +1960,8 @@ def _generate_variant(
         trim_needed = False
     if trim_needed:
         previous_text = article_text
+        previous_report = post_analysis_report
+        before_snapshot = _build_snapshot(previous_text, previous_report)
         trim_prompt = _build_trim_prompt(
             article_text,
             requirements,
@@ -1914,8 +1970,11 @@ def _generate_variant(
         active_messages = list(active_messages)
         active_messages.append({"role": "assistant", "content": previous_text})
         active_messages.append({"role": "user", "content": trim_prompt})
-        trim_tokens = TRIM_PASS_MAX_TOKENS if TRIM_PASS_MAX_TOKENS > 0 else max_tokens_current
-        trim_tokens = min(max_tokens_current, trim_tokens)
+        if max_tokens_current > 0:
+            trim_tokens = min(max_tokens_current, TRIM_PASS_MAX_TOKENS)
+            trim_tokens = max(trim_tokens, min(max_tokens_current, TRIM_PASS_MIN_TOKENS))
+        else:
+            trim_tokens = max(TRIM_PASS_MAX_TOKENS, TRIM_PASS_MIN_TOKENS)
         trim_result = llm_generate(
             active_messages,
             model=model_name,
@@ -1924,38 +1983,69 @@ def _generate_variant(
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
+        retry_used = True
         article_candidate = trim_result.text
         if article_candidate.strip():
-            before_chars = len(previous_text)
-            before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
-            article_text = _clean_trailing_noise(article_candidate)
-            effective_model = trim_result.model_used
-            fallback_used = trim_result.fallback_used
-            fallback_reason = trim_result.fallback_reason
-            api_route = trim_result.api_route
-            response_schema = trim_result.schema
-            retry_used = True
-            trim_pass_used = True
-            after_chars = len(article_text)
-            after_chars_no_spaces = len(re.sub(r"\s+", "", article_text))
-            trim_pass_delta_chars = max(0, before_chars - after_chars)
-            llm_result = GenerationResult(
-                text=article_text,
-                model_used=effective_model,
-                retry_used=True,
-                fallback_used=fallback_used,
-                fallback_reason=fallback_reason,
-                api_route=api_route,
-                schema=response_schema,
-                metadata=trim_result.metadata,
+            candidate_text = _clean_trailing_noise(article_candidate)
+            candidate_model = trim_result.model_used
+            candidate_fallback_used = trim_result.fallback_used
+            candidate_fallback_reason = trim_result.fallback_reason
+            candidate_api_route = trim_result.api_route
+            candidate_schema = trim_result.schema
+            after_report = analyze_post(
+                candidate_text,
+                requirements=requirements,
+                model=candidate_model or model_name,
+                retry_count=post_retry_attempts,
+                fallback_used=bool(candidate_fallback_used),
             )
-        post_analysis_report = analyze_post(
-            article_text,
-            requirements=requirements,
-            model=effective_model or model_name,
-            retry_count=post_retry_attempts,
-            fallback_used=bool(fallback_used),
-        )
+            after_snapshot = _build_snapshot(candidate_text, after_report)
+            valid, rollback_reason, _ = _validate_snapshot(
+                before_snapshot,
+                after_snapshot,
+                pass_name="trim",
+            )
+            if not _is_full_article(candidate_text):
+                valid = False
+                rollback_reason = rollback_reason or "full_text_guard"
+                full_text_guard_triggered = True
+            if valid:
+                article_text = candidate_text
+                post_analysis_report = after_report
+                effective_model = candidate_model
+                fallback_used = candidate_fallback_used
+                fallback_reason = candidate_fallback_reason
+                api_route = candidate_api_route
+                response_schema = candidate_schema
+                trim_pass_used = True
+                before_chars = len(previous_text)
+                after_chars = len(article_text)
+                trim_pass_delta_chars = max(0, before_chars - after_chars)
+                llm_result = GenerationResult(
+                    text=article_text,
+                    model_used=effective_model,
+                    retry_used=True,
+                    fallback_used=fallback_used,
+                    fallback_reason=fallback_reason,
+                    api_route=api_route,
+                    schema=response_schema,
+                    metadata=trim_result.metadata,
+                )
+            else:
+                article_text = previous_text
+                post_analysis_report = previous_report
+                if not rollback_info["used"]:
+                    rollback_info = {
+                        "used": True,
+                        "reason": rollback_reason or "trim_failed",
+                        "pass": "trim",
+                    }
+        else:
+            article_text = previous_text
+            post_analysis_report = previous_report
+            if not rollback_info["used"]:
+                rollback_info = {"used": True, "reason": "empty_trim_response", "pass": "trim"}
+
         last_missing_keywords = [
             str(term).strip()
             for term in (post_analysis_report.get("missing_keywords") or [])
@@ -1967,6 +2057,7 @@ def _generate_variant(
         previous_text = article_text
         previous_report = post_analysis_report
         before_snapshot = _build_snapshot(previous_text, previous_report)
+        repair_pass_run = True
         active_messages = list(active_messages)
         active_messages.append({"role": "assistant", "content": previous_text})
         active_messages.append({"role": "user", "content": repair_prompt})
@@ -1993,6 +2084,7 @@ def _generate_variant(
         if fragment_triggered:
             repair_pass_rollback_used = True
             repair_pass_reason = "short_output_guard_triggered"
+            full_text_guard_triggered = True
             merged_text, added_pairs_candidate, patched = _merge_faq_patch(
                 previous_text,
                 candidate_text,
@@ -2058,37 +2150,22 @@ def _generate_variant(
     quality_extend_total_chars = len(article_text)
     analysis_characters = len(article_text)
     analysis_characters_no_spaces = len(re.sub(r"\s+", "", article_text))
-    if isinstance(post_analysis_report, dict):
-        post_analysis_report["had_extend"] = quality_extend_used
-        post_analysis_report["extend_delta_chars"] = quality_extend_delta_chars
-        post_analysis_report["extend_total_chars"] = quality_extend_total_chars
-        post_analysis_report["extend_passes"] = quality_extend_passes
-        post_analysis_report["extend_iterations"] = quality_extend_iterations
-        post_analysis_report["extend_incomplete"] = extend_incomplete
-        post_analysis_report["faq_only_passes"] = faq_only_passes
-        post_analysis_report["faq_only_iterations"] = faq_only_iterations
-        post_analysis_report["faq_only_max_iterations"] = FAQ_PASS_MAX_ITERATIONS
-        post_analysis_report["trim_pass_used"] = trim_pass_used
-        post_analysis_report["trim_pass_delta_chars"] = trim_pass_delta_chars
-        post_analysis_report["rollback"] = rollback_info
-        post_analysis_report["faq_added_pairs"] = faq_added_pairs_total
-        post_analysis_report["keywords_regress_prevented"] = keywords_regress_prevented
-        post_analysis_report["jsonld_deferred"] = jsonld_deferred
-        post_analysis_report["repair_pass_fallback"] = repair_pass_fallback_used
-        post_analysis_report["repair_pass_rollback"] = repair_pass_rollback_used
-        post_analysis_report["repair_pass_reason"] = repair_pass_reason
-
     final_text = article_text
-    final_text, postfix_appended, default_cta_used = _append_cta_if_needed(
-        final_text,
-        cta_text=cta_text,
-        default_cta=cta_is_default,
-    )
+    meets_requirements_flag = bool(post_analysis_report.get("meets_requirements")) if isinstance(post_analysis_report, dict) else False
+    if meets_requirements_flag:
+        final_text, postfix_appended, default_cta_used = _append_cta_if_needed(
+            final_text,
+            cta_text=cta_text,
+            default_cta=cta_is_default,
+        )
+    else:
+        postfix_appended = False
+        default_cta_used = False
     final_text, disclaimer_appended = _append_disclaimer_if_requested(final_text, prepared_data)
 
-    if include_jsonld_flag and not post_analysis_report.get("meets_requirements"):
+    if include_jsonld_flag and not meets_requirements_flag:
         jsonld_deferred = True
-    if include_jsonld_flag and post_analysis_report.get("meets_requirements") and article_text.strip():
+    if include_jsonld_flag and meets_requirements_flag and article_text.strip():
         jsonld_messages = _build_jsonld_messages(article_text, requirements)
         jsonld_result = llm_generate(
             jsonld_messages,
@@ -2110,6 +2187,29 @@ def _generate_variant(
             jsonld_fallback_reason = jsonld_result.fallback_reason
             final_text = f"{final_text.rstrip()}\n\n{jsonld_text}\n"
             retry_used = retry_used or jsonld_result.retry_used
+
+    if isinstance(post_analysis_report, dict):
+        post_analysis_report["had_extend"] = quality_extend_used
+        post_analysis_report["extend_delta_chars"] = quality_extend_delta_chars
+        post_analysis_report["extend_total_chars"] = quality_extend_total_chars
+        post_analysis_report["extend_passes"] = quality_extend_passes
+        post_analysis_report["extend_iterations"] = quality_extend_iterations
+        post_analysis_report["extend_incomplete"] = extend_incomplete
+        post_analysis_report["faq_only_passes"] = faq_only_passes
+        post_analysis_report["faq_only_iterations"] = faq_only_iterations
+        post_analysis_report["faq_only_max_iterations"] = FAQ_PASS_MAX_ITERATIONS
+        post_analysis_report["faq_anchor_inserted"] = faq_anchor_inserted
+        post_analysis_report["trim_pass_used"] = trim_pass_used
+        post_analysis_report["trim_pass_delta_chars"] = trim_pass_delta_chars
+        post_analysis_report["rollback"] = rollback_info
+        post_analysis_report["faq_added_pairs"] = faq_added_pairs_total
+        post_analysis_report["keywords_regress_prevented"] = keywords_regress_prevented
+        post_analysis_report["jsonld_deferred"] = jsonld_deferred
+        post_analysis_report["repair_pass_run"] = repair_pass_run
+        post_analysis_report["repair_pass_fallback"] = repair_pass_fallback_used
+        post_analysis_report["repair_pass_rollback"] = repair_pass_rollback_used
+        post_analysis_report["repair_pass_reason"] = repair_pass_reason
+        post_analysis_report["full_text_guard_triggered"] = full_text_guard_triggered
 
     article_text = final_text
 
@@ -2170,13 +2270,18 @@ def _generate_variant(
         "faq_only_passes": faq_only_passes,
         "faq_only_iterations": faq_only_iterations,
         "faq_only_max_iterations": FAQ_PASS_MAX_ITERATIONS,
+        "faq_anchor_inserted": faq_anchor_inserted,
         "trim_pass_used": trim_pass_used,
         "trim_pass_delta_chars": trim_pass_delta_chars,
         "rollback": rollback_info,
         "faq_added_pairs": faq_added_pairs_total,
         "keywords_regress_prevented": keywords_regress_prevented,
         "jsonld_deferred": jsonld_deferred,
+        "full_text_guard_triggered": full_text_guard_triggered,
+        "repair_pass_run": repair_pass_run,
         "repair_pass_fallback": repair_pass_fallback_used,
+        "repair_pass_rollback": repair_pass_rollback_used,
+        "repair_pass_reason": repair_pass_reason,
         "length_range_target": {"min": min_chars, "max": max_chars},
         "length_limits_applied": {"min": min_chars, "max": max_chars},
         "mode": mode,
