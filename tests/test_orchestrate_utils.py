@@ -105,10 +105,12 @@ def test_quality_extend_prompt_mentions_keywords_and_faq():
         "missing_keywords": ["ключевое слово"],
         "faq": {"within_range": False, "count": 1},
     }
-    prompt = _build_quality_extend_prompt(report, _make_requirements())
+    requirements = _make_requirements()
+    prompt = _build_quality_extend_prompt(report, requirements)
     assert "продолжить и завершить FAQ" in prompt
     assert "ключевое слово" in prompt
-    assert "3500" in prompt and "6000" in prompt
+    expected_range = f"{requirements.min_chars}\u2013{requirements.max_chars}"
+    assert expected_range in prompt
     assert "Добавь недостающие ключевые фразы" in prompt
 
 

@@ -1334,6 +1334,20 @@ function buildRequestPayload() {
 
 function renderMetadata(meta) {
   reportView.innerHTML = "";
+  const lengthWarnings = [];
+  if (Array.isArray(meta?.length_limits_warnings)) {
+    meta.length_limits_warnings.forEach((note) => {
+      if (typeof note === "string" && note.trim()) {
+        lengthWarnings.push(note.trim());
+      }
+    });
+  }
+  if (typeof meta?.length_limits_warning === "string" && meta.length_limits_warning.trim()) {
+    lengthWarnings.push(meta.length_limits_warning.trim());
+  }
+  if (lengthWarnings.length) {
+    showToast({ message: lengthWarnings[0], type: "warn" });
+  }
   const summary = buildQualityReport(meta);
   if (summary) {
     reportView.append(summary);
@@ -1358,18 +1372,41 @@ function buildQualityReport(meta) {
   }
   const list = document.createElement("ul");
   list.className = "quality-report";
+  const appliedLimits =
+    post.length_limits_applied && typeof post.length_limits_applied === "object"
+      ? post.length_limits_applied
+      : null;
 
   const lengthBlock = post.length;
   if (lengthBlock && typeof lengthBlock === "object") {
     const chars = Number(lengthBlock.chars_no_spaces) || 0;
-    const min = Number(lengthBlock.min ?? meta.length_limits?.min_chars ?? 0);
-    const max = Number(lengthBlock.max ?? meta.length_limits?.max_chars ?? 0);
+    const min = Number(
+      lengthBlock.min ?? appliedLimits?.min ?? meta.length_limits?.min_chars ?? 0,
+    );
+    const max = Number(
+      lengthBlock.max ?? appliedLimits?.max ?? meta.length_limits?.max_chars ?? 0,
+    );
     const within = Boolean(lengthBlock.within_limits);
     const label = within
       ? `Объём: ${chars.toLocaleString("ru-RU")} зн. (в норме)`
       : `Объём: ${chars.toLocaleString("ru-RU")} зн. (нужно ${min}–${max})`;
     list.append(createQualityItem(within ? "success" : "warning", label));
   }
+
+  const limitWarnings = [];
+  if (Array.isArray(meta.length_limits_warnings)) {
+    meta.length_limits_warnings.forEach((note) => {
+      if (typeof note === "string" && note.trim()) {
+        limitWarnings.push(note.trim());
+      }
+    });
+  }
+  if (typeof meta.length_limits_warning === "string" && meta.length_limits_warning.trim()) {
+    limitWarnings.push(meta.length_limits_warning.trim());
+  }
+  [...new Set(limitWarnings)].forEach((note) => {
+    list.append(createQualityItem("warning", note));
+  });
 
   const coverage = Array.isArray(post.keywords_coverage) ? post.keywords_coverage : [];
   if (coverage.length > 0) {
@@ -1540,12 +1577,14 @@ function updateResultBadges(meta) {
   if (!hasContent) {
     appendBadge("Пустой ответ", "warning");
   }
+  const appliedLimits =
+    post && typeof post.length_limits_applied === "object" ? post.length_limits_applied : null;
   const lengthInfo = post?.length && typeof post.length === "object" ? post.length : null;
   if (lengthInfo) {
     const chars = Number(lengthInfo.chars_no_spaces ?? meta.characters_no_spaces ?? meta.characters) || 0;
     const within = Boolean(lengthInfo.within_limits);
-    const min = Number(lengthInfo.min ?? meta.length_limits?.min_chars ?? 0);
-    const max = Number(lengthInfo.max ?? meta.length_limits?.max_chars ?? 0);
+    const min = Number(lengthInfo.min ?? appliedLimits?.min ?? meta.length_limits?.min_chars ?? 0);
+    const max = Number(lengthInfo.max ?? appliedLimits?.max ?? meta.length_limits?.max_chars ?? 0);
     const label = within
       ? `Объём ${chars.toLocaleString("ru-RU")} зн.`
       : `Объём ${chars.toLocaleString("ru-RU")} (нужно ${min}–${max})`;

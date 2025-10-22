@@ -83,6 +83,7 @@ def build_prompt(data: Dict[str, Any]) -> str:
     audience_line = _render_optional_line("Целевая аудитория", spec.audience)
     title_line = _render_optional_line("Название", spec.title)
     length_line = _render_length_line(spec.min_len, spec.max_len)
+    length_strict_line = _render_length_strict_line(spec.min_len, spec.max_len)
     keywords_mode_line = _render_keywords_mode_line(spec.keywords_mode)
     sources_block = _render_sources_block(spec.sources)
     faq_line = _render_faq_line(spec.include_faq, spec.faq_questions)
@@ -93,6 +94,7 @@ def build_prompt(data: Dict[str, Any]) -> str:
         goal=spec.goal,
         tone=spec.tone,
         length_line=length_line,
+        length_strict_line=length_strict_line,
         style_line=style_line,
         audience_line=audience_line,
         title_line=title_line,
@@ -130,7 +132,11 @@ def _render_optional_line(label: str, value: str) -> str:
 
 
 def _render_length_line(min_len: int, max_len: int) -> str:
-    return f"{min_len}\u2013{max_len} символов без пробелов."
+    return f"{min_len}\u2013{max_len} символов без пробелов"
+
+
+def _render_length_strict_line(min_len: int, max_len: int) -> str:
+    return f"Строго соблюдай диапазон {min_len}\u2013{max_len} символов без пробелов."
 
 
 def _render_keywords_mode_line(mode: str) -> str:

@@ -32,6 +32,7 @@ from config import (
     OPENAI_API_KEY,
 )
 from keywords import parse_manual_keywords
+from length_limits import ResolvedLengthLimits, resolve_length_limits
 from post_analysis import (
     PostAnalysisRequirements,
     analyze as analyze_post,
@@ -74,6 +75,7 @@ class GenerationContext:
     custom_context_hash: Optional[str] = None
     custom_context_truncated: bool = False
     jsonld_requested: bool = False
+    length_limits: Optional[ResolvedLengthLimits] = None
 
 
 def _get_cta_text() -> str:
@@ -500,6 +502,19 @@ def make_generation_context(
     context_filename: Optional[str] = None,
 ) -> GenerationContext:
     payload = deepcopy(data)
+    length_info = resolve_length_limits(theme, payload)
+    payload["length_limits"] = {
+        "min_chars": length_info.min_chars,
+        "max_chars": length_info.max_chars,
+    }
+    payload["_length_limits_source"] = {
+        "min": length_info.min_source,
+        "max": length_info.max_source,
+    }
+    if length_info.profile_source:
+        payload["_length_limits_profile_source"] = length_info.profile_source
+    if length_info.warnings:
+        payload["_length_limits_warnings"] = list(length_info.warnings)
     jsonld_requested = bool(payload.get("include_jsonld", False))
     if "include_jsonld" in payload:
         payload.pop("include_jsonld", None)
@@ -618,6 +633,7 @@ def make_generation_context(
         custom_context_hash=custom_context_hash,
         custom_context_truncated=custom_context_truncated,
         jsonld_requested=jsonld_requested,
+        length_limits=length_info,
     )
 
 
@@ -801,11 +817,33 @@ def _generate_variant(
     system_prompt = next((msg.get("content") for msg in active_messages if msg.get("role") == "system"), "")
     user_prompt = next((msg.get("content") for msg in reversed(active_messages) if msg.get("role") == "user"), "")
 
-    length_limits_data = prepared_data.get("length_limits") or {}
-    min_chars = _safe_positive_int(length_limits_data.get("min_chars"), DEFAULT_MIN_LENGTH)
-    max_chars = _safe_positive_int(length_limits_data.get("max_chars"), DEFAULT_MAX_LENGTH)
-    if max_chars < min_chars:
-        max_chars = max(min_chars + 500, DEFAULT_MAX_LENGTH)
+    length_info: ResolvedLengthLimits
+    if generation_context.length_limits is not None:
+        length_info = generation_context.length_limits
+    else:
+        length_info = resolve_length_limits(theme, prepared_data)
+        existing_limits = prepared_data.get("length_limits")
+        if not isinstance(existing_limits, dict):
+            existing_limits = {}
+        existing_limits.update(
+            {"min_chars": length_info.min_chars, "max_chars": length_info.max_chars}
+        )
+        prepared_data["length_limits"] = existing_limits
+
+    min_chars = length_info.min_chars
+    max_chars = length_info.max_chars
+    length_sources = {"min": length_info.min_source, "max": length_info.max_source}
+    length_warnings = list(length_info.warnings)
+    if length_info.swapped and not length_warnings:
+        length_warnings.append(
+            "Минимальный объём в брифе был больше максимального; значения переставлены местами."
+        )
+    source_label = f"min={length_sources['min']}, max={length_sources['max']}"
+    if length_info.profile_source and "profile" in length_sources.values():
+        source_label += f" (profile={length_info.profile_source})"
+    print(f"[orchestrate] LENGTH LIMITS: {min_chars}\u2013{max_chars} ({source_label})")
+    for note in length_warnings:
+        print(f"[orchestrate] LENGTH LIMITS WARNING: {note}")
 
     keywords_required = [
         str(kw).strip()
@@ -1131,6 +1169,7 @@ def _generate_variant(
         "quality_extend_total_chars": quality_extend_total_chars,
         "quality_extend_passes": quality_extend_passes,
         "length_range_target": {"min": min_chars, "max": max_chars},
+        "length_limits_applied": {"min": min_chars, "max": max_chars},
         "mode": mode,
         "model_used": effective_model,
         "temperature_used": used_temperature,
@@ -1167,6 +1206,13 @@ def _generate_variant(
         "post_analysis": post_analysis_report,
         "post_analysis_retry_count": post_retry_attempts,
     }
+
+    if length_info.profile_source and "profile" in length_sources.values():
+        metadata["length_limits_profile_source"] = length_info.profile_source
+    if length_warnings:
+        metadata["length_limits_warnings"] = length_warnings
+        metadata["length_limits_warning"] = length_warnings[0]
+    metadata["length_limits_source"] = length_sources
 
     if normalized_source == "custom":
         metadata["context_len"] = generation_context.custom_context_len

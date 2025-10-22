@@ -128,6 +128,10 @@ def analyze(
             "min": requirements.min_chars,
             "max": requirements.max_chars,
         },
+        "length_limits_applied": {
+            "min": requirements.min_chars,
+            "max": requirements.max_chars,
+        },
         "keywords_coverage": keywords_coverage,
         "missing_keywords": [item["term"] for item in keywords_coverage if not item["found"]],
         "keywords_found": keywords_found,

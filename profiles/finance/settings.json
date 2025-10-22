@@ -1,0 +1,8 @@
+{
+  "defaults": {
+    "length_limits": {
+      "min_chars": 3200,
+      "max_chars": 5400
+    }
+  }
+}
