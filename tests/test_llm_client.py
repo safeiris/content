@@ -10,6 +10,13 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from llm_client import GenerationResult, generate
 
 
+@pytest.fixture(autouse=True)
+def _force_api_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    yield
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
 class DummyResponse:
     def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
         if payload is None:
@@ -433,7 +440,7 @@ def test_generate_escalates_max_tokens_when_truncated():
     assert result.text == "expanded"
     assert result.retry_used is True
     assert client.call_count == 2
-    assert client.requests[1]["json"]["max_output_tokens"] == 2048
+    assert client.requests[1]["json"]["max_output_tokens"] == 2200
 
 
 def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):

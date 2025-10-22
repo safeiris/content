@@ -15,13 +15,16 @@ from orchestrate import (  # noqa: E402
     LENGTH_SHRINK_THRESHOLD,
     _append_cta_if_needed,
     _choose_section_for_extension,
+    _build_quality_extend_prompt,
     _ensure_length,
     _is_truncated,
     _make_output_path,
     _normalize_custom_context_text,
+    _should_force_quality_extend,
     generate_article_from_payload,
     make_generation_context,
 )
+from post_analysis import PostAnalysisRequirements  # noqa: E402
 from config import MAX_CUSTOM_CONTEXT_CHARS  # noqa: E402
 
 
@@ -75,6 +78,40 @@ def test_is_truncated_detects_ellipsis():
     assert _is_truncated("Оборванный текст...")
 
 
+def _make_requirements() -> PostAnalysisRequirements:
+    return PostAnalysisRequirements(
+        min_chars=3500,
+        max_chars=6000,
+        keywords=["ключевое слово"],
+        keyword_mode="soft",
+        faq_questions=None,
+        sources=[],
+        style_profile="",
+    )
+
+
+def test_quality_extend_triggers_on_missing_faq():
+    report = {
+        "length": {"chars_no_spaces": 3600, "min": 3500, "max": 6000},
+        "missing_keywords": [],
+        "faq": {"within_range": False, "count": 1},
+    }
+    assert _should_force_quality_extend(report, _make_requirements())
+
+
+def test_quality_extend_prompt_mentions_keywords_and_faq():
+    report = {
+        "length": {"chars_no_spaces": 2800, "min": 3500, "max": 6000},
+        "missing_keywords": ["ключевое слово"],
+        "faq": {"within_range": False, "count": 1},
+    }
+    prompt = _build_quality_extend_prompt(report, _make_requirements())
+    assert "продолжить и завершить FAQ" in prompt
+    assert "ключевое слово" in prompt
+    assert "3500" in prompt and "6000" in prompt
+    assert "Добавь недостающие ключевые фразы" in prompt
+
+
 def test_ensure_length_triggers_extend(monkeypatch):
     captured = {}
 
@@ -101,9 +138,12 @@ def test_ensure_length_triggers_extend(monkeypatch):
         backoff_schedule=[0.5],
     )
 
-    assert new_result.text == "extended"
+    assert new_result.text.endswith("extended")
+    assert new_result.text.startswith(short_text)
     assert adjustment == "extend"
-    assert len(new_messages) == len(base_messages) + 1
+    assert len(new_messages) == len(base_messages) + 2
+    assert new_messages[-2]["role"] == "assistant"
+    assert new_messages[-2]["content"] == short_text
     assert "Основная часть" in captured["prompt"]
 
 

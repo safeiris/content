@@ -48,6 +48,7 @@ DEFAULT_CTA_TEXT = (
 )
 TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
 LENGTH_EXTEND_THRESHOLD = DEFAULT_MIN_LENGTH
+QUALITY_EXTEND_MAX_TOKENS = 800
 LENGTH_SHRINK_THRESHOLD = DEFAULT_MAX_LENGTH
 DISCLAIMER_TEMPLATE = (
     "⚠️ Дисклеймер: Материал носит информационный характер и не является финансовой рекомендацией. Прежде чем принимать решения, оцените риски и проконсультируйтесь со специалистом."
@@ -269,6 +270,88 @@ def _build_shrink_prompt(*, min_target: int, max_target: int) -> str:
     )
 
 
+def _merge_extend_output(base_text: str, extension_text: str) -> Tuple[str, int]:
+    base = base_text or ""
+    extension = extension_text or ""
+    if not extension.strip():
+        return base, 0
+    if not base:
+        combined = extension
+    else:
+        separator = ""
+        if not base.endswith("\n") and not extension.lstrip().startswith("\n"):
+            separator = "\n\n"
+        combined = f"{base}{separator}{extension.lstrip()}"
+    delta = len(combined) - len(base)
+    if delta < 0:
+        delta = 0
+    return combined, delta
+
+
+def _should_force_quality_extend(
+    report: Dict[str, object],
+    requirements: PostAnalysisRequirements,
+) -> bool:
+    length_block = report.get("length") if isinstance(report, dict) else {}
+    too_short = False
+    if isinstance(length_block, dict):
+        actual = length_block.get("chars_no_spaces")
+        min_required = length_block.get("min", requirements.min_chars)
+        try:
+            too_short = int(actual) < int(min_required)
+        except (TypeError, ValueError):
+            too_short = False
+    missing_keywords = report.get("missing_keywords") if isinstance(report, dict) else []
+    has_missing_keywords = isinstance(missing_keywords, list) and bool(missing_keywords)
+    faq_block = report.get("faq") if isinstance(report, dict) else {}
+    faq_within_range = True
+    if isinstance(faq_block, dict):
+        faq_within_range = bool(faq_block.get("within_range", False))
+    else:
+        faq_count = report.get("faq_count") if isinstance(report, dict) else None
+        if not isinstance(faq_count, int) or faq_count < 3 or faq_count > 5:
+            faq_within_range = False
+    return too_short or has_missing_keywords or not faq_within_range
+
+
+def _build_quality_extend_prompt(
+    report: Dict[str, object],
+    requirements: PostAnalysisRequirements,
+) -> str:
+    min_required = requirements.min_chars
+    max_required = requirements.max_chars
+    missing_keywords = report.get("missing_keywords") if isinstance(report, dict) else []
+    faq_block = report.get("faq") if isinstance(report, dict) else {}
+    faq_count = None
+    if isinstance(faq_block, dict):
+        faq_count = faq_block.get("count")
+    elif isinstance(report.get("faq_count"), int):
+        faq_count = report.get("faq_count")
+
+    parts: List[str] = [
+        (
+            f"Продолжи текст, чтобы итоговый объём попал в диапазон {min_required}\u2013{max_required} символов без пробелов."
+        )
+    ]
+    if isinstance(missing_keywords, list) and missing_keywords:
+        highlighted = ", ".join(list(dict.fromkeys(missing_keywords)))
+        parts.append(f"Добавь недостающие ключевые слова: {highlighted}.")
+    else:
+        parts.append("Убедись, что использованы все ключевые слова из списка.")
+
+    faq_instruction = "Обязательно продолжить и завершить FAQ: сделай 3\u20135 вопросов с развёрнутыми ответами."
+    if not isinstance(faq_count, int) or faq_count < 3:
+        parts.append("Добавь недостающие вопросы в блок FAQ, чтобы было минимум три.")
+    elif faq_count > 5:
+        parts.append("Сократи блок FAQ до 3\u20135 вопросов.")
+    parts.append(faq_instruction)
+    parts.append(
+        "Добавь недостающие ключевые фразы в точной форме, без изменения их написания или порядка слов."
+    )
+
+    return " ".join(parts)
+
+
 def _ensure_length(
     result: GenerationResult,
     messages: List[Dict[str, str]],
@@ -301,14 +384,27 @@ def _ensure_length(
         section = _choose_section_for_extension(data)
         prompt = _build_extend_prompt(section, min_target=min_effective, max_target=max_effective)
         adjusted_messages = list(messages)
+        adjusted_messages.append({"role": "assistant", "content": text})
         adjusted_messages.append({"role": "user", "content": prompt})
-        new_result = llm_generate(
+        extend_tokens = max(1, min(max_tokens, QUALITY_EXTEND_MAX_TOKENS))
+        extend_result = llm_generate(
             adjusted_messages,
             model=model_name,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=extend_tokens,
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
+        )
+        combined_text, _ = _merge_extend_output(text, extend_result.text)
+        new_result = GenerationResult(
+            text=combined_text,
+            model_used=extend_result.model_used,
+            retry_used=True,
+            fallback_used=extend_result.fallback_used,
+            fallback_reason=extend_result.fallback_reason,
+            api_route=extend_result.api_route,
+            schema=extend_result.schema,
+            metadata=extend_result.metadata,
         )
         return new_result, "extend", adjusted_messages
 
@@ -488,9 +584,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=1400,
+        default=1500,
         dest="max_tokens",
-        help="Max tokens for generation (default: 1400).",
+        help="Max tokens for generation (default: 1500).",
     )
     parser.add_argument(
         "--timeout",
@@ -780,6 +876,9 @@ def _generate_variant(
 
     post_retry_attempts = 0
     post_analysis_report: Dict[str, object] = {}
+    quality_extend_used = False
+    quality_extend_delta_chars = 0
+    quality_extend_total_chars = len(article_text)
     while True:
         article_text, postfix_appended, default_cta_used = _append_cta_if_needed(
             article_text,
@@ -795,6 +894,45 @@ def _generate_variant(
             retry_count=post_retry_attempts,
             fallback_used=bool(fallback_used),
         )
+        if not quality_extend_used and _should_force_quality_extend(post_analysis_report, requirements):
+            extend_instruction = _build_quality_extend_prompt(post_analysis_report, requirements)
+            previous_text = article_text
+            active_messages = list(active_messages)
+            active_messages.append({"role": "assistant", "content": previous_text})
+            active_messages.append({"role": "user", "content": extend_instruction})
+            extend_tokens = max(1, min(max_tokens_current, QUALITY_EXTEND_MAX_TOKENS))
+            extend_result = llm_generate(
+                active_messages,
+                model=model_name,
+                temperature=temperature,
+                max_tokens=extend_tokens,
+                timeout_s=timeout,
+                backoff_schedule=backoff_schedule,
+            )
+            combined_text, delta = _merge_extend_output(previous_text, extend_result.text)
+            article_text = combined_text
+            effective_model = extend_result.model_used
+            fallback_used = extend_result.fallback_used
+            fallback_reason = extend_result.fallback_reason
+            api_route = extend_result.api_route
+            response_schema = extend_result.schema
+            retry_used = True
+            quality_extend_used = True
+            quality_extend_delta_chars = delta
+            quality_extend_total_chars = len(article_text)
+            llm_result = GenerationResult(
+                text=article_text,
+                model_used=effective_model,
+                retry_used=True,
+                fallback_used=fallback_used,
+                fallback_reason=fallback_reason,
+                api_route=api_route,
+                schema=response_schema,
+                metadata=extend_result.metadata,
+            )
+            continue
+        if quality_extend_used:
+            break
         if not post_should_retry(post_analysis_report) or post_retry_attempts >= 2:
             break
         refinement_instruction = build_retry_instruction(post_analysis_report, requirements)
@@ -816,6 +954,12 @@ def _generate_variant(
         response_schema = llm_result.schema
         retry_used = True
         post_retry_attempts += 1
+
+    quality_extend_total_chars = len(article_text)
+    if isinstance(post_analysis_report, dict):
+        post_analysis_report["had_extend"] = quality_extend_used
+        post_analysis_report["extend_delta_chars"] = quality_extend_delta_chars
+        post_analysis_report["extend_total_chars"] = quality_extend_total_chars
 
     duration = time.time() - start_time
     context_bundle = generation_context.context_bundle
@@ -861,6 +1005,9 @@ def _generate_variant(
         "context_budget_tokens_limit": context_bundle.token_budget_limit,
         "postfix_appended": postfix_appended,
         "length_adjustment": length_adjustment,
+        "quality_extend_triggered": quality_extend_used,
+        "quality_extend_delta_chars": quality_extend_delta_chars,
+        "quality_extend_total_chars": quality_extend_total_chars,
         "length_range_target": {"min": min_chars, "max": max_chars},
         "mode": mode,
         "model_used": effective_model,

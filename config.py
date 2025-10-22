@@ -35,22 +35,16 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return raw not in {"0", "false", "off", "no"}
 
-# Тестовые ключи для учебной лаборатории
-_DEFAULT_OPENAI_API_KEY = (
-    "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"
-)
-OPENAI_API_KEY = (
-    str(os.getenv("OPENAI_API_KEY", _DEFAULT_OPENAI_API_KEY)).strip() or _DEFAULT_OPENAI_API_KEY
-)
+OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
 
 _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
 FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
 
 # GPT-5 Responses tuning
-G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1400)
-G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2048)
-G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 3072)
-G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 4096)
+G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1500)
+G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2200)
+G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 2600)
+G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3000)
 _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
 G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
 G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
@@ -79,3 +73,5 @@ APPEND_STYLE_PROFILE_DEFAULT = (
     str(os.getenv("APPEND_STYLE_PROFILE_DEFAULT", "true")).strip().lower() not in {"0", "false", "off", "no"}
 )
 
+# Ключевые слова
+KEYWORDS_ALLOW_AUTO = _env_bool("KEYWORDS_ALLOW_AUTO", False)

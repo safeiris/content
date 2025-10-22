@@ -172,8 +172,10 @@ def _render_faq_line(include_faq: bool, faq_questions: Optional[int]) -> str:
     if not include_faq:
         return ""
     if faq_questions and faq_questions > 0:
-        return f"В конце добавь блок FAQ (часто задаваемые вопросы по теме) на {faq_questions} вопросов.\n"
-    return "В конце добавь блок FAQ (часто задаваемые вопросы по теме).\n"
+        return (
+            f"В конце добавь блок FAQ (часто задаваемые вопросы по теме) на {faq_questions} вопросов с ответами.\n"
+        )
+    return "В конце добавь блок FAQ (часто задаваемые вопросы по теме) на 3\u20135 вопросов с ответами.\n"
 
 
 def _render_jsonld_line(include_jsonld: bool) -> str:

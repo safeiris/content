@@ -8,6 +8,41 @@ from typing import Dict, List, Optional
 
 
 _SPACE_RE = re.compile(r"\s+", re.MULTILINE)
+_NORMALIZE_TRANSLATION = str.maketrans(
+    {
+        "\u00ab": '"',
+        "\u00bb": '"',
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\u201f": '"',
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u2039": "'",
+        "\u203a": "'",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2212": "-",
+        "\u2043": "-",
+        "\u00a0": " ",
+        "\u202f": " ",
+        "ё": "е",
+        "Ё": "Е",
+    }
+)
+
+
+def _normalize_text(value: str) -> str:
+    normalized = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.translate(_NORMALIZE_TRANSLATION)
+
+
+def _normalize_keyword(term: str) -> str:
+    normalized = _normalize_text(term)
+    normalized = normalized.lower()
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 @dataclass(frozen=True)
 class PostAnalysisRequirements:
     min_chars: int
@@ -29,7 +64,7 @@ def analyze(
 ) -> Dict[str, object]:
     """Compute quality diagnostics for the generated article."""
 
-    normalized = text or ""
+    normalized = _normalize_text(text or "")
     chars_no_spaces = len(_SPACE_RE.sub("", normalized))
     within_limits = requirements.min_chars <= chars_no_spaces <= requirements.max_chars
 
@@ -37,13 +72,29 @@ def analyze(
     sources_used: List[str] = []
 
     lowered = normalized.lower()
+    lowered_for_phrases = re.sub(r"\s+", " ", lowered)
+    seen_keywords = set()
+    keywords_found = 0
+    keywords_total = 0
     for keyword in requirements.keywords:
         term = keyword.strip()
         if not term:
             continue
-        pattern = re.compile(re.escape(term), re.IGNORECASE)
-        count = len(pattern.findall(normalized))
-        keywords_coverage.append({"term": term, "found": count > 0, "count": count})
+        normalized_term = _normalize_keyword(term)
+        if normalized_term in seen_keywords:
+            continue
+        seen_keywords.add(normalized_term)
+        is_phrase = " " in normalized_term or "-" in normalized_term
+        if is_phrase:
+            count = lowered_for_phrases.count(normalized_term)
+        else:
+            pattern = re.compile(rf"(?<!\w){re.escape(normalized_term)}(?!\w)")
+            count = len(pattern.findall(lowered))
+        found = count > 0
+        if found:
+            keywords_found += 1
+        keywords_total += 1
+        keywords_coverage.append({"term": term, "found": found, "count": count})
 
     for source in requirements.sources:
         candidate = source.strip()
@@ -57,6 +108,18 @@ def analyze(
                 sources_used.append(candidate)
 
     faq_count = _estimate_faq_questions(normalized)
+    faq_within_range = 3 <= faq_count <= 5
+
+    keywords_usage_percent = 100.0 if keywords_total == 0 else round((keywords_found / keywords_total) * 100, 2)
+
+    fail_reasons: List[str] = []
+    if not within_limits:
+        fail_reasons.append("length")
+    if keywords_total > 0 and keywords_found < keywords_total:
+        fail_reasons.append("keywords")
+    if not faq_within_range:
+        fail_reasons.append("faq")
+    meets_requirements = not fail_reasons
 
     report: Dict[str, object] = {
         "length": {
@@ -67,12 +130,23 @@ def analyze(
         },
         "keywords_coverage": keywords_coverage,
         "missing_keywords": [item["term"] for item in keywords_coverage if not item["found"]],
+        "keywords_found": keywords_found,
+        "keywords_total": keywords_total,
+        "keywords_usage_percent": keywords_usage_percent,
         "faq_count": faq_count,
+        "faq": {
+            "count": faq_count,
+            "within_range": faq_within_range,
+            "min": 3,
+            "max": 5,
+        },
         "sources_used": sources_used,
         "style_profile": requirements.style_profile,
         "model": model,
         "retry_count": retry_count,
         "fallback": bool(fallback_used),
+        "meets_requirements": meets_requirements,
+        "fail_reasons": fail_reasons,
     }
     return report
 
@@ -84,7 +158,10 @@ def should_retry(report: Dict[str, object]) -> bool:
     if isinstance(length_block, dict) and not length_block.get("within_limits", True):
         return True
     missing = report.get("missing_keywords")
-    if isinstance(missing, list) and len(missing) > 2:
+    if isinstance(missing, list) and missing:
+        return True
+    faq_block = report.get("faq") if isinstance(report, dict) else {}
+    if isinstance(faq_block, dict) and not faq_block.get("within_range", True):
         return True
     return False
 
@@ -120,6 +197,17 @@ def build_retry_instruction(
         instructions.append(
             "Добавь недостающие ключевые слова в естественном виде: " + highlighted + "."
         )
+
+    faq_block = report.get("faq") if isinstance(report, dict) else {}
+    faq_count = None
+    if isinstance(faq_block, dict):
+        faq_count = faq_block.get("count")
+        if not faq_block.get("within_range", True):
+            instructions.append("Сделай блок FAQ на 3–5 вопросов с развёрнутыми ответами.")
+    elif isinstance(report.get("faq_count"), int):
+        faq_count = report.get("faq_count")
+        if faq_count < 3 or faq_count > 5:
+            instructions.append("Сделай блок FAQ на 3–5 вопросов с развёрнутыми ответами.")
 
     if not instructions:
         return "Уточни ответ с учётом исходных требований."

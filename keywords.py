@@ -5,6 +5,8 @@ import re
 from collections import Counter
 from typing import Iterable, List, Sequence, Tuple
 
+from config import KEYWORDS_ALLOW_AUTO
+
 KEYWORD_LIMIT = 8
 KEYWORD_MAX_LENGTH = 64
 
@@ -164,7 +166,11 @@ def merge_keywords(
     """Merge manual and auto-generated keywords with deduplication and limits."""
 
     manual_candidates = [kw for kw in manual if kw]
-    auto_candidates = [kw for kw in auto if kw]
+    auto_candidates: List[str]
+    if KEYWORDS_ALLOW_AUTO:
+        auto_candidates = [kw for kw in auto if kw]
+    else:
+        auto_candidates = []
 
     manual_used: List[str] = []
     auto_used: List[str] = []
@@ -202,5 +208,9 @@ def format_keywords_block(keywords: Sequence[str]) -> str:
     if not items:
         return ""
     bullet_list = "\n".join(f"- {kw}" for kw in items)
-    return "Ключевые слова (используй естественно):\n" + bullet_list + "\n\n"
+    return (
+        "Ключевые слова (каждое должно прозвучать в тексте естественно):\n"
+        + bullet_list
+        + "\n\n"
+    )
 
