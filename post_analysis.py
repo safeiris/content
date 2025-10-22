@@ -52,6 +52,8 @@ class PostAnalysisRequirements:
     faq_questions: Optional[int]
     sources: List[str]
     style_profile: str
+    length_sources: Optional[Dict[str, str]] = None
+    jsonld_enabled: bool = False
 
 
 def analyze(
@@ -108,7 +110,15 @@ def analyze(
                 sources_used.append(candidate)
 
     faq_count = _estimate_faq_questions(normalized)
-    faq_within_range = 3 <= faq_count <= 5
+    faq_required = requirements.faq_questions if isinstance(requirements.faq_questions, int) else None
+    faq_min = 3
+    faq_max = 5
+    if isinstance(faq_required, int) and faq_required > 0:
+        faq_min = max(faq_min, faq_required)
+        faq_max = max(faq_max, faq_required)
+    faq_within_range = faq_min <= faq_count <= faq_max
+    if requirements.jsonld_enabled and faq_count < faq_min:
+        faq_within_range = False
 
     keywords_usage_percent = 100.0 if keywords_total == 0 else round((keywords_found / keywords_total) * 100, 2)
 
@@ -121,16 +131,25 @@ def analyze(
         fail_reasons.append("faq")
     meets_requirements = not fail_reasons
 
+    length_sources = requirements.length_sources or {}
     report: Dict[str, object] = {
         "length": {
             "chars_no_spaces": chars_no_spaces,
             "within_limits": within_limits,
             "min": requirements.min_chars,
             "max": requirements.max_chars,
+            "source": {
+                "min": length_sources.get("min"),
+                "max": length_sources.get("max"),
+            },
         },
         "length_limits_applied": {
             "min": requirements.min_chars,
             "max": requirements.max_chars,
+            "source": {
+                "min": length_sources.get("min"),
+                "max": length_sources.get("max"),
+            },
         },
         "keywords_coverage": keywords_coverage,
         "missing_keywords": [item["term"] for item in keywords_coverage if not item["found"]],
@@ -141,8 +160,10 @@ def analyze(
         "faq": {
             "count": faq_count,
             "within_range": faq_within_range,
-            "min": 3,
-            "max": 5,
+            "min": faq_min,
+            "max": faq_max,
+            "required": faq_required,
+            "jsonld_enabled": requirements.jsonld_enabled,
         },
         "sources_used": sources_used,
         "style_profile": requirements.style_profile,

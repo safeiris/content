@@ -83,7 +83,17 @@
                 </header>
                 <div class="form-card__body">
                   <div class="form-row">
-                    <label class="field-label" for="min-chars-input">Объём текста (без пробелов)</label>
+                    <label class="field-label" for="min-chars-input">
+                      <span>Объём текста (без пробелов)</span>
+                      <span
+                        class="info-icon"
+                        tabindex="0"
+                        role="img"
+                        aria-label="Если статья короче нормы — система автоматически запустит extend до требуемого объёма"
+                        title="Если статья короче нормы — система автоматически запустит extend до требуемого объёма"
+                        >🛈</span
+                      >
+                    </label>
                     <div class="length-range">
                       <input id="min-chars-input" type="number" min="500" value="3500" />
                       <span class="range-separator">—</span>

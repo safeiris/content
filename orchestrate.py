@@ -313,8 +313,10 @@ def _merge_extend_output(base_text: str, extension_text: str) -> Tuple[str, int]
 
 def _resolve_extend_tokens(max_tokens: int) -> int:
     if max_tokens <= 0:
-        return QUALITY_EXTEND_MIN_TOKENS
-    candidate = max(max_tokens, QUALITY_EXTEND_MIN_TOKENS)
+        base = QUALITY_EXTEND_MIN_TOKENS
+    else:
+        base = max_tokens
+    candidate = max(base * 2, QUALITY_EXTEND_MIN_TOKENS)
     if QUALITY_EXTEND_MAX_TOKENS > 0:
         candidate = min(candidate, QUALITY_EXTEND_MAX_TOKENS)
     return max(QUALITY_EXTEND_MIN_TOKENS, candidate)
@@ -382,6 +384,14 @@ def _build_quality_extend_prompt(
     min_required = requirements.min_chars
     max_required = requirements.max_chars
     missing_keywords = report.get("missing_keywords") if isinstance(report, dict) else []
+    keyword_list: List[str] = []
+    if isinstance(missing_keywords, list):
+        keyword_list = [
+            str(term).strip()
+            for term in missing_keywords
+            if isinstance(term, str) and str(term).strip()
+        ]
+    keyword_list = list(dict.fromkeys(keyword_list))
     faq_block = report.get("faq") if isinstance(report, dict) else {}
     faq_count = None
     if isinstance(faq_block, dict):
@@ -394,9 +404,12 @@ def _build_quality_extend_prompt(
             f"Перепиши и расширь текст полностью, чтобы итоговый объём уверенно попал в диапазон {min_required}\u2013{max_required} символов без пробелов (не меньше {min_required})."
         )
     ]
-    if isinstance(missing_keywords, list) and missing_keywords:
-        highlighted = ", ".join(list(dict.fromkeys(missing_keywords)))
-        parts.append(f"Добавь недостающие ключевые слова: {highlighted}.")
+    parts.append("Добавь 5 вопросов FAQ, если их нет.")
+    if keyword_list:
+        bullet_list = "\n".join(f"- {term}" for term in keyword_list)
+        parts.append(
+            "Используй недостающие ключевые фразы строго в указанном виде:" "\n" + bullet_list
+        )
     else:
         parts.append("Убедись, что использованы все ключевые слова из списка.")
 
@@ -412,6 +425,28 @@ def _build_quality_extend_prompt(
     parts.append("Верни полный обновлённый текст целиком, без пояснений и черновых пометок.")
 
     return " ".join(parts)
+
+
+def _build_keywords_only_prompt(missing_keywords: List[str]) -> str:
+    keyword_list = [
+        str(term).strip()
+        for term in missing_keywords
+        if isinstance(term, str) and str(term).strip()
+    ]
+    keyword_list = list(dict.fromkeys(keyword_list))
+    if not keyword_list:
+        return (
+            "Проверь текст и убедись, что все ключевые слова из брифа сохранены в точной форме."
+            " Верни полный текст статьи без пояснений."
+        )
+    bullet_list = "\n".join(f"- {term}" for term in keyword_list)
+    return (
+        "Аккуратно добавь недостающие ключевые фразы в точной форме, сохрани структуру и объём текста. "
+        "Не сокращай и не расширяй материал, просто интегрируй ключи в подходящие абзацы. "
+        "Список обязательных фраз:\n"
+        f"{bullet_list}\n"
+        "Верни полный обновлённый текст без пояснений и служебных пометок."
+    )
 
 
 def _ensure_length(
@@ -833,6 +868,24 @@ def _generate_variant(
     min_chars = length_info.min_chars
     max_chars = length_info.max_chars
     length_sources = {"min": length_info.min_source, "max": length_info.max_source}
+    input_length_limits = prepared_data.get("length_limits")
+    if isinstance(input_length_limits, dict):
+        min_candidate = _safe_optional_positive_int(
+            input_length_limits.get("min_chars") or input_length_limits.get("min")
+        )
+        max_candidate = _safe_optional_positive_int(
+            input_length_limits.get("max_chars") or input_length_limits.get("max")
+        )
+        if min_candidate is not None:
+            min_chars = min_candidate
+        if max_candidate is not None:
+            max_chars = max_candidate
+    length_sources_override = prepared_data.get("_length_limits_source")
+    if isinstance(length_sources_override, dict):
+        length_sources.update({
+            "min": length_sources_override.get("min", length_sources.get("min")),
+            "max": length_sources_override.get("max", length_sources.get("max")),
+        })
     length_warnings = list(length_info.warnings)
     if length_info.swapped and not length_warnings:
         length_warnings.append(
@@ -866,6 +919,8 @@ def _generate_variant(
         faq_questions=faq_questions,
         sources=sources_values,
         style_profile=str(prepared_data.get("style_profile", "")),
+        length_sources=dict(length_sources),
+        jsonld_enabled=include_jsonld_flag,
     )
 
     max_tokens_requested = max_tokens
@@ -991,6 +1046,11 @@ def _generate_variant(
     quality_extend_used = False
     quality_extend_delta_chars = 0
     quality_extend_passes = 0
+    quality_extend_iterations: List[Dict[str, Any]] = []
+    quality_extend_max_iterations = 3
+    extend_incomplete = False
+    keywords_only_extend_used = False
+    last_missing_keywords: List[str] = []
     postfix_appended = False
     default_cta_used = False
     disclaimer_appended = False
@@ -1011,8 +1071,35 @@ def _generate_variant(
             retry_count=post_retry_attempts,
             fallback_used=bool(fallback_used),
         )
-        needs_quality_extend = _should_force_quality_extend(post_analysis_report, requirements)
+        missing_keywords_raw = (
+            post_analysis_report.get("missing_keywords")
+            if isinstance(post_analysis_report, dict)
+            else []
+        )
+        missing_keywords_list = [
+            str(term).strip()
+            for term in missing_keywords_raw
+            if isinstance(term, str) and str(term).strip()
+        ]
+        last_missing_keywords = list(missing_keywords_list)
+        length_block = post_analysis_report.get("length") if isinstance(post_analysis_report, dict) else {}
+        chars_no_spaces = None
+        if isinstance(length_block, dict):
+            chars_no_spaces = length_block.get("chars_no_spaces")
+        try:
+            length_issue = int(chars_no_spaces) < int(requirements.min_chars)
+        except (TypeError, ValueError):
+            length_issue = False
+        faq_block = post_analysis_report.get("faq") if isinstance(post_analysis_report, dict) else {}
+        faq_issue = False
+        if isinstance(faq_block, dict):
+            faq_issue = not bool(faq_block.get("within_range", False))
+        needs_quality_extend = bool(length_issue or missing_keywords_list or faq_issue)
         if needs_quality_extend:
+            if quality_extend_passes >= quality_extend_max_iterations:
+                if length_issue:
+                    extend_incomplete = True
+                break
             extend_instruction = _build_quality_extend_prompt(post_analysis_report, requirements)
             previous_text = article_text
             active_messages = list(active_messages)
@@ -1027,12 +1114,11 @@ def _generate_variant(
                 timeout_s=timeout,
                 backoff_schedule=backoff_schedule,
             )
+            before_chars = len(previous_text)
+            before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
             combined_text, delta = _merge_extend_output(previous_text, extend_result.text)
-            if delta <= 0 and quality_extend_passes > 0:
-                article_text = previous_text
-                print("[orchestrate] QUALITY EXTEND: no growth detected, stopping extend loop")
-                break
-            article_text = combined_text
+            growth_detected = delta > 0 or quality_extend_passes == 0
+            article_text = combined_text if growth_detected else previous_text
             effective_model = extend_result.model_used
             fallback_used = extend_result.fallback_used
             fallback_reason = extend_result.fallback_reason
@@ -1040,8 +1126,26 @@ def _generate_variant(
             response_schema = extend_result.schema
             retry_used = True
             quality_extend_used = True
-            quality_extend_delta_chars += max(0, delta)
-            quality_extend_passes += 1
+            after_chars = len(article_text)
+            after_chars_no_spaces = len(re.sub(r"\s+", "", article_text))
+            delta_chars = max(0, after_chars - before_chars)
+            quality_extend_delta_chars += delta_chars
+            iteration_number = quality_extend_passes + 1
+            quality_extend_iterations.append(
+                {
+                    "iteration": iteration_number,
+                    "mode": "quality",
+                    "max_iterations": quality_extend_max_iterations,
+                    "before_chars": before_chars,
+                    "before_chars_no_spaces": before_chars_no_spaces,
+                    "after_chars": after_chars,
+                    "after_chars_no_spaces": after_chars_no_spaces,
+                    "length_issue": bool(length_issue),
+                    "faq_issue": bool(faq_issue),
+                    "missing_keywords": list(missing_keywords_list),
+                }
+            )
+            quality_extend_passes = iteration_number
             llm_result = GenerationResult(
                 text=article_text,
                 model_used=effective_model,
@@ -1052,6 +1156,9 @@ def _generate_variant(
                 schema=response_schema,
                 metadata=extend_result.metadata,
             )
+            if not growth_detected and quality_extend_passes > 0:
+                print("[orchestrate] QUALITY EXTEND: no growth detected, stopping extend loop")
+                break
             continue
         if post_should_retry(post_analysis_report) and post_retry_attempts < 2:
             refinement_instruction = build_retry_instruction(post_analysis_report, requirements)
@@ -1076,6 +1183,74 @@ def _generate_variant(
             continue
         break
 
+    if last_missing_keywords and not keywords_only_extend_used:
+        keyword_prompt = _build_keywords_only_prompt(last_missing_keywords)
+        previous_text = article_text
+        active_messages = list(active_messages)
+        active_messages.append({"role": "assistant", "content": previous_text})
+        active_messages.append({"role": "user", "content": keyword_prompt})
+        extend_tokens = _resolve_extend_tokens(max_tokens_current)
+        extend_result = llm_generate(
+            active_messages,
+            model=model_name,
+            temperature=temperature,
+            max_tokens=extend_tokens,
+            timeout_s=timeout,
+            backoff_schedule=backoff_schedule,
+        )
+        before_chars = len(previous_text)
+        before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
+        combined_text, _ = _merge_extend_output(previous_text, extend_result.text)
+        article_text = combined_text
+        effective_model = extend_result.model_used
+        fallback_used = extend_result.fallback_used
+        fallback_reason = extend_result.fallback_reason
+        api_route = extend_result.api_route
+        response_schema = extend_result.schema
+        retry_used = True
+        quality_extend_used = True
+        keywords_only_extend_used = True
+        after_chars = len(article_text)
+        after_chars_no_spaces = len(re.sub(r"\s+", "", article_text))
+        delta_chars = max(0, after_chars - before_chars)
+        quality_extend_delta_chars += delta_chars
+        quality_extend_iterations.append(
+            {
+                "iteration": quality_extend_passes + 1,
+                "mode": "keywords",
+                "max_iterations": quality_extend_max_iterations,
+                "before_chars": before_chars,
+                "before_chars_no_spaces": before_chars_no_spaces,
+                "after_chars": after_chars,
+                "after_chars_no_spaces": after_chars_no_spaces,
+                "length_issue": False,
+                "faq_issue": False,
+                "missing_keywords": list(last_missing_keywords),
+            }
+        )
+        llm_result = GenerationResult(
+            text=article_text,
+            model_used=effective_model,
+            retry_used=True,
+            fallback_used=fallback_used,
+            fallback_reason=fallback_reason,
+            api_route=api_route,
+            schema=response_schema,
+            metadata=extend_result.metadata,
+        )
+        post_analysis_report = analyze_post(
+            article_text,
+            requirements=requirements,
+            model=effective_model or model_name,
+            retry_count=post_retry_attempts,
+            fallback_used=bool(fallback_used),
+        )
+        last_missing_keywords = [
+            str(term).strip()
+            for term in (post_analysis_report.get("missing_keywords") or [])
+            if isinstance(term, str) and str(term).strip()
+        ]
+
     quality_extend_total_chars = len(article_text)
     analysis_characters = len(article_text)
     analysis_characters_no_spaces = len(re.sub(r"\s+", "", article_text))
@@ -1084,6 +1259,8 @@ def _generate_variant(
         post_analysis_report["extend_delta_chars"] = quality_extend_delta_chars
         post_analysis_report["extend_total_chars"] = quality_extend_total_chars
         post_analysis_report["extend_passes"] = quality_extend_passes
+        post_analysis_report["extend_iterations"] = quality_extend_iterations
+        post_analysis_report["extend_incomplete"] = extend_incomplete
 
     final_text = article_text
     final_text, postfix_appended, default_cta_used = _append_cta_if_needed(
@@ -1168,6 +1345,10 @@ def _generate_variant(
         "quality_extend_delta_chars": quality_extend_delta_chars,
         "quality_extend_total_chars": quality_extend_total_chars,
         "quality_extend_passes": quality_extend_passes,
+        "quality_extend_iterations": quality_extend_iterations,
+        "quality_extend_max_iterations": quality_extend_max_iterations,
+        "quality_extend_keywords_used": keywords_only_extend_used,
+        "extend_incomplete": extend_incomplete,
         "length_range_target": {"min": min_chars, "max": max_chars},
         "length_limits_applied": {"min": min_chars, "max": max_chars},
         "mode": mode,

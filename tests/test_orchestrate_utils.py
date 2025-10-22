@@ -87,6 +87,8 @@ def _make_requirements() -> PostAnalysisRequirements:
         faq_questions=None,
         sources=[],
         style_profile="",
+        length_sources=None,
+        jsonld_enabled=False,
     )
 
 
@@ -111,7 +113,8 @@ def test_quality_extend_prompt_mentions_keywords_and_faq():
     assert "ключевое слово" in prompt
     expected_range = f"{requirements.min_chars}\u2013{requirements.max_chars}"
     assert expected_range in prompt
-    assert "Добавь недостающие ключевые фразы" in prompt
+    assert "Добавь 5 вопросов FAQ, если их нет" in prompt
+    assert "Используй недостающие ключевые фразы" in prompt
 
 
 def test_ensure_length_triggers_extend(monkeypatch):

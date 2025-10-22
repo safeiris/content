@@ -1442,6 +1442,39 @@ function buildQualityReport(meta) {
     );
   }
 
+  const extendIterations = Array.isArray(meta.quality_extend_iterations)
+    ? meta.quality_extend_iterations
+    : [];
+  const maxExtend = Number(meta.quality_extend_max_iterations) || 3;
+  if (extendIterations.length) {
+    extendIterations.forEach((step, index) => {
+      if (!step || typeof step !== "object") {
+        return;
+      }
+      const mode = step.mode === "keywords" ? "keywords" : "quality";
+      const iteration = Number(step.iteration) || index + 1;
+      const before = Number(step.before_chars_no_spaces ?? step.before_chars ?? 0);
+      const after = Number(step.after_chars_no_spaces ?? step.after_chars ?? 0);
+      const labelBase = mode === "keywords" ? "Extend ключи" : `Extend ${iteration}/${maxExtend}`;
+      const label = `${labelBase}: ${before.toLocaleString("ru-RU")} → ${after.toLocaleString("ru-RU")} зн.`;
+      let status = "info";
+      if (after > before && mode !== "keywords") {
+        status = "success";
+      } else if (mode === "keywords" && after > before) {
+        status = "success";
+      }
+      list.append(createQualityItem(status, label));
+    });
+  }
+  if (meta.extend_incomplete) {
+    list.append(
+      createQualityItem(
+        "warning",
+        "Extend: после трёх попыток объём остаётся ниже минимального требования.",
+      ),
+    );
+  }
+
   const requestedSources = Array.isArray(meta.sources_requested)
     ? meta.sources_requested.map((item) => item?.value || item)
     : [];
@@ -1602,6 +1635,33 @@ function updateResultBadges(meta) {
     appendBadge("Ключи: нет данных", "warning");
   } else {
     appendBadge("Ключи: не заданы", "neutral");
+  }
+
+  const extendIterations = Array.isArray(meta.quality_extend_iterations)
+    ? meta.quality_extend_iterations
+    : [];
+  const maxExtend = Number(meta.quality_extend_max_iterations) || 3;
+  extendIterations.forEach((step, index) => {
+    if (!step || typeof step !== "object") {
+      return;
+    }
+    const mode = step.mode === "keywords" ? "keywords" : "quality";
+    const iteration = Number(step.iteration) || index + 1;
+    const before = Number(step.before_chars_no_spaces ?? step.before_chars ?? 0);
+    const after = Number(step.after_chars_no_spaces ?? step.after_chars ?? 0);
+    if (mode === "keywords") {
+      const grew = after >= before && after > 0;
+      appendBadge(
+        "Extend ключи",
+        grew ? "success" : "warning",
+      );
+    } else {
+      const grew = after > before;
+      appendBadge(`Extend ${iteration}/${maxExtend}`, grew ? "success" : "neutral");
+    }
+  });
+  if (meta.extend_incomplete) {
+    appendBadge("Extend: объём ниже минимума", "warning");
   }
 
   if (meta.include_faq) {

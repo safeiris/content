@@ -10,6 +10,8 @@ def _make_requirements(keywords):
         faq_questions=None,
         sources=[],
         style_profile="",
+        length_sources=None,
+        jsonld_enabled=False,
     )
 
 
@@ -51,3 +53,25 @@ def test_keyword_normalization_handles_yo_and_nbsp():
     assert not report["missing_keywords"], report["missing_keywords"]
     assert report["meets_requirements"]
     assert report["fail_reasons"] == []
+
+
+def test_analyze_reports_length_sources_and_jsonld_requirement():
+    requirements = PostAnalysisRequirements(
+        min_chars=100,
+        max_chars=500,
+        keywords=[],
+        keyword_mode="strict",
+        faq_questions=5,
+        sources=[],
+        style_profile="",
+        length_sources={"min": "user", "max": "profile"},
+        jsonld_enabled=True,
+    )
+    text = "a" * 150
+    report = analyze(text, requirements=requirements, model="gpt", retry_count=0, fallback_used=False)
+
+    assert report["length"]["source"] == {"min": "user", "max": "profile"}
+    assert report["length_limits_applied"]["source"] == {"min": "user", "max": "profile"}
+    assert report["faq"]["jsonld_enabled"] is True
+    assert report["faq"]["min"] == 5
+    assert "faq" in report["fail_reasons"]

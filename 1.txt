@@ -1,391 +1,389 @@
-diff --git a/base_prompt.txt b/base_prompt.txt
-index e6ad2382dae32669cc79ed2611b15256e47fcdb3..62662645374be46abc1f6f7d6f3562f7760264ba 100644
---- a/base_prompt.txt
-+++ b/base_prompt.txt
-@@ -1,20 +1,25 @@
- Ты — SEO-редактор, создающий экспертный материал по теме {theme}.
- {style_line}
- Цель: {goal}
- {audience_line}{title_line}Тон: {tone}
+diff --git a/frontend_demo/index.html b/frontend_demo/index.html
+index ebf20c8ab5c85156d43470f60e5910c32a9b7de8..9ba85e093d60e7ef7b338bec83f4fbfdba8e8843 100644
+--- a/frontend_demo/index.html
++++ b/frontend_demo/index.html
+@@ -61,51 +61,61 @@
+                       <option value="строгий">Строгий</option>
+                     </select>
+                     <p class="field-hint">Тон влияет на рекомендации в промпте и итоговом тексте.</p>
+                   </div>
+                   <div class="form-row">
+                     <label for="style-profile-select">Стиль</label>
+                     <select id="style-profile-select">
+                       <option value="sravni.ru" selected>sravni.ru — экспертно, структурировано</option>
+                       <option value="tinkoff.ru">tinkoff.ru — дружелюбно и с примерами</option>
+                       <option value="banki.ru">banki.ru — аналитично и по делу</option>
+                       <option value="off">off — без стилевого профиля</option>
+                     </select>
+                     <p class="field-hint" id="style-profile-hint">
+                       Определяет тон и подачу текста, близкие к стилю выбранного бренда.
+                     </p>
+                   </div>
+                 </div>
+               </section>
  
- Объём: {length_line}
-+Строго соблюдай диапазон 3500–6000 символов без пробелов.
- Если текст короче — добавь полезные уточнения, не повторяй.
- Если длиннее — сократи, сохрани смысл.
+               <section class="form-card">
+                 <header class="form-card__header">
+                   <h2 class="form-card__title">Объём и структура</h2>
+                 </header>
+                 <div class="form-card__body">
+                   <div class="form-row">
+-                    <label class="field-label" for="min-chars-input">Объём текста (без пробелов)</label>
++                    <label class="field-label" for="min-chars-input">
++                      <span>Объём текста (без пробелов)</span>
++                      <span
++                        class="info-icon"
++                        tabindex="0"
++                        role="img"
++                        aria-label="Если статья короче нормы — система автоматически запустит extend до требуемого объёма"
++                        title="Если статья короче нормы — система автоматически запустит extend до требуемого объёма"
++                        >🛈</span
++                      >
++                    </label>
+                     <div class="length-range">
+                       <input id="min-chars-input" type="number" min="500" value="3500" />
+                       <span class="range-separator">—</span>
+                       <input id="max-chars-input" type="number" min="600" value="6000" />
+                     </div>
+                     <p class="field-hint">По умолчанию используется рекомендуемый для темы диапазон, значения можно уточнить вручную.</p>
+                   </div>
+                   <div class="form-row">
+                     <label for="structure-preset">Пресет структуры</label>
+                     <select id="structure-preset">
+                       <option value="custom">Своя структура</option>
+                       <option value="seo">SEO-гайд</option>
+                       <option value="faq">FAQ-материал</option>
+                       <option value="overview">Обзор/рецензия</option>
+                     </select>
+                   </div>
+                   <div class="form-row">
+                     <label for="structure-input">Структура материала</label>
+                     <textarea id="structure-input" rows="4" placeholder="Каждый пункт с новой строки"></textarea>
+                   </div>
+                 </div>
+               </section>
  
-+Обязательные условия SEO:
-+- Используй каждое ключевое слово из списка минимум один раз.
-+- В конце добавь блок FAQ с 3–5 вопросами и развёрнутыми ответами.
+               <section class="form-card">
+                 <header class="form-card__header">
+diff --git a/frontend_demo/script.js b/frontend_demo/script.js
+index 9fee644f904a74f67ea8e7fb3f3974e3b30a8b4d..e8f6028b4389da73fd42ece5c1c101982b202828 100644
+--- a/frontend_demo/script.js
++++ b/frontend_demo/script.js
+@@ -1420,50 +1420,83 @@ function buildQualityReport(meta) {
+           .join(", ")}${missingItems.length > 3 ? "…" : ""})`
+       : `Ключевые слова: ${foundCount}/${total} найдены`;
+     list.append(createQualityItem(missingItems.length ? "warning" : "success", label));
+   } else {
+     list.append(createQualityItem("info", "Ключевые слова: не заданы"));
+   }
+ 
+   if (meta.include_faq) {
+     const targetFaq = Number(meta.faq_questions) || null;
+     const actualFaq = Number(post.faq_count) || 0;
+     const matches = targetFaq ? actualFaq === targetFaq : actualFaq > 0;
+     const label = targetFaq
+       ? `FAQ: ${actualFaq} вопросов (ожидание ${targetFaq})`
+       : `FAQ: ${actualFaq} вопросов`;
+     list.append(createQualityItem(matches ? "success" : "warning", label));
+   } else {
+     list.append(createQualityItem("info", "FAQ: отключён"));
+   }
+ 
+   if (typeof meta.include_jsonld === "boolean") {
+     list.append(
+       createQualityItem(meta.include_jsonld ? "success" : "info", meta.include_jsonld ? "JSON-LD: включён" : "JSON-LD: отключён"),
+     );
+   }
+ 
++  const extendIterations = Array.isArray(meta.quality_extend_iterations)
++    ? meta.quality_extend_iterations
++    : [];
++  const maxExtend = Number(meta.quality_extend_max_iterations) || 3;
++  if (extendIterations.length) {
++    extendIterations.forEach((step, index) => {
++      if (!step || typeof step !== "object") {
++        return;
++      }
++      const mode = step.mode === "keywords" ? "keywords" : "quality";
++      const iteration = Number(step.iteration) || index + 1;
++      const before = Number(step.before_chars_no_spaces ?? step.before_chars ?? 0);
++      const after = Number(step.after_chars_no_spaces ?? step.after_chars ?? 0);
++      const labelBase = mode === "keywords" ? "Extend ключи" : `Extend ${iteration}/${maxExtend}`;
++      const label = `${labelBase}: ${before.toLocaleString("ru-RU")} → ${after.toLocaleString("ru-RU")} зн.`;
++      let status = "info";
++      if (after > before && mode !== "keywords") {
++        status = "success";
++      } else if (mode === "keywords" && after > before) {
++        status = "success";
++      }
++      list.append(createQualityItem(status, label));
++    });
++  }
++  if (meta.extend_incomplete) {
++    list.append(
++      createQualityItem(
++        "warning",
++        "Extend: после трёх попыток объём остаётся ниже минимального требования.",
++      ),
++    );
++  }
 +
- Структура:
- {structure_block}
+   const requestedSources = Array.isArray(meta.sources_requested)
+     ? meta.sources_requested.map((item) => item?.value || item)
+     : [];
+   const usedSourcesRaw = Array.isArray(post.sources_used) ? post.sources_used : [];
+   const usedSourcesClean = usedSourcesRaw
+     .map((value) => (typeof value === "string" ? value.trim() : ""))
+     .filter(Boolean);
+   const usedSourcesUnique = Array.from(new Set(usedSourcesClean));
+   const usedSourcesLookup = new Set(usedSourcesUnique.map((value) => value.toLowerCase()));
+   if (requestedSources.length > 0) {
+     const missingSources = requestedSources
+       .map((source) => (typeof source === "string" ? source.trim() : ""))
+       .filter(Boolean)
+       .filter((source) => !usedSourcesLookup.has(source.toLowerCase()));
+     const label = missingSources.length
+       ? `Источники: ${usedSourcesUnique.length}/${requestedSources.length} (нет: ${missingSources.join(", ")})`
+       : `Источники: ${usedSourcesUnique.length}/${requestedSources.length} использованы`;
+     list.append(createQualityItem(missingSources.length ? "warning" : "success", label));
+     if (usedSourcesUnique.length) {
+       list.append(createQualityItem("info", `Использованы: ${usedSourcesUnique.join(", ")}`));
+     } else {
+       list.append(createQualityItem("warning", "Источники из брифа не использованы"));
+     }
+   } else if (usedSourcesUnique.length > 0) {
+     list.append(createQualityItem("info", `Источники: ${usedSourcesUnique.join(", ")}`));
+@@ -1582,50 +1615,77 @@ function updateResultBadges(meta) {
+   const lengthInfo = post?.length && typeof post.length === "object" ? post.length : null;
+   if (lengthInfo) {
+     const chars = Number(lengthInfo.chars_no_spaces ?? meta.characters_no_spaces ?? meta.characters) || 0;
+     const within = Boolean(lengthInfo.within_limits);
+     const min = Number(lengthInfo.min ?? appliedLimits?.min ?? meta.length_limits?.min_chars ?? 0);
+     const max = Number(lengthInfo.max ?? appliedLimits?.max ?? meta.length_limits?.max_chars ?? 0);
+     const label = within
+       ? `Объём ${chars.toLocaleString("ru-RU")} зн.`
+       : `Объём ${chars.toLocaleString("ru-RU")} (нужно ${min}–${max})`;
+     appendBadge(label, within ? "success" : "warning");
+   }
  
- {keywords_block}{keywords_mode_line}{sources_block}{faq_line}{jsonld_line}Требования к качеству:
- - Пиши экспертно, избегай воды и общих фраз.
- - Поддерживай читабельные абзацы (2–5 предложений).
- - Проверяй факты и указывай источники, если они заданы.
- - Добавь чёткий вывод и CTA.
+   const coverage = Array.isArray(post?.keywords_coverage) ? post.keywords_coverage : [];
+   const hasKeywordsInBrief = Array.isArray(meta.input_data?.keywords) && meta.input_data.keywords.length > 0;
+   if (coverage.length > 0) {
+     const found = coverage.filter((item) => item && item.found).length;
+     const total = coverage.length;
+     const missing = total - found;
+     appendBadge(`Ключи ${found}/${total}`, missing > 0 ? "warning" : "success");
+   } else if (hasKeywordsInBrief) {
+     appendBadge("Ключи: нет данных", "warning");
+   } else {
+     appendBadge("Ключи: не заданы", "neutral");
+   }
  
- Если предоставлен блок CONTEXT с выдержками из качественных материалов, используй их стиль и фактуру без дословного копирования; если CONTEXT отсутствует или фрагменты не покрывают запрос, пиши универсально, сохраняя заданную структуру.
- 
-diff --git a/config.py b/config.py
-index ef7f4f07bee4e5d62c75701ab2b9c18879c67d18..f709b0557068c7e3a5cb81d98c994c0a056d43cf 100644
---- a/config.py
-+++ b/config.py
-@@ -13,69 +13,65 @@ def _env_int(name: str, default: int) -> int:
-         return default
- 
- 
- def _env_float_list(name: str, default: str) -> tuple[float, ...]:
-     raw = str(os.getenv(name, "")).strip()
-     if not raw:
-         raw = default
-     parts = [part.strip() for part in raw.split(",") if part.strip()]
-     delays = []
-     for part in parts:
-         try:
-             delays.append(float(part))
-         except ValueError:
-             continue
-     if not delays:
-         delays = [float(value) for value in default.split(",") if value]
-     return tuple(delays)
- 
- 
- def _env_bool(name: str, default: bool) -> bool:
-     raw = str(os.getenv(name, "")).strip().lower()
-     if not raw:
-         return default
-     return raw not in {"0", "false", "off", "no"}
- 
--# Тестовые ключи для учебной лаборатории
--_DEFAULT_OPENAI_API_KEY = (
--    "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"
--)
--OPENAI_API_KEY = (
--    str(os.getenv("OPENAI_API_KEY", _DEFAULT_OPENAI_API_KEY)).strip() or _DEFAULT_OPENAI_API_KEY
--)
-+OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
- 
- _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
- FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
- 
- # GPT-5 Responses tuning
--G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1400)
--G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2048)
--G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 3072)
--G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 4096)
-+G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1500)
-+G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2200)
-+G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 2600)
-+G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3000)
- _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
- G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
- G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
- G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
- 
- # Дефолтные настройки ядра
- DEFAULT_TONE = "экспертный, дружелюбный"
- DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "Вывод"]
- 
- # Простая «норма» для SEO: ориентир по упоминаниям ключей на ~100 слов
- DEFAULT_SEO_DENSITY = 2
- 
- # Рекомендуемые границы объёма (знаков)
- DEFAULT_MIN_LENGTH = 3500
- DEFAULT_MAX_LENGTH = 6000
- 
- # Максимальный объём пользовательского контекста (символов)
- MAX_CUSTOM_CONTEXT_CHARS = 20_000
- 
- # Стилевые профили
- STYLE_PROFILE_PATH = "profiles/finance/style_profile.md"
- STYLE_PROFILE_VARIANT = str(os.getenv("STYLE_PROFILE_VARIANT", "full")).strip().lower() or "full"
- if STYLE_PROFILE_VARIANT not in {"full", "light"}:
-     STYLE_PROFILE_VARIANT = "full"
- APPEND_STYLE_PROFILE_DEFAULT = (
-     str(os.getenv("APPEND_STYLE_PROFILE_DEFAULT", "true")).strip().lower() not in {"0", "false", "off", "no"}
- )
- 
-+# Ключевые слова
-+KEYWORDS_ALLOW_AUTO = _env_bool("KEYWORDS_ALLOW_AUTO", False)
-diff --git a/keywords.py b/keywords.py
-index 1e90cfe7f117a9c150b904d4de954390a65bbb87..babc9025632bc2a43cbe5619493236da0dd041d3 100644
---- a/keywords.py
-+++ b/keywords.py
-@@ -1,32 +1,34 @@
- """Utilities for keyword normalization and lightweight auto-suggestion."""
- from __future__ import annotations
- 
- import re
- from collections import Counter
- from typing import Iterable, List, Sequence, Tuple
- 
-+from config import KEYWORDS_ALLOW_AUTO
++  const extendIterations = Array.isArray(meta.quality_extend_iterations)
++    ? meta.quality_extend_iterations
++    : [];
++  const maxExtend = Number(meta.quality_extend_max_iterations) || 3;
++  extendIterations.forEach((step, index) => {
++    if (!step || typeof step !== "object") {
++      return;
++    }
++    const mode = step.mode === "keywords" ? "keywords" : "quality";
++    const iteration = Number(step.iteration) || index + 1;
++    const before = Number(step.before_chars_no_spaces ?? step.before_chars ?? 0);
++    const after = Number(step.after_chars_no_spaces ?? step.after_chars ?? 0);
++    if (mode === "keywords") {
++      const grew = after >= before && after > 0;
++      appendBadge(
++        "Extend ключи",
++        grew ? "success" : "warning",
++      );
++    } else {
++      const grew = after > before;
++      appendBadge(`Extend ${iteration}/${maxExtend}`, grew ? "success" : "neutral");
++    }
++  });
++  if (meta.extend_incomplete) {
++    appendBadge("Extend: объём ниже минимума", "warning");
++  }
 +
- KEYWORD_LIMIT = 8
- KEYWORD_MAX_LENGTH = 64
+   if (meta.include_faq) {
+     const actualFaq = Number(post?.faq_count) || 0;
+     const targetFaq = Number(meta.faq_questions) || null;
+     const ok = targetFaq ? actualFaq === targetFaq : actualFaq > 0;
+     const faqLabel = targetFaq ? `FAQ ${actualFaq}/${targetFaq}` : `FAQ ${actualFaq}`;
+     appendBadge(faqLabel, ok ? "success" : "warning");
+   } else if (Number(post?.faq_count) > 0) {
+     appendBadge(`FAQ ${post.faq_count}`, "neutral");
+   }
  
- _PUNCT_STRIP = "\u00ab\u00bb\u201e\u201c\u201d\"'()[]{}<>.,:;!?-–—"
- _STOPWORDS = {
-     "как",
-     "что",
-     "это",
-     "для",
-     "или",
-     "про",
-     "чтобы",
-     "где",
-     "когда",
-     "от",
-     "до",
-     "при",
-     "под",
-     "над",
-     "без",
-     "через",
-     "между",
-     "если",
-     "ли",
-     "же",
-@@ -142,65 +144,73 @@ def suggest_keywords(
-         _consume(snippet, weight=1)
+   if (typeof meta.include_jsonld === "boolean") {
+     appendBadge(meta.include_jsonld ? "JSON-LD" : "Без JSON-LD", meta.include_jsonld ? "success" : "neutral");
+   }
  
-     if not counter:
-         return []
- 
-     ranked = sorted(counter.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))
-     suggestions: List[str] = []
-     for phrase, _ in ranked:
-         if phrase in suggestions:
-             continue
-         suggestions.append(phrase)
-         if len(suggestions) >= limit:
-             break
-     return suggestions
- 
- 
- def merge_keywords(
-     manual: Iterable[str],
-     auto: Iterable[str],
-     *,
-     limit: int = KEYWORD_LIMIT,
- ) -> Tuple[List[str], List[str], List[str]]:
-     """Merge manual and auto-generated keywords with deduplication and limits."""
- 
-     manual_candidates = [kw for kw in manual if kw]
--    auto_candidates = [kw for kw in auto if kw]
-+    auto_candidates: List[str]
-+    if KEYWORDS_ALLOW_AUTO:
-+        auto_candidates = [kw for kw in auto if kw]
-+    else:
-+        auto_candidates = []
- 
-     manual_used: List[str] = []
-     auto_used: List[str] = []
-     final: List[str] = []
-     seen = set()
- 
-     for kw in manual_candidates:
-         normalized = _cleanup_keyword(kw, allow_digits=True)
-         if not normalized or normalized in seen:
-             continue
-         manual_used.append(normalized)
-         final.append(normalized)
-         seen.add(normalized)
-         if len(final) >= limit:
-             break
- 
-     if len(final) < limit:
-         for kw in auto_candidates:
-             normalized = _cleanup_keyword(kw, allow_digits=False)
-             if not normalized or normalized in seen:
-                 continue
-             auto_used.append(normalized)
-             final.append(normalized)
-             seen.add(normalized)
-             if len(final) >= limit:
-                 break
- 
-     return manual_used, auto_used, final
- 
- 
- def format_keywords_block(keywords: Sequence[str]) -> str:
-     """Render keywords for prompt inclusion as a multi-line block."""
- 
-     items = [kw for kw in keywords if kw]
-     if not items:
-         return ""
-     bullet_list = "\n".join(f"- {kw}" for kw in items)
--    return "Ключевые слова (используй естественно):\n" + bullet_list + "\n\n"
-+    return (
-+        "Ключевые слова (каждое должно прозвучать в тексте естественно):\n"
-+        + bullet_list
-+        + "\n\n"
-+    )
- 
+   const requestedRaw = Array.isArray(meta.sources_requested) ? meta.sources_requested : [];
+   const requestedValues = requestedRaw
+     .map((item) => (typeof item === "string" ? item : item && item.value))
+     .map((value) => (typeof value === "string" ? value.trim() : ""))
+     .filter(Boolean);
+   const requestedCount = requestedValues.length;
+   const usedSources = Array.isArray(post?.sources_used) ? post.sources_used : [];
+   if (requestedCount > 0) {
+     const normalizedUsed = Array.from(new Set(usedSources.map((source) => String(source).trim().toLowerCase()).filter(Boolean)));
+     const usedCount = normalizedUsed.length;
+     const missingCount = requestedValues.filter((value) => !normalizedUsed.includes(value.toLowerCase())).length;
 diff --git a/orchestrate.py b/orchestrate.py
-index e1aced02ffb6260078c80f7a2852372804870c62..5294b4f8a6d335c137bff2c7486ca68d91cd5d68 100644
+index 401d81fe697a8b675141cbcd8d5ea648484782b0..6ec6988af6d8220c6b67179b2d1916674f743c1c 100644
 --- a/orchestrate.py
 +++ b/orchestrate.py
-@@ -26,50 +26,51 @@ from plagiarism_guard import is_too_similar
- from artifacts_store import register_artifact
- from config import (
-     DEFAULT_MAX_LENGTH,
-     DEFAULT_MIN_LENGTH,
-     MAX_CUSTOM_CONTEXT_CHARS,
-     G5_MAX_OUTPUT_TOKENS_MAX,
-     OPENAI_API_KEY,
- )
- from keywords import parse_manual_keywords
- from post_analysis import (
-     PostAnalysisRequirements,
-     analyze as analyze_post,
-     build_retry_instruction,
-     should_retry as post_should_retry,
- )
- from retrieval import estimate_tokens
+@@ -291,52 +291,54 @@ def _merge_extend_output(base_text: str, extension_text: str) -> Tuple[str, int]
+         base_len = len(base)
+         extension_len = len(cleaned_extension)
+         should_replace = False
+         if normalized_extension:
+             if extension_len >= max(base_len, QUALITY_EXTEND_MIN_TOKENS // 2):
+                 should_replace = True
+             elif base_len > 0 and extension_len >= int(base_len * 0.6):
+                 should_replace = True
+             elif normalized_base and normalized_base in normalized_extension and extension_len >= base_len:
+                 should_replace = True
+         if should_replace:
+             combined = cleaned_extension
+         else:
+             separator = ""
+             if not base.endswith("\n") and not cleaned_extension.startswith("\n"):
+                 separator = "\n\n"
+             combined = f"{base}{separator}{cleaned_extension}"
+     delta = len(combined) - len(base)
+     if delta < 0:
+         delta = 0
+     return combined, delta
  
  
- BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
- DEFAULT_CTA_TEXT = (
-     "Семейная ипотека помогает молодым семьям купить жильё на понятных условиях. "
-     "Сравните программы банков и сделайте первый шаг к дому своей мечты уже сегодня."
- )
- TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
- LENGTH_EXTEND_THRESHOLD = DEFAULT_MIN_LENGTH
-+QUALITY_EXTEND_MAX_TOKENS = 800
- LENGTH_SHRINK_THRESHOLD = DEFAULT_MAX_LENGTH
- DISCLAIMER_TEMPLATE = (
-     "⚠️ Дисклеймер: Материал носит информационный характер и не является финансовой рекомендацией. Прежде чем принимать решения, оцените риски и проконсультируйтесь со специалистом."
- )
+ def _resolve_extend_tokens(max_tokens: int) -> int:
+     if max_tokens <= 0:
+-        return QUALITY_EXTEND_MIN_TOKENS
+-    candidate = max(max_tokens, QUALITY_EXTEND_MIN_TOKENS)
++        base = QUALITY_EXTEND_MIN_TOKENS
++    else:
++        base = max_tokens
++    candidate = max(base * 2, QUALITY_EXTEND_MIN_TOKENS)
+     if QUALITY_EXTEND_MAX_TOKENS > 0:
+         candidate = min(candidate, QUALITY_EXTEND_MAX_TOKENS)
+     return max(QUALITY_EXTEND_MIN_TOKENS, candidate)
  
  
- @dataclass
- class GenerationContext:
-     data: Dict[str, Any]
-     context_bundle: ContextBundle
-     messages: List[Dict[str, Any]]
-     clip_texts: List[str]
-     style_profile_applied: bool = False
-     style_profile_source: Optional[str] = None
-     style_profile_variant: Optional[str] = None
-     keywords_manual: List[str] = field(default_factory=list)
-     context_source: str = "index.json"
-     custom_context_text: Optional[str] = None
-     custom_context_len: int = 0
-     custom_context_filename: Optional[str] = None
-     custom_context_hash: Optional[str] = None
-     custom_context_truncated: bool = False
- 
- 
- def _get_cta_text() -> str:
-@@ -247,91 +248,186 @@ def _should_expand_max_tokens(metadata: Optional[Dict[str, Any]]) -> bool:
- def _choose_section_for_extension(data: Dict[str, Any]) -> str:
-     structure = data.get("structure")
-     if isinstance(structure, Iterable):
-         structure_list = [str(item).strip() for item in structure if str(item).strip()]
-         if len(structure_list) >= 2:
-             return structure_list[1]
-         if structure_list:
-             return structure_list[0]
-     return "основную часть"
- 
- 
- def _build_extend_prompt(section_name: str, *, min_target: int, max_target: int) -> str:
+ def _build_jsonld_prompt(article_text: str, requirements: PostAnalysisRequirements) -> str:
+     faq_hint = requirements.faq_questions
+     if isinstance(faq_hint, int) and faq_hint > 0:
+         faq_line = f"Используй вопросы и ответы из блока FAQ (ровно {faq_hint} штук, без изменений)."
+     else:
+         faq_line = "Используй вопросы и ответы из блока FAQ (итоговый блок должен содержать 3\u20135 элементов)."
      return (
-         f"Раскрой раздел «{section_name}», добавь факты и примеры, доведи объём до {min_target}\u2013{max_target} "
-         "символов без пробелов, избегай повторов."
+         "На основе финального текста статьи сформируй JSON-LD разметку FAQPage. "
+         "Сохрани формулировки вопросов и ответов, не придумывай новые. "
+         "Верни только валидный JSON без пояснений и префиксов.\n\n"
+         f"{faq_line}\n\n"
+         f"Текст статьи:\n{article_text.strip()}"
      )
  
  
- def _build_shrink_prompt(*, min_target: int, max_target: int) -> str:
-     return (
-         f"Сократи повторы и второстепенные детали, приведи текст к {min_target}\u2013{max_target} символам без пробелов, "
-         "сохрани исходную структуру."
-     )
+ def _build_jsonld_messages(
+     article_text: str,
+     requirements: PostAnalysisRequirements,
+ ) -> List[Dict[str, str]]:
+     system_message = (
+@@ -360,82 +362,115 @@ def _should_force_quality_extend(
+         min_required = length_block.get("min", requirements.min_chars)
+         try:
+             too_short = int(actual) < int(min_required)
+         except (TypeError, ValueError):
+             too_short = False
+     missing_keywords = report.get("missing_keywords") if isinstance(report, dict) else []
+     has_missing_keywords = isinstance(missing_keywords, list) and bool(missing_keywords)
+     faq_block = report.get("faq") if isinstance(report, dict) else {}
+     faq_within_range = True
+     if isinstance(faq_block, dict):
+         faq_within_range = bool(faq_block.get("within_range", False))
+     else:
+         faq_count = report.get("faq_count") if isinstance(report, dict) else None
+         if not isinstance(faq_count, int) or faq_count < 3 or faq_count > 5:
+             faq_within_range = False
+     return too_short or has_missing_keywords or not faq_within_range
  
  
-+def _merge_extend_output(base_text: str, extension_text: str) -> Tuple[str, int]:
-+    base = base_text or ""
-+    extension = extension_text or ""
-+    if not extension.strip():
-+        return base, 0
-+    if not base:
-+        combined = extension
-+    else:
-+        separator = ""
-+        if not base.endswith("\n") and not extension.lstrip().startswith("\n"):
-+            separator = "\n\n"
-+        combined = f"{base}{separator}{extension.lstrip()}"
-+    delta = len(combined) - len(base)
-+    if delta < 0:
-+        delta = 0
-+    return combined, delta
-+
-+
-+def _should_force_quality_extend(
-+    report: Dict[str, object],
-+    requirements: PostAnalysisRequirements,
-+) -> bool:
-+    length_block = report.get("length") if isinstance(report, dict) else {}
-+    too_short = False
-+    if isinstance(length_block, dict):
-+        actual = length_block.get("chars_no_spaces")
-+        min_required = length_block.get("min", requirements.min_chars)
-+        try:
-+            too_short = int(actual) < int(min_required)
-+        except (TypeError, ValueError):
-+            too_short = False
-+    missing_keywords = report.get("missing_keywords") if isinstance(report, dict) else []
-+    has_missing_keywords = isinstance(missing_keywords, list) and bool(missing_keywords)
-+    faq_block = report.get("faq") if isinstance(report, dict) else {}
-+    faq_within_range = True
-+    if isinstance(faq_block, dict):
-+        faq_within_range = bool(faq_block.get("within_range", False))
-+    else:
-+        faq_count = report.get("faq_count") if isinstance(report, dict) else None
-+        if not isinstance(faq_count, int) or faq_count < 3 or faq_count > 5:
-+            faq_within_range = False
-+    return too_short or has_missing_keywords or not faq_within_range
-+
-+
-+def _build_quality_extend_prompt(
-+    report: Dict[str, object],
-+    requirements: PostAnalysisRequirements,
-+) -> str:
-+    min_required = requirements.min_chars
-+    max_required = requirements.max_chars
-+    missing_keywords = report.get("missing_keywords") if isinstance(report, dict) else []
-+    faq_block = report.get("faq") if isinstance(report, dict) else {}
-+    faq_count = None
-+    if isinstance(faq_block, dict):
-+        faq_count = faq_block.get("count")
-+    elif isinstance(report.get("faq_count"), int):
-+        faq_count = report.get("faq_count")
-+
-+    parts: List[str] = [
-+        (
-+            f"Продолжи текст, чтобы итоговый объём попал в диапазон {min_required}\u2013{max_required} символов без пробелов."
+ def _build_quality_extend_prompt(
+     report: Dict[str, object],
+     requirements: PostAnalysisRequirements,
+ ) -> str:
+     min_required = requirements.min_chars
+     max_required = requirements.max_chars
+     missing_keywords = report.get("missing_keywords") if isinstance(report, dict) else []
++    keyword_list: List[str] = []
++    if isinstance(missing_keywords, list):
++        keyword_list = [
++            str(term).strip()
++            for term in missing_keywords
++            if isinstance(term, str) and str(term).strip()
++        ]
++    keyword_list = list(dict.fromkeys(keyword_list))
+     faq_block = report.get("faq") if isinstance(report, dict) else {}
+     faq_count = None
+     if isinstance(faq_block, dict):
+         faq_count = faq_block.get("count")
+     elif isinstance(report.get("faq_count"), int):
+         faq_count = report.get("faq_count")
+ 
+     parts: List[str] = [
+         (
+             f"Перепиши и расширь текст полностью, чтобы итоговый объём уверенно попал в диапазон {min_required}\u2013{max_required} символов без пробелов (не меньше {min_required})."
+         )
+     ]
+-    if isinstance(missing_keywords, list) and missing_keywords:
+-        highlighted = ", ".join(list(dict.fromkeys(missing_keywords)))
+-        parts.append(f"Добавь недостающие ключевые слова: {highlighted}.")
++    parts.append("Добавь 5 вопросов FAQ, если их нет.")
++    if keyword_list:
++        bullet_list = "\n".join(f"- {term}" for term in keyword_list)
++        parts.append(
++            "Используй недостающие ключевые фразы строго в указанном виде:" "\n" + bullet_list
 +        )
+     else:
+         parts.append("Убедись, что использованы все ключевые слова из списка.")
+ 
+     faq_instruction = "Обязательно продолжить и завершить FAQ: сделай 3\u20135 вопросов с развёрнутыми ответами."
+     if not isinstance(faq_count, int) or faq_count < 3:
+         parts.append("Добавь недостающие вопросы в блок FAQ, чтобы было минимум три.")
+     elif faq_count > 5:
+         parts.append("Сократи блок FAQ до 3\u20135 вопросов.")
+     parts.append(faq_instruction)
+     parts.append(
+         "Добавь недостающие ключевые фразы в точной форме, без изменения их написания или порядка слов."
+     )
+     parts.append("Верни полный обновлённый текст целиком, без пояснений и черновых пометок.")
+ 
+     return " ".join(parts)
+ 
+ 
++def _build_keywords_only_prompt(missing_keywords: List[str]) -> str:
++    keyword_list = [
++        str(term).strip()
++        for term in missing_keywords
++        if isinstance(term, str) and str(term).strip()
 +    ]
-+    if isinstance(missing_keywords, list) and missing_keywords:
-+        highlighted = ", ".join(list(dict.fromkeys(missing_keywords)))
-+        parts.append(f"Добавь недостающие ключевые слова: {highlighted}.")
-+    else:
-+        parts.append("Убедись, что использованы все ключевые слова из списка.")
-+
-+    faq_instruction = "Обязательно продолжить и завершить FAQ: сделай 3\u20135 вопросов с развёрнутыми ответами."
-+    if not isinstance(faq_count, int) or faq_count < 3:
-+        parts.append("Добавь недостающие вопросы в блок FAQ, чтобы было минимум три.")
-+    elif faq_count > 5:
-+        parts.append("Сократи блок FAQ до 3\u20135 вопросов.")
-+    parts.append(faq_instruction)
-+    parts.append(
-+        "Добавь недостающие ключевые фразы в точной форме, без изменения их написания или порядка слов."
++    keyword_list = list(dict.fromkeys(keyword_list))
++    if not keyword_list:
++        return (
++            "Проверь текст и убедись, что все ключевые слова из брифа сохранены в точной форме."
++            " Верни полный текст статьи без пояснений."
++        )
++    bullet_list = "\n".join(f"- {term}" for term in keyword_list)
++    return (
++        "Аккуратно добавь недостающие ключевые фразы в точной форме, сохрани структуру и объём текста. "
++        "Не сокращай и не расширяй материал, просто интегрируй ключи в подходящие абзацы. "
++        "Список обязательных фраз:\n"
++        f"{bullet_list}\n"
++        "Верни полный обновлённый текст без пояснений и служебных пометок."
 +    )
-+
-+    return " ".join(parts)
 +
 +
  def _ensure_length(
@@ -413,122 +411,111 @@ index e1aced02ffb6260078c80f7a2852372804870c62..5294b4f8a6d335c137bff2c7486ca68d
      except (TypeError, ValueError):
          max_effective = LENGTH_SHRINK_THRESHOLD
  
-     if max_effective < min_effective:
-         max_effective = max(min_effective, LENGTH_SHRINK_THRESHOLD)
+@@ -811,83 +846,103 @@ def _generate_variant(
+     )
+     normalized_source = generation_context.context_source or normalized_source
+     prepared_data = generation_context.data
+     active_messages = list(generation_context.messages)
+     cta_text, cta_is_default = _resolve_cta_source(prepared_data)
  
-     if length_no_spaces < max(min_effective, 1):
-         section = _choose_section_for_extension(data)
-         prompt = _build_extend_prompt(section, min_target=min_effective, max_target=max_effective)
-         adjusted_messages = list(messages)
-+        adjusted_messages.append({"role": "assistant", "content": text})
-         adjusted_messages.append({"role": "user", "content": prompt})
--        new_result = llm_generate(
-+        extend_tokens = max(1, min(max_tokens, QUALITY_EXTEND_MAX_TOKENS))
-+        extend_result = llm_generate(
-             adjusted_messages,
-             model=model_name,
-             temperature=temperature,
--            max_tokens=max_tokens,
-+            max_tokens=extend_tokens,
-             timeout_s=timeout,
-             backoff_schedule=backoff_schedule,
+     system_prompt = next((msg.get("content") for msg in active_messages if msg.get("role") == "system"), "")
+     user_prompt = next((msg.get("content") for msg in reversed(active_messages) if msg.get("role") == "user"), "")
+ 
+     length_info: ResolvedLengthLimits
+     if generation_context.length_limits is not None:
+         length_info = generation_context.length_limits
+     else:
+         length_info = resolve_length_limits(theme, prepared_data)
+         existing_limits = prepared_data.get("length_limits")
+         if not isinstance(existing_limits, dict):
+             existing_limits = {}
+         existing_limits.update(
+             {"min_chars": length_info.min_chars, "max_chars": length_info.max_chars}
          )
-+        combined_text, _ = _merge_extend_output(text, extend_result.text)
-+        new_result = GenerationResult(
-+            text=combined_text,
-+            model_used=extend_result.model_used,
-+            retry_used=True,
-+            fallback_used=extend_result.fallback_used,
-+            fallback_reason=extend_result.fallback_reason,
-+            api_route=extend_result.api_route,
-+            schema=extend_result.schema,
-+            metadata=extend_result.metadata,
+         prepared_data["length_limits"] = existing_limits
+ 
+     min_chars = length_info.min_chars
+     max_chars = length_info.max_chars
+     length_sources = {"min": length_info.min_source, "max": length_info.max_source}
++    input_length_limits = prepared_data.get("length_limits")
++    if isinstance(input_length_limits, dict):
++        min_candidate = _safe_optional_positive_int(
++            input_length_limits.get("min_chars") or input_length_limits.get("min")
 +        )
-         return new_result, "extend", adjusted_messages
- 
-     if length_no_spaces > max_effective:
-         prompt = _build_shrink_prompt(min_target=min_effective, max_target=max_effective)
-         adjusted_messages = list(messages)
-         adjusted_messages.append({"role": "user", "content": prompt})
-         new_result = llm_generate(
-             adjusted_messages,
-             model=model_name,
-             temperature=temperature,
-             max_tokens=max_tokens,
-             timeout_s=timeout,
-             backoff_schedule=backoff_schedule,
++        max_candidate = _safe_optional_positive_int(
++            input_length_limits.get("max_chars") or input_length_limits.get("max")
++        )
++        if min_candidate is not None:
++            min_chars = min_candidate
++        if max_candidate is not None:
++            max_chars = max_candidate
++    length_sources_override = prepared_data.get("_length_limits_source")
++    if isinstance(length_sources_override, dict):
++        length_sources.update({
++            "min": length_sources_override.get("min", length_sources.get("min")),
++            "max": length_sources_override.get("max", length_sources.get("max")),
++        })
+     length_warnings = list(length_info.warnings)
+     if length_info.swapped and not length_warnings:
+         length_warnings.append(
+             "Минимальный объём в брифе был больше максимального; значения переставлены местами."
          )
-         return new_result, "shrink", adjusted_messages
+     source_label = f"min={length_sources['min']}, max={length_sources['max']}"
+     if length_info.profile_source and "profile" in length_sources.values():
+         source_label += f" (profile={length_info.profile_source})"
+     print(f"[orchestrate] LENGTH LIMITS: {min_chars}\u2013{max_chars} ({source_label})")
+     for note in length_warnings:
+         print(f"[orchestrate] LENGTH LIMITS WARNING: {note}")
  
-     return result, None, messages
- 
- 
- def _local_now() -> datetime:
-     return datetime.now(BELGRADE_TZ)
- 
- 
- def make_generation_context(
-     *,
-@@ -466,53 +562,53 @@ def _parse_args() -> argparse.Namespace:
-     parser = argparse.ArgumentParser(description="Generate an article using the configured LLM.")
- 
-     env_mode = os.getenv("GEN_MODE", "final").strip().lower() or "final"
-     if env_mode not in {"draft", "final"}:
-         env_mode = "final"
-     default_timeout = _default_timeout()
-     env_backoff = os.getenv("LLM_RETRY_BACKOFF")
- 
-     parser.add_argument("--theme", help="Theme slug (matches profiles/<theme>/...)")
-     parser.add_argument("--data", help="Path to the JSON brief with generation parameters.")
-     parser.add_argument(
-         "--outfile",
-         help="Optional path for the resulting markdown. Defaults to artifacts/<timestamp>__<theme>__article.md",
+     keywords_required = [
+         str(kw).strip()
+         for kw in prepared_data.get("keywords", [])
+         if isinstance(kw, str) and str(kw).strip()
+     ]
+     keyword_mode = str(prepared_data.get("keywords_mode") or "strict").strip().lower() or "strict"
+     if keyword_mode != "strict":
+         keyword_mode = "strict"
+     include_faq = bool(prepared_data.get("include_faq", True))
+     faq_questions_raw = prepared_data.get("faq_questions") if include_faq else None
+     faq_questions = _safe_optional_positive_int(faq_questions_raw)
+     sources_values = _extract_source_values(prepared_data.get("sources"))
+     include_jsonld_flag = bool(getattr(generation_context, "jsonld_requested", False))
+     requirements = PostAnalysisRequirements(
+         min_chars=min_chars,
+         max_chars=max_chars,
+         keywords=list(keywords_required),
+         keyword_mode=keyword_mode,
+         faq_questions=faq_questions,
+         sources=sources_values,
+         style_profile=str(prepared_data.get("style_profile", "")),
++        length_sources=dict(length_sources),
++        jsonld_enabled=include_jsonld_flag,
      )
-     parser.add_argument(
-         "--k",
-         type=int,
-         default=0,
-         help="Number of exemplar clips to attach to CONTEXT (default: 0).",
-     )
-     parser.add_argument("--model", help="Override model name (otherwise uses LLM_MODEL env or default).")
-     parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature (default: 0.3).")
-     parser.add_argument(
-         "--max-tokens",
-         type=int,
--        default=1400,
-+        default=1500,
-         dest="max_tokens",
--        help="Max tokens for generation (default: 1400).",
-+        help="Max tokens for generation (default: 1500).",
-     )
-     parser.add_argument(
-         "--timeout",
-         type=int,
-         default=default_timeout,
-         help="Timeout per request in seconds (default: 60 or LLM_TIMEOUT env).",
-     )
-     parser.add_argument(
-         "--mode",
-         choices=["draft", "final"],
-         default=env_mode,
-         help="Execution mode for metadata tags (defaults to GEN_MODE env or 'final').",
-     )
-     parser.add_argument("--ab", choices=["compare"], help="Run A/B comparison (compare: without vs with context).")
-     parser.add_argument("--batch", help="Path to a JSON/YAML file describing batch generation payloads.")
-     parser.add_argument("--check", action="store_true", help="Validate environment prerequisites and exit.")
-     parser.add_argument(
-         "--retry-backoff",
-         default=env_backoff,
-         help="Override retry backoff schedule in seconds, e.g. '0.5,1,2'.",
-     )
-     return parser.parse_args()
  
+     max_tokens_requested = max_tokens
+     max_tokens_current = _resolve_max_tokens_for_model(model_name, max_tokens_requested, max_chars)
+     tokens_escalated = False
  
- def _parse_backoff_schedule(raw: Optional[str]) -> Optional[List[float]]:
-@@ -758,131 +854,182 @@ def _generate_variant(
-             break
-         if truncation_retry_used:
-             break
+     llm_result = llm_generate(
+         active_messages,
+         model=model_name,
+         temperature=temperature,
+         max_tokens=max_tokens_current,
+         timeout_s=timeout,
+         backoff_schedule=backoff_schedule,
+     )
+ 
+     article_text = llm_result.text
+     effective_model = llm_result.model_used
+     retry_used = llm_result.retry_used
+     fallback_used = llm_result.fallback_used
+     fallback_reason = llm_result.fallback_reason
+     api_route = llm_result.api_route
+     response_schema = llm_result.schema
+ 
+     if model_name.lower().startswith("gpt-5"):
+         escalation_attempts = 0
+@@ -969,143 +1024,265 @@ def _generate_variant(
          truncation_retry_used = True
          print("[orchestrate] Детектор усечённого вывода — запускаю повторную генерацию", file=sys.stderr)
          llm_result = llm_generate(
@@ -551,17 +538,27 @@ index e1aced02ffb6260078c80f7a2852372804870c62..5294b4f8a6d335c137bff2c7486ca68d
  
      post_retry_attempts = 0
      post_analysis_report: Dict[str, object] = {}
-+    quality_extend_used = False
-+    quality_extend_delta_chars = 0
-+    quality_extend_total_chars = len(article_text)
-     while True:
-         article_text, postfix_appended, default_cta_used = _append_cta_if_needed(
-             article_text,
-             cta_text=cta_text,
-             default_cta=cta_is_default,
-         )
-         article_text, disclaimer_appended = _append_disclaimer_if_requested(article_text, prepared_data)
+     quality_extend_used = False
+     quality_extend_delta_chars = 0
+     quality_extend_passes = 0
++    quality_extend_iterations: List[Dict[str, Any]] = []
++    quality_extend_max_iterations = 3
++    extend_incomplete = False
++    keywords_only_extend_used = False
++    last_missing_keywords: List[str] = []
+     postfix_appended = False
+     default_cta_used = False
+     disclaimer_appended = False
+     jsonld_generated = False
+     jsonld_text: str = ""
+     jsonld_model_used: Optional[str] = None
+     jsonld_api_route: Optional[str] = None
+     jsonld_metadata: Optional[Dict[str, Any]] = None
+     jsonld_retry_used: Optional[bool] = None
+     jsonld_fallback_used: Optional[bool] = None
+     jsonld_fallback_reason: Optional[str] = None
  
+     while True:
          post_analysis_report = analyze_post(
              article_text,
              requirements=requirements,
@@ -569,98 +566,230 @@ index e1aced02ffb6260078c80f7a2852372804870c62..5294b4f8a6d335c137bff2c7486ca68d
              retry_count=post_retry_attempts,
              fallback_used=bool(fallback_used),
          )
-+        if not quality_extend_used and _should_force_quality_extend(post_analysis_report, requirements):
-+            extend_instruction = _build_quality_extend_prompt(post_analysis_report, requirements)
-+            previous_text = article_text
-+            active_messages = list(active_messages)
-+            active_messages.append({"role": "assistant", "content": previous_text})
-+            active_messages.append({"role": "user", "content": extend_instruction})
-+            extend_tokens = max(1, min(max_tokens_current, QUALITY_EXTEND_MAX_TOKENS))
-+            extend_result = llm_generate(
-+                active_messages,
-+                model=model_name,
-+                temperature=temperature,
-+                max_tokens=extend_tokens,
-+                timeout_s=timeout,
-+                backoff_schedule=backoff_schedule,
+-        needs_quality_extend = _should_force_quality_extend(post_analysis_report, requirements)
++        missing_keywords_raw = (
++            post_analysis_report.get("missing_keywords")
++            if isinstance(post_analysis_report, dict)
++            else []
++        )
++        missing_keywords_list = [
++            str(term).strip()
++            for term in missing_keywords_raw
++            if isinstance(term, str) and str(term).strip()
++        ]
++        last_missing_keywords = list(missing_keywords_list)
++        length_block = post_analysis_report.get("length") if isinstance(post_analysis_report, dict) else {}
++        chars_no_spaces = None
++        if isinstance(length_block, dict):
++            chars_no_spaces = length_block.get("chars_no_spaces")
++        try:
++            length_issue = int(chars_no_spaces) < int(requirements.min_chars)
++        except (TypeError, ValueError):
++            length_issue = False
++        faq_block = post_analysis_report.get("faq") if isinstance(post_analysis_report, dict) else {}
++        faq_issue = False
++        if isinstance(faq_block, dict):
++            faq_issue = not bool(faq_block.get("within_range", False))
++        needs_quality_extend = bool(length_issue or missing_keywords_list or faq_issue)
+         if needs_quality_extend:
++            if quality_extend_passes >= quality_extend_max_iterations:
++                if length_issue:
++                    extend_incomplete = True
++                break
+             extend_instruction = _build_quality_extend_prompt(post_analysis_report, requirements)
+             previous_text = article_text
+             active_messages = list(active_messages)
+             active_messages.append({"role": "assistant", "content": previous_text})
+             active_messages.append({"role": "user", "content": extend_instruction})
+             extend_tokens = _resolve_extend_tokens(max_tokens_current)
+             extend_result = llm_generate(
+                 active_messages,
+                 model=model_name,
+                 temperature=temperature,
+                 max_tokens=extend_tokens,
+                 timeout_s=timeout,
+                 backoff_schedule=backoff_schedule,
+             )
++            before_chars = len(previous_text)
++            before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
+             combined_text, delta = _merge_extend_output(previous_text, extend_result.text)
+-            if delta <= 0 and quality_extend_passes > 0:
+-                article_text = previous_text
+-                print("[orchestrate] QUALITY EXTEND: no growth detected, stopping extend loop")
+-                break
+-            article_text = combined_text
++            growth_detected = delta > 0 or quality_extend_passes == 0
++            article_text = combined_text if growth_detected else previous_text
+             effective_model = extend_result.model_used
+             fallback_used = extend_result.fallback_used
+             fallback_reason = extend_result.fallback_reason
+             api_route = extend_result.api_route
+             response_schema = extend_result.schema
+             retry_used = True
+             quality_extend_used = True
+-            quality_extend_delta_chars += max(0, delta)
+-            quality_extend_passes += 1
++            after_chars = len(article_text)
++            after_chars_no_spaces = len(re.sub(r"\s+", "", article_text))
++            delta_chars = max(0, after_chars - before_chars)
++            quality_extend_delta_chars += delta_chars
++            iteration_number = quality_extend_passes + 1
++            quality_extend_iterations.append(
++                {
++                    "iteration": iteration_number,
++                    "mode": "quality",
++                    "max_iterations": quality_extend_max_iterations,
++                    "before_chars": before_chars,
++                    "before_chars_no_spaces": before_chars_no_spaces,
++                    "after_chars": after_chars,
++                    "after_chars_no_spaces": after_chars_no_spaces,
++                    "length_issue": bool(length_issue),
++                    "faq_issue": bool(faq_issue),
++                    "missing_keywords": list(missing_keywords_list),
++                }
 +            )
-+            combined_text, delta = _merge_extend_output(previous_text, extend_result.text)
-+            article_text = combined_text
-+            effective_model = extend_result.model_used
-+            fallback_used = extend_result.fallback_used
-+            fallback_reason = extend_result.fallback_reason
-+            api_route = extend_result.api_route
-+            response_schema = extend_result.schema
-+            retry_used = True
-+            quality_extend_used = True
-+            quality_extend_delta_chars = delta
-+            quality_extend_total_chars = len(article_text)
-+            llm_result = GenerationResult(
-+                text=article_text,
-+                model_used=effective_model,
-+                retry_used=True,
-+                fallback_used=fallback_used,
-+                fallback_reason=fallback_reason,
-+                api_route=api_route,
-+                schema=response_schema,
-+                metadata=extend_result.metadata,
-+            )
-+            continue
-+        if quality_extend_used:
-+            break
-         if not post_should_retry(post_analysis_report) or post_retry_attempts >= 2:
-             break
-         refinement_instruction = build_retry_instruction(post_analysis_report, requirements)
-         active_messages = list(active_messages)
-         active_messages.append({"role": "user", "content": refinement_instruction})
-         llm_result = llm_generate(
-             active_messages,
++            quality_extend_passes = iteration_number
+             llm_result = GenerationResult(
+                 text=article_text,
+                 model_used=effective_model,
+                 retry_used=True,
+                 fallback_used=fallback_used,
+                 fallback_reason=fallback_reason,
+                 api_route=api_route,
+                 schema=response_schema,
+                 metadata=extend_result.metadata,
+             )
++            if not growth_detected and quality_extend_passes > 0:
++                print("[orchestrate] QUALITY EXTEND: no growth detected, stopping extend loop")
++                break
+             continue
+         if post_should_retry(post_analysis_report) and post_retry_attempts < 2:
+             refinement_instruction = build_retry_instruction(post_analysis_report, requirements)
+             active_messages = list(active_messages)
+             active_messages.append({"role": "user", "content": refinement_instruction})
+             llm_result = llm_generate(
+                 active_messages,
+                 model=model_name,
+                 temperature=temperature,
+                 max_tokens=max_tokens_current,
+                 timeout_s=timeout,
+                 backoff_schedule=backoff_schedule,
+             )
+             article_text = llm_result.text
+             effective_model = llm_result.model_used
+             fallback_used = llm_result.fallback_used
+             fallback_reason = llm_result.fallback_reason
+             api_route = llm_result.api_route
+             response_schema = llm_result.schema
+             retry_used = True
+             post_retry_attempts += 1
+             continue
+         break
+ 
++    if last_missing_keywords and not keywords_only_extend_used:
++        keyword_prompt = _build_keywords_only_prompt(last_missing_keywords)
++        previous_text = article_text
++        active_messages = list(active_messages)
++        active_messages.append({"role": "assistant", "content": previous_text})
++        active_messages.append({"role": "user", "content": keyword_prompt})
++        extend_tokens = _resolve_extend_tokens(max_tokens_current)
++        extend_result = llm_generate(
++            active_messages,
++            model=model_name,
++            temperature=temperature,
++            max_tokens=extend_tokens,
++            timeout_s=timeout,
++            backoff_schedule=backoff_schedule,
++        )
++        before_chars = len(previous_text)
++        before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
++        combined_text, _ = _merge_extend_output(previous_text, extend_result.text)
++        article_text = combined_text
++        effective_model = extend_result.model_used
++        fallback_used = extend_result.fallback_used
++        fallback_reason = extend_result.fallback_reason
++        api_route = extend_result.api_route
++        response_schema = extend_result.schema
++        retry_used = True
++        quality_extend_used = True
++        keywords_only_extend_used = True
++        after_chars = len(article_text)
++        after_chars_no_spaces = len(re.sub(r"\s+", "", article_text))
++        delta_chars = max(0, after_chars - before_chars)
++        quality_extend_delta_chars += delta_chars
++        quality_extend_iterations.append(
++            {
++                "iteration": quality_extend_passes + 1,
++                "mode": "keywords",
++                "max_iterations": quality_extend_max_iterations,
++                "before_chars": before_chars,
++                "before_chars_no_spaces": before_chars_no_spaces,
++                "after_chars": after_chars,
++                "after_chars_no_spaces": after_chars_no_spaces,
++                "length_issue": False,
++                "faq_issue": False,
++                "missing_keywords": list(last_missing_keywords),
++            }
++        )
++        llm_result = GenerationResult(
++            text=article_text,
++            model_used=effective_model,
++            retry_used=True,
++            fallback_used=fallback_used,
++            fallback_reason=fallback_reason,
++            api_route=api_route,
++            schema=response_schema,
++            metadata=extend_result.metadata,
++        )
++        post_analysis_report = analyze_post(
++            article_text,
++            requirements=requirements,
++            model=effective_model or model_name,
++            retry_count=post_retry_attempts,
++            fallback_used=bool(fallback_used),
++        )
++        last_missing_keywords = [
++            str(term).strip()
++            for term in (post_analysis_report.get("missing_keywords") or [])
++            if isinstance(term, str) and str(term).strip()
++        ]
++
+     quality_extend_total_chars = len(article_text)
+     analysis_characters = len(article_text)
+     analysis_characters_no_spaces = len(re.sub(r"\s+", "", article_text))
+     if isinstance(post_analysis_report, dict):
+         post_analysis_report["had_extend"] = quality_extend_used
+         post_analysis_report["extend_delta_chars"] = quality_extend_delta_chars
+         post_analysis_report["extend_total_chars"] = quality_extend_total_chars
+         post_analysis_report["extend_passes"] = quality_extend_passes
++        post_analysis_report["extend_iterations"] = quality_extend_iterations
++        post_analysis_report["extend_incomplete"] = extend_incomplete
+ 
+     final_text = article_text
+     final_text, postfix_appended, default_cta_used = _append_cta_if_needed(
+         final_text,
+         cta_text=cta_text,
+         default_cta=cta_is_default,
+     )
+     final_text, disclaimer_appended = _append_disclaimer_if_requested(final_text, prepared_data)
+ 
+     if include_jsonld_flag and post_analysis_report.get("meets_requirements") and article_text.strip():
+         jsonld_messages = _build_jsonld_messages(article_text, requirements)
+         jsonld_result = llm_generate(
+             jsonld_messages,
              model=model_name,
-             temperature=temperature,
-             max_tokens=max_tokens_current,
+             temperature=0.0,
+             max_tokens=min(max_tokens_current, JSONLD_MAX_TOKENS),
              timeout_s=timeout,
              backoff_schedule=backoff_schedule,
          )
-         article_text = llm_result.text
-         effective_model = llm_result.model_used
-         fallback_used = llm_result.fallback_used
-         fallback_reason = llm_result.fallback_reason
-         api_route = llm_result.api_route
-         response_schema = llm_result.schema
-         retry_used = True
-         post_retry_attempts += 1
- 
-+    quality_extend_total_chars = len(article_text)
-+    if isinstance(post_analysis_report, dict):
-+        post_analysis_report["had_extend"] = quality_extend_used
-+        post_analysis_report["extend_delta_chars"] = quality_extend_delta_chars
-+        post_analysis_report["extend_total_chars"] = quality_extend_total_chars
-+
-     duration = time.time() - start_time
-     context_bundle = generation_context.context_bundle
-     if normalized_source == "custom":
-         context_used = bool(generation_context.custom_context_text)
-     else:
-         context_used = bool(
-             context_bundle.context_used and not context_bundle.index_missing and effective_k > 0
-         )
- 
-     used_temperature = None
-     if effective_model and not effective_model.lower().startswith("gpt-5"):
-         used_temperature = temperature
- 
-     metadata: Dict[str, Any] = {
-         "theme": theme,
-         "data_path": data_path,
-         "model": model_name,
-         "temperature": temperature,
-         "max_tokens": max_tokens_requested,
-         "timeout_s": timeout,
-         "retrieval_k": effective_k,
-         "context_applied_k": len(context_bundle.items),
-         "clips": [
-             {
-                 "path": item.get("path"),
+         jsonld_candidate = jsonld_result.text.strip()
+         if jsonld_candidate:
+             jsonld_generated = True
+             jsonld_text = jsonld_candidate
+             jsonld_model_used = jsonld_result.model_used
+             jsonld_api_route = jsonld_result.api_route
+@@ -1146,50 +1323,54 @@ def _generate_variant(
                  "score": item.get("score"),
                  "token_estimate": item.get("token_estimate"),
              }
@@ -672,6 +801,8 @@ index e1aced02ffb6260078c80f7a2852372804870c62..5294b4f8a6d335c137bff2c7486ca68d
          "duration_seconds": round(duration, 3),
          "characters": len(article_text),
          "characters_no_spaces": len(re.sub(r"\s+", "", article_text)),
+         "analysis_characters": analysis_characters,
+         "analysis_characters_no_spaces": analysis_characters_no_spaces,
          "words": len(article_text.split()) if article_text.strip() else 0,
          "messages_count": len(active_messages),
          "context_used": context_used,
@@ -680,10 +811,16 @@ index e1aced02ffb6260078c80f7a2852372804870c62..5294b4f8a6d335c137bff2c7486ca68d
          "context_budget_tokens_limit": context_bundle.token_budget_limit,
          "postfix_appended": postfix_appended,
          "length_adjustment": length_adjustment,
-+        "quality_extend_triggered": quality_extend_used,
-+        "quality_extend_delta_chars": quality_extend_delta_chars,
-+        "quality_extend_total_chars": quality_extend_total_chars,
+         "quality_extend_triggered": quality_extend_used,
+         "quality_extend_delta_chars": quality_extend_delta_chars,
+         "quality_extend_total_chars": quality_extend_total_chars,
+         "quality_extend_passes": quality_extend_passes,
++        "quality_extend_iterations": quality_extend_iterations,
++        "quality_extend_max_iterations": quality_extend_max_iterations,
++        "quality_extend_keywords_used": keywords_only_extend_used,
++        "extend_incomplete": extend_incomplete,
          "length_range_target": {"min": min_chars, "max": max_chars},
+         "length_limits_applied": {"min": min_chars, "max": max_chars},
          "mode": mode,
          "model_used": effective_model,
          "temperature_used": used_temperature,
@@ -707,57 +844,27 @@ index e1aced02ffb6260078c80f7a2852372804870c62..5294b4f8a6d335c137bff2c7486ca68d
          "context_source": normalized_source,
          "include_faq": include_faq,
          "faq_questions": faq_questions,
-         "include_jsonld": bool(prepared_data.get("include_jsonld", False)),
 diff --git a/post_analysis.py b/post_analysis.py
-index fffed7204641231524654fa1e3b80e7f4beae383..e7e3d4cf6db4c88663871ec0051c2201e642a161 100644
+index 390602a2ab5910423f8c24543ad665a51e466e52..9282cf4419fb8aa67892445133f913d0df64cfb1 100644
 --- a/post_analysis.py
 +++ b/post_analysis.py
-@@ -1,148 +1,236 @@
- """Lightweight quality checks for generated materials."""
- 
- from __future__ import annotations
- 
- import re
- from dataclasses import dataclass
- from typing import Dict, List, Optional
+@@ -30,50 +30,52 @@ _NORMALIZE_TRANSLATION = str.maketrans(
+         "ё": "е",
+         "Ё": "Е",
+     }
+ )
  
  
- _SPACE_RE = re.compile(r"\s+", re.MULTILINE)
-+_NORMALIZE_TRANSLATION = str.maketrans(
-+    {
-+        "\u00ab": '"',
-+        "\u00bb": '"',
-+        "\u201c": '"',
-+        "\u201d": '"',
-+        "\u201e": '"',
-+        "\u201f": '"',
-+        "\u2018": "'",
-+        "\u2019": "'",
-+        "\u2039": "'",
-+        "\u203a": "'",
-+        "\u2013": "-",
-+        "\u2014": "-",
-+        "\u2015": "-",
-+        "\u2212": "-",
-+        "\u2043": "-",
-+        "\u00a0": " ",
-+        "\u202f": " ",
-+        "ё": "е",
-+        "Ё": "Е",
-+    }
-+)
-+
-+
-+def _normalize_text(value: str) -> str:
-+    normalized = (value or "").replace("\r\n", "\n").replace("\r", "\n")
-+    return normalized.translate(_NORMALIZE_TRANSLATION)
-+
-+
-+def _normalize_keyword(term: str) -> str:
-+    normalized = _normalize_text(term)
-+    normalized = normalized.lower()
-+    normalized = re.sub(r"\s+", " ", normalized).strip()
-+    return normalized
+ def _normalize_text(value: str) -> str:
+     normalized = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+     return normalized.translate(_NORMALIZE_TRANSLATION)
+ 
+ 
+ def _normalize_keyword(term: str) -> str:
+     normalized = _normalize_text(term)
+     normalized = normalized.lower()
+     normalized = re.sub(r"\s+", " ", normalized).strip()
+     return normalized
  @dataclass(frozen=True)
  class PostAnalysisRequirements:
      min_chars: int
@@ -767,6 +874,8 @@ index fffed7204641231524654fa1e3b80e7f4beae383..e7e3d4cf6db4c88663871ec0051c2201
      faq_questions: Optional[int]
      sources: List[str]
      style_profile: str
++    length_sources: Optional[Dict[str, str]] = None
++    jsonld_enabled: bool = False
  
  
  def analyze(
@@ -779,8 +888,7 @@ index fffed7204641231524654fa1e3b80e7f4beae383..e7e3d4cf6db4c88663871ec0051c2201
  ) -> Dict[str, object]:
      """Compute quality diagnostics for the generated article."""
  
--    normalized = text or ""
-+    normalized = _normalize_text(text or "")
+     normalized = _normalize_text(text or "")
      chars_no_spaces = len(_SPACE_RE.sub("", normalized))
      within_limits = requirements.min_chars <= chars_no_spaces <= requirements.max_chars
  
@@ -788,32 +896,24 @@ index fffed7204641231524654fa1e3b80e7f4beae383..e7e3d4cf6db4c88663871ec0051c2201
      sources_used: List[str] = []
  
      lowered = normalized.lower()
-+    lowered_for_phrases = re.sub(r"\s+", " ", lowered)
-+    seen_keywords = set()
-+    keywords_found = 0
-+    keywords_total = 0
+     lowered_for_phrases = re.sub(r"\s+", " ", lowered)
+     seen_keywords = set()
+     keywords_found = 0
+     keywords_total = 0
      for keyword in requirements.keywords:
-         term = keyword.strip()
-         if not term:
-             continue
--        pattern = re.compile(re.escape(term), re.IGNORECASE)
--        count = len(pattern.findall(normalized))
--        keywords_coverage.append({"term": term, "found": count > 0, "count": count})
-+        normalized_term = _normalize_keyword(term)
-+        if normalized_term in seen_keywords:
-+            continue
-+        seen_keywords.add(normalized_term)
-+        is_phrase = " " in normalized_term or "-" in normalized_term
-+        if is_phrase:
-+            count = lowered_for_phrases.count(normalized_term)
-+        else:
-+            pattern = re.compile(rf"(?<!\w){re.escape(normalized_term)}(?!\w)")
-+            count = len(pattern.findall(lowered))
-+        found = count > 0
-+        if found:
-+            keywords_found += 1
-+        keywords_total += 1
-+        keywords_coverage.append({"term": term, "found": found, "count": count})
+@@ -86,85 +88,104 @@ def analyze(
+         seen_keywords.add(normalized_term)
+         is_phrase = " " in normalized_term or "-" in normalized_term
+         if is_phrase:
+             count = lowered_for_phrases.count(normalized_term)
+         else:
+             pattern = re.compile(rf"(?<!\w){re.escape(normalized_term)}(?!\w)")
+             count = len(pattern.findall(lowered))
+         found = count > 0
+         if found:
+             keywords_found += 1
+         keywords_total += 1
+         keywords_coverage.append({"term": term, "found": found, "count": count})
  
      for source in requirements.sources:
          candidate = source.strip()
@@ -827,45 +927,71 @@ index fffed7204641231524654fa1e3b80e7f4beae383..e7e3d4cf6db4c88663871ec0051c2201
                  sources_used.append(candidate)
  
      faq_count = _estimate_faq_questions(normalized)
-+    faq_within_range = 3 <= faq_count <= 5
-+
-+    keywords_usage_percent = 100.0 if keywords_total == 0 else round((keywords_found / keywords_total) * 100, 2)
-+
-+    fail_reasons: List[str] = []
-+    if not within_limits:
-+        fail_reasons.append("length")
-+    if keywords_total > 0 and keywords_found < keywords_total:
-+        fail_reasons.append("keywords")
-+    if not faq_within_range:
-+        fail_reasons.append("faq")
-+    meets_requirements = not fail_reasons
+-    faq_within_range = 3 <= faq_count <= 5
++    faq_required = requirements.faq_questions if isinstance(requirements.faq_questions, int) else None
++    faq_min = 3
++    faq_max = 5
++    if isinstance(faq_required, int) and faq_required > 0:
++        faq_min = max(faq_min, faq_required)
++        faq_max = max(faq_max, faq_required)
++    faq_within_range = faq_min <= faq_count <= faq_max
++    if requirements.jsonld_enabled and faq_count < faq_min:
++        faq_within_range = False
  
+     keywords_usage_percent = 100.0 if keywords_total == 0 else round((keywords_found / keywords_total) * 100, 2)
+ 
+     fail_reasons: List[str] = []
+     if not within_limits:
+         fail_reasons.append("length")
+     if keywords_total > 0 and keywords_found < keywords_total:
+         fail_reasons.append("keywords")
+     if not faq_within_range:
+         fail_reasons.append("faq")
+     meets_requirements = not fail_reasons
+ 
++    length_sources = requirements.length_sources or {}
      report: Dict[str, object] = {
          "length": {
              "chars_no_spaces": chars_no_spaces,
              "within_limits": within_limits,
              "min": requirements.min_chars,
              "max": requirements.max_chars,
++            "source": {
++                "min": length_sources.get("min"),
++                "max": length_sources.get("max"),
++            },
+         },
+         "length_limits_applied": {
+             "min": requirements.min_chars,
+             "max": requirements.max_chars,
++            "source": {
++                "min": length_sources.get("min"),
++                "max": length_sources.get("max"),
++            },
          },
          "keywords_coverage": keywords_coverage,
          "missing_keywords": [item["term"] for item in keywords_coverage if not item["found"]],
-+        "keywords_found": keywords_found,
-+        "keywords_total": keywords_total,
-+        "keywords_usage_percent": keywords_usage_percent,
+         "keywords_found": keywords_found,
+         "keywords_total": keywords_total,
+         "keywords_usage_percent": keywords_usage_percent,
          "faq_count": faq_count,
-+        "faq": {
-+            "count": faq_count,
-+            "within_range": faq_within_range,
-+            "min": 3,
-+            "max": 5,
-+        },
+         "faq": {
+             "count": faq_count,
+             "within_range": faq_within_range,
+-            "min": 3,
+-            "max": 5,
++            "min": faq_min,
++            "max": faq_max,
++            "required": faq_required,
++            "jsonld_enabled": requirements.jsonld_enabled,
+         },
          "sources_used": sources_used,
          "style_profile": requirements.style_profile,
          "model": model,
          "retry_count": retry_count,
          "fallback": bool(fallback_used),
-+        "meets_requirements": meets_requirements,
-+        "fail_reasons": fail_reasons,
+         "meets_requirements": meets_requirements,
+         "fail_reasons": fail_reasons,
      }
      return report
  
@@ -877,338 +1003,17 @@ index fffed7204641231524654fa1e3b80e7f4beae383..e7e3d4cf6db4c88663871ec0051c2201
      if isinstance(length_block, dict) and not length_block.get("within_limits", True):
          return True
      missing = report.get("missing_keywords")
--    if isinstance(missing, list) and len(missing) > 2:
-+    if isinstance(missing, list) and missing:
-+        return True
-+    faq_block = report.get("faq") if isinstance(report, dict) else {}
-+    if isinstance(faq_block, dict) and not faq_block.get("within_range", True):
+     if isinstance(missing, list) and missing:
+         return True
+     faq_block = report.get("faq") if isinstance(report, dict) else {}
+     if isinstance(faq_block, dict) and not faq_block.get("within_range", True):
          return True
      return False
- 
- 
- def build_retry_instruction(
-     report: Dict[str, object],
-     requirements: PostAnalysisRequirements,
- ) -> str:
-     """Generate a user-level instruction for the follow-up retry."""
- 
-     instructions: List[str] = []
-     length_block = report.get("length") if isinstance(report, dict) else {}
-     if isinstance(length_block, dict) and not length_block.get("within_limits", True):
-         target_min = length_block.get("min", requirements.min_chars)
-         target_max = length_block.get("max", requirements.max_chars)
-         actual = length_block.get("chars_no_spaces")
-         if isinstance(actual, int) and actual < target_min:
-             instructions.append(
-                 f"Расширь текст до {target_min}\u2013{target_max} символов без пробелов, добавь новые факты и примеры."
-             )
-         elif isinstance(actual, int) and actual > target_max:
-             instructions.append(
-                 f"Сократи текст до {target_min}\u2013{target_max} символов без пробелов, убери повторы и оставь главное."
-             )
-         else:
-             instructions.append(
-                 f"Соблюдай диапазон {target_min}\u2013{target_max} символов без пробелов."
-             )
- 
-     missing = report.get("missing_keywords")
-     if isinstance(missing, list) and missing:
-         highlighted = ", ".join(list(dict.fromkeys(missing)))
-         instructions.append(
-             "Добавь недостающие ключевые слова в естественном виде: " + highlighted + "."
-         )
- 
-+    faq_block = report.get("faq") if isinstance(report, dict) else {}
-+    faq_count = None
-+    if isinstance(faq_block, dict):
-+        faq_count = faq_block.get("count")
-+        if not faq_block.get("within_range", True):
-+            instructions.append("Сделай блок FAQ на 3–5 вопросов с развёрнутыми ответами.")
-+    elif isinstance(report.get("faq_count"), int):
-+        faq_count = report.get("faq_count")
-+        if faq_count < 3 or faq_count > 5:
-+            instructions.append("Сделай блок FAQ на 3–5 вопросов с развёрнутыми ответами.")
-+
-     if not instructions:
-         return "Уточни ответ с учётом исходных требований."
-     return " ".join(instructions)
- 
- 
- def _extract_domain(value: str) -> str:
-     cleaned = value.lower().strip()
-     cleaned = cleaned.replace("https://", "").replace("http://", "")
-     if "/" in cleaned:
-         cleaned = cleaned.split("/", 1)[0]
-     return cleaned
- 
- 
- def _estimate_faq_questions(text: str) -> int:
-     lines = text.splitlines()
-     question_count = 0
-     in_faq = False
-     for raw_line in lines:
-         line = raw_line.strip()
-         if not line:
-             continue
-         lowered = line.lower()
-         if lowered.startswith("faq") or lowered.startswith("# faq") or lowered.startswith("## faq"):
-             in_faq = True
-             continue
-diff --git a/rules_engine.py b/rules_engine.py
-index f3401c966b03009bdc68d64227d7643ade470ad3..a13c626b2a342926971083c5ab9661cd40fc0135 100644
---- a/rules_engine.py
-+++ b/rules_engine.py
-@@ -150,52 +150,54 @@ def _render_sources_block(sources: List[Dict[str, str]]) -> str:
-     lines: List[str] = []
-     usage_labels = {
-         "quote": "цитата с атрибуцией",
-         "summary": "пересказ со ссылкой",
-         "inspiration": "вдохновение без ссылки",
-     }
-     for source in sources:
-         value = str(source.get("value", "")).strip()
-         if not value:
-             continue
-         usage = str(source.get("usage", "")).strip().lower()
-         usage_label = usage_labels.get(usage, usage)
-         if usage_label:
-             lines.append(f"- {value} — {usage_label}")
-         else:
-             lines.append(f"- {value}")
-     if not lines:
-         return ""
-     return "Если указаны источники — используй только их:\n" + "\n".join(lines) + "\n\n"
- 
- 
- def _render_faq_line(include_faq: bool, faq_questions: Optional[int]) -> str:
-     if not include_faq:
-         return ""
-     if faq_questions and faq_questions > 0:
--        return f"В конце добавь блок FAQ (часто задаваемые вопросы по теме) на {faq_questions} вопросов.\n"
--    return "В конце добавь блок FAQ (часто задаваемые вопросы по теме).\n"
-+        return (
-+            f"В конце добавь блок FAQ (часто задаваемые вопросы по теме) на {faq_questions} вопросов с ответами.\n"
-+        )
-+    return "В конце добавь блок FAQ (часто задаваемые вопросы по теме) на 3\u20135 вопросов с ответами.\n"
- 
- 
- def _render_jsonld_line(include_jsonld: bool) -> str:
-     if not include_jsonld:
-         return ""
-     return "Если включена опция JSON-LD — сгенерируй корректную SEO-разметку FAQPage.\n\n"
- 
- 
- def _normalize_sources(raw: Any) -> List[Dict[str, str]]:
-     if not isinstance(raw, list):
-         return []
-     normalized: List[Dict[str, str]] = []
-     for item in raw:
-         if not isinstance(item, dict):
-             continue
-         value = str(item.get("value", "")).strip()
-         usage = str(item.get("usage", "")).strip().lower()
-         if not value:
-             continue
-         normalized.append({"value": value, "usage": usage})
-     return normalized
- 
- 
- __all__ = ["build_prompt"]
- 
-diff --git a/tests/test_keywords.py b/tests/test_keywords.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..f1f2f290172e7282450d169e0303ff4eacacc018
---- /dev/null
-+++ b/tests/test_keywords.py
-@@ -0,0 +1,29 @@
-+from __future__ import annotations
-+
-+import keywords
-+
-+
-+def test_merge_keywords_skips_auto_when_flag_disabled(monkeypatch):
-+    monkeypatch.setattr(keywords, "KEYWORDS_ALLOW_AUTO", False, raising=False)
-+
-+    manual_used, auto_used, final = keywords.merge_keywords(
-+        ["Ручной ключ"],
-+        ["Автоматический вариант"],
-+    )
-+
-+    assert manual_used == ["ручной ключ"]
-+    assert auto_used == []
-+    assert final == manual_used
-+
-+
-+def test_merge_keywords_includes_auto_when_flag_enabled(monkeypatch):
-+    monkeypatch.setattr(keywords, "KEYWORDS_ALLOW_AUTO", True, raising=False)
-+
-+    manual_used, auto_used, final = keywords.merge_keywords(
-+        ["Manual"],
-+        ["Auto Candidate"],
-+    )
-+
-+    assert manual_used == ["manual"]
-+    assert auto_used == ["auto candidate"]
-+    assert final == manual_used + auto_used
-diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index e942e90fc967d9908c0bd577a4860c9c67f3d5bc..9fabf7c9ed4c9a1443010e2aa53aa54b4d0be828 100644
---- a/tests/test_llm_client.py
-+++ b/tests/test_llm_client.py
-@@ -1,37 +1,44 @@
- # -*- coding: utf-8 -*-
- from pathlib import Path
- from unittest.mock import patch
- import httpx
- import pytest
- import sys
- 
- sys.path.append(str(Path(__file__).resolve().parents[1]))
- 
- from llm_client import GenerationResult, generate
- 
- 
-+@pytest.fixture(autouse=True)
-+def _force_api_key(monkeypatch):
-+    monkeypatch.setenv("OPENAI_API_KEY", "test")
-+    yield
-+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-+
-+
- class DummyResponse:
-     def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
-         if payload is None:
-             payload = {
-                 "choices": [
-                     {
-                         "message": {
-                             "content": "ok",
-                         }
-                     }
-                 ]
-             }
-         self._json = payload
-         self.status_code = status_code
-         self.text = text
-         self._raise_for_status_exc = raise_for_status_exc
- 
-     def raise_for_status(self):
-         if self._raise_for_status_exc:
-             raise self._raise_for_status_exc
-         return None
- 
-     def json(self):
-         return self._json
- 
-@@ -411,41 +418,41 @@ def test_generate_escalates_max_tokens_when_truncated():
-             }
-         ],
-     }
-     final_payload = {
-         "status": "completed",
-         "output": [
-             {
-                 "content": [
-                     {"type": "text", "text": "expanded"},
-                 ]
-             }
-         ],
-     }
-     client = DummyClient(payloads=[initial_payload, final_payload])
-     with patch("llm_client.httpx.Client", return_value=client):
-         result = generate(
-             messages=[{"role": "user", "content": "ping"}],
-             model="gpt-5",
-             temperature=0.1,
-         )
- 
-     assert isinstance(result, GenerationResult)
-     assert result.text == "expanded"
-     assert result.retry_used is True
-     assert client.call_count == 2
--    assert client.requests[1]["json"]["max_output_tokens"] == 2048
-+    assert client.requests[1]["json"]["max_output_tokens"] == 2200
- 
- 
- def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):
-     monkeypatch.setattr("llm_client.FORCE_MODEL", True)
-     client = DummyClient(payloads=[], availability=[403])
-     with patch("llm_client.httpx.Client", return_value=client):
-         with pytest.raises(RuntimeError) as excinfo:
-             generate(
-                 messages=[{"role": "user", "content": "ping"}],
-                 model="gpt-5",
-                 temperature=0.1,
-                 max_tokens=42,
-             )
- 
-     assert "Model GPT-5 not available for this key/plan" in str(excinfo.value)
 diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
-index fa7b2ae7f6586b7531cd7466ecf01d3363ddfee3..e960c41512556c49fddbf687763a214eb829ac00 100644
+index 8157602ffaa7a22c2de4456d13d76eda6485a8f4..140dc18f704908f7b16bd9242f60efa27a66deb0 100644
 --- a/tests/test_orchestrate_utils.py
 +++ b/tests/test_orchestrate_utils.py
-@@ -1,49 +1,52 @@
- # -*- coding: utf-8 -*-
- import os
- import sys
- from datetime import datetime
- from pathlib import Path
- 
- import pytest
- from zoneinfo import ZoneInfo
- 
- sys.path.append(str(Path(__file__).resolve().parents[1]))
- 
- from llm_client import GenerationResult  # noqa: E402
- from orchestrate import (  # noqa: E402
-     LENGTH_EXTEND_THRESHOLD,
-     LENGTH_SHRINK_THRESHOLD,
-     _append_cta_if_needed,
-     _choose_section_for_extension,
-+    _build_quality_extend_prompt,
-     _ensure_length,
-     _is_truncated,
-     _make_output_path,
-     _normalize_custom_context_text,
-+    _should_force_quality_extend,
-     generate_article_from_payload,
-     make_generation_context,
- )
-+from post_analysis import PostAnalysisRequirements  # noqa: E402
- from config import MAX_CUSTOM_CONTEXT_CHARS  # noqa: E402
- 
- 
- def test_is_truncated_detects_comma():
-     assert _is_truncated("Незавершённое предложение,")
- 
- 
- def test_is_truncated_accepts_finished_sentence():
-     assert not _is_truncated("Предложение завершено.")
- 
- 
- def test_append_cta_appends_when_needed():
-     env_var = "DEFAULT_CTA"
-     previous = os.environ.get(env_var)
-     try:
-         os.environ[env_var] = "Тестовый CTA."
-         appended_text, appended, default_used = _append_cta_if_needed(
-             "Описание продукта,",
-             cta_text="Тестовый CTA.",
-             default_cta=True,
-         )
-         assert appended
-         assert appended_text.endswith("Тестовый CTA.")
-         assert "\n\n" in appended_text
-         assert default_used
-@@ -53,79 +56,116 @@ def test_append_cta_appends_when_needed():
-         elif env_var in os.environ:
-             del os.environ[env_var]
- 
- 
- def test_choose_section_prefers_second_item():
-     data = {"structure": ["Введение", "Основная часть", "Заключение"]}
-     assert _choose_section_for_extension(data) == "Основная часть"
- 
- 
+@@ -65,75 +65,78 @@ def test_choose_section_prefers_second_item():
  def test_append_cta_respects_complete_text():
      text = "Готовый вывод."
      appended_text, appended, default_used = _append_cta_if_needed(
@@ -1225,46 +1030,57 @@ index fa7b2ae7f6586b7531cd7466ecf01d3363ddfee3..e960c41512556c49fddbf687763a214e
      assert _is_truncated("Оборванный текст...")
  
  
-+def _make_requirements() -> PostAnalysisRequirements:
-+    return PostAnalysisRequirements(
-+        min_chars=3500,
-+        max_chars=6000,
-+        keywords=["ключевое слово"],
-+        keyword_mode="soft",
-+        faq_questions=None,
-+        sources=[],
-+        style_profile="",
-+    )
-+
-+
-+def test_quality_extend_triggers_on_missing_faq():
-+    report = {
-+        "length": {"chars_no_spaces": 3600, "min": 3500, "max": 6000},
-+        "missing_keywords": [],
-+        "faq": {"within_range": False, "count": 1},
-+    }
-+    assert _should_force_quality_extend(report, _make_requirements())
-+
-+
-+def test_quality_extend_prompt_mentions_keywords_and_faq():
-+    report = {
-+        "length": {"chars_no_spaces": 2800, "min": 3500, "max": 6000},
-+        "missing_keywords": ["ключевое слово"],
-+        "faq": {"within_range": False, "count": 1},
-+    }
-+    prompt = _build_quality_extend_prompt(report, _make_requirements())
-+    assert "продолжить и завершить FAQ" in prompt
-+    assert "ключевое слово" in prompt
-+    assert "3500" in prompt and "6000" in prompt
-+    assert "Добавь недостающие ключевые фразы" in prompt
-+
-+
+ def _make_requirements() -> PostAnalysisRequirements:
+     return PostAnalysisRequirements(
+         min_chars=3500,
+         max_chars=6000,
+         keywords=["ключевое слово"],
+         keyword_mode="strict",
+         faq_questions=None,
+         sources=[],
+         style_profile="",
++        length_sources=None,
++        jsonld_enabled=False,
+     )
+ 
+ 
+ def test_quality_extend_triggers_on_missing_faq():
+     report = {
+         "length": {"chars_no_spaces": 3600, "min": 3500, "max": 6000},
+         "missing_keywords": [],
+         "faq": {"within_range": False, "count": 1},
+     }
+     assert _should_force_quality_extend(report, _make_requirements())
+ 
+ 
+ def test_quality_extend_prompt_mentions_keywords_and_faq():
+     report = {
+         "length": {"chars_no_spaces": 2800, "min": 3500, "max": 6000},
+         "missing_keywords": ["ключевое слово"],
+         "faq": {"within_range": False, "count": 1},
+     }
+     requirements = _make_requirements()
+     prompt = _build_quality_extend_prompt(report, requirements)
+     assert "продолжить и завершить FAQ" in prompt
+     assert "ключевое слово" in prompt
+     expected_range = f"{requirements.min_chars}\u2013{requirements.max_chars}"
+     assert expected_range in prompt
+-    assert "Добавь недостающие ключевые фразы" in prompt
++    assert "Добавь 5 вопросов FAQ, если их нет" in prompt
++    assert "Используй недостающие ключевые фразы" in prompt
+ 
+ 
  def test_ensure_length_triggers_extend(monkeypatch):
      captured = {}
  
      def fake_llm(messages, **kwargs):
          captured["prompt"] = messages[-1]["content"]
-         return GenerationResult(text="extended", model_used="model", retry_used=False, fallback_used=None)
+         return GenerationResult(
+             text="Полный обновлённый текст",
+             model_used="model",
+             retry_used=False,
+             fallback_used=None,
+         )
  
      monkeypatch.setattr("orchestrate.llm_generate", fake_llm)
      short_text = "s"
@@ -1277,104 +1093,86 @@ index fa7b2ae7f6586b7531cd7466ecf01d3363ddfee3..e960c41512556c49fddbf687763a214e
      new_result, adjustment, new_messages = _ensure_length(
          base_result,
          base_messages,
-         data=data,
-         model_name="model",
-         temperature=0.3,
-         max_tokens=100,
-         timeout=5,
-         backoff_schedule=[0.5],
+diff --git a/tests/test_post_analysis.py b/tests/test_post_analysis.py
+index 4a5bd8324d7f35b47368eeb4e88b6bd4e805b6e5..c1137ebf0b0d066fe7704bd6ca01cf62bf9ee74d 100644
+--- a/tests/test_post_analysis.py
++++ b/tests/test_post_analysis.py
+@@ -1,53 +1,77 @@
+ from post_analysis import PostAnalysisRequirements, analyze
+ 
+ 
+ def _make_requirements(keywords):
+     return PostAnalysisRequirements(
+         min_chars=0,
+         max_chars=10000,
+         keywords=list(keywords),
+         keyword_mode="strict",
+         faq_questions=None,
+         sources=[],
+         style_profile="",
++        length_sources=None,
++        jsonld_enabled=False,
      )
  
--    assert new_result.text == "extended"
-+    assert new_result.text.endswith("extended")
-+    assert new_result.text.startswith(short_text)
-     assert adjustment == "extend"
--    assert len(new_messages) == len(base_messages) + 1
-+    assert len(new_messages) == len(base_messages) + 2
-+    assert new_messages[-2]["role"] == "assistant"
-+    assert new_messages[-2]["content"] == short_text
-     assert "Основная часть" in captured["prompt"]
+ 
+ def test_keyword_detection_respects_word_boundaries():
+     requirements = _make_requirements(["банк", "страхование жизни"])
+     text = (
+         "Это банковский продукт. Страхование жизни доступно.\n\n"
+         "FAQ\n"
+         "1. Что такое страхование жизни?\n"
+         "Ответ.\n"
+         "2. Как оформить полис?\n"
+         "Ответ.\n"
+         "3. Какие преимущества?\n"
+         "Ответ."
+     )  # no standalone "банк"
+     report = analyze(text, requirements=requirements, model="gpt", retry_count=0, fallback_used=False)
+ 
+     assert "банк" in report["missing_keywords"]
+     assert "страхование жизни" not in report["missing_keywords"]
+     assert "keywords" in report["fail_reasons"]
+     assert "faq" not in report["fail_reasons"]
+     assert not report["meets_requirements"]
  
  
- def test_ensure_length_triggers_shrink(monkeypatch):
-     captured = {}
+ def test_keyword_normalization_handles_yo_and_nbsp():
+     requirements = _make_requirements(["ёлка", "тёплый прием"])
+     text = (
+         "Елка украшена. Теплый\u00a0прием гостей организован.\n\n"
+         "FAQ\n"
+         "1. Что дарить?\n"
+         "Ответ.\n"
+         "2. Когда готовиться?\n"
+         "Ответ.\n"
+         "3. Как украсить дом?\n"
+         "Ответ."
+     )
+     report = analyze(text, requirements=requirements, model="gpt", retry_count=0, fallback_used=False)
  
-     def fake_llm(messages, **kwargs):
-         captured["prompt"] = messages[-1]["content"]
-         return GenerationResult(text="shrunk", model_used="model", retry_used=False, fallback_used=None)
- 
-     monkeypatch.setattr("orchestrate.llm_generate", fake_llm)
-     long_text = "x" * (LENGTH_SHRINK_THRESHOLD + 10)
-     base_messages = [{"role": "system", "content": "base"}]
- 
-     base_result = GenerationResult(text=long_text, model_used="model", retry_used=False, fallback_used=None)
- 
-     new_result, adjustment, new_messages = _ensure_length(
-         base_result,
-         base_messages,
-         data={},
-         model_name="model",
-         temperature=0.3,
-         max_tokens=100,
-         timeout=5,
-         backoff_schedule=[0.5],
-diff --git a/tests/test_post_analysis.py b/tests/test_post_analysis.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..4a5bd8324d7f35b47368eeb4e88b6bd4e805b6e5
---- /dev/null
-+++ b/tests/test_post_analysis.py
-@@ -0,0 +1,53 @@
-+from post_analysis import PostAnalysisRequirements, analyze
+     assert not report["missing_keywords"], report["missing_keywords"]
+     assert report["meets_requirements"]
+     assert report["fail_reasons"] == []
 +
 +
-+def _make_requirements(keywords):
-+    return PostAnalysisRequirements(
-+        min_chars=0,
-+        max_chars=10000,
-+        keywords=list(keywords),
++def test_analyze_reports_length_sources_and_jsonld_requirement():
++    requirements = PostAnalysisRequirements(
++        min_chars=100,
++        max_chars=500,
++        keywords=[],
 +        keyword_mode="strict",
-+        faq_questions=None,
++        faq_questions=5,
 +        sources=[],
 +        style_profile="",
++        length_sources={"min": "user", "max": "profile"},
++        jsonld_enabled=True,
 +    )
-+
-+
-+def test_keyword_detection_respects_word_boundaries():
-+    requirements = _make_requirements(["банк", "страхование жизни"])
-+    text = (
-+        "Это банковский продукт. Страхование жизни доступно.\n\n"
-+        "FAQ\n"
-+        "1. Что такое страхование жизни?\n"
-+        "Ответ.\n"
-+        "2. Как оформить полис?\n"
-+        "Ответ.\n"
-+        "3. Какие преимущества?\n"
-+        "Ответ."
-+    )  # no standalone "банк"
++    text = "a" * 150
 +    report = analyze(text, requirements=requirements, model="gpt", retry_count=0, fallback_used=False)
 +
-+    assert "банк" in report["missing_keywords"]
-+    assert "страхование жизни" not in report["missing_keywords"]
-+    assert "keywords" in report["fail_reasons"]
-+    assert "faq" not in report["fail_reasons"]
-+    assert not report["meets_requirements"]
-+
-+
-+def test_keyword_normalization_handles_yo_and_nbsp():
-+    requirements = _make_requirements(["ёлка", "тёплый прием"])
-+    text = (
-+        "Елка украшена. Теплый\u00a0прием гостей организован.\n\n"
-+        "FAQ\n"
-+        "1. Что дарить?\n"
-+        "Ответ.\n"
-+        "2. Когда готовиться?\n"
-+        "Ответ.\n"
-+        "3. Как украсить дом?\n"
-+        "Ответ."
-+    )
-+    report = analyze(text, requirements=requirements, model="gpt", retry_count=0, fallback_used=False)
-+
-+    assert not report["missing_keywords"], report["missing_keywords"]
-+    assert report["meets_requirements"]
-+    assert report["fail_reasons"] == []
++    assert report["length"]["source"] == {"min": "user", "max": "profile"}
++    assert report["length_limits_applied"]["source"] == {"min": "user", "max": "profile"}
++    assert report["faq"]["jsonld_enabled"] is True
++    assert report["faq"]["min"] == 5
++    assert "faq" in report["fail_reasons"]
 
