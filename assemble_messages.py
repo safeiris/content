@@ -24,81 +24,74 @@ _STYLE_PROFILE_VARIANT_PATHS = {
     "light": STYLE_PROFILE_LIGHT_PATH,
 }
 
-STYLES_DIR = Path(__file__).resolve().parent / "profiles/finance/styles"
+STYLES_DIR = Path("profiles/finance/styles")
 
 
-def _load_style_json(path: Path) -> Any:
+def _safe_load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as stream:
         return json.load(stream)
 
 
-def _normalize_style_tokens(raw: Any) -> List[str]:
-    if isinstance(raw, str):
-        text = raw.strip()
-        return [text] if text else []
-    if isinstance(raw, (list, tuple, set)):
-        normalized: List[str] = []
-        for item in raw:
-            token = str(item).strip()
-            if token:
-                normalized.append(token)
-        return normalized
-    return []
+def _load_style_profile(name: str) -> Optional[Dict[str, Any]]:
+    profile_path = STYLES_DIR / f"{name}.json"
+    if not profile_path.exists() or profile_path.stat().st_size < 2:
+        return None
+    try:
+        payload = _safe_load_json(profile_path)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def build_style_instruction(style_data: Dict[str, Any]) -> str:
-    if not isinstance(style_data, dict) or not style_data.get("enabled"):
+    if not style_data or not style_data.get("enabled"):
         return ""
 
     style_slug = str(style_data.get("style", "sravni")).strip().lower() or "sravni"
-    strength_raw = style_data.get("strength", 0.6)
     try:
-        strength = float(strength_raw)
+        strength = float(style_data.get("strength", 0.6))
     except (TypeError, ValueError):
         strength = 0.6
 
-    profile_path = STYLES_DIR / f"{style_slug}.json"
-    if not profile_path.exists():
+    profile = _load_style_profile(style_slug)
+    if not profile:
         return ""
 
+    tone = str(profile.get("tone", "нейтральный, понятный")).strip() or "нейтральный, понятный"
+    avg_len_raw = profile.get("avg_sentence_len", 15)
     try:
-        profile_payload = _load_style_json(profile_path)
-    except (OSError, json.JSONDecodeError):
-        return ""
+        avg_len = int(avg_len_raw)
+    except (TypeError, ValueError):
+        try:
+            avg_len = int(float(avg_len_raw))
+        except (TypeError, ValueError):
+            avg_len = 15
 
-    profile: Dict[str, Any]
-    if isinstance(profile_payload, dict):
-        profile = profile_payload
-    elif isinstance(profile_payload, list):
-        profile = next(
-            (
-                item
-                for item in profile_payload
-                if isinstance(item, dict)
-                and any(key in item for key in ("tone", "avg_sentence_len", "must_use", "avoid_words"))
-            ),
-            {},
-        )
-    else:
-        profile = {}
+    must_tokens = profile.get("must_use", []) or []
+    avoid_tokens = profile.get("avoid_words", []) or []
+    hints_raw = profile.get("style_hints", []) or []
 
-    tone = str(profile.get("tone", "нейтральный")).strip() or "нейтральный"
+    hints: List[str] = []
+    for item in hints_raw if isinstance(hints_raw, (list, tuple, set)) else []:
+        text = str(item).strip()
+        if text:
+            hints.append(text)
+
+    must = ", ".join(str(item).strip() for item in must_tokens if str(item).strip())
+    avoid = ", ".join(str(item).strip() for item in avoid_tokens if str(item).strip())
+
     parts = [f"Пиши в тоне: {tone}."]
-
     if strength > 0.4:
-        avg_sentence_len = profile.get("avg_sentence_len", 15)
-        parts.append(f"Средняя длина предложений {avg_sentence_len} слов.")
-    if strength > 0.5:
-        parts.append("Используй структуру: определение → шаги → пример расчёта → вывод.")
+        parts.append(f"Средняя длина предложений — около {avg_len} слов.")
+    if strength > 0.5 and hints:
+        parts.append("Следуй схеме: " + "; ".join(hints) + ".")
     if strength > 0.7:
-        must_tokens = _normalize_style_tokens(profile.get("must_use", []))
-        avoid_tokens = _normalize_style_tokens(profile.get("avoid_words", []))
-        if must_tokens:
-            parts.append(f"Используй слова: {', '.join(must_tokens)}.")
-        if avoid_tokens:
-            parts.append(f"Избегай слов: {', '.join(avoid_tokens)}.")
+        if must:
+            parts.append(f"Используй слова: {must}.")
+        if avoid:
+            parts.append(f"Избегай слов: {avoid}.")
 
-    return " ".join(parts).strip()
+    return " ".join(parts)
 
 
 def _style_profile_file_for_variant(variant: str) -> Tuple[str, Path]:
@@ -291,9 +284,6 @@ def _build_user_instruction(payload: Dict[str, Any]) -> str:
         else:
             instruction = base_instruction
 
-    style_instruction = build_style_instruction(payload.get("style", {})) if payload else ""
-    if style_instruction:
-        return f"{style_instruction}\n\n{instruction}".strip()
     return instruction
 
 
@@ -372,7 +362,12 @@ def assemble_messages(
             messages.append({"role": "system", "content": f"CONTEXT\n{context_block}"})
 
     user_instruction = _build_user_instruction(payload)
-    messages.append({"role": "user", "content": user_instruction})
+    style_instruction = build_style_instruction(payload.get("style", {})) if payload else ""
+    if style_instruction:
+        user_prompt = f"{style_instruction}\n\n{user_instruction}".strip()
+    else:
+        user_prompt = user_instruction
+    messages.append({"role": "user", "content": user_prompt})
     return messages
 
 

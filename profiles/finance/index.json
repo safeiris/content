@@ -1,13 +1,4 @@
 {
-  "style_profiles": ["sravni", "banki"],
-  "default_style": "sravni",
-  "style_strength": 0.6,
-  "style_enabled_default": false
-}
-
-
-
-{
   "theme": "finance",
   "model": "text-embedding-3-small",
   "max_tokens_est": 600,
@@ -4644,5 +4635,12 @@
       "content_hash": "c81cc3f461cd27b4b48767aa463268d3",
       "token_estimate": 30
     }
-  ]
+  ],
+  "style_profiles": [
+    "sravni",
+    "banki"
+  ],
+  "default_style": "sravni",
+  "style_strength": 0.6,
+  "style_enabled_default": false
 }
