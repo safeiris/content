@@ -51,6 +51,9 @@ TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
 LENGTH_EXTEND_THRESHOLD = DEFAULT_MIN_LENGTH
 QUALITY_EXTEND_MAX_TOKENS = 2800
 QUALITY_EXTEND_MIN_TOKENS = 2000
+FAQ_PASS_MAX_TOKENS = 900
+FAQ_PASS_MAX_ITERATIONS = 2
+TRIM_PASS_MAX_TOKENS = 900
 LENGTH_SHRINK_THRESHOLD = DEFAULT_MAX_LENGTH
 JSONLD_MAX_TOKENS = 800
 DISCLAIMER_TEMPLATE = (
@@ -196,6 +199,18 @@ def _append_disclaimer_if_requested(text: str, data: Dict[str, Any]) -> Tuple[st
     if stripped:
         return f"{stripped}\n\n{template}", True
     return template, True
+
+
+def _clean_trailing_noise(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = text.rstrip()
+    if not cleaned:
+        return cleaned
+    default_cta = _get_cta_text().rstrip()
+    if default_cta and cleaned.endswith(default_cta):
+        cleaned = cleaned[: -len(default_cta)].rstrip()
+    return cleaned
 
 
 def _safe_positive_int(value: Any, default: int) -> int:
@@ -425,6 +440,151 @@ def _build_quality_extend_prompt(
     parts.append("Верни полный обновлённый текст целиком, без пояснений и черновых пометок.")
 
     return " ".join(parts)
+
+
+def _extract_faq_block(text: str) -> Tuple[str, str, str]:
+    if not text:
+        return "", "", ""
+    pattern = re.compile(r"(?im)(^|\n)(##?\s*)?faq\s*\n")
+    match = pattern.search(text)
+    if not match:
+        return text, "", ""
+    start = match.start()
+    block_start = match.end()
+    remainder = text[block_start:]
+    end_match = re.search(r"\n#(?!#?\s*faq)", remainder, flags=re.IGNORECASE)
+    block_end = block_start + end_match.start() if end_match else len(text)
+    prefix = text[:start].rstrip()
+    block = text[start:block_end].strip()
+    suffix = text[block_end:].lstrip("\n")
+    return prefix, block, suffix
+
+
+def _parse_faq_pairs(block: str) -> List[Tuple[str, str]]:
+    if not block:
+        return []
+    lines = block.splitlines()
+    content_lines: List[str] = []
+    heading_skipped = False
+    for line in lines:
+        if not heading_skipped and "faq" in line.lower():
+            heading_skipped = True
+            continue
+        content_lines.append(line)
+    content = "\n".join(content_lines).strip()
+    if not content:
+        return []
+    pattern = re.compile(
+        r"\*\*Вопрос[^*]*\*\*\s*(.+?)\n+\*\*Ответ\.\*\*\s*(.*?)(?=\n\*\*Вопрос|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    pairs: List[Tuple[str, str]] = []
+    for match in pattern.finditer(content):
+        question = re.sub(r"\s+", " ", match.group(1)).strip()
+        answer = match.group(2).strip()
+        pairs.append((question, answer))
+    return pairs
+
+
+def _faq_block_format_valid(text: str, expected_pairs: int) -> Tuple[bool, Dict[str, Any]]:
+    _, block, _ = _extract_faq_block(text)
+    result: Dict[str, Any] = {
+        "has_block": bool(block),
+        "expected_pairs": expected_pairs,
+    }
+    if not block:
+        result["pairs_found"] = 0
+        result["unique_questions"] = 0
+        result["invalid_answers"] = expected_pairs
+        return False, result
+    pairs = _parse_faq_pairs(block)
+    result["pairs_found"] = len(pairs)
+    if len(pairs) != expected_pairs:
+        result["unique_questions"] = len({q.lower(): q for q, _ in pairs})
+        result["invalid_answers"] = expected_pairs
+        return False, result
+    unique_questions: Dict[str, str] = {}
+    invalid_answers = 0
+    for question, answer in pairs:
+        normalized_question = re.sub(r"\s+", " ", question.lower()).strip()
+        unique_questions[normalized_question] = question
+        sentences = re.findall(r"[^.!?]+[.!?]", answer)
+        sentence_count = len(sentences)
+        if sentence_count < 2 or sentence_count > 5:
+            invalid_answers += 1
+            continue
+        words = re.findall(r"[A-Za-zА-Яа-яЁё0-9-]+", answer.lower())
+        frequency: Dict[str, int] = {}
+        spam_detected = False
+        for word in words:
+            if len(word) <= 3:
+                continue
+            frequency[word] = frequency.get(word, 0) + 1
+            if frequency[word] >= 4:
+                spam_detected = True
+                break
+        if spam_detected:
+            invalid_answers += 1
+    result["unique_questions"] = len(unique_questions)
+    result["invalid_answers"] = invalid_answers
+    if len(unique_questions) != expected_pairs:
+        return False, result
+    if invalid_answers > 0:
+        return False, result
+    heading_present = False
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        heading_present = "faq" in stripped.lower()
+        break
+    result["has_heading"] = heading_present
+    if not heading_present:
+        return False, result
+    return True, result
+
+
+def _build_faq_only_prompt(
+    article_text: str,
+    report: Dict[str, object],
+    requirements: PostAnalysisRequirements,
+    *,
+    target_pairs: int,
+) -> str:
+    length_block = report.get("length") if isinstance(report, dict) else {}
+    min_required = length_block.get("min", requirements.min_chars)
+    max_required = length_block.get("max", requirements.max_chars)
+    return (
+        "Ты опытный редактор. Перепиши материал, изменяя только блок FAQ. Остальные разделы оставь слово в слово.\n"
+        f"Сформируй блок FAQ на ровно {target_pairs} уникальных пар «Вопрос/Ответ».\n"
+        "Требования к FAQ: заголовок «FAQ», далее по порядку пары с префиксами «**Вопрос N.**» и «**Ответ.**».\n"
+        "Ответ должен содержать 2–5 информативных предложений без повторов и keyword-спама.\n"
+        "Не повторяй вопросы, не изменяй структуру остальных разделов. Верни полный текст без пояснений.\n"
+        f"Соблюдай итоговый диапазон {min_required}\u2013{max_required} символов без пробелов.\n\n"
+        f"Текущая версия:\n{article_text.strip()}"
+    )
+
+
+def _build_trim_prompt(
+    article_text: str,
+    requirements: PostAnalysisRequirements,
+    *,
+    target_max: int,
+) -> str:
+    _, faq_block, _ = _extract_faq_block(article_text)
+    faq_section = faq_block.strip()
+    faq_instruction = (
+        "Сохрани блок FAQ без единого изменения: вопросы, ответы, форматирование."
+        if faq_section
+        else ""
+    )
+    return (
+        "Сократи материал до верхнего предела по длине, убрав воду и повторы в основных разделах."
+        f" Итог должен быть ≤ {target_max} символов без пробелов.\n"
+        f"{faq_instruction}\n"
+        "Смысловая структура разделов должна сохраниться. Верни полный текст без пояснений.\n\n"
+        f"Текущая версия:\n{article_text.strip()}"
+    )
 
 
 def _build_keywords_only_prompt(missing_keywords: List[str]) -> str:
@@ -1017,6 +1177,7 @@ def _generate_variant(
         fallback_reason = llm_result.fallback_reason
         api_route = llm_result.api_route
         response_schema = llm_result.schema
+        article_text = _clean_trailing_noise(article_text)
         if not _is_truncated(article_text):
             break
         if truncation_retry_used:
@@ -1038,6 +1199,7 @@ def _generate_variant(
         retry_used = True
         api_route = llm_result.api_route
         response_schema = llm_result.schema
+        article_text = _clean_trailing_noise(article_text)
 
     retry_used = retry_used or truncation_retry_used or llm_result.retry_used
 
@@ -1051,6 +1213,10 @@ def _generate_variant(
     extend_incomplete = False
     keywords_only_extend_used = False
     last_missing_keywords: List[str] = []
+    faq_only_passes = 0
+    faq_only_iterations: List[Dict[str, Any]] = []
+    trim_pass_used = False
+    trim_pass_delta_chars = 0
     postfix_appended = False
     default_cta_used = False
     disclaimer_appended = False
@@ -1064,6 +1230,7 @@ def _generate_variant(
     jsonld_fallback_reason: Optional[str] = None
 
     while True:
+        article_text = _clean_trailing_noise(article_text)
         post_analysis_report = analyze_post(
             article_text,
             requirements=requirements,
@@ -1119,6 +1286,7 @@ def _generate_variant(
             combined_text, delta = _merge_extend_output(previous_text, extend_result.text)
             growth_detected = delta > 0 or quality_extend_passes == 0
             article_text = combined_text if growth_detected else previous_text
+            article_text = _clean_trailing_noise(article_text)
             effective_model = extend_result.model_used
             fallback_used = extend_result.fallback_used
             fallback_reason = extend_result.fallback_reason
@@ -1202,6 +1370,7 @@ def _generate_variant(
         before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
         combined_text, _ = _merge_extend_output(previous_text, extend_result.text)
         article_text = combined_text
+        article_text = _clean_trailing_noise(article_text)
         effective_model = extend_result.model_used
         fallback_used = extend_result.fallback_used
         fallback_reason = extend_result.fallback_reason
@@ -1251,6 +1420,175 @@ def _generate_variant(
             if isinstance(term, str) and str(term).strip()
         ]
 
+    faq_target_pairs = requirements.faq_questions if isinstance(requirements.faq_questions, int) and requirements.faq_questions > 0 else 5
+    while faq_only_passes < FAQ_PASS_MAX_ITERATIONS:
+        faq_block = post_analysis_report.get("faq") if isinstance(post_analysis_report, dict) else {}
+        required_pairs = None
+        if isinstance(faq_block, dict):
+            required_pairs = faq_block.get("required")
+        if not isinstance(required_pairs, int) or required_pairs <= 0:
+            required_pairs = faq_target_pairs
+        target_pairs = max(5, required_pairs)
+        format_ok, format_meta = _faq_block_format_valid(article_text, target_pairs)
+        faq_count = None
+        if isinstance(faq_block, dict):
+            faq_count = faq_block.get("count")
+        needs_pass = False
+        if not isinstance(faq_count, int) or faq_count < target_pairs:
+            needs_pass = True
+        if not format_ok:
+            needs_pass = True
+        if not needs_pass:
+            break
+        previous_text = article_text
+        faq_prompt = _build_faq_only_prompt(
+            article_text,
+            post_analysis_report,
+            requirements,
+            target_pairs=target_pairs,
+        )
+        active_messages = list(active_messages)
+        active_messages.append({"role": "assistant", "content": previous_text})
+        active_messages.append({"role": "user", "content": faq_prompt})
+        faq_tokens = FAQ_PASS_MAX_TOKENS if FAQ_PASS_MAX_TOKENS > 0 else max_tokens_current
+        faq_tokens = min(max_tokens_current, faq_tokens)
+        faq_result = llm_generate(
+            active_messages,
+            model=model_name,
+            temperature=temperature,
+            max_tokens=faq_tokens,
+            timeout_s=timeout,
+            backoff_schedule=backoff_schedule,
+        )
+        before_chars = len(previous_text)
+        before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
+        article_candidate = faq_result.text
+        if not article_candidate.strip():
+            break
+        article_text = _clean_trailing_noise(article_candidate)
+        effective_model = faq_result.model_used
+        fallback_used = faq_result.fallback_used
+        fallback_reason = faq_result.fallback_reason
+        api_route = faq_result.api_route
+        response_schema = faq_result.schema
+        retry_used = True
+        faq_only_passes += 1
+        llm_result = GenerationResult(
+            text=article_text,
+            model_used=effective_model,
+            retry_used=True,
+            fallback_used=fallback_used,
+            fallback_reason=fallback_reason,
+            api_route=api_route,
+            schema=response_schema,
+            metadata=faq_result.metadata,
+        )
+        post_analysis_report = analyze_post(
+            article_text,
+            requirements=requirements,
+            model=effective_model or model_name,
+            retry_count=post_retry_attempts,
+            fallback_used=bool(fallback_used),
+        )
+        faq_block_after = post_analysis_report.get("faq") if isinstance(post_analysis_report, dict) else {}
+        faq_count_after = None
+        if isinstance(faq_block_after, dict):
+            faq_count_after = faq_block_after.get("count")
+        format_ok_after, format_meta_after = _faq_block_format_valid(article_text, target_pairs)
+        after_chars = len(article_text)
+        after_chars_no_spaces = len(re.sub(r"\s+", "", article_text))
+        faq_only_iterations.append(
+            {
+                "iteration": faq_only_passes,
+                "target_pairs": target_pairs,
+                "before_chars": before_chars,
+                "before_chars_no_spaces": before_chars_no_spaces,
+                "after_chars": after_chars,
+                "after_chars_no_spaces": after_chars_no_spaces,
+                "count_before": faq_count,
+                "count_after": faq_count_after,
+                "format_ok_before": format_ok,
+                "format_ok_after": format_ok_after,
+                "format_meta_before": format_meta,
+                "format_meta_after": format_meta_after,
+            }
+        )
+        last_missing_keywords = [
+            str(term).strip()
+            for term in (post_analysis_report.get("missing_keywords") or [])
+            if isinstance(term, str) and str(term).strip()
+        ]
+        if faq_only_passes >= FAQ_PASS_MAX_ITERATIONS:
+            break
+
+    length_block = post_analysis_report.get("length") if isinstance(post_analysis_report, dict) else {}
+    chars_no_spaces_final = None
+    if isinstance(length_block, dict):
+        chars_no_spaces_final = length_block.get("chars_no_spaces")
+    trim_needed = False
+    try:
+        if int(chars_no_spaces_final) > int(requirements.max_chars):
+            trim_needed = True
+    except (TypeError, ValueError):
+        trim_needed = False
+    if trim_needed:
+        previous_text = article_text
+        trim_prompt = _build_trim_prompt(
+            article_text,
+            requirements,
+            target_max=requirements.max_chars,
+        )
+        active_messages = list(active_messages)
+        active_messages.append({"role": "assistant", "content": previous_text})
+        active_messages.append({"role": "user", "content": trim_prompt})
+        trim_tokens = TRIM_PASS_MAX_TOKENS if TRIM_PASS_MAX_TOKENS > 0 else max_tokens_current
+        trim_tokens = min(max_tokens_current, trim_tokens)
+        trim_result = llm_generate(
+            active_messages,
+            model=model_name,
+            temperature=temperature,
+            max_tokens=trim_tokens,
+            timeout_s=timeout,
+            backoff_schedule=backoff_schedule,
+        )
+        article_candidate = trim_result.text
+        if article_candidate.strip():
+            before_chars = len(previous_text)
+            before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
+            article_text = _clean_trailing_noise(article_candidate)
+            effective_model = trim_result.model_used
+            fallback_used = trim_result.fallback_used
+            fallback_reason = trim_result.fallback_reason
+            api_route = trim_result.api_route
+            response_schema = trim_result.schema
+            retry_used = True
+            trim_pass_used = True
+            after_chars = len(article_text)
+            after_chars_no_spaces = len(re.sub(r"\s+", "", article_text))
+            trim_pass_delta_chars = max(0, before_chars - after_chars)
+            llm_result = GenerationResult(
+                text=article_text,
+                model_used=effective_model,
+                retry_used=True,
+                fallback_used=fallback_used,
+                fallback_reason=fallback_reason,
+                api_route=api_route,
+                schema=response_schema,
+                metadata=trim_result.metadata,
+            )
+            post_analysis_report = analyze_post(
+                article_text,
+                requirements=requirements,
+                model=effective_model or model_name,
+                retry_count=post_retry_attempts,
+                fallback_used=bool(fallback_used),
+            )
+            last_missing_keywords = [
+                str(term).strip()
+                for term in (post_analysis_report.get("missing_keywords") or [])
+                if isinstance(term, str) and str(term).strip()
+            ]
+
     quality_extend_total_chars = len(article_text)
     analysis_characters = len(article_text)
     analysis_characters_no_spaces = len(re.sub(r"\s+", "", article_text))
@@ -1261,6 +1599,11 @@ def _generate_variant(
         post_analysis_report["extend_passes"] = quality_extend_passes
         post_analysis_report["extend_iterations"] = quality_extend_iterations
         post_analysis_report["extend_incomplete"] = extend_incomplete
+        post_analysis_report["faq_only_passes"] = faq_only_passes
+        post_analysis_report["faq_only_iterations"] = faq_only_iterations
+        post_analysis_report["faq_only_max_iterations"] = FAQ_PASS_MAX_ITERATIONS
+        post_analysis_report["trim_pass_used"] = trim_pass_used
+        post_analysis_report["trim_pass_delta_chars"] = trim_pass_delta_chars
 
     final_text = article_text
     final_text, postfix_appended, default_cta_used = _append_cta_if_needed(
@@ -1349,6 +1692,11 @@ def _generate_variant(
         "quality_extend_max_iterations": quality_extend_max_iterations,
         "quality_extend_keywords_used": keywords_only_extend_used,
         "extend_incomplete": extend_incomplete,
+        "faq_only_passes": faq_only_passes,
+        "faq_only_iterations": faq_only_iterations,
+        "faq_only_max_iterations": FAQ_PASS_MAX_ITERATIONS,
+        "trim_pass_used": trim_pass_used,
+        "trim_pass_delta_chars": trim_pass_delta_chars,
         "length_range_target": {"min": min_chars, "max": max_chars},
         "length_limits_applied": {"min": min_chars, "max": max_chars},
         "mode": mode,

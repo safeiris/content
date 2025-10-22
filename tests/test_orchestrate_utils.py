@@ -14,7 +14,9 @@ from orchestrate import (  # noqa: E402
     LENGTH_EXTEND_THRESHOLD,
     LENGTH_SHRINK_THRESHOLD,
     _append_cta_if_needed,
+    _clean_trailing_noise,
     _choose_section_for_extension,
+    _faq_block_format_valid,
     _build_quality_extend_prompt,
     _ensure_length,
     _is_truncated,
@@ -266,3 +268,40 @@ def test_generate_article_with_custom_context_metadata(monkeypatch):
     assert metadata["context_filename"] == "notes.txt"
     assert metadata["context_note"] == "k_ignored"
     assert metadata["custom_context_text"].startswith("Параграф один")
+
+
+def test_clean_trailing_noise_removes_default_cta(monkeypatch):
+    monkeypatch.setenv("DEFAULT_CTA", "Тестовый CTA.")
+    text = "Основной текст.\n\nТестовый CTA."
+    assert _clean_trailing_noise(text) == "Основной текст."
+
+
+def _build_valid_faq_block() -> str:
+    entries = []
+    for idx in range(1, 6):
+        entries.append(
+            (
+                f"**Вопрос {idx}.** Как работает пункт {idx}?\n"
+                "**Ответ.** Первое пояснение по теме. Второе предложение раскрывает деталь."
+            )
+        )
+    return "Введение\n\nFAQ\n" + "\n\n".join(entries)
+
+
+def test_faq_block_format_validator_accepts_valid_block():
+    text = _build_valid_faq_block()
+    ok, meta = _faq_block_format_valid(text, 5)
+    assert ok
+    assert meta["pairs_found"] == 5
+    assert meta["invalid_answers"] == 0
+
+
+def test_faq_block_format_validator_detects_short_answer():
+    text = _build_valid_faq_block().replace(
+        "Первое пояснение по теме. Второе предложение раскрывает деталь.",
+        "Короткое пояснение.",
+        1,
+    )
+    ok, meta = _faq_block_format_valid(text, 5)
+    assert not ok
+    assert meta["invalid_answers"] >= 1
