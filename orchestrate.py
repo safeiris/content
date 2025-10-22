@@ -48,8 +48,8 @@ DEFAULT_CTA_TEXT = (
 )
 TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
 LENGTH_EXTEND_THRESHOLD = DEFAULT_MIN_LENGTH
-QUALITY_EXTEND_MAX_TOKENS = 1500
-QUALITY_EXTEND_MIN_TOKENS = 1200
+QUALITY_EXTEND_MAX_TOKENS = 2800
+QUALITY_EXTEND_MIN_TOKENS = 2000
 LENGTH_SHRINK_THRESHOLD = DEFAULT_MAX_LENGTH
 JSONLD_MAX_TOKENS = 800
 DISCLAIMER_TEMPLATE = (
@@ -73,6 +73,7 @@ class GenerationContext:
     custom_context_filename: Optional[str] = None
     custom_context_hash: Optional[str] = None
     custom_context_truncated: bool = False
+    jsonld_requested: bool = False
 
 
 def _get_cta_text() -> str:
@@ -310,11 +311,11 @@ def _merge_extend_output(base_text: str, extension_text: str) -> Tuple[str, int]
 
 def _resolve_extend_tokens(max_tokens: int) -> int:
     if max_tokens <= 0:
-        return 1
-    upper_bound = min(max_tokens, QUALITY_EXTEND_MAX_TOKENS)
-    if max_tokens < QUALITY_EXTEND_MIN_TOKENS:
-        return max(1, upper_bound)
-    return max(QUALITY_EXTEND_MIN_TOKENS, upper_bound)
+        return QUALITY_EXTEND_MIN_TOKENS
+    candidate = max(max_tokens, QUALITY_EXTEND_MIN_TOKENS)
+    if QUALITY_EXTEND_MAX_TOKENS > 0:
+        candidate = min(candidate, QUALITY_EXTEND_MAX_TOKENS)
+    return max(QUALITY_EXTEND_MIN_TOKENS, candidate)
 
 
 def _build_jsonld_prompt(article_text: str, requirements: PostAnalysisRequirements) -> str:
@@ -499,6 +500,16 @@ def make_generation_context(
     context_filename: Optional[str] = None,
 ) -> GenerationContext:
     payload = deepcopy(data)
+    jsonld_requested = bool(payload.get("include_jsonld", False))
+    if "include_jsonld" in payload:
+        payload.pop("include_jsonld", None)
+
+    keywords_mode_raw = payload.get("keywords_mode")
+    normalized_mode = None
+    if isinstance(keywords_mode_raw, str):
+        normalized_mode = keywords_mode_raw.strip().lower()
+    if normalized_mode != "strict":
+        payload["keywords_mode"] = "strict"
     requested_source = context_source if context_source is not None else payload.get("context_source")
     normalized_source = str(requested_source or "index.json").strip().lower() or "index.json"
     if normalized_source == "index":
@@ -606,6 +617,7 @@ def make_generation_context(
         custom_context_filename=filename,
         custom_context_hash=custom_context_hash,
         custom_context_truncated=custom_context_truncated,
+        jsonld_requested=jsonld_requested,
     )
 
 
@@ -801,11 +813,13 @@ def _generate_variant(
         if isinstance(kw, str) and str(kw).strip()
     ]
     keyword_mode = str(prepared_data.get("keywords_mode") or "strict").strip().lower() or "strict"
+    if keyword_mode != "strict":
+        keyword_mode = "strict"
     include_faq = bool(prepared_data.get("include_faq", True))
     faq_questions_raw = prepared_data.get("faq_questions") if include_faq else None
     faq_questions = _safe_optional_positive_int(faq_questions_raw)
     sources_values = _extract_source_values(prepared_data.get("sources"))
-    include_jsonld_flag = bool(prepared_data.get("include_jsonld", False))
+    include_jsonld_flag = bool(getattr(generation_context, "jsonld_requested", False))
     requirements = PostAnalysisRequirements(
         min_chars=min_chars,
         max_chars=max_chars,
@@ -938,6 +952,7 @@ def _generate_variant(
     post_analysis_report: Dict[str, object] = {}
     quality_extend_used = False
     quality_extend_delta_chars = 0
+    quality_extend_passes = 0
     postfix_appended = False
     default_cta_used = False
     disclaimer_appended = False
@@ -958,7 +973,8 @@ def _generate_variant(
             retry_count=post_retry_attempts,
             fallback_used=bool(fallback_used),
         )
-        if not quality_extend_used and _should_force_quality_extend(post_analysis_report, requirements):
+        needs_quality_extend = _should_force_quality_extend(post_analysis_report, requirements)
+        if needs_quality_extend:
             extend_instruction = _build_quality_extend_prompt(post_analysis_report, requirements)
             previous_text = article_text
             active_messages = list(active_messages)
@@ -974,6 +990,10 @@ def _generate_variant(
                 backoff_schedule=backoff_schedule,
             )
             combined_text, delta = _merge_extend_output(previous_text, extend_result.text)
+            if delta <= 0 and quality_extend_passes > 0:
+                article_text = previous_text
+                print("[orchestrate] QUALITY EXTEND: no growth detected, stopping extend loop")
+                break
             article_text = combined_text
             effective_model = extend_result.model_used
             fallback_used = extend_result.fallback_used
@@ -982,7 +1002,8 @@ def _generate_variant(
             response_schema = extend_result.schema
             retry_used = True
             quality_extend_used = True
-            quality_extend_delta_chars = delta
+            quality_extend_delta_chars += max(0, delta)
+            quality_extend_passes += 1
             llm_result = GenerationResult(
                 text=article_text,
                 model_used=effective_model,
@@ -1024,6 +1045,7 @@ def _generate_variant(
         post_analysis_report["had_extend"] = quality_extend_used
         post_analysis_report["extend_delta_chars"] = quality_extend_delta_chars
         post_analysis_report["extend_total_chars"] = quality_extend_total_chars
+        post_analysis_report["extend_passes"] = quality_extend_passes
 
     final_text = article_text
     final_text, postfix_appended, default_cta_used = _append_cta_if_needed(
@@ -1107,6 +1129,7 @@ def _generate_variant(
         "quality_extend_triggered": quality_extend_used,
         "quality_extend_delta_chars": quality_extend_delta_chars,
         "quality_extend_total_chars": quality_extend_total_chars,
+        "quality_extend_passes": quality_extend_passes,
         "length_range_target": {"min": min_chars, "max": max_chars},
         "mode": mode,
         "model_used": effective_model,
