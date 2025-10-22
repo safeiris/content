@@ -14,6 +14,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from zoneinfo import ZoneInfo
@@ -84,6 +85,13 @@ class GenerationContext:
     custom_context_truncated: bool = False
     jsonld_requested: bool = False
     length_limits: Optional[ResolvedLengthLimits] = None
+
+
+@dataclass
+class DeduplicationStats:
+    sentences_removed: int = 0
+    paragraphs_removed: int = 0
+    duplicates_detected: bool = False
 
 
 def _get_cta_text() -> str:
@@ -215,6 +223,126 @@ def _clean_trailing_noise(text: str) -> str:
     default_cta = _get_cta_text().rstrip()
     if default_cta and cleaned.endswith(default_cta):
         cleaned = cleaned[: -len(default_cta)].rstrip()
+    return cleaned
+
+
+def _normalize_unit_for_dedup(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text.strip().lower())
+    cleaned = re.sub(r"^[\-\*•]+\s*", "", cleaned)
+    cleaned = cleaned.strip("«»\"'()[]{}")
+    return cleaned
+
+
+def _normalize_paragraph_for_dedup(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    normalized = normalized.strip()
+    return normalized
+
+
+def _split_paragraph_units(paragraph: str) -> Tuple[List[str], str]:
+    lines = [line.rstrip() for line in paragraph.splitlines()]
+    bullet_lines = [line for line in lines if re.match(r"\s*[\-\*•]\s+", line)]
+    if bullet_lines and len(bullet_lines) >= max(1, len(lines) // 2):
+        units = [line.strip() for line in lines if line.strip()]
+        return units, "list"
+    joined = re.sub(r"\s+", " ", paragraph.strip())
+    sentences = re.split(r"(?<=[.!?…])\s+", joined)
+    cleaned_sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+    if not cleaned_sentences and paragraph.strip():
+        cleaned_sentences = [paragraph.strip()]
+    return cleaned_sentences, "sentences"
+
+
+def _rebuild_paragraph(units: List[str], mode: str, original: str) -> str:
+    if not units:
+        return ""
+    if mode == "list":
+        return "\n".join(units)
+    if mode == "sentences":
+        paragraph = " ".join(units)
+        return paragraph.strip()
+    return original.strip()
+
+
+def _deduplicate_text(text: str) -> Tuple[str, int, int, bool]:
+    stripped = text or ""
+    if not stripped.strip():
+        return stripped, 0, 0, False
+    paragraphs_raw = re.split(r"\n\s*\n", stripped.strip())
+    kept_paragraphs: List[str] = []
+    kept_norms: List[str] = []
+    norm_index: Dict[str, int] = {}
+    sentences_seen: Set[str] = set()
+    removed_sentences = 0
+    removed_paragraphs = 0
+    duplicates_detected = False
+
+    for paragraph in paragraphs_raw:
+        original_paragraph = paragraph
+        units, mode = _split_paragraph_units(paragraph)
+        filtered_units: List[str] = []
+        for unit in units:
+            norm_unit = _normalize_unit_for_dedup(unit)
+            if not norm_unit:
+                continue
+            if norm_unit in sentences_seen:
+                removed_sentences += 1
+                duplicates_detected = True
+                continue
+            sentences_seen.add(norm_unit)
+            filtered_units.append(unit.strip())
+        rebuilt = _rebuild_paragraph(filtered_units, mode, original_paragraph)
+        if not rebuilt.strip():
+            continue
+        paragraph_norm = _normalize_paragraph_for_dedup(rebuilt)
+        if not paragraph_norm:
+            continue
+        duplicate_idx = norm_index.get(paragraph_norm)
+        if duplicate_idx is not None:
+            duplicates_detected = True
+            removed_paragraphs += 1
+            existing = kept_paragraphs[duplicate_idx]
+            if len(rebuilt) > len(existing):
+                kept_paragraphs[duplicate_idx] = rebuilt
+                kept_norms[duplicate_idx] = paragraph_norm
+            continue
+        similar_idx: Optional[int] = None
+        for idx, existing in enumerate(kept_paragraphs):
+            if not existing:
+                continue
+            ratio = SequenceMatcher(None, existing.lower(), rebuilt.lower()).ratio()
+            if ratio >= 0.92:
+                similar_idx = idx
+                break
+        if similar_idx is not None:
+            duplicates_detected = True
+            existing_text = kept_paragraphs[similar_idx]
+            if len(rebuilt) > len(existing_text):
+                old_norm = kept_norms[similar_idx]
+                if old_norm in norm_index and norm_index[old_norm] == similar_idx:
+                    del norm_index[old_norm]
+                kept_paragraphs[similar_idx] = rebuilt
+                kept_norms[similar_idx] = paragraph_norm
+                norm_index[paragraph_norm] = similar_idx
+            removed_paragraphs += 1
+            continue
+        norm_index[paragraph_norm] = len(kept_paragraphs)
+        kept_paragraphs.append(rebuilt)
+        kept_norms.append(paragraph_norm)
+
+    cleaned_paragraphs = [para.strip() for para in kept_paragraphs if para.strip()]
+    result = "\n\n".join(cleaned_paragraphs)
+    return result.strip(), removed_sentences, removed_paragraphs, duplicates_detected
+
+
+def _apply_deduplication(text: str, stats: DeduplicationStats) -> str:
+    cleaned, removed_sentences, removed_paragraphs, duplicates_detected = _deduplicate_text(text)
+    if removed_sentences:
+        stats.sentences_removed += removed_sentences
+    if removed_paragraphs:
+        stats.paragraphs_removed += removed_paragraphs
+    if duplicates_detected:
+        stats.duplicates_detected = True
     return cleaned
 
 
@@ -1342,7 +1470,20 @@ def _generate_variant(
         backoff_schedule=backoff_schedule,
     )
 
-    article_text = llm_result.text
+    article_text = _clean_trailing_noise(llm_result.text)
+    dedup_stats = DeduplicationStats()
+    article_text = _apply_deduplication(article_text, dedup_stats)
+    if article_text != llm_result.text:
+        llm_result = GenerationResult(
+            text=article_text,
+            model_used=llm_result.model_used,
+            retry_used=llm_result.retry_used,
+            fallback_used=llm_result.fallback_used,
+            fallback_reason=llm_result.fallback_reason,
+            api_route=llm_result.api_route,
+            schema=llm_result.schema,
+            metadata=llm_result.metadata,
+        )
     effective_model = llm_result.model_used
     retry_used = llm_result.retry_used
     fallback_used = llm_result.fallback_used
@@ -1395,7 +1536,19 @@ def _generate_variant(
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
-        article_text = llm_result.text
+        article_text = _clean_trailing_noise(llm_result.text)
+        article_text = _apply_deduplication(article_text, dedup_stats)
+        if article_text != llm_result.text:
+            llm_result = GenerationResult(
+                text=article_text,
+                model_used=llm_result.model_used,
+                retry_used=llm_result.retry_used,
+                fallback_used=llm_result.fallback_used,
+                fallback_reason=llm_result.fallback_reason,
+                api_route=llm_result.api_route,
+                schema=llm_result.schema,
+                metadata=llm_result.metadata,
+            )
         effective_model = llm_result.model_used
         fallback_used = llm_result.fallback_used
         fallback_reason = llm_result.fallback_reason
@@ -1417,13 +1570,37 @@ def _generate_variant(
             max_target=max_chars,
             backoff_schedule=backoff_schedule,
         )
-        article_text = llm_result.text
+        article_text = _clean_trailing_noise(llm_result.text)
+        article_text = _apply_deduplication(article_text, dedup_stats)
+        if article_text != llm_result.text:
+            llm_result = GenerationResult(
+                text=article_text,
+                model_used=llm_result.model_used,
+                retry_used=llm_result.retry_used,
+                fallback_used=llm_result.fallback_used,
+                fallback_reason=llm_result.fallback_reason,
+                api_route=llm_result.api_route,
+                schema=llm_result.schema,
+                metadata=llm_result.metadata,
+            )
         effective_model = llm_result.model_used
         fallback_used = llm_result.fallback_used
         fallback_reason = llm_result.fallback_reason
         api_route = llm_result.api_route
         response_schema = llm_result.schema
         article_text = _clean_trailing_noise(article_text)
+        article_text = _apply_deduplication(article_text, dedup_stats)
+        if article_text != llm_result.text:
+            llm_result = GenerationResult(
+                text=article_text,
+                model_used=llm_result.model_used,
+                retry_used=llm_result.retry_used,
+                fallback_used=llm_result.fallback_used,
+                fallback_reason=llm_result.fallback_reason,
+                api_route=llm_result.api_route,
+                schema=llm_result.schema,
+                metadata=llm_result.metadata,
+            )
         if not _is_truncated(article_text):
             break
         if truncation_retry_used:
@@ -1438,7 +1615,19 @@ def _generate_variant(
             timeout_s=timeout,
             backoff_schedule=backoff_schedule,
         )
-        article_text = llm_result.text
+        article_text = _clean_trailing_noise(llm_result.text)
+        article_text = _apply_deduplication(article_text, dedup_stats)
+        if article_text != llm_result.text:
+            llm_result = GenerationResult(
+                text=article_text,
+                model_used=llm_result.model_used,
+                retry_used=llm_result.retry_used,
+                fallback_used=llm_result.fallback_used,
+                fallback_reason=llm_result.fallback_reason,
+                api_route=llm_result.api_route,
+                schema=llm_result.schema,
+                metadata=llm_result.metadata,
+            )
         effective_model = llm_result.model_used
         fallback_used = llm_result.fallback_used
         fallback_reason = llm_result.fallback_reason
@@ -1446,6 +1635,7 @@ def _generate_variant(
         api_route = llm_result.api_route
         response_schema = llm_result.schema
         article_text = _clean_trailing_noise(article_text)
+        article_text = _apply_deduplication(article_text, dedup_stats)
 
     retry_used = retry_used or truncation_retry_used or llm_result.retry_used
 
@@ -1488,6 +1678,7 @@ def _generate_variant(
 
     while True:
         article_text = _clean_trailing_noise(article_text)
+        article_text = _apply_deduplication(article_text, dedup_stats)
         post_analysis_report = analyze_post(
             article_text,
             requirements=requirements,
@@ -1546,6 +1737,7 @@ def _generate_variant(
             growth_detected = delta > 0 or quality_extend_passes == 0
             candidate_text = combined_text if growth_detected else previous_text
             candidate_text = _clean_trailing_noise(candidate_text)
+            candidate_text = _apply_deduplication(candidate_text, dedup_stats)
             effective_model = extend_result.model_used
             fallback_used = extend_result.fallback_used
             fallback_reason = extend_result.fallback_reason
@@ -1703,6 +1895,7 @@ def _generate_variant(
         before_chars_no_spaces = len(re.sub(r"\s+", "", previous_text))
         combined_text, _ = _merge_extend_output(previous_text, extend_result.text)
         candidate_text = _clean_trailing_noise(combined_text)
+        candidate_text = _apply_deduplication(candidate_text, dedup_stats)
         effective_model = extend_result.model_used
         fallback_used = extend_result.fallback_used
         fallback_reason = extend_result.fallback_reason
@@ -1871,6 +2064,7 @@ def _generate_variant(
                 rollback_info = {"used": True, "reason": "empty_faq_response", "pass": "faq_only"}
             break
         candidate_text = _clean_trailing_noise(article_candidate)
+        candidate_text = _apply_deduplication(candidate_text, dedup_stats)
         patch_applied = False
         added_pairs = 0
         if not _is_full_article(candidate_text):
@@ -1882,6 +2076,7 @@ def _generate_variant(
             )
             if patched:
                 candidate_text = _clean_trailing_noise(merged_text)
+                candidate_text = _apply_deduplication(candidate_text, dedup_stats)
                 patch_applied = True
                 added_pairs = added_pairs_candidate
                 if not faq_patch_applied:
@@ -2028,6 +2223,7 @@ def _generate_variant(
         article_candidate = trim_result.text
         if article_candidate.strip():
             candidate_text = _clean_trailing_noise(article_candidate)
+            candidate_text = _apply_deduplication(candidate_text, dedup_stats)
             candidate_model = trim_result.model_used
             candidate_fallback_used = trim_result.fallback_used
             candidate_fallback_reason = trim_result.fallback_reason
@@ -2116,6 +2312,7 @@ def _generate_variant(
             backoff_schedule=backoff_schedule,
         )
         candidate_text = _clean_trailing_noise(repair_result.text)
+        candidate_text = _apply_deduplication(candidate_text, dedup_stats)
         effective_model = repair_result.model_used
         fallback_used = repair_result.fallback_used
         fallback_reason = repair_result.fallback_reason
@@ -2137,6 +2334,7 @@ def _generate_variant(
             )
             if patched:
                 candidate_text = _clean_trailing_noise(merged_text)
+                candidate_text = _apply_deduplication(candidate_text, dedup_stats)
                 patch_applied = True
                 if not faq_patch_applied:
                     faq_patch_applied = True
@@ -2266,6 +2464,9 @@ def _generate_variant(
         post_analysis_report["repair_pass_rollback"] = repair_pass_rollback_used
         post_analysis_report["repair_pass_reason"] = repair_pass_reason
         post_analysis_report["full_text_guard_triggered"] = full_text_guard_triggered
+        post_analysis_report["dedup_removed_sentences"] = dedup_stats.sentences_removed
+        post_analysis_report["dedup_removed_paragraphs"] = dedup_stats.paragraphs_removed
+        post_analysis_report["had_repetition"] = bool(dedup_stats.duplicates_detected)
 
     article_text = final_text
 
@@ -2339,6 +2540,9 @@ def _generate_variant(
         "repair_pass_fallback": repair_pass_fallback_used,
         "repair_pass_rollback": repair_pass_rollback_used,
         "repair_pass_reason": repair_pass_reason,
+        "dedup_removed_sentences": dedup_stats.sentences_removed,
+        "dedup_removed_paragraphs": dedup_stats.paragraphs_removed,
+        "had_repetition": bool(dedup_stats.duplicates_detected),
         "length_range_target": {"min": min_chars, "max": max_chars},
         "length_limits_applied": {"min": min_chars, "max": max_chars},
         "mode": mode,
