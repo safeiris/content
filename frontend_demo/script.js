@@ -1192,7 +1192,7 @@ function buildRequestPayload() {
     throw new Error("Максимальный объём должен быть больше или равен минимальному");
   }
 
-  const keywordMode = Array.from(keywordModeInputs).find((input) => input.checked)?.value || "soft";
+  const keywordMode = Array.from(keywordModeInputs).find((input) => input.checked)?.value || "strict";
   const sources = collectSources();
   const styleProfile = styleProfileSelect?.value || "sravni.ru";
   const title = titleInput?.value.trim();

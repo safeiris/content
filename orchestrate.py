@@ -48,8 +48,10 @@ DEFAULT_CTA_TEXT = (
 )
 TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
 LENGTH_EXTEND_THRESHOLD = DEFAULT_MIN_LENGTH
-QUALITY_EXTEND_MAX_TOKENS = 800
+QUALITY_EXTEND_MAX_TOKENS = 1500
+QUALITY_EXTEND_MIN_TOKENS = 1200
 LENGTH_SHRINK_THRESHOLD = DEFAULT_MAX_LENGTH
+JSONLD_MAX_TOKENS = 800
 DISCLAIMER_TEMPLATE = (
     "⚠️ Дисклеймер: Материал носит информационный характер и не является финансовой рекомендацией. Прежде чем принимать решения, оцените риски и проконсультируйтесь со специалистом."
 )
@@ -258,8 +260,10 @@ def _choose_section_for_extension(data: Dict[str, Any]) -> str:
 
 def _build_extend_prompt(section_name: str, *, min_target: int, max_target: int) -> str:
     return (
-        f"Раскрой раздел «{section_name}», добавь факты и примеры, доведи объём до {min_target}\u2013{max_target} "
-        "символов без пробелов, избегай повторов."
+        f"Раскрой и дополни раздел «{section_name}», добавь факты и примеры. "
+        f"Приведи весь текст статьи к {min_target}\u2013{max_target} символам без пробелов (не меньше {min_target}). "
+        "Убедись, что блок FAQ завершён и содержит 3\u20135 вопросов с развёрнутыми ответами, а все ключевые фразы "
+        "использованы в точной форме. Верни полный обновлённый текст целиком, без пояснений и черновых пометок."
     )
 
 
@@ -273,19 +277,73 @@ def _build_shrink_prompt(*, min_target: int, max_target: int) -> str:
 def _merge_extend_output(base_text: str, extension_text: str) -> Tuple[str, int]:
     base = base_text or ""
     extension = extension_text or ""
-    if not extension.strip():
+    cleaned_extension = extension.strip()
+    if not cleaned_extension:
         return base, 0
     if not base:
-        combined = extension
+        combined = cleaned_extension
     else:
-        separator = ""
-        if not base.endswith("\n") and not extension.lstrip().startswith("\n"):
-            separator = "\n\n"
-        combined = f"{base}{separator}{extension.lstrip()}"
+        normalized_base = re.sub(r"\s+", " ", base).strip()
+        normalized_extension = re.sub(r"\s+", " ", cleaned_extension).strip()
+        base_len = len(base)
+        extension_len = len(cleaned_extension)
+        should_replace = False
+        if normalized_extension:
+            if extension_len >= max(base_len, QUALITY_EXTEND_MIN_TOKENS // 2):
+                should_replace = True
+            elif base_len > 0 and extension_len >= int(base_len * 0.6):
+                should_replace = True
+            elif normalized_base and normalized_base in normalized_extension and extension_len >= base_len:
+                should_replace = True
+        if should_replace:
+            combined = cleaned_extension
+        else:
+            separator = ""
+            if not base.endswith("\n") and not cleaned_extension.startswith("\n"):
+                separator = "\n\n"
+            combined = f"{base}{separator}{cleaned_extension}"
     delta = len(combined) - len(base)
     if delta < 0:
         delta = 0
     return combined, delta
+
+
+def _resolve_extend_tokens(max_tokens: int) -> int:
+    if max_tokens <= 0:
+        return 1
+    upper_bound = min(max_tokens, QUALITY_EXTEND_MAX_TOKENS)
+    if max_tokens < QUALITY_EXTEND_MIN_TOKENS:
+        return max(1, upper_bound)
+    return max(QUALITY_EXTEND_MIN_TOKENS, upper_bound)
+
+
+def _build_jsonld_prompt(article_text: str, requirements: PostAnalysisRequirements) -> str:
+    faq_hint = requirements.faq_questions
+    if isinstance(faq_hint, int) and faq_hint > 0:
+        faq_line = f"Используй вопросы и ответы из блока FAQ (ровно {faq_hint} штук, без изменений)."
+    else:
+        faq_line = "Используй вопросы и ответы из блока FAQ (итоговый блок должен содержать 3\u20135 элементов)."
+    return (
+        "На основе финального текста статьи сформируй JSON-LD разметку FAQPage. "
+        "Сохрани формулировки вопросов и ответов, не придумывай новые. "
+        "Верни только валидный JSON без пояснений и префиксов.\n\n"
+        f"{faq_line}\n\n"
+        f"Текст статьи:\n{article_text.strip()}"
+    )
+
+
+def _build_jsonld_messages(
+    article_text: str,
+    requirements: PostAnalysisRequirements,
+) -> List[Dict[str, str]]:
+    system_message = (
+        "Ты помощник SEO-редактора. Отвечай только валидным JSON-LD для FAQPage, без текста вне JSON."
+    )
+    user_message = _build_jsonld_prompt(article_text, requirements)
+    return [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_message},
+    ]
 
 
 def _should_force_quality_extend(
@@ -330,7 +388,7 @@ def _build_quality_extend_prompt(
 
     parts: List[str] = [
         (
-            f"Продолжи текст, чтобы итоговый объём попал в диапазон {min_required}\u2013{max_required} символов без пробелов."
+            f"Перепиши и расширь текст полностью, чтобы итоговый объём уверенно попал в диапазон {min_required}\u2013{max_required} символов без пробелов (не меньше {min_required})."
         )
     ]
     if isinstance(missing_keywords, list) and missing_keywords:
@@ -348,6 +406,7 @@ def _build_quality_extend_prompt(
     parts.append(
         "Добавь недостающие ключевые фразы в точной форме, без изменения их написания или порядка слов."
     )
+    parts.append("Верни полный обновлённый текст целиком, без пояснений и черновых пометок.")
 
     return " ".join(parts)
 
@@ -386,7 +445,7 @@ def _ensure_length(
         adjusted_messages = list(messages)
         adjusted_messages.append({"role": "assistant", "content": text})
         adjusted_messages.append({"role": "user", "content": prompt})
-        extend_tokens = max(1, min(max_tokens, QUALITY_EXTEND_MAX_TOKENS))
+        extend_tokens = _resolve_extend_tokens(max_tokens)
         extend_result = llm_generate(
             adjusted_messages,
             model=model_name,
@@ -741,11 +800,12 @@ def _generate_variant(
         for kw in prepared_data.get("keywords", [])
         if isinstance(kw, str) and str(kw).strip()
     ]
-    keyword_mode = str(prepared_data.get("keywords_mode") or "soft").strip().lower() or "soft"
+    keyword_mode = str(prepared_data.get("keywords_mode") or "strict").strip().lower() or "strict"
     include_faq = bool(prepared_data.get("include_faq", True))
     faq_questions_raw = prepared_data.get("faq_questions") if include_faq else None
     faq_questions = _safe_optional_positive_int(faq_questions_raw)
     sources_values = _extract_source_values(prepared_data.get("sources"))
+    include_jsonld_flag = bool(prepared_data.get("include_jsonld", False))
     requirements = PostAnalysisRequirements(
         min_chars=min_chars,
         max_chars=max_chars,
@@ -878,15 +938,19 @@ def _generate_variant(
     post_analysis_report: Dict[str, object] = {}
     quality_extend_used = False
     quality_extend_delta_chars = 0
-    quality_extend_total_chars = len(article_text)
-    while True:
-        article_text, postfix_appended, default_cta_used = _append_cta_if_needed(
-            article_text,
-            cta_text=cta_text,
-            default_cta=cta_is_default,
-        )
-        article_text, disclaimer_appended = _append_disclaimer_if_requested(article_text, prepared_data)
+    postfix_appended = False
+    default_cta_used = False
+    disclaimer_appended = False
+    jsonld_generated = False
+    jsonld_text: str = ""
+    jsonld_model_used: Optional[str] = None
+    jsonld_api_route: Optional[str] = None
+    jsonld_metadata: Optional[Dict[str, Any]] = None
+    jsonld_retry_used: Optional[bool] = None
+    jsonld_fallback_used: Optional[bool] = None
+    jsonld_fallback_reason: Optional[str] = None
 
+    while True:
         post_analysis_report = analyze_post(
             article_text,
             requirements=requirements,
@@ -900,7 +964,7 @@ def _generate_variant(
             active_messages = list(active_messages)
             active_messages.append({"role": "assistant", "content": previous_text})
             active_messages.append({"role": "user", "content": extend_instruction})
-            extend_tokens = max(1, min(max_tokens_current, QUALITY_EXTEND_MAX_TOKENS))
+            extend_tokens = _resolve_extend_tokens(max_tokens_current)
             extend_result = llm_generate(
                 active_messages,
                 model=model_name,
@@ -919,7 +983,6 @@ def _generate_variant(
             retry_used = True
             quality_extend_used = True
             quality_extend_delta_chars = delta
-            quality_extend_total_chars = len(article_text)
             llm_result = GenerationResult(
                 text=article_text,
                 model_used=effective_model,
@@ -931,35 +994,69 @@ def _generate_variant(
                 metadata=extend_result.metadata,
             )
             continue
-        if quality_extend_used:
-            break
-        if not post_should_retry(post_analysis_report) or post_retry_attempts >= 2:
-            break
-        refinement_instruction = build_retry_instruction(post_analysis_report, requirements)
-        active_messages = list(active_messages)
-        active_messages.append({"role": "user", "content": refinement_instruction})
-        llm_result = llm_generate(
-            active_messages,
-            model=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens_current,
-            timeout_s=timeout,
-            backoff_schedule=backoff_schedule,
-        )
-        article_text = llm_result.text
-        effective_model = llm_result.model_used
-        fallback_used = llm_result.fallback_used
-        fallback_reason = llm_result.fallback_reason
-        api_route = llm_result.api_route
-        response_schema = llm_result.schema
-        retry_used = True
-        post_retry_attempts += 1
+        if post_should_retry(post_analysis_report) and post_retry_attempts < 2:
+            refinement_instruction = build_retry_instruction(post_analysis_report, requirements)
+            active_messages = list(active_messages)
+            active_messages.append({"role": "user", "content": refinement_instruction})
+            llm_result = llm_generate(
+                active_messages,
+                model=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens_current,
+                timeout_s=timeout,
+                backoff_schedule=backoff_schedule,
+            )
+            article_text = llm_result.text
+            effective_model = llm_result.model_used
+            fallback_used = llm_result.fallback_used
+            fallback_reason = llm_result.fallback_reason
+            api_route = llm_result.api_route
+            response_schema = llm_result.schema
+            retry_used = True
+            post_retry_attempts += 1
+            continue
+        break
 
     quality_extend_total_chars = len(article_text)
+    analysis_characters = len(article_text)
+    analysis_characters_no_spaces = len(re.sub(r"\s+", "", article_text))
     if isinstance(post_analysis_report, dict):
         post_analysis_report["had_extend"] = quality_extend_used
         post_analysis_report["extend_delta_chars"] = quality_extend_delta_chars
         post_analysis_report["extend_total_chars"] = quality_extend_total_chars
+
+    final_text = article_text
+    final_text, postfix_appended, default_cta_used = _append_cta_if_needed(
+        final_text,
+        cta_text=cta_text,
+        default_cta=cta_is_default,
+    )
+    final_text, disclaimer_appended = _append_disclaimer_if_requested(final_text, prepared_data)
+
+    if include_jsonld_flag and post_analysis_report.get("meets_requirements") and article_text.strip():
+        jsonld_messages = _build_jsonld_messages(article_text, requirements)
+        jsonld_result = llm_generate(
+            jsonld_messages,
+            model=model_name,
+            temperature=0.0,
+            max_tokens=min(max_tokens_current, JSONLD_MAX_TOKENS),
+            timeout_s=timeout,
+            backoff_schedule=backoff_schedule,
+        )
+        jsonld_candidate = jsonld_result.text.strip()
+        if jsonld_candidate:
+            jsonld_generated = True
+            jsonld_text = jsonld_candidate
+            jsonld_model_used = jsonld_result.model_used
+            jsonld_api_route = jsonld_result.api_route
+            jsonld_metadata = jsonld_result.metadata
+            jsonld_retry_used = jsonld_result.retry_used
+            jsonld_fallback_used = jsonld_result.fallback_used
+            jsonld_fallback_reason = jsonld_result.fallback_reason
+            final_text = f"{final_text.rstrip()}\n\n{jsonld_text}\n"
+            retry_used = retry_used or jsonld_result.retry_used
+
+    article_text = final_text
 
     duration = time.time() - start_time
     context_bundle = generation_context.context_bundle
@@ -997,6 +1094,8 @@ def _generate_variant(
         "duration_seconds": round(duration, 3),
         "characters": len(article_text),
         "characters_no_spaces": len(re.sub(r"\s+", "", article_text)),
+        "analysis_characters": analysis_characters,
+        "analysis_characters_no_spaces": analysis_characters_no_spaces,
         "words": len(article_text.split()) if article_text.strip() else 0,
         "messages_count": len(active_messages),
         "context_used": context_used,
@@ -1032,7 +1131,15 @@ def _generate_variant(
         "context_source": normalized_source,
         "include_faq": include_faq,
         "faq_questions": faq_questions,
-        "include_jsonld": bool(prepared_data.get("include_jsonld", False)),
+        "include_jsonld": include_jsonld_flag,
+        "jsonld_generated": jsonld_generated,
+        "jsonld_text": jsonld_text,
+        "jsonld_model_used": jsonld_model_used,
+        "jsonld_api_route": jsonld_api_route,
+        "jsonld_metadata": jsonld_metadata,
+        "jsonld_retry_used": jsonld_retry_used,
+        "jsonld_fallback_used": jsonld_fallback_used,
+        "jsonld_fallback_reason": jsonld_fallback_reason,
         "style_profile": prepared_data.get("style_profile"),
         "post_analysis": post_analysis_report,
         "post_analysis_retry_count": post_retry_attempts,

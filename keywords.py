@@ -71,6 +71,16 @@ def _cleanup_keyword(raw: str, *, allow_digits: bool) -> str:
     return cleaned
 
 
+def _cleanup_manual_keyword(raw: str) -> str:
+    cleaned = _normalize_space(str(raw).replace("\r", " ").replace("\n", " "))
+    cleaned = cleaned.strip(_PUNCT_STRIP)
+    if not cleaned:
+        return ""
+    if len(cleaned) > KEYWORD_MAX_LENGTH:
+        cleaned = cleaned[:KEYWORD_MAX_LENGTH].rstrip()
+    return cleaned
+
+
 def parse_manual_keywords(raw: object) -> List[str]:
     """Return a normalized list of user-provided keywords."""
 
@@ -84,13 +94,14 @@ def parse_manual_keywords(raw: object) -> List[str]:
     normalized: List[str] = []
     seen = set()
     for item in items:
-        candidate = _cleanup_keyword(item, allow_digits=True)
-        if not candidate or candidate in seen:
+        display = _cleanup_manual_keyword(item)
+        if not display:
             continue
-        normalized.append(candidate)
-        seen.add(candidate)
-        if len(normalized) >= KEYWORD_LIMIT:
-            break
+        normalized_key = _cleanup_keyword(item, allow_digits=True)
+        if not normalized_key or normalized_key in seen:
+            continue
+        normalized.append(display)
+        seen.add(normalized_key)
     return normalized
 
 
@@ -178,16 +189,18 @@ def merge_keywords(
     seen = set()
 
     for kw in manual_candidates:
+        display = _cleanup_manual_keyword(kw)
+        if not display:
+            continue
         normalized = _cleanup_keyword(kw, allow_digits=True)
         if not normalized or normalized in seen:
             continue
-        manual_used.append(normalized)
-        final.append(normalized)
+        manual_used.append(display)
+        final.append(display)
         seen.add(normalized)
-        if len(final) >= limit:
-            break
 
-    if len(final) < limit:
+    auto_budget = limit if limit > 0 else 0
+    if auto_budget and auto_candidates:
         for kw in auto_candidates:
             normalized = _cleanup_keyword(kw, allow_digits=False)
             if not normalized or normalized in seen:
@@ -195,7 +208,7 @@ def merge_keywords(
             auto_used.append(normalized)
             final.append(normalized)
             seen.add(normalized)
-            if len(final) >= limit:
+            if len(auto_used) >= auto_budget:
                 break
 
     return manual_used, auto_used, final
@@ -209,7 +222,7 @@ def format_keywords_block(keywords: Sequence[str]) -> str:
         return ""
     bullet_list = "\n".join(f"- {kw}" for kw in items)
     return (
-        "Ключевые слова (каждое должно прозвучать в тексте естественно):\n"
+        "Ключевые слова (используй каждое хотя бы один раз в точной форме, без изменений):\n"
         + bullet_list
         + "\n\n"
     )

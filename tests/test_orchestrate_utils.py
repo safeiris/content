@@ -83,7 +83,7 @@ def _make_requirements() -> PostAnalysisRequirements:
         min_chars=3500,
         max_chars=6000,
         keywords=["ключевое слово"],
-        keyword_mode="soft",
+        keyword_mode="strict",
         faq_questions=None,
         sources=[],
         style_profile="",
@@ -117,7 +117,12 @@ def test_ensure_length_triggers_extend(monkeypatch):
 
     def fake_llm(messages, **kwargs):
         captured["prompt"] = messages[-1]["content"]
-        return GenerationResult(text="extended", model_used="model", retry_used=False, fallback_used=None)
+        return GenerationResult(
+            text="Полный обновлённый текст",
+            model_used="model",
+            retry_used=False,
+            fallback_used=None,
+        )
 
     monkeypatch.setattr("orchestrate.llm_generate", fake_llm)
     short_text = "s"
@@ -138,13 +143,13 @@ def test_ensure_length_triggers_extend(monkeypatch):
         backoff_schedule=[0.5],
     )
 
-    assert new_result.text.endswith("extended")
-    assert new_result.text.startswith(short_text)
+    assert new_result.text == "Полный обновлённый текст"
     assert adjustment == "extend"
     assert len(new_messages) == len(base_messages) + 2
     assert new_messages[-2]["role"] == "assistant"
     assert new_messages[-2]["content"] == short_text
     assert "Основная часть" in captured["prompt"]
+    assert "Верни полный обновлённый текст" in captured["prompt"]
 
 
 def test_ensure_length_triggers_shrink(monkeypatch):

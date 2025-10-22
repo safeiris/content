@@ -41,7 +41,7 @@ class InputSpec:
     audience: str = ""
     title: str = ""
     style_profile: str = "sravni.ru"
-    keywords_mode: str = "soft"
+    keywords_mode: str = "strict"
     include_faq: bool = True
     faq_questions: Optional[int] = None
     include_jsonld: bool = False
@@ -54,7 +54,7 @@ def build_prompt(data: Dict[str, Any]) -> str:
     length_limits = data.get("length_limits") or {}
     min_len = _safe_int(length_limits.get("min_chars"), DEFAULT_MIN_LENGTH)
     max_len = _safe_int(length_limits.get("max_chars"), DEFAULT_MAX_LENGTH)
-    keywords_mode = str(data.get("keywords_mode") or "soft").strip().lower() or "soft"
+    keywords_mode = str(data.get("keywords_mode") or "strict").strip().lower() or "strict"
 
     spec = InputSpec(
         theme=str(data.get("theme", "общая тема")).strip() or "общая тема",
@@ -134,13 +134,13 @@ def _render_length_line(min_len: int, max_len: int) -> str:
 
 
 def _render_keywords_mode_line(mode: str) -> str:
-    normalized = (mode or "soft").lower()
+    normalized = (mode or "strict").lower()
     labels = {
         "soft": "мягкий — допускаются синонимы и естественные формы",
         "strict": "строгий — используй точные вхождения",
         "anti_spam": "запрет переспама — не чаще двух повторов на 1000 символов",
     }
-    label = labels.get(normalized, labels["soft"])
+    label = labels.get(normalized, labels["strict"])
     return f"Режим ключевых слов: {label}.\n\n"
 
 
@@ -181,7 +181,9 @@ def _render_faq_line(include_faq: bool, faq_questions: Optional[int]) -> str:
 def _render_jsonld_line(include_jsonld: bool) -> str:
     if not include_jsonld:
         return ""
-    return "Если включена опция JSON-LD — сгенерируй корректную SEO-разметку FAQPage.\n\n"
+    return (
+        "Опция JSON-LD включена, но на этом шаге не добавляй разметку — мы запросим её отдельно после проверки текста.\n\n"
+    )
 
 
 def _normalize_sources(raw: Any) -> List[Dict[str, str]]:
