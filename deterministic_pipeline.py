@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import json
 import logging
 import re
 import textwrap
@@ -608,42 +607,91 @@ class DeterministicPipeline:
                 raise
             metadata_snapshot = result.metadata or {}
             status = str(metadata_snapshot.get("status") or "ok").lower()
-            if status == "incomplete" or metadata_snapshot.get("incomplete_reason"):
-                LOGGER.warning(
-                    "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
-                    attempt,
-                    status,
-                    metadata_snapshot.get("incomplete_reason") or "",
-                )
-                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                continue
+            reason = str(metadata_snapshot.get("incomplete_reason") or "").lower()
             raw_text = result.text.strip()
             if "<response_json>" in raw_text and "</response_json>" in raw_text:
                 try:
                     raw_text = raw_text.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
                 except Exception:  # pragma: no cover - defensive
                     raw_text = raw_text
+            parsed_payload: Optional[Dict[str, object]] = None
+            decode_error: Optional[json.JSONDecodeError] = None
+            if raw_text:
+                try:
+                    parsed_payload = json.loads(raw_text)
+                except json.JSONDecodeError as exc:
+                    decode_error = exc
+                    parsed_payload = None
+            if status == "incomplete" or reason:
+                accepted_incomplete = False
+                if parsed_payload is not None:
+                    try:
+                        normalized_payload = normalize_skeleton_payload(parsed_payload)
+                        markdown_candidate, summary = self._render_skeleton_markdown(normalized_payload)
+                        snapshot = dict(normalized_payload)
+                        snapshot["outline"] = summary.get("outline", [])
+                        if "faq" in summary:
+                            snapshot["faq"] = summary.get("faq", [])
+                        self.skeleton_payload = snapshot
+                        metadata_snapshot = dict(metadata_snapshot)
+                        metadata_snapshot["status"] = "completed"
+                        metadata_snapshot["incomplete_reason"] = ""
+                        LOGGER.info("SKELETON_INCOMPLETE_ACCEPT attempt=%d", attempt)
+                        markdown = markdown_candidate
+                        payload = normalized_payload
+                        accepted_incomplete = True
+                    except Exception as exc:  # noqa: BLE001
+                        last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
+                        LOGGER.warning("SKELETON_INCOMPLETE_INVALID attempt=%d error=%s", attempt, exc)
+                        parsed_payload = None
+                if accepted_incomplete:
+                    break
+                LOGGER.warning(
+                    "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
+                    attempt,
+                    status,
+                    reason,
+                )
+                if decode_error is not None:
+                    LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, decode_error)
+                    LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
+                    last_error = PipelineStepError(
+                        PipelineStep.SKELETON, "Ответ модели не является корректным JSON."
+                    )
+                    json_error_count += 1
+                    if not use_fallback and json_error_count >= 2:
+                        LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
+                        use_fallback = True
+                        attempt = 0
+                        continue
+                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
+                continue
             if not raw_text:
                 last_error = PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=empty", attempt)
                 skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
                 continue
-            try:
-                payload = json.loads(raw_text)
-                payload = normalize_skeleton_payload(payload)
-                LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
-            except json.JSONDecodeError as exc:
-                LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, exc)
+            if parsed_payload is None:
+                if decode_error is not None:
+                    LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, decode_error)
+                    LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
+                    skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
+                    last_error = PipelineStepError(
+                        PipelineStep.SKELETON, "Ответ модели не является корректным JSON."
+                    )
+                    json_error_count += 1
+                    if not use_fallback and json_error_count >= 2:
+                        LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
+                        use_fallback = True
+                        attempt = 0
+                        continue
+                    continue
+                last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
                 skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
-                json_error_count += 1
-                if not use_fallback and json_error_count >= 2:
-                    LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
-                    use_fallback = True
-                    attempt = 0
-                    continue
                 continue
+            payload = normalize_skeleton_payload(parsed_payload)
+            LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
             try:
                 markdown, summary = self._render_skeleton_markdown(payload)
                 snapshot = dict(payload)

@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from jsonschema import Draft7Validator
+from jsonschema.exceptions import SchemaError as JSONSchemaError
+from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 
 from config import (
     FORCE_MODEL,
@@ -319,6 +322,35 @@ def _shrink_responses_input(text_value: str) -> str:
         return condensed
     target = max(1000, int(len(text_value) * 0.9))
     return text_value[:target]
+
+
+def _is_valid_json_schema_instance(schema: Dict[str, Any], text: str) -> bool:
+    """Validate the provided JSON text against the supplied schema."""
+
+    if not schema or not text:
+        return False
+
+    try:
+        instance = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+
+    if not isinstance(instance, (dict, list)):
+        return False
+
+    try:
+        Draft7Validator.check_schema(schema)
+    except JSONSchemaError:
+        LOGGER.warning("RESP_INCOMPLETE_SCHEMA_INVALID schema=invalid")
+        return False
+
+    try:
+        Draft7Validator(schema).validate(instance)
+    except JSONSchemaValidationError as exc:
+        LOGGER.warning("RESP_INCOMPLETE_SCHEMA_INVALID message=%s", exc.message)
+        return False
+
+    return True
 
 
 def _coerce_bool(value: object) -> Optional[bool]:
@@ -1606,6 +1638,8 @@ def generate(
         incomplete_retry_count = 0
         token_escalations = 0
         resume_from_response_id: Optional[str] = None
+        content_started = False
+        cap_retry_performed = False
 
         def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
             candidate = current
@@ -1680,18 +1714,24 @@ def generate(
             if resume_from_response_id:
                 current_payload["previous_response_id"] = resume_from_response_id
                 LOGGER.info("RESP_CONTINUE previous_response_id=%s", resume_from_response_id)
-            if shrink_applied and shrunken_input:
-                current_payload["input"] = shrunken_input
-            elif shrink_next_attempt:
-                shrink_next_attempt = False
-                if shrunken_input and shrunken_input != base_input_text:
+            if not content_started:
+                if shrink_applied and shrunken_input:
                     current_payload["input"] = shrunken_input
-                    shrink_applied = True
-                    LOGGER.info(
-                        "RESP_PROMPT_SHRINK original_len=%d shrunk_len=%d",
-                        len(base_input_text),
-                        len(shrunken_input),
-                    )
+                elif shrink_next_attempt:
+                    shrink_next_attempt = False
+                    if shrunken_input and shrunken_input != base_input_text:
+                        current_payload["input"] = shrunken_input
+                        shrink_applied = True
+                        LOGGER.info(
+                            "RESP_PROMPT_SHRINK original_len=%d shrunk_len=%d",
+                            len(base_input_text),
+                            len(shrunken_input),
+                        )
+            else:
+                if shrink_applied:
+                    LOGGER.info("RESP_PROMPT_SHRINK_DISABLED after_content_started")
+                shrink_applied = False
+                shrink_next_attempt = False
             current_payload["max_output_tokens"] = max(min_token_floor, int(current_max))
             if attempts > 1:
                 retry_used = True
@@ -1730,6 +1770,16 @@ def generate(
                 metadata = _extract_metadata(data)
                 if isinstance(parse_flags, dict):
                     parse_flags["metadata"] = metadata
+                content_lengths = 0
+                if isinstance(parse_flags, dict):
+                    output_len = int(parse_flags.get("output_text_len", 0) or 0)
+                    content_len = int(parse_flags.get("content_text_len", 0) or 0)
+                    content_lengths = output_len + content_len
+                if content_lengths > 0 and not content_started:
+                    content_started = True
+                    shrink_applied = False
+                    shrink_next_attempt = False
+                    LOGGER.info("RESP_CONTENT_STARTED len=%d", content_lengths)
                 status = metadata.get("status") or ""
                 reason = metadata.get("incomplete_reason") or ""
                 segments = int(parse_flags.get("segments", 0) or 0)
@@ -1746,6 +1796,16 @@ def generate(
                         metadata = _extract_metadata(data)
                         if isinstance(parse_flags, dict):
                             parse_flags["metadata"] = metadata
+                        content_lengths = 0
+                        if isinstance(parse_flags, dict):
+                            output_len = int(parse_flags.get("output_text_len", 0) or 0)
+                            content_len = int(parse_flags.get("content_text_len", 0) or 0)
+                            content_lengths = output_len + content_len
+                        if content_lengths > 0 and not content_started:
+                            content_started = True
+                            shrink_applied = False
+                            shrink_next_attempt = False
+                            LOGGER.info("RESP_CONTENT_STARTED len=%d", content_lengths)
                         status = metadata.get("status") or ""
                         reason = metadata.get("incomplete_reason") or ""
                         segments = int(parse_flags.get("segments", 0) or 0)
@@ -1767,13 +1827,48 @@ def generate(
                             and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
                         ):
                             resume_from_response_id = str(response_id_value)
+                        schema_dict: Optional[Dict[str, Any]] = None
+                        if isinstance(format_block, dict):
+                            candidate_schema = format_block.get("schema")
+                            if isinstance(candidate_schema, dict):
+                                schema_dict = candidate_schema
+                        if schema_dict and text and _is_valid_json_schema_instance(schema_dict, text):
+                            LOGGER.info(
+                                "RESP_INCOMPLETE_ACCEPT schema_valid len=%d",
+                                len(text),
+                            )
+                            metadata = dict(metadata)
+                            metadata["status"] = "completed"
+                            metadata["incomplete_reason"] = ""
+                            parse_flags["metadata"] = metadata
+                            updated_data = dict(data)
+                            updated_data["metadata"] = metadata
+                            _persist_raw_response(updated_data)
+                            return text, parse_flags, updated_data, schema_label
                         if upper_cap is not None and int(current_max) >= upper_cap:
                             message = (
                                 f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
-                                "Увеличь кап или упростите ТЗ/схему."
+                                "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру."
                             )
                             raise RuntimeError(message)
                         if token_escalations >= RESPONSES_MAX_ESCALATIONS:
+                            if (
+                                upper_cap is not None
+                                and int(current_max) < upper_cap
+                                and upper_cap > 0
+                            ):
+                                LOGGER.info(
+                                    "RESP_ESCALATE_TOKENS reason=max_output_tokens cap_force=%s",
+                                    upper_cap,
+                                )
+                                token_escalations += 1
+                                current_max = upper_cap
+                                sanitized_payload["max_output_tokens"] = max(
+                                    min_token_floor, int(current_max)
+                                )
+                                cap_retry_performed = True
+                                shrink_next_attempt = False
+                                continue
                             break
                         next_max = _compute_next_max_tokens(
                             int(current_max), token_escalations, upper_cap
@@ -1782,7 +1877,7 @@ def generate(
                             if upper_cap is not None and int(current_max) >= upper_cap:
                                 message = (
                                     f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
-                                    "Увеличь кап или упростите ТЗ/схему."
+                                    "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру."
                                 )
                                 raise RuntimeError(message)
                             break
@@ -1795,6 +1890,8 @@ def generate(
                         )
                         token_escalations += 1
                         current_max = next_max
+                        if upper_cap is not None and int(current_max) == upper_cap:
+                            cap_retry_performed = True
                         sanitized_payload["max_output_tokens"] = max(
                             min_token_floor, int(current_max)
                         )
@@ -1887,6 +1984,18 @@ def generate(
             time.sleep(sleep_for)
 
         if last_error:
+            if (
+                isinstance(last_error, RuntimeError)
+                and str(last_error) == "responses_incomplete"
+                and cap_retry_performed
+                and upper_cap is not None
+                and int(current_max) >= upper_cap
+            ):
+                message = (
+                    f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
+                    "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру."
+                )
+                raise RuntimeError(message)
             if isinstance(last_error, httpx.HTTPStatusError):
                 _raise_for_last_error(last_error)
             if isinstance(last_error, (httpx.TimeoutException, httpx.TransportError)):

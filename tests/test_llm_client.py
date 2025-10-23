@@ -5,6 +5,8 @@ import httpx
 import pytest
 import sys
 
+import json
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from llm_client import (
@@ -472,6 +474,104 @@ def test_generate_escalates_max_tokens_when_truncated():
     assert client.requests[0]["json"].get("previous_response_id") is None
 
 
+def test_generate_accepts_incomplete_with_valid_json():
+    skeleton_payload = {
+        "intro": "Вступление",
+        "main": ["Блок 1", "Блок 2", "Блок 3"],
+        "faq": [
+            {"q": f"Вопрос {idx}", "a": f"Ответ {idx}. Детали."}
+            for idx in range(1, 6)
+        ],
+        "conclusion": "Вывод",
+    }
+    skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
+    incomplete_payload = {
+        "id": "resp-accept",
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": skeleton_text},
+                ]
+            }
+        ],
+    }
+    client = DummyClient(payloads=[incomplete_payload])
+    with patch("llm_client.httpx.Client", return_value=client):
+        result = generate(
+            messages=[{"role": "user", "content": "ping"}],
+            model="gpt-5",
+            temperature=0.1,
+        )
+
+    assert client.call_count == 1
+    assert isinstance(result, GenerationResult)
+    assert result.text == skeleton_text
+    assert result.metadata is not None
+    assert result.metadata.get("status") == "completed"
+    assert result.metadata.get("incomplete_reason") in {None, ""}
+
+
+def test_generate_does_not_shrink_prompt_after_content_started():
+    skeleton_payload = {
+        "intro": "Вступление",
+        "main": ["Блок 1", "Блок 2", "Блок 3"],
+        "faq": [
+            {"q": f"Вопрос {idx}", "a": f"Ответ {idx}. Детали."}
+            for idx in range(1, 6)
+        ],
+        "conclusion": "Вывод",
+    }
+    skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
+    first_payload = {
+        "id": "resp-partial",
+        "status": "incomplete",
+        "incomplete_details": {"reason": "safety"},
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "partial draft"},
+                ]
+            }
+        ],
+    }
+    final_payload = {
+        "status": "completed",
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": skeleton_text},
+                ]
+            }
+        ],
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": "A\nB\nA",
+        },
+        {
+            "role": "user",
+            "content": "C\nC\nD",
+        },
+    ]
+    client = DummyClient(payloads=[first_payload, final_payload])
+    with patch("llm_client.httpx.Client", return_value=client):
+        result = generate(
+            messages=messages,
+            model="gpt-5",
+            temperature=0.2,
+        )
+
+    assert client.call_count == 2
+    assert isinstance(result, GenerationResult)
+    assert result.text == skeleton_text
+    first_input = client.requests[0]["json"]["input"]
+    second_input = client.requests[1]["json"]["input"]
+    assert second_input == first_input
+
+
 def test_generate_raises_when_incomplete_at_cap(monkeypatch):
     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 1800)
     initial_payload = {
@@ -493,7 +593,9 @@ def test_generate_raises_when_incomplete_at_cap(monkeypatch):
                 temperature=0.1,
             )
 
-    assert "Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX=1800" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX=1800" in message
+    assert "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру" in message
 
 
 def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):
