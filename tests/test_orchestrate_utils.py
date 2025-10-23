@@ -12,6 +12,8 @@ from llm_client import GenerationResult
 from orchestrate import generate_article_from_payload, gather_health_status
 from validators import ValidationError, strip_jsonld, validate_article
 
+MIN_REQUIRED = 3500
+MAX_REQUIRED = 6000
 
 def test_keyword_injection_protects_terms_and_locks_all_occurrences():
     base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
@@ -58,11 +60,19 @@ def test_faq_builder_produces_jsonld_block():
 def test_trim_preserves_locked_and_faq():
     intro = " ".join(["Параграф с вводной информацией, который можно сократить." for _ in range(4)])
     removable = "Дополнительный абзац с примерами, который допустимо удалить."
+    faq_lines = []
+    for idx in range(1, 6):
+        faq_lines.append(f"**Вопрос {idx}.** Что важно?")
+        faq_lines.append("**Ответ.** Ответ с деталями.")
+        faq_lines.append("")
+    faq_block = "\n".join(faq_lines).strip()
     article = (
         f"## Введение\n\n{intro}\n\n"
         f"{LOCK_START_TEMPLATE.format(term='важный термин')}важный термин<!--LOCK_END-->\n\n"
         f"{removable}\n\n"
-        "## FAQ\n\n<!--FAQ_START-->\n**Вопрос 1.** Что важно?\n\n**Ответ.** Ответ с деталями.\n\n<!--FAQ_END-->"
+        "## FAQ\n\n<!--FAQ_START-->\n"
+        f"{faq_block}\n"
+        "<!--FAQ_END-->"
     )
     trimmed = trim_text(article, min_chars=200, max_chars=400)
     assert "важный термин" in trimmed.text
@@ -116,8 +126,14 @@ def test_validator_length_ignores_jsonld():
             "",
         ]
     )
+    intro_paragraph = (
+        "Содержательный абзац с фактами и цифрами, объясняющий контекст и приводящий примеры. "
+        "Практические советы включают последовательность действий, промежуточные выводы и точные формулировки."
+    )
+    intro = "\n\n".join([intro_paragraph for _ in range(22)])
     article = (
         "## Введение\n\n"
+        f"{intro}\n\n"
         f"{LOCK_START_TEMPLATE.format(term='ключ')}ключ<!--LOCK_END--> фиксирует термин.\n\n"
         "## FAQ\n\n<!--FAQ_START-->\n"
         f"{faq_block}\n"
@@ -130,9 +146,13 @@ def test_validator_length_ignores_jsonld():
     base_length = len("".join(article_no_jsonld.split()))
     full_length = len("".join(article.split()))
     assert full_length > base_length
-    min_chars = max(10, base_length - 5)
-    max_chars = base_length + 5
-    result = validate_article(article, keywords=["ключ"], min_chars=min_chars, max_chars=max_chars)
+    assert MIN_REQUIRED <= base_length <= MAX_REQUIRED
+    result = validate_article(
+        article,
+        keywords=["ключ"],
+        min_chars=MIN_REQUIRED,
+        max_chars=MAX_REQUIRED,
+    )
     assert result.length_ok
     assert result.jsonld_ok
 

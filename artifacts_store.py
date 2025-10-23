@@ -265,6 +265,11 @@ def register_artifact(
     if finalized:
         _update_latest(record)
         _append_changelog(record)
+        LOGGER.info(
+            "ARTIFACT_SAVED path=%s metadata=%s",
+            record.path,
+            record.metadata_path or "-",
+        )
     return record
 
 

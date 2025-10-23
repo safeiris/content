@@ -1118,8 +1118,17 @@ async function handleGenerate(event) {
         ? response.error.trim()
         : typeof meta?.error === "string" && meta.error.trim()
           ? meta.error.trim()
-          : "Генерация завершилась с ошибкой.";
-      throw new Error(backendError);
+          : "";
+      const backendMessage = typeof response?.backend_message === "string" && response.backend_message.trim()
+        ? response.backend_message.trim()
+        : typeof meta?.backend_message === "string" && meta.backend_message.trim()
+          ? meta.backend_message.trim()
+          : "";
+      const messageParts = [backendMessage, backendError].filter(Boolean);
+      const failureMessage = messageParts.length > 0
+        ? messageParts.join(" ")
+        : "Генерация завершилась с ошибкой.";
+      throw new Error(failureMessage);
     }
     const artifactPaths = response?.artifact_paths;
     const metadataCharacters = typeof meta.characters === "number" ? meta.characters : undefined;

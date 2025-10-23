@@ -15,11 +15,12 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from llm_client import GenerationResult, generate as llm_generate
 from keyword_injector import (
     KeywordInjectionResult,
+    LOCK_END,
     LOCK_START_TEMPLATE,
     build_term_pattern,
     inject_keywords,
 )
-from length_trimmer import TrimResult, trim_text
+from length_trimmer import TrimResult, TrimValidationError, trim_text
 from validators import (
     ValidationError,
     ValidationResult,
@@ -125,6 +126,7 @@ class DeterministicPipeline:
         self.locked_terms: List[str] = []
         self.jsonld_reserve: int = 0
         self.skeleton_payload: Optional[Dict[str, object]] = None
+        self.keywords_coverage_percent: float = 0.0
 
         self._model_used: Optional[str] = None
         self._fallback_used: Optional[str] = None
@@ -198,34 +200,67 @@ class DeterministicPipeline:
         max_tokens: Optional[int] = None,
     ) -> GenerationResult:
         prompt_len = self._prompt_length(messages)
-        LOGGER.info("LOG:LLM_REQUEST step=%s model=%s prompt_len=%d", step.value, self.model, prompt_len)
         limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
         if not limit or limit <= 0:
             limit = 700
-        try:
-            result = llm_generate(
-                list(messages),
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=limit,
-                timeout_s=self.timeout_s,
-                backoff_schedule=self.backoff_schedule,
+        attempt = 0
+        while attempt < 3:
+            attempt += 1
+            LOGGER.info(
+                "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d attempt=%d max_tokens=%d",
+                step.value,
+                self.model,
+                prompt_len,
+                attempt,
+                limit,
             )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
-            raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
+            try:
+                result = llm_generate(
+                    list(messages),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=limit,
+                    timeout_s=self.timeout_s,
+                    backoff_schedule=self.backoff_schedule,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
+                raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
 
-        usage = self._extract_usage(result)
-        metadata = result.metadata or {}
-        status = str(metadata.get("status") or "ok")
-        LOGGER.info(
-            "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
-            step.value,
-            "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
-            status,
-        )
-        self._register_llm_result(result, usage)
-        return result
+            usage = self._extract_usage(result)
+            metadata = result.metadata or {}
+            status = str(metadata.get("status") or "ok")
+            incomplete_reason = metadata.get("incomplete_reason") or ""
+            LOGGER.info(
+                "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
+                step.value,
+                "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
+                status,
+            )
+            if status.lower() != "incomplete" and not incomplete_reason:
+                self._register_llm_result(result, usage)
+                return result
+
+            if attempt >= 3:
+                message = "Модель не завершила генерацию (incomplete)."
+                LOGGER.error(
+                    "LLM_INCOMPLETE_ABORT step=%s status=%s reason=%s",
+                    step.value,
+                    status or "incomplete",
+                    incomplete_reason or "",
+                )
+                raise PipelineStepError(step, message)
+
+            LOGGER.warning(
+                "LLM_RETRY_incomplete step=%s attempt=%d status=%s reason=%s",
+                step.value,
+                attempt,
+                status or "incomplete",
+                incomplete_reason or "",
+            )
+            limit = max(200, int(limit * 0.9))
+
+        raise PipelineStepError(step, "Не удалось получить ответ от модели.")
 
     def _check_template_text(self, text: str, step: PipelineStep) -> None:
         lowered = text.lower()
@@ -469,6 +504,15 @@ class DeterministicPipeline:
     def _sync_locked_terms(self, text: str) -> None:
         pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
         self.locked_terms = pattern.findall(text)
+        if self.normalized_keywords:
+            article = strip_jsonld(text)
+            found = 0
+            for term in self.normalized_keywords:
+                lock_token = LOCK_START_TEMPLATE.format(term=term)
+                lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
+                if lock_pattern.search(text) and build_term_pattern(term).search(article):
+                    found += 1
+            self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
 
     # ------------------------------------------------------------------
     # Step implementations
@@ -557,12 +601,13 @@ class DeterministicPipeline:
         self._log(PipelineStep.KEYWORDS, "running")
         result = inject_keywords(text, self.keywords)
         self.locked_terms = list(result.locked_terms)
+        self.keywords_coverage_percent = result.coverage_percent
         total = result.total_terms
         found = result.found_terms
         missing = sorted(result.missing_terms)
         LOGGER.info(
-            "KEYWORDS_COVERAGE=%s missing=%s",
-            result.coverage_report,
+            "KEYWORDS_COVERAGE=%.0f%% missing=%s",
+            result.coverage_percent,
             ",".join(missing) if missing else "-",
         )
         if total and found < total:
@@ -570,10 +615,12 @@ class DeterministicPipeline:
                 PipelineStep.KEYWORDS,
                 "Не удалось обеспечить 100% покрытие ключей: " + ", ".join(missing),
             )
+        LOGGER.info("KEYWORDS_OK coverage=%.2f%%", result.coverage_percent)
         self._update_log(
             PipelineStep.KEYWORDS,
             "ok",
             KEYWORDS_COVERAGE=result.coverage_report,
+            KEYWORDS_COVERAGE_PERCENT=result.coverage_percent,
             KEYWORDS_MISSING=missing,
             inserted_section=result.inserted_section,
             **self._metrics(result.text),
@@ -634,12 +681,15 @@ class DeterministicPipeline:
         self._log(PipelineStep.TRIM, "running")
         reserve = self.jsonld_reserve if self.jsonld else 0
         target_max = max(self.min_chars, self.max_chars - reserve)
-        result = trim_text(
-            text,
-            min_chars=self.min_chars,
-            max_chars=target_max,
-            protected_blocks=self.locked_terms,
-        )
+        try:
+            result = trim_text(
+                text,
+                min_chars=self.min_chars,
+                max_chars=target_max,
+                protected_blocks=self.locked_terms,
+            )
+        except TrimValidationError as exc:
+            raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
         current_length = length_no_spaces(result.text)
         if current_length < self.min_chars or current_length > self.max_chars:
             raise PipelineStepError(
@@ -699,9 +749,15 @@ class DeterministicPipeline:
                 min_chars=self.min_chars,
                 max_chars=self.max_chars,
                 skeleton_payload=self.skeleton_payload,
+                keyword_coverage_percent=self.keywords_coverage_percent,
             )
         except ValidationError as exc:
             raise PipelineStepError(PipelineStep.TRIM, str(exc), status_code=400) from exc
+        LOGGER.info(
+            "VALIDATION_OK length=%s keywords=%.0f%%",
+            validation.stats.get("length_no_spaces"),
+            float(validation.stats.get("keywords_coverage_percent") or 0.0),
+        )
         return PipelineState(
             text=combined_text,
             jsonld=self.jsonld,
@@ -753,9 +809,15 @@ class DeterministicPipeline:
                 min_chars=self.min_chars,
                 max_chars=self.max_chars,
                 skeleton_payload=self.skeleton_payload,
+                keyword_coverage_percent=self.keywords_coverage_percent,
             )
         except ValidationError as exc:
             raise PipelineStepError(step, str(exc), status_code=400) from exc
+        LOGGER.info(
+            "VALIDATION_OK length=%s keywords=%.0f%%",
+            validation.stats.get("length_no_spaces"),
+            float(validation.stats.get("keywords_coverage_percent") or 0.0),
+        )
         return PipelineState(
             text=combined_text,
             jsonld=self.jsonld,

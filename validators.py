@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
 from keyword_injector import LOCK_END, LOCK_START_TEMPLATE, build_term_pattern
 
 _FAQ_START = "<!--FAQ_START-->"
@@ -154,6 +155,7 @@ def validate_article(
     min_chars: int,
     max_chars: int,
     skeleton_payload: Optional[Dict[str, object]] = None,
+    keyword_coverage_percent: Optional[float] = None,
 ) -> ValidationResult:
     length = _length_no_spaces(text)
     skeleton_ok, skeleton_message = _skeleton_status(skeleton_payload, text)
@@ -200,7 +202,13 @@ def validate_article(
     if not faq_ok and faq_error is None:
         faq_error = "FAQ должен содержать ровно 5 вопросов и ответов."
 
-    length_ok = min_chars <= length <= max_chars
+    coverage_percent = 100.0 if not normalized_keywords else round(
+        (len(normalized_keywords) - len(missing)) / len(normalized_keywords) * 100,
+        2,
+    )
+
+    length_ok = DEFAULT_MIN_LENGTH <= length <= DEFAULT_MAX_LENGTH
+    requested_range_ok = min_chars <= length <= max_chars
 
     stats: Dict[str, object] = {
         "length_no_spaces": length,
@@ -208,11 +216,26 @@ def validate_article(
         "keywords_missing": missing,
         "keywords_found": len(normalized_keywords) - len(missing),
         "keywords_coverage": f"{len(normalized_keywords) - len(missing)}/{len(normalized_keywords) if normalized_keywords else 0}",
+        "keywords_coverage_percent": coverage_percent,
+        "keyword_coverage_expected_percent": keyword_coverage_percent,
         "faq_count": faq_count,
         "faq_jsonld_count": len(jsonld_entries),
         "faq_mismatched_questions": mismatched_questions,
         "jsonld_ok": jsonld_ok,
+        "length_requested_range_ok": requested_range_ok,
+        "length_required_min": DEFAULT_MIN_LENGTH,
+        "length_required_max": DEFAULT_MAX_LENGTH,
     }
+
+    if keyword_coverage_percent is not None and keyword_coverage_percent < 100.0:
+        raise ValidationError(
+            "keywords",
+            (
+                "Этап подстановки ключевых слов завершился с покрытием "
+                f"{keyword_coverage_percent:.0f}%, требуется 100%."
+            ),
+            details=stats,
+        )
 
     result = ValidationResult(
         skeleton_ok=skeleton_ok,
@@ -237,7 +260,10 @@ def validate_article(
     if not length_ok:
         raise ValidationError(
             "length",
-            f"Объём статьи {length} зн. без пробелов, требуется {min_chars}-{max_chars}.",
+            (
+                f"Объём статьи {length} зн. без пробелов, требуется "
+                f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH}."
+            ),
             details=stats,
         )
     return result

@@ -27,6 +27,7 @@ class KeywordInjectionResult:
     found_terms: int = 0
     missing_terms: List[str] = field(default_factory=list)
     coverage_report: str = "0/0"
+    coverage_percent: float = 0.0
 
 
 def _normalize_keywords(keywords: Iterable[str]) -> List[str]:
@@ -190,6 +191,7 @@ def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResul
     total_terms = len(normalized)
     found_terms = total_terms - len(missing_report)
     coverage_report = f"{found_terms}/{total_terms}" if total_terms else "0/0"
+    coverage_percent = 100.0 if total_terms == 0 else round(found_terms / total_terms * 100, 2)
     return KeywordInjectionResult(
         text=working,
         coverage=coverage,
@@ -199,4 +201,5 @@ def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResul
         found_terms=found_terms,
         missing_terms=missing_report,
         coverage_report=coverage_report,
+        coverage_percent=coverage_percent,
     )

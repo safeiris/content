@@ -1,153 +1,8 @@
 diff --git a/artifacts_store.py b/artifacts_store.py
-index fac01878336197a01d70cffaa24b73d0d25fc5ef..47d2441cd3fd40562d9abd139bfaf4404fe42b04 100644
+index 47d2441cd3fd40562d9abd139bfaf4404fe42b04..a2d15bc772a0fc6f6a71388487e1fe5f7552049e 100644
 --- a/artifacts_store.py
 +++ b/artifacts_store.py
-@@ -21,77 +21,85 @@ CHANGELOG_FILENAME = "changelog.json"
- class ArtifactRecord:
-     """Normalized representation of an artifact entry."""
- 
-     id: str
-     path: str
-     metadata_path: Optional[str]
-     name: str
-     updated_at: Optional[str]
-     status: Optional[str]
-     extra: Dict[str, Any]
- 
- 
- def _index_path() -> Path:
-     return ARTIFACTS_DIR / INDEX_FILENAME
- 
- 
- def _ensure_dir() -> None:
-     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
- 
- 
- def _atomic_write_text(path: Path, text: str, *, validator: Optional[Callable[[Path], None]] = None) -> None:
-     _ensure_dir()
-     tmp_path = path.with_suffix(path.suffix + ".tmp")
-     path.parent.mkdir(parents=True, exist_ok=True)
-     tmp_path.write_text(text, encoding="utf-8")
--    if validator is not None:
--        validator(tmp_path)
--    tmp_path.replace(path)
-+    try:
-+        if validator is not None:
-+            validator(tmp_path)
-+        tmp_path.replace(path)
-+    finally:
-+        try:
-+            if tmp_path.exists():
-+                tmp_path.unlink()
-+        except OSError:
-+            pass
- 
- 
- def resolve_artifact_path(raw_path: str | Path) -> Path:
-     """Return absolute path within the artifacts directory."""
- 
--    base_dir = ARTIFACTS_DIR
--    if not isinstance(raw_path, Path):
--        candidate = Path(str(raw_path))
--    else:
--        candidate = raw_path
--
--    if not candidate.is_absolute():
--        candidate = (base_dir / candidate).resolve()
-+    base_dir = ARTIFACTS_DIR.resolve()
-+    candidate = Path(raw_path) if not isinstance(raw_path, Path) else raw_path
-+    if candidate.is_absolute():
-+        resolved = candidate.resolve()
-     else:
--        candidate = candidate.resolve()
-+        tentative = (Path.cwd() / candidate).resolve()
-+        try:
-+            tentative.relative_to(base_dir)
-+            resolved = tentative
-+        except ValueError:
-+            resolved = (base_dir / candidate).resolve()
- 
--    if candidate == base_dir:
-+    if resolved == base_dir:
-         raise ValueError("Запрошенный путь указывает на каталог artifacts")
- 
-     try:
--        candidate.relative_to(base_dir)
-+        resolved.relative_to(base_dir)
-     except ValueError as exc:  # noqa: PERF203 - explicit error message helps debugging
-         raise ValueError("Запрошенный путь вне каталога artifacts") from exc
--    return candidate
-+    return resolved
- 
- 
- def _read_index() -> List[Dict[str, Any]]:
-     index_path = _index_path()
-     if not index_path.exists():
-         return []
-     try:
-         raw = json.loads(index_path.read_text(encoding="utf-8"))
-     except json.JSONDecodeError as exc:
-         LOGGER.warning("Не удалось разобрать artifacts/index.json: %s", exc)
-         return []
-     if not isinstance(raw, list):
-         LOGGER.warning("Некорректный формат artifacts/index.json — ожидается массив")
-         return []
-     return [entry for entry in raw if isinstance(entry, dict)]
- 
- 
- def _write_index(entries: Sequence[Dict[str, Any]]) -> None:
-     index_path = _index_path()
-     payload = json.dumps(list(entries), ensure_ascii=False, indent=2, sort_keys=True)
-     _atomic_write_text(index_path, payload)
- 
- 
- def _latest_path() -> Path:
-     return ARTIFACTS_DIR / LATEST_FILENAME
-@@ -192,51 +200,55 @@ def _build_record_from_file(path: Path, metadata: Optional[Dict[str, Any]] = Non
-     record_id = str(payload.get("id") or payload.get("artifact_id") or path.stem)
-     status = payload.get("status") or ("Ready" if path.exists() else None)
-     updated_at = payload.get("generated_at") or None
-     name = payload.get("name") or path.name
- 
-     return ArtifactRecord(
-         id=record_id,
-         path=_relative_path(path),
-         metadata_path=_relative_path(metadata_path) if metadata_path.exists() else None,
-         name=name,
-         updated_at=str(updated_at) if updated_at else None,
-         status=str(status) if status else None,
-         extra={},
-     )
- 
- 
- def register_artifact(
-     markdown_path: Path,
-     metadata: Optional[Dict[str, Any]] = None,
-     *,
-     finalized: bool = True,
- ) -> ArtifactRecord:
-     """Ensure that the artifact index contains an entry for the file."""
- 
-     resolved = resolve_artifact_path(markdown_path)
--    payload = metadata if metadata is not None else _read_metadata(resolved.with_suffix(".json"))
-+    if not resolved.exists():
-+        raise FileNotFoundError(f"Артефакт {resolved} не найден и не может быть зарегистрирован.")
-+    if metadata is not None and not isinstance(metadata, dict):
-+        raise ValueError("metadata must be a dictionary")
-+    payload = dict(metadata) if isinstance(metadata, dict) else _read_metadata(resolved.with_suffix(".json"))
-     record = _build_record_from_file(resolved, payload)
-     entries = _read_index()
- 
-     updated = False
-     for idx, entry in enumerate(entries):
-         candidate = _build_record_from_entry(entry)
-         if candidate and (candidate.path == record.path or candidate.id == record.id):
-             merged = dict(entry)
-             merged.update(
-                 {
-                     "id": record.id,
-                     "path": record.path,
-                     "metadata_path": record.metadata_path,
+@@ -243,50 +243,55 @@ def register_artifact(
                      "name": record.name,
                      "status": record.status,
                      "updated_at": record.updated_at,
@@ -160,7 +15,27 @@ index fac01878336197a01d70cffaa24b73d0d25fc5ef..47d2441cd3fd40562d9abd139bfaf440
          entries.append(
              {
                  "id": record.id,
-@@ -259,51 +271,51 @@ def register_artifact(
+                 "path": record.path,
+                 "metadata_path": record.metadata_path,
+                 "name": record.name,
+                 "status": record.status,
+                 "updated_at": record.updated_at,
+             }
+         )
+ 
+     entries = _sort_entries(entries)
+     _write_index(entries)
+     if finalized:
+         _update_latest(record)
+         _append_changelog(record)
++        LOGGER.info(
++            "ARTIFACT_SAVED path=%s metadata=%s",
++            record.path,
++            record.metadata_path or "-",
++        )
+     return record
+ 
+ 
  def _sort_entries(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
      def _key(entry: Dict[str, Any]) -> tuple:
          updated_at = entry.get("updated_at")
@@ -183,41 +58,310 @@ index fac01878336197a01d70cffaa24b73d0d25fc5ef..47d2441cd3fd40562d9abd139bfaf440
          artifacts_dir = ARTIFACTS_DIR
          if artifacts_dir.exists():
              for path in sorted(artifacts_dir.glob("*.md"), reverse=True):
-                 metadata = _read_metadata(path.with_suffix(".json"))
-                 record = _build_record_from_file(path, metadata)
-                 try:
--                    register_artifact(path, metadata)
-+                    register_artifact(path, metadata, finalized=False)
-                 except Exception as exc:  # noqa: BLE001 - keep listing even if index update fails
-                     LOGGER.warning("Не удалось обновить индекс для %s: %s", path, exc)
-                 records.append(record)
- 
-     items: List[Dict[str, Any]] = []
-     for record in records:
-         artifact_path = resolve_artifact_path(record.path)
-         metadata_path = None
-         if record.metadata_path:
-             try:
-                 metadata_path = resolve_artifact_path(record.metadata_path)
-             except ValueError:
-                 metadata_path = None
- 
-         metadata = _read_metadata(metadata_path) if metadata_path else {}
-         if theme and not _matches_theme(theme, metadata, artifact_path):
-             continue
- 
-         stat = None
-         if artifact_path.exists() and artifact_path.is_file():
-             stat = artifact_path.stat()
-         item = {
-             "id": record.id,
-             "name": record.name or artifact_path.name,
-             "path": record.path,
 diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 63b410e950cd8a719f4330a4a7079aca7f0654aa..f291c6569cdfbc1103878756ce674c0f9ee5dc9d 100644
+index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f7d8e322f 100644
 --- a/deterministic_pipeline.py
 +++ b/deterministic_pipeline.py
-@@ -537,121 +537,163 @@ class DeterministicPipeline:
+@@ -1,47 +1,48 @@
+ """LLM-driven content pipeline with explicit step-level guarantees."""
+ 
+ from __future__ import annotations
+ 
+ import json
+ import json
+ import logging
+ import re
+ import textwrap
+ import time
+ from dataclasses import dataclass, field
+ from enum import Enum
+ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+ 
+ from llm_client import GenerationResult, generate as llm_generate
+ from keyword_injector import (
+     KeywordInjectionResult,
++    LOCK_END,
+     LOCK_START_TEMPLATE,
+     build_term_pattern,
+     inject_keywords,
+ )
+-from length_trimmer import TrimResult, trim_text
++from length_trimmer import TrimResult, TrimValidationError, trim_text
+ from validators import (
+     ValidationError,
+     ValidationResult,
+     length_no_spaces,
+     strip_jsonld,
+     validate_article,
+ )
+ 
+ 
+ LOGGER = logging.getLogger("content_factory.pipeline")
+ 
+ FAQ_START = "<!--FAQ_START-->"
+ FAQ_END = "<!--FAQ_END-->"
+ 
+ _TEMPLATE_SNIPPETS = [
+     "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
+     "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист",
+     "В выводах собираем план действий, назначаем контрольные даты",
+ ]
+ 
+ 
+ class PipelineStep(str, Enum):
+     SKELETON = "skeleton"
+     KEYWORDS = "keywords"
+     FAQ = "faq"
+@@ -103,50 +104,51 @@ class DeterministicPipeline:
+     ) -> None:
+         if not model or not str(model).strip():
+             raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
+ 
+         self.topic = topic.strip() or "Тема"
+         self.base_outline = list(base_outline) if base_outline else ["Введение", "Основная часть", "Вывод"]
+         self.keywords = [str(term).strip() for term in keywords if str(term).strip()]
+         self.normalized_keywords = [term for term in self.keywords if term]
+         self.min_chars = int(min_chars)
+         self.max_chars = int(max_chars)
+         self.messages = [dict(message) for message in messages]
+         self.model = str(model).strip()
+         self.temperature = float(temperature)
+         self.max_tokens = int(max_tokens) if max_tokens else 0
+         self.timeout_s = int(timeout_s)
+         self.backoff_schedule = list(backoff_schedule) if backoff_schedule else None
+         self.provided_faq = provided_faq or []
+         self.jsonld_requested = bool(jsonld_requested)
+ 
+         self.logs: List[PipelineLogEntry] = []
+         self.checkpoints: Dict[PipelineStep, str] = {}
+         self.jsonld: Optional[str] = None
+         self.locked_terms: List[str] = []
+         self.jsonld_reserve: int = 0
+         self.skeleton_payload: Optional[Dict[str, object]] = None
++        self.keywords_coverage_percent: float = 0.0
+ 
+         self._model_used: Optional[str] = None
+         self._fallback_used: Optional[str] = None
+         self._fallback_reason: Optional[str] = None
+         self._api_route: Optional[str] = None
+         self._token_usage: Optional[float] = None
+ 
+     # ------------------------------------------------------------------
+     # Internal helpers
+     # ------------------------------------------------------------------
+     def _log(self, step: PipelineStep, status: str, **notes: object) -> None:
+         entry = PipelineLogEntry(step=step, started_at=time.time(), status=status, notes=dict(notes))
+         self.logs.append(entry)
+ 
+     def _update_log(self, step: PipelineStep, status: str, **notes: object) -> None:
+         for entry in reversed(self.logs):
+             if entry.step == step:
+                 entry.status = status
+                 entry.finished_at = time.time()
+                 entry.notes.update(notes)
+                 return
+         self.logs.append(
+             PipelineLogEntry(step=step, started_at=time.time(), finished_at=time.time(), status=status, notes=dict(notes))
+         )
+ 
+@@ -176,78 +178,111 @@ class DeterministicPipeline:
+         metadata = result.metadata or {}
+         if not isinstance(metadata, dict):
+             return None
+         candidates = [
+             metadata.get("usage_output_tokens"),
+             metadata.get("token_usage"),
+             metadata.get("output_tokens"),
+         ]
+         usage_block = metadata.get("usage")
+         if isinstance(usage_block, dict):
+             candidates.append(usage_block.get("output_tokens"))
+             candidates.append(usage_block.get("total_tokens"))
+         for candidate in candidates:
+             if isinstance(candidate, (int, float)):
+                 return float(candidate)
+         return None
+ 
+     def _call_llm(
+         self,
+         *,
+         step: PipelineStep,
+         messages: Sequence[Dict[str, object]],
+         max_tokens: Optional[int] = None,
+     ) -> GenerationResult:
+         prompt_len = self._prompt_length(messages)
+-        LOGGER.info("LOG:LLM_REQUEST step=%s model=%s prompt_len=%d", step.value, self.model, prompt_len)
+         limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
+         if not limit or limit <= 0:
+             limit = 700
+-        try:
+-            result = llm_generate(
+-                list(messages),
+-                model=self.model,
+-                temperature=self.temperature,
+-                max_tokens=limit,
+-                timeout_s=self.timeout_s,
+-                backoff_schedule=self.backoff_schedule,
++        attempt = 0
++        while attempt < 3:
++            attempt += 1
++            LOGGER.info(
++                "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d attempt=%d max_tokens=%d",
++                step.value,
++                self.model,
++                prompt_len,
++                attempt,
++                limit,
+             )
+-        except Exception as exc:  # noqa: BLE001
+-            LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
+-            raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
++            try:
++                result = llm_generate(
++                    list(messages),
++                    model=self.model,
++                    temperature=self.temperature,
++                    max_tokens=limit,
++                    timeout_s=self.timeout_s,
++                    backoff_schedule=self.backoff_schedule,
++                )
++            except Exception as exc:  # noqa: BLE001
++                LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
++                raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
+ 
+-        usage = self._extract_usage(result)
+-        metadata = result.metadata or {}
+-        status = str(metadata.get("status") or "ok")
+-        LOGGER.info(
+-            "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
+-            step.value,
+-            "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
+-            status,
+-        )
+-        self._register_llm_result(result, usage)
+-        return result
++            usage = self._extract_usage(result)
++            metadata = result.metadata or {}
++            status = str(metadata.get("status") or "ok")
++            incomplete_reason = metadata.get("incomplete_reason") or ""
++            LOGGER.info(
++                "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
++                step.value,
++                "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
++                status,
++            )
++            if status.lower() != "incomplete" and not incomplete_reason:
++                self._register_llm_result(result, usage)
++                return result
++
++            if attempt >= 3:
++                message = "Модель не завершила генерацию (incomplete)."
++                LOGGER.error(
++                    "LLM_INCOMPLETE_ABORT step=%s status=%s reason=%s",
++                    step.value,
++                    status or "incomplete",
++                    incomplete_reason or "",
++                )
++                raise PipelineStepError(step, message)
++
++            LOGGER.warning(
++                "LLM_RETRY_incomplete step=%s attempt=%d status=%s reason=%s",
++                step.value,
++                attempt,
++                status or "incomplete",
++                incomplete_reason or "",
++            )
++            limit = max(200, int(limit * 0.9))
++
++        raise PipelineStepError(step, "Не удалось получить ответ от модели.")
+ 
+     def _check_template_text(self, text: str, step: PipelineStep) -> None:
+         lowered = text.lower()
+         if lowered.count("дополнительно рассматривается") >= 3:
+             raise PipelineStepError(step, "Обнаружен шаблонный текст 'Дополнительно рассматривается'.")
+         for snippet in _TEMPLATE_SNIPPETS:
+             if snippet in lowered:
+                 raise PipelineStepError(step, "Найден служебный шаблонный фрагмент, генерация отклонена.")
+ 
+     def _metrics(self, text: str) -> Dict[str, object]:
+         article = strip_jsonld(text)
+         chars_no_spaces = length_no_spaces(article)
+         keywords_found = 0
+         for term in self.normalized_keywords:
+             if build_term_pattern(term).search(article):
+                 keywords_found += 1
+         return {
+             "chars_no_spaces": chars_no_spaces,
+             "keywords_found": keywords_found,
+             "keywords_total": len(self.normalized_keywords),
+         }
+ 
+     def _resolve_skeleton_tokens(self) -> int:
+         baseline = max(self.max_tokens, self.max_chars + 400)
+         if baseline <= 0:
+@@ -447,50 +482,59 @@ class DeterministicPipeline:
+ 
+         user_instructions = [
+             "Ниже приведена статья без блока FAQ. Сформируй пять уникальных вопросов и ответов.",
+             "Верни результат в формате JSON: {\"faq\": [{\"question\": \"...\", \"answer\": \"...\"}, ...]}.",
+             "Ответы должны быть развернутыми, практичными и без повторов.",
+             "Не используй клише вроде 'Дополнительно рассматривается'.",
+         ]
+         if hints:
+             user_instructions.extend(hints)
+         payload = "\n".join(user_instructions)
+         article_block = f"СТАТЬЯ:\n{base_text.strip()}"
+         return [
+             {
+                 "role": "system",
+                 "content": (
+                     "Ты опытный финансовый редактор. Сформируй полезный FAQ без повторов,"
+                     " обеспечь, чтобы вопросы отличались по фокусу и помогали читателю действовать."
+                 ),
+             },
+             {"role": "user", "content": f"{payload}\n\n{article_block}"},
+         ]
+ 
+     def _sync_locked_terms(self, text: str) -> None:
+         pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
+         self.locked_terms = pattern.findall(text)
++        if self.normalized_keywords:
++            article = strip_jsonld(text)
++            found = 0
++            for term in self.normalized_keywords:
++                lock_token = LOCK_START_TEMPLATE.format(term=term)
++                lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
++                if lock_pattern.search(text) and build_term_pattern(term).search(article):
++                    found += 1
++            self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
+ 
+     # ------------------------------------------------------------------
+     # Step implementations
+     # ------------------------------------------------------------------
+     def _run_skeleton(self) -> str:
+         self._log(PipelineStep.SKELETON, "running")
+         messages = self._build_skeleton_messages()
+         skeleton_tokens = self._resolve_skeleton_tokens()
+         attempt = 0
+         last_error: Optional[Exception] = None
+         payload: Optional[Dict[str, object]] = None
+         markdown: Optional[str] = None
+         metadata_snapshot: Dict[str, object] = {}
+         while attempt < 3 and markdown is None:
+             attempt += 1
+             try:
+                 result = self._call_llm(
+                     step=PipelineStep.SKELETON,
+                     messages=messages,
+                     max_tokens=skeleton_tokens,
+                 )
+             except PipelineStepError:
+                 raise
+             metadata_snapshot = result.metadata or {}
+             status = str(metadata_snapshot.get("status") or "ok").lower()
+@@ -535,67 +579,70 @@ class DeterministicPipeline:
+             if last_error:
+                 raise last_error
              raise PipelineStepError(
                  PipelineStep.SKELETON,
                  "Не удалось получить корректный скелет статьи после нескольких попыток.",
@@ -241,26 +385,29 @@ index 63b410e950cd8a719f4330a4a7079aca7f0654aa..f291c6569cdfbc1103878756ce674c0f
          self._log(PipelineStep.KEYWORDS, "running")
          result = inject_keywords(text, self.keywords)
          self.locked_terms = list(result.locked_terms)
++        self.keywords_coverage_percent = result.coverage_percent
          total = result.total_terms
          found = result.found_terms
-+        missing = sorted(result.missing_terms)
-+        LOGGER.info(
-+            "KEYWORDS_COVERAGE=%s missing=%s",
-+            result.coverage_report,
-+            ",".join(missing) if missing else "-",
-+        )
+         missing = sorted(result.missing_terms)
+         LOGGER.info(
+-            "KEYWORDS_COVERAGE=%s missing=%s",
+-            result.coverage_report,
++            "KEYWORDS_COVERAGE=%.0f%% missing=%s",
++            result.coverage_percent,
+             ",".join(missing) if missing else "-",
+         )
          if total and found < total:
--            missing = sorted(term for term, ok in result.coverage.items() if not ok)
              raise PipelineStepError(
                  PipelineStep.KEYWORDS,
                  "Не удалось обеспечить 100% покрытие ключей: " + ", ".join(missing),
              )
++        LOGGER.info("KEYWORDS_OK coverage=%.2f%%", result.coverage_percent)
          self._update_log(
              PipelineStep.KEYWORDS,
              "ok",
--            coverage_summary=f"{found}/{total}",
-+            KEYWORDS_COVERAGE=result.coverage_report,
-+            KEYWORDS_MISSING=missing,
+             KEYWORDS_COVERAGE=result.coverage_report,
++            KEYWORDS_COVERAGE_PERCENT=result.coverage_percent,
+             KEYWORDS_MISSING=missing,
              inserted_section=result.inserted_section,
              **self._metrics(result.text),
          )
@@ -270,76 +417,62 @@ index 63b410e950cd8a719f4330a4a7079aca7f0654aa..f291c6569cdfbc1103878756ce674c0f
      def _run_faq(self, text: str) -> str:
          self._log(PipelineStep.FAQ, "running")
          messages = self._build_faq_messages(text)
--        result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=700)
--        entries = self._parse_faq_entries(result.text)
--        faq_block = self._render_faq_markdown(entries)
--        merged_text = self._merge_faq(text, faq_block)
--        self.jsonld = self._build_jsonld(entries)
--        self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
--        self._update_log(
--            PipelineStep.FAQ,
--            "ok",
--            entries=[entry["question"] for entry in entries],
--            **self._metrics(merged_text),
--        )
--        self.checkpoints[PipelineStep.FAQ] = merged_text
--        return merged_text
-+        faq_tokens = 700
-+        attempt = 0
-+        last_error: Optional[Exception] = None
-+        while attempt < 3:
-+            attempt += 1
-+            try:
-+                result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=faq_tokens)
-+            except PipelineStepError:
-+                raise
-+            metadata = result.metadata or {}
-+            status = str(metadata.get("status") or "").lower()
-+            if status == "incomplete" or metadata.get("incomplete_reason"):
-+                LOGGER.warning(
-+                    "FAQ_RETRY_incomplete attempt=%d status=%s reason=%s",
-+                    attempt,
-+                    status or "incomplete",
-+                    metadata.get("incomplete_reason") or "",
-+                )
-+                faq_tokens = max(300, int(faq_tokens * 0.9))
-+                last_error = PipelineStepError(PipelineStep.FAQ, "Модель не завершила формирование FAQ.")
-+                continue
-+            try:
-+                entries = self._parse_faq_entries(result.text)
-+            except PipelineStepError as exc:
-+                last_error = exc
-+                LOGGER.warning("FAQ_RETRY_parse_error attempt=%d error=%s", attempt, exc)
-+                faq_tokens = max(300, int(faq_tokens * 0.9))
-+                continue
-+            faq_block = self._render_faq_markdown(entries)
-+            merged_text = self._merge_faq(text, faq_block)
-+            self.jsonld = self._build_jsonld(entries)
-+            self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
-+            LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in entries))
-+            self._update_log(
-+                PipelineStep.FAQ,
-+                "ok",
-+                entries=[entry["question"] for entry in entries],
-+                **self._metrics(merged_text),
-+            )
-+            self.checkpoints[PipelineStep.FAQ] = merged_text
-+            return merged_text
-+
-+        if last_error:
-+            raise last_error
-+        raise PipelineStepError(PipelineStep.FAQ, "Не удалось сформировать блок FAQ после нескольких попыток.")
+         faq_tokens = 700
+         attempt = 0
+         last_error: Optional[Exception] = None
+         while attempt < 3:
+             attempt += 1
+             try:
+                 result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=faq_tokens)
+             except PipelineStepError:
+                 raise
+             metadata = result.metadata or {}
+             status = str(metadata.get("status") or "").lower()
+             if status == "incomplete" or metadata.get("incomplete_reason"):
+                 LOGGER.warning(
+                     "FAQ_RETRY_incomplete attempt=%d status=%s reason=%s",
+                     attempt,
+@@ -612,56 +659,59 @@ class DeterministicPipeline:
+                 LOGGER.warning("FAQ_RETRY_parse_error attempt=%d error=%s", attempt, exc)
+                 faq_tokens = max(300, int(faq_tokens * 0.9))
+                 continue
+             faq_block = self._render_faq_markdown(entries)
+             merged_text = self._merge_faq(text, faq_block)
+             self.jsonld = self._build_jsonld(entries)
+             self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
+             LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in entries))
+             self._update_log(
+                 PipelineStep.FAQ,
+                 "ok",
+                 entries=[entry["question"] for entry in entries],
+                 **self._metrics(merged_text),
+             )
+             self.checkpoints[PipelineStep.FAQ] = merged_text
+             return merged_text
+ 
+         if last_error:
+             raise last_error
+         raise PipelineStepError(PipelineStep.FAQ, "Не удалось сформировать блок FAQ после нескольких попыток.")
  
      def _run_trim(self, text: str) -> TrimResult:
          self._log(PipelineStep.TRIM, "running")
          reserve = self.jsonld_reserve if self.jsonld else 0
          target_max = max(self.min_chars, self.max_chars - reserve)
-         result = trim_text(
-             text,
-             min_chars=self.min_chars,
-             max_chars=target_max,
-             protected_blocks=self.locked_terms,
-         )
+-        result = trim_text(
+-            text,
+-            min_chars=self.min_chars,
+-            max_chars=target_max,
+-            protected_blocks=self.locked_terms,
+-        )
++        try:
++            result = trim_text(
++                text,
++                min_chars=self.min_chars,
++                max_chars=target_max,
++                protected_blocks=self.locked_terms,
++            )
++        except TrimValidationError as exc:
++            raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
          current_length = length_no_spaces(result.text)
          if current_length < self.min_chars or current_length > self.max_chars:
              raise PipelineStepError(
@@ -365,15 +498,7 @@ index 63b410e950cd8a719f4330a4a7079aca7f0654aa..f291c6569cdfbc1103878756ce674c0f
          if len(faq_pairs) != 5:
              raise PipelineStepError(
                  PipelineStep.TRIM,
-                 "FAQ должен содержать ровно 5 вопросов после тримминга.",
-             )
-+        LOGGER.info(
-+            "TRIM_OK chars_no_spaces=%d removed_paragraphs=%d",
-+            current_length,
-+            len(result.removed_paragraphs),
-+        )
-         self._update_log(
-             PipelineStep.TRIM,
+@@ -677,53 +727,59 @@ class DeterministicPipeline:
              "ok",
              removed=len(result.removed_paragraphs),
              **self._metrics(result.text),
@@ -397,45 +522,95 @@ index 63b410e950cd8a719f4330a4a7079aca7f0654aa..f291c6569cdfbc1103878756ce674c0f
                  combined_text,
                  keywords=self.keywords,
                  min_chars=self.min_chars,
+                 max_chars=self.max_chars,
+                 skeleton_payload=self.skeleton_payload,
++                keyword_coverage_percent=self.keywords_coverage_percent,
+             )
+         except ValidationError as exc:
+             raise PipelineStepError(PipelineStep.TRIM, str(exc), status_code=400) from exc
++        LOGGER.info(
++            "VALIDATION_OK length=%s keywords=%.0f%%",
++            validation.stats.get("length_no_spaces"),
++            float(validation.stats.get("keywords_coverage_percent") or 0.0),
++        )
+         return PipelineState(
+             text=combined_text,
+             jsonld=self.jsonld,
+             validation=validation,
+             logs=self.logs,
+             checkpoints=self.checkpoints,
+             model_used=self._model_used or self.model,
+             fallback_used=self._fallback_used,
+             fallback_reason=self._fallback_reason,
+             api_route=self._api_route,
+             token_usage=self._token_usage,
+             skeleton_payload=self.skeleton_payload,
+         )
+ 
+     def resume(self, from_step: PipelineStep) -> PipelineState:
+         order = [PipelineStep.SKELETON, PipelineStep.KEYWORDS, PipelineStep.FAQ, PipelineStep.TRIM]
+         if from_step == PipelineStep.SKELETON:
+             return self.run()
+ 
+         requested_index = order.index(from_step)
+         base_index = requested_index - 1
+         fallback_index = base_index
+         while fallback_index >= 0 and order[fallback_index] not in self.checkpoints:
+             fallback_index -= 1
+ 
+@@ -731,41 +787,47 @@ class DeterministicPipeline:
+             raise PipelineStepError(from_step, "Чекпоинты отсутствуют; требуется полный перезапуск.")
+ 
+         base_step = order[fallback_index]
+         base_text = self.checkpoints[base_step]
+         self._sync_locked_terms(base_text)
+ 
+         text = base_text
+         for step in order[fallback_index + 1 :]:
+             if step == PipelineStep.KEYWORDS:
+                 text = self._run_keywords(text).text
+             elif step == PipelineStep.FAQ:
+                 text = self._run_faq(text)
+             elif step == PipelineStep.TRIM:
+                 text = self._run_trim(text).text
+ 
+         combined_text = text
+         if self.jsonld and self.jsonld_requested:
+             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
+         try:
+             validation = validate_article(
+                 combined_text,
+                 keywords=self.keywords,
+                 min_chars=self.min_chars,
+                 max_chars=self.max_chars,
+                 skeleton_payload=self.skeleton_payload,
++                keyword_coverage_percent=self.keywords_coverage_percent,
+             )
+         except ValidationError as exc:
+             raise PipelineStepError(step, str(exc), status_code=400) from exc
++        LOGGER.info(
++            "VALIDATION_OK length=%s keywords=%.0f%%",
++            validation.stats.get("length_no_spaces"),
++            float(validation.stats.get("keywords_coverage_percent") or 0.0),
++        )
+         return PipelineState(
+             text=combined_text,
+             jsonld=self.jsonld,
+             validation=validation,
+             logs=self.logs,
+             checkpoints=self.checkpoints,
+             model_used=self._model_used or self.model,
+             fallback_used=self._fallback_used,
+             fallback_reason=self._fallback_reason,
+             api_route=self._api_route,
+             token_usage=self._token_usage,
+             skeleton_payload=self.skeleton_payload,
+         )
 diff --git a/frontend_demo/script.js b/frontend_demo/script.js
-index 516c9d88bb063d62637edfe18ca7b3686880329f..d5a3708d25e4d9b5f62d23e4e7a7b37e62818ac6 100644
+index d5a3708d25e4d9b5f62d23e4e7a7b37e62818ac6..ba7487ce8c7a152a82b1c4b9ed9857c3c0088e3b 100644
 --- a/frontend_demo/script.js
 +++ b/frontend_demo/script.js
-@@ -1063,75 +1063,86 @@ async function handlePromptPreview() {
-     const preview = await fetchJson("/api/prompt/preview", {
-       method: "POST",
-       body: JSON.stringify(previewRequest),
-     });
-     updatePromptPreview(preview);
-     switchTab("result");
-   } catch (error) {
-     console.error(error);
-     showToast({ message: `Не удалось собрать промпт: ${getErrorMessage(error)}`, type: "error" });
-   } finally {
-     setButtonLoading(previewBtn, false);
-     setInteractiveBusy(false);
-     showProgress(false);
-   }
- }
- 
- async function handleGenerate(event) {
-   event.preventDefault();
-   try {
-     const payload = buildRequestPayload();
-     toggleRetryButton(false);
-     setInteractiveBusy(true);
-     setButtonLoading(generateBtn, true);
-     showProgress(true, "Генерируем материалы…");
-     renderUsedKeywords(null);
-+    const requestModel = payload.model || null;
-     const requestBody = {
-       theme: payload.theme,
-       data: payload.data,
-       k: payload.k,
--      model: payload.model,
-+      model: requestModel,
-       temperature: payload.temperature,
-       max_tokens: payload.maxTokens,
+@@ -1096,52 +1096,61 @@ async function handleGenerate(event) {
        context_source: payload.context_source,
        keywords: Array.isArray(payload.data?.keywords) ? payload.data.keywords : [],
        length_range: { min: 3500, max: 6000, mode: "no_spaces" },
@@ -454,16 +629,27 @@ index 516c9d88bb063d62637edfe18ca7b3686880329f..d5a3708d25e4d9b5f62d23e4e7a7b37e
      });
      const markdown = response?.markdown ?? "";
      const meta = (response?.meta_json && typeof response.meta_json === "object") ? response.meta_json : {};
-+    const responseStatus = typeof response?.status === "string" ? response.status.trim().toLowerCase() : "";
-+    const metaStatus = typeof meta?.status === "string" ? meta.status.trim().toLowerCase() : "";
-+    if (["failed", "error"].includes(responseStatus) || ["failed", "error"].includes(metaStatus)) {
-+      const backendError = typeof response?.error === "string" && response.error.trim()
-+        ? response.error.trim()
-+        : typeof meta?.error === "string" && meta.error.trim()
-+          ? meta.error.trim()
-+          : "Генерация завершилась с ошибкой.";
-+      throw new Error(backendError);
-+    }
+     const responseStatus = typeof response?.status === "string" ? response.status.trim().toLowerCase() : "";
+     const metaStatus = typeof meta?.status === "string" ? meta.status.trim().toLowerCase() : "";
+     if (["failed", "error"].includes(responseStatus) || ["failed", "error"].includes(metaStatus)) {
+       const backendError = typeof response?.error === "string" && response.error.trim()
+         ? response.error.trim()
+         : typeof meta?.error === "string" && meta.error.trim()
+           ? meta.error.trim()
+-          : "Генерация завершилась с ошибкой.";
+-      throw new Error(backendError);
++          : "";
++      const backendMessage = typeof response?.backend_message === "string" && response.backend_message.trim()
++        ? response.backend_message.trim()
++        : typeof meta?.backend_message === "string" && meta.backend_message.trim()
++          ? meta.backend_message.trim()
++          : "";
++      const messageParts = [backendMessage, backendError].filter(Boolean);
++      const failureMessage = messageParts.length > 0
++        ? messageParts.join(" ")
++        : "Генерация завершилась с ошибкой.";
++      throw new Error(failureMessage);
+     }
      const artifactPaths = response?.artifact_paths;
      const metadataCharacters = typeof meta.characters === "number" ? meta.characters : undefined;
      const characters = typeof metadataCharacters === "number" ? metadataCharacters : markdown.trim().length;
@@ -488,14 +674,11 @@ index 516c9d88bb063d62637edfe18ca7b3686880329f..d5a3708d25e4d9b5f62d23e4e7a7b37e
        context: meta.clips || [],
        user: meta.user_prompt_preview,
        context_used: meta.context_used,
-       context_index_missing: meta.context_index_missing,
 diff --git a/keyword_injector.py b/keyword_injector.py
-index 52f5bfddf2eb52abc0d334edac8cf3086fa62d17..e358b0596df31a374f173a0d3f8e34b620cc2457 100644
+index e358b0596df31a374f173a0d3f8e34b620cc2457..70d594d09bde55ef2131c160b3969bf45b750908 100644
 --- a/keyword_injector.py
 +++ b/keyword_injector.py
-@@ -3,173 +3,200 @@ from __future__ import annotations
- import re
- from dataclasses import dataclass, field
+@@ -5,50 +5,51 @@ from dataclasses import dataclass, field
  from typing import Dict, Iterable, List, Optional, Sequence, Tuple
  
  LOCK_START_TEMPLATE = "<!--LOCK_START term=\"{term}\"-->"
@@ -519,8 +702,9 @@ index 52f5bfddf2eb52abc0d334edac8cf3086fa62d17..e358b0596df31a374f173a0d3f8e34b6
      inserted_section: bool = False
      total_terms: int = 0
      found_terms: int = 0
-+    missing_terms: List[str] = field(default_factory=list)
-+    coverage_report: str = "0/0"
+     missing_terms: List[str] = field(default_factory=list)
+     coverage_report: str = "0/0"
++    coverage_percent: float = 0.0
  
  
  def _normalize_keywords(keywords: Iterable[str]) -> List[str]:
@@ -542,186 +726,37 @@ index 52f5bfddf2eb52abc0d334edac8cf3086fa62d17..e358b0596df31a374f173a0d3f8e34b6
      return bool(pattern.search(text))
  
  
-+def _existing_lock_spans(text: str, term: str) -> List[Tuple[int, int]]:
-+    lock_start = re.escape(LOCK_START_TEMPLATE.format(term=term))
-+    block_pattern = re.compile(rf"{lock_start}(.*?){re.escape(LOCK_END)}", re.DOTALL)
-+    return [(match.start(), match.end()) for match in block_pattern.finditer(text)]
-+
-+
- def _ensure_lock(text: str, term: str) -> str:
-+    pattern = build_term_pattern(term)
-     lock_start = LOCK_START_TEMPLATE.format(term=term)
--    if lock_start in text:
-+    locked_spans = _existing_lock_spans(text, term)
-+    if not pattern.search(text):
-         return text
- 
--    pattern = build_term_pattern(term)
--
--    def _replacement(match: re.Match[str]) -> str:
--        return f"{lock_start}{match.group(0)}{LOCK_END}"
--
--    updated, count = pattern.subn(_replacement, text, count=1)
--    if count:
--        return updated
--    return text
-+    result: List[str] = []
-+    cursor = 0
-+    for match in pattern.finditer(text):
-+        start, end = match.span()
-+        if any(span_start <= start < span_end for span_start, span_end in locked_spans):
-+            continue
-+        result.append(text[cursor:start])
-+        result.append(f"{lock_start}{match.group(0)}{LOCK_END}")
-+        cursor = end
-+    result.append(text[cursor:])
-+    updated = "".join(result)
-+    return updated
- 
- 
--def _build_terms_section(terms: Sequence[str]) -> str:
-+def _build_terms_inset(terms: Sequence[str]) -> str:
-+    items = ", ".join(terms)
-     lines = [_TERMS_SECTION_HEADING, ""]
--    for term in terms:
--        lines.append(
--            f"{term} — ключевой термин, который раскрывается в материале на практических примерах."
--        )
-+    lines.append(
-+        "Разбираемся в терминах: фиксируем ключевые формулировки, которые должны остаться неизменными."
-+    )
-+    lines.append(
-+        f"В материале используем {items} в исходном написании, чтобы автоматические проверки проходили без расхождений."
-+    )
-+    lines.append("Просим не редактировать эти формулировки при дальнейшей работе с текстом.")
-     lines.append("")
-     return "\n".join(lines)
- 
- 
--def _insert_terms_section(text: str, terms: Sequence[str]) -> str:
--    section = _build_terms_section(terms)
--    if _TERMS_SECTION_HEADING in text:
--        return text
--
-+def _insert_terms_inset(text: str, terms: Sequence[str]) -> Tuple[str, bool]:
-+    if not terms:
-+        return text, False
-+    inset = _build_terms_inset(terms)
-+    bounds = _find_main_section_bounds(text)
-+    if bounds:
-+        start, end = bounds
-+        section = text[start:end].rstrip()
-+        updated_section = f"{section}\n\n{inset}" if section else inset
-+        return f"{text[:start]}{updated_section}\n{text[end:]}" if updated_section else text, True
-     faq_anchor = "\n## FAQ"
-     anchor_idx = text.find(faq_anchor)
-     if anchor_idx == -1:
--        return f"{text.rstrip()}\n\n{section}\n"
--    return f"{text[:anchor_idx].rstrip()}\n\n{section}\n\n{text[anchor_idx:]}"
-+        return f"{text.rstrip()}\n\n{inset}\n", True
-+    return f"{text[:anchor_idx].rstrip()}\n\n{inset}\n\n{text[anchor_idx:]}", True
- 
- 
- def _find_main_section_bounds(text: str) -> Optional[Tuple[int, int]]:
-     heading = "## Основная часть"
-     start_idx = text.find(heading)
-     if start_idx == -1:
-         return None
-     section_start = text.find("\n", start_idx)
-     if section_start == -1:
-         return None
-     section_start += 1
-     match = re.search(r"\n## ", text[section_start:])
-     section_end = section_start + match.start() if match else len(text)
-     return section_start, section_end
- 
- 
- def _insert_term_into_main_section(text: str, term: str) -> Tuple[str, bool]:
-     bounds = _find_main_section_bounds(text)
-     if not bounds:
-         return text, False
- 
-     start, end = bounds
-     section = text[start:end]
-     paragraphs = section.split("\n\n")
-     for idx, paragraph in enumerate(paragraphs):
-         if paragraph.strip():
-             appended = (
-                 paragraph.rstrip()
-                 + f" Дополнительно рассматривается {term} через прикладные сценарии."
-             )
-             paragraphs[idx] = appended
-             new_section = "\n\n".join(paragraphs)
-             return f"{text[:start]}{new_section}{text[end:]}", True
- 
-     return text, False
- 
- 
- def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResult:
-     """Insert missing keywords and protect them with lock markers."""
- 
-     normalized = _normalize_keywords(keywords)
-     if not normalized:
-         return KeywordInjectionResult(text=text, coverage={}, locked_terms=[])
- 
-     coverage: Dict[str, bool] = {}
-     working = text
--    missing_for_section: List[str] = []
-+    missing_terms: List[str] = []
- 
-     for term in normalized:
-         if not term:
-             continue
- 
-         if _contains_term(working, term):
-             working = _ensure_lock(working, term)
--            coverage[term] = True
-             continue
- 
--        inserted = False
-         working, inserted = _insert_term_into_main_section(working, term)
-         if inserted and _contains_term(working, term):
-             working = _ensure_lock(working, term)
--            coverage[term] = True
--        else:
--            coverage[term] = False
-+            continue
- 
--        missing_for_section.append(term)
-+        missing_terms.append(term)
+ def _existing_lock_spans(text: str, term: str) -> List[Tuple[int, int]]:
+     lock_start = re.escape(LOCK_START_TEMPLATE.format(term=term))
+     block_pattern = re.compile(rf"{lock_start}(.*?){re.escape(LOCK_END)}", re.DOTALL)
+     return [(match.start(), match.end()) for match in block_pattern.finditer(text)]
+@@ -168,35 +169,37 @@ def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResul
+         missing_terms.append(term)
  
      inserted_section = False
--    if missing_for_section:
--        updated = _insert_terms_section(working, missing_for_section)
--        inserted_section = updated != working
--        working = updated
-+    if missing_terms:
-+        working, inserted_section = _insert_terms_inset(working, missing_terms)
+     if missing_terms:
+         working, inserted_section = _insert_terms_inset(working, missing_terms)
  
--    for term in missing_for_section:
-+    for term in missing_terms:
+     for term in missing_terms:
          working = _ensure_lock(working, term)
--        coverage[term] = LOCK_START_TEMPLATE.format(term=term) in working
  
-+    locked_terms: List[str] = []
-+    missing_report: List[str] = []
+     locked_terms: List[str] = []
+     missing_report: List[str] = []
      for term in normalized:
--        coverage.setdefault(term, LOCK_START_TEMPLATE.format(term=term) in working)
-+        lock_token = LOCK_START_TEMPLATE.format(term=term)
-+        lock_present = bool(re.search(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", working, re.DOTALL))
-+        present = bool(build_term_pattern(term).search(working))
-+        ok = present and lock_present
-+        coverage[term] = ok
-+        if ok:
-+            locked_terms.append(term)
-+        else:
-+            missing_report.append(term)
+         lock_token = LOCK_START_TEMPLATE.format(term=term)
+         lock_present = bool(re.search(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", working, re.DOTALL))
+         present = bool(build_term_pattern(term).search(working))
+         ok = present and lock_present
+         coverage[term] = ok
+         if ok:
+             locked_terms.append(term)
+         else:
+             missing_report.append(term)
  
--    locked_terms = [term for term in normalized if LOCK_START_TEMPLATE.format(term=term) in working]
--    found_terms = sum(1 for term in normalized if coverage.get(term))
      total_terms = len(normalized)
-+    found_terms = total_terms - len(missing_report)
-+    coverage_report = f"{found_terms}/{total_terms}" if total_terms else "0/0"
+     found_terms = total_terms - len(missing_report)
+     coverage_report = f"{found_terms}/{total_terms}" if total_terms else "0/0"
++    coverage_percent = 100.0 if total_terms == 0 else round(found_terms / total_terms * 100, 2)
      return KeywordInjectionResult(
          text=working,
          coverage=coverage,
@@ -729,25 +764,34 @@ index 52f5bfddf2eb52abc0d334edac8cf3086fa62d17..e358b0596df31a374f173a0d3f8e34b6
          inserted_section=inserted_section,
          total_terms=total_terms,
          found_terms=found_terms,
-+        missing_terms=missing_report,
-+        coverage_report=coverage_report,
+         missing_terms=missing_report,
+         coverage_report=coverage_report,
++        coverage_percent=coverage_percent,
      )
 diff --git a/length_trimmer.py b/length_trimmer.py
-index 1a0b313ab485cbb932f24b8b86eed37317671e45..8b98554d963d046b88fa92c331cbc1d824805c46 100644
+index 8b98554d963d046b88fa92c331cbc1d824805c46..6bed24ceee4420c4e121f96d9d953688f460ab1b 100644
 --- a/length_trimmer.py
 +++ b/length_trimmer.py
-@@ -1,32 +1,33 @@
+@@ -1,101 +1,165 @@
  from __future__ import annotations
  
  import re
  from dataclasses import dataclass
- from typing import Iterable, List, Sequence
+-from typing import Iterable, List, Sequence
++from typing import Iterable, List, Sequence, Set, Tuple
  
  from keyword_injector import LOCK_START_TEMPLATE, LOCK_END
-+from validators import strip_jsonld
+ from validators import strip_jsonld
  
  _FAQ_START = "<!--FAQ_START-->"
  _FAQ_END = "<!--FAQ_END-->"
++_JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">.*?</script>", re.DOTALL)
++
++
++class TrimValidationError(RuntimeError):
++    """Raised when trimming corrupts protected content."""
++
++    pass
  
  
  @dataclass
@@ -758,19 +802,35 @@ index 1a0b313ab485cbb932f24b8b86eed37317671e45..8b98554d963d046b88fa92c331cbc1d8
  
  def _split_paragraphs(text: str) -> List[str]:
      parts = re.split(r"\n\s*\n", text)
-     return [part for part in (part.strip("\n") for part in parts)]
+-    return [part for part in (part.strip("\n") for part in parts)]
++    return [part.strip("\n") for part in parts]
  
  
- def _is_protected(paragraph: str) -> bool:
+-def _is_protected(paragraph: str) -> bool:
++def _is_protected(paragraph: str, lock_tokens: Set[str]) -> bool:
      if not paragraph.strip():
          return True
      if paragraph.strip().startswith("##"):
          return True
-     if LOCK_START_TEMPLATE.split("{term}")[0] in paragraph:
+-    if LOCK_START_TEMPLATE.split("{term}")[0] in paragraph:
++    if "<!--LOCK_START" in paragraph:
          return True
      if LOCK_END in paragraph:
          return True
-@@ -45,51 +46,52 @@ def _score_paragraph(paragraph: str) -> float:
+     if _FAQ_START in paragraph or _FAQ_END in paragraph:
+         return True
+     if paragraph.lower().startswith(("**вопрос", "**ответ")):
+         return True
++    if any(token in paragraph for token in lock_tokens):
++        return True
+     return False
+ 
+ 
+ def _score_paragraph(paragraph: str) -> float:
+     if not paragraph.strip():
+         return 1e9
+     lowered = paragraph.lower()
+     penalties = 0.0
      if any(token in lowered for token in ["во-первых", "во-вторых", "таким образом", "в целом"]):
          penalties += 2.5
      if len(paragraph) < 220:
@@ -784,6 +844,50 @@ index 1a0b313ab485cbb932f24b8b86eed37317671e45..8b98554d963d046b88fa92c331cbc1d8
      return "\n\n".join(paragraphs).strip() + "\n"
  
  
++def _extract_jsonld(text: str) -> Tuple[str, str]:
++    match = _JSONLD_PATTERN.search(text)
++    if not match:
++        return text, ""
++    jsonld_block = match.group(0)
++    before = text[: match.start()].rstrip()
++    after = text[match.end() :].lstrip()
++    article = before
++    if after:
++        article = f"{article}\n\n{after}" if article else after
++    return article, jsonld_block.strip()
++
++
++def _paragraph_signature(paragraph: str) -> str:
++    normalized = re.sub(r"\s+", " ", paragraph.strip().lower())
++    return normalized
++
++
++def _validate_locked_terms(text: str, terms: Sequence[str]) -> None:
++    if not terms:
++        return
++    missing: List[str] = []
++    for term in terms:
++        if not term:
++            continue
++        lock_token = LOCK_START_TEMPLATE.format(term=term)
++        pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
++        if not pattern.search(text):
++            missing.append(term)
++    if missing:
++        raise TrimValidationError(
++            "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing))
++        )
++
++
++def _validate_faq(text: str) -> None:
++    if _FAQ_START not in text or _FAQ_END not in text:
++        raise TrimValidationError("После тримминга нарушена структура блока FAQ.")
++    block = text.split(_FAQ_START, 1)[1].split(_FAQ_END, 1)[0]
++    pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block)
++    if len(pairs) != 5:
++        raise TrimValidationError("FAQ должен содержать ровно 5 вопросов и ответов.")
++
++
  def trim_text(
      text: str,
      *,
@@ -791,14 +895,19 @@ index 1a0b313ab485cbb932f24b8b86eed37317671e45..8b98554d963d046b88fa92c331cbc1d8
      max_chars: int,
      protected_blocks: Iterable[str] | None = None,
  ) -> TrimResult:
-     working = text
+-    working = text
++    article, jsonld_block = _extract_jsonld(text)
++    working = article
      removed: List[str] = []
-     protect_patterns = list(protected_blocks or [])
+-    protect_patterns = list(protected_blocks or [])
++    protected_terms = [str(term).strip() for term in (protected_blocks or []) if str(term).strip()]
++    lock_tokens: Set[str] = {LOCK_START_TEMPLATE.format(term=term) for term in protected_terms}
++    skip_signatures: Set[str] = set()
  
      def _length(current: str) -> int:
--        return len(re.sub(r"\s+", "", current))
-+        article = strip_jsonld(current)
-+        return len(re.sub(r"\s+", "", article))
+-        article = strip_jsonld(current)
+-        return len(re.sub(r"\s+", "", article))
++        return len(re.sub(r"\s+", "", strip_jsonld(current)))
  
      while _length(working) > max_chars:
          paragraphs = _split_paragraphs(working)
@@ -809,9 +918,11 @@ index 1a0b313ab485cbb932f24b8b86eed37317671e45..8b98554d963d046b88fa92c331cbc1d8
                  faq_zone = True
              if _FAQ_END in paragraph:
                  faq_zone = False
-             if faq_zone or _is_protected(paragraph):
-                 continue
-             if any(pattern in paragraph for pattern in protect_patterns):
+-            if faq_zone or _is_protected(paragraph):
+-                continue
+-            if any(pattern in paragraph for pattern in protect_patterns):
++            signature = _paragraph_signature(paragraph)
++            if faq_zone or _is_protected(paragraph, lock_tokens) or signature in skip_signatures:
                  continue
              score = _score_paragraph(paragraph)
              candidates.append((score, idx))
@@ -821,14 +932,32 @@ index 1a0b313ab485cbb932f24b8b86eed37317671e45..8b98554d963d046b88fa92c331cbc1d8
          _, drop_idx = candidates[0]
          removed_para = paragraphs.pop(drop_idx)
          removed.append(removed_para)
-         working = _rebuild_text(paragraphs)
-         if _length(working) < min_chars:
+-        working = _rebuild_text(paragraphs)
+-        if _length(working) < min_chars:
++        updated = _rebuild_text(paragraphs)
++        if _length(updated) < min_chars:
              paragraphs.insert(drop_idx, removed.pop())
++            skip_signatures.add(_paragraph_signature(paragraphs[drop_idx]))
+             working = _rebuild_text(paragraphs)
+-            protect_patterns.append(removed_para[:40])
+             continue
+-    return TrimResult(text=working, removed_paragraphs=removed)
++        skip_signatures.add(_paragraph_signature(removed_para))
++        working = updated
++
++    working = working.rstrip() + "\n"
++    _validate_locked_terms(working, protected_terms)
++    _validate_faq(working)
++
++    final_text = working
++    if jsonld_block:
++        final_text = f"{final_text.rstrip()}\n\n{jsonld_block}\n"
++    return TrimResult(text=final_text, removed_paragraphs=removed)
 diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
-index 003951276dfd77913a05f0a4402ecd20e6f3ff6d..06f532c2307baacddae3de8cb62d3f2e04c94011 100644
+index 06f532c2307baacddae3de8cb62d3f2e04c94011..5d80024450602e0ef05a351c04847b07a839ca18 100644
 --- a/tests/test_orchestrate_utils.py
 +++ b/tests/test_orchestrate_utils.py
-@@ -1,123 +1,140 @@
+@@ -1,90 +1,100 @@
  import json
  import uuid
  from pathlib import Path
@@ -843,43 +972,39 @@ index 003951276dfd77913a05f0a4402ecd20e6f3ff6d..06f532c2307baacddae3de8cb62d3f2e
  from orchestrate import generate_article_from_payload, gather_health_status
  from validators import ValidationError, strip_jsonld, validate_article
  
++MIN_REQUIRED = 3500
++MAX_REQUIRED = 6000
  
--def test_keyword_injection_adds_terms_section():
-+def test_keyword_injection_protects_terms_and_locks_all_occurrences():
+ def test_keyword_injection_protects_terms_and_locks_all_occurrences():
      base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
      result = inject_keywords(base_text, ["ключевая фраза", "дополнительный термин"])
--    assert "### Разбираемся в терминах" in result.text
--    assert LOCK_START_TEMPLATE.format(term="ключевая фраза") in result.text
--    assert result.coverage["дополнительный термин"]
-+    assert result.coverage_report == "2/2"
-+    assert result.missing_terms == []
+     assert result.coverage_report == "2/2"
+     assert result.missing_terms == []
      main_section = result.text.split("## FAQ", 1)[0]
--    expected_phrase = (
-+    first_phrase = (
+     first_phrase = (
          "Дополнительно рассматривается "
          + f"{LOCK_START_TEMPLATE.format(term='ключевая фраза')}ключевая фраза<!--LOCK_END-->"
          + " через прикладные сценарии."
      )
--    assert expected_phrase in main_section
-+    second_phrase = (
-+        "Дополнительно рассматривается "
-+        + f"{LOCK_START_TEMPLATE.format(term='дополнительный термин')}дополнительный термин<!--LOCK_END-->"
-+        + " через прикладные сценарии."
-+    )
-+    assert first_phrase in main_section
-+    assert second_phrase in main_section
-+    assert "### Разбираемся в терминах" not in result.text
-+    assert not result.inserted_section
-+
-+
-+def test_keyword_injection_adds_terms_inset_when_needed():
-+    base_text = "# Заголовок\n\nВступление.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
-+    result = inject_keywords(base_text, ["редкий термин"])
-+    assert result.inserted_section is True
-+    assert "### Разбираемся в терминах" in result.text
-+    lock_token = LOCK_START_TEMPLATE.format(term="редкий термин")
-+    assert lock_token in result.text
-+    assert result.coverage_report == "1/1"
+     second_phrase = (
+         "Дополнительно рассматривается "
+         + f"{LOCK_START_TEMPLATE.format(term='дополнительный термин')}дополнительный термин<!--LOCK_END-->"
+         + " через прикладные сценарии."
+     )
+     assert first_phrase in main_section
+     assert second_phrase in main_section
+     assert "### Разбираемся в терминах" not in result.text
+     assert not result.inserted_section
+ 
+ 
+ def test_keyword_injection_adds_terms_inset_when_needed():
+     base_text = "# Заголовок\n\nВступление.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
+     result = inject_keywords(base_text, ["редкий термин"])
+     assert result.inserted_section is True
+     assert "### Разбираемся в терминах" in result.text
+     lock_token = LOCK_START_TEMPLATE.format(term="редкий термин")
+     assert lock_token in result.text
+     assert result.coverage_report == "1/1"
  
  
  def test_faq_builder_produces_jsonld_block():
@@ -895,11 +1020,20 @@ index 003951276dfd77913a05f0a4402ecd20e6f3ff6d..06f532c2307baacddae3de8cb62d3f2e
  def test_trim_preserves_locked_and_faq():
      intro = " ".join(["Параграф с вводной информацией, который можно сократить." for _ in range(4)])
      removable = "Дополнительный абзац с примерами, который допустимо удалить."
++    faq_lines = []
++    for idx in range(1, 6):
++        faq_lines.append(f"**Вопрос {idx}.** Что важно?")
++        faq_lines.append("**Ответ.** Ответ с деталями.")
++        faq_lines.append("")
++    faq_block = "\n".join(faq_lines).strip()
      article = (
          f"## Введение\n\n{intro}\n\n"
          f"{LOCK_START_TEMPLATE.format(term='важный термин')}важный термин<!--LOCK_END-->\n\n"
          f"{removable}\n\n"
-         "## FAQ\n\n<!--FAQ_START-->\n**Вопрос 1.** Что важно?\n\n**Ответ.** Ответ с деталями.\n\n<!--FAQ_END-->"
+-        "## FAQ\n\n<!--FAQ_START-->\n**Вопрос 1.** Что важно?\n\n**Ответ.** Ответ с деталями.\n\n<!--FAQ_END-->"
++        "## FAQ\n\n<!--FAQ_START-->\n"
++        f"{faq_block}\n"
++        "<!--FAQ_END-->"
      )
      trimmed = trim_text(article, min_chars=200, max_chars=400)
      assert "важный термин" in trimmed.text
@@ -925,11 +1059,8 @@ index 003951276dfd77913a05f0a4402ecd20e6f3ff6d..06f532c2307baacddae3de8cb62d3f2e
      payload = {
          "@context": "https://schema.org",
          "@type": "FAQPage",
-         "mainEntity": [
-             {
-                 "@type": "Question",
--                "name": f"Вопрос {idx}",
-+                "name": f"Вопрос {idx}?",
+@@ -94,67 +104,77 @@ def test_validator_length_ignores_jsonld():
+                 "name": f"Вопрос {idx}?",
                  "acceptedAnswer": {"@type": "Answer", "text": f"Ответ {idx}"},
              }
              for idx in range(1, 6)
@@ -937,35 +1068,31 @@ index 003951276dfd77913a05f0a4402ecd20e6f3ff6d..06f532c2307baacddae3de8cb62d3f2e
      }
      faq_block = "\n".join(
          [
--            "**Вопрос 1.** Что?",
--            "**Ответ.** Ответ.",
-+            "**Вопрос 1.** Вопрос 1?",
-+            "**Ответ.** Ответ 1",
+             "**Вопрос 1.** Вопрос 1?",
+             "**Ответ.** Ответ 1",
              "",
--            "**Вопрос 2.** Что?",
--            "**Ответ.** Ответ.",
-+            "**Вопрос 2.** Вопрос 2?",
-+            "**Ответ.** Ответ 2",
+             "**Вопрос 2.** Вопрос 2?",
+             "**Ответ.** Ответ 2",
              "",
--            "**Вопрос 3.** Что?",
--            "**Ответ.** Ответ.",
-+            "**Вопрос 3.** Вопрос 3?",
-+            "**Ответ.** Ответ 3",
+             "**Вопрос 3.** Вопрос 3?",
+             "**Ответ.** Ответ 3",
              "",
--            "**Вопрос 4.** Что?",
--            "**Ответ.** Ответ.",
-+            "**Вопрос 4.** Вопрос 4?",
-+            "**Ответ.** Ответ 4",
+             "**Вопрос 4.** Вопрос 4?",
+             "**Ответ.** Ответ 4",
              "",
--            "**Вопрос 5.** Что?",
--            "**Ответ.** Ответ.",
-+            "**Вопрос 5.** Вопрос 5?",
-+            "**Ответ.** Ответ 5",
+             "**Вопрос 5.** Вопрос 5?",
+             "**Ответ.** Ответ 5",
              "",
          ]
      )
++    intro_paragraph = (
++        "Содержательный абзац с фактами и цифрами, объясняющий контекст и приводящий примеры. "
++        "Практические советы включают последовательность действий, промежуточные выводы и точные формулировки."
++    )
++    intro = "\n\n".join([intro_paragraph for _ in range(22)])
      article = (
          "## Введение\n\n"
++        f"{intro}\n\n"
          f"{LOCK_START_TEMPLATE.format(term='ключ')}ключ<!--LOCK_END--> фиксирует термин.\n\n"
          "## FAQ\n\n<!--FAQ_START-->\n"
          f"{faq_block}\n"
@@ -978,19 +1105,46 @@ index 003951276dfd77913a05f0a4402ecd20e6f3ff6d..06f532c2307baacddae3de8cb62d3f2e
      base_length = len("".join(article_no_jsonld.split()))
      full_length = len("".join(article.split()))
      assert full_length > base_length
-     min_chars = max(10, base_length - 5)
-     max_chars = base_length + 5
-     result = validate_article(article, keywords=["ключ"], min_chars=min_chars, max_chars=max_chars)
+-    min_chars = max(10, base_length - 5)
+-    max_chars = base_length + 5
+-    result = validate_article(article, keywords=["ключ"], min_chars=min_chars, max_chars=max_chars)
++    assert MIN_REQUIRED <= base_length <= MAX_REQUIRED
++    result = validate_article(
++        article,
++        keywords=["ключ"],
++        min_chars=MIN_REQUIRED,
++        max_chars=MAX_REQUIRED,
++    )
      assert result.length_ok
      assert result.jsonld_ok
  
  
  def _stub_llm(monkeypatch):
+     base_paragraph = (
+         "Абзац с анализом показателей и практическими советами для семейного бюджета. "
+         "Расчёт коэффициентов сопровождаем примерами и перечнем действий."
+     )
+     outline = ["Введение", "Аналитика", "Решения"]
+     intro_block = []
+     for idx in range(4):
+         intro_block.append(
+             f"{base_paragraph} Введение блок {idx + 1} показывает, как сформировать картину текущей ситуации и определить безопасные пределы долга."
+         )
+     intro_text = "\n\n".join(intro_block)
+ 
+     main_blocks = []
+     for idx in range(5):
+         main_blocks.append(
+             f"{base_paragraph} Аналитика блок {idx + 1} фокусируется на цифрах, добавляет формулы и объясняет, как применять их на практике."
+         )
+     main_text = "\n\n".join(main_blocks)
+ 
+     outro_parts = []
 diff --git a/validators.py b/validators.py
-index bd422ec787f6ff86947d7770a97d4d7c2cd72fb5..762d07e1443a717452abeb9202ea6c9d5dbb4393 100644
+index 762d07e1443a717452abeb9202ea6c9d5dbb4393..85b884a5b8d70e92bb7b498525e886995217e654 100644
 --- a/validators.py
 +++ b/validators.py
-@@ -1,184 +1,243 @@
+@@ -1,32 +1,33 @@
  from __future__ import annotations
  
  import json
@@ -998,16 +1152,16 @@ index bd422ec787f6ff86947d7770a97d4d7c2cd72fb5..762d07e1443a717452abeb9202ea6c9d
  from dataclasses import dataclass, field
  from typing import Dict, Iterable, List, Optional, Tuple
  
--from keyword_injector import LOCK_START_TEMPLATE
-+from keyword_injector import LOCK_END, LOCK_START_TEMPLATE, build_term_pattern
++from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
+ from keyword_injector import LOCK_END, LOCK_START_TEMPLATE, build_term_pattern
  
  _FAQ_START = "<!--FAQ_START-->"
  _FAQ_END = "<!--FAQ_END-->"
  _JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">(.*?)</script>", re.DOTALL)
-+_FAQ_ENTRY_PATTERN = re.compile(
-+    r"\*\*Вопрос\s+(?P<index>\d+)\.\*\*\s*(?P<question>.+?)\s*\n\*\*Ответ\.\*\*\s*(?P<answer>.*?)(?=\n\*\*Вопрос\s+\d+\.\*\*|\Z)",
-+    re.DOTALL,
-+)
+ _FAQ_ENTRY_PATTERN = re.compile(
+     r"\*\*Вопрос\s+(?P<index>\d+)\.\*\*\s*(?P<question>.+?)\s*\n\*\*Ответ\.\*\*\s*(?P<answer>.*?)(?=\n\*\*Вопрос\s+\d+\.\*\*|\Z)",
+     re.DOTALL,
+ )
  
  
  class ValidationError(RuntimeError):
@@ -1024,124 +1178,7 @@ index bd422ec787f6ff86947d7770a97d4d7c2cd72fb5..762d07e1443a717452abeb9202ea6c9d
      skeleton_ok: bool
      keywords_ok: bool
      faq_ok: bool
-     length_ok: bool
-     jsonld_ok: bool
-     stats: Dict[str, object] = field(default_factory=dict)
- 
-     @property
-     def is_valid(self) -> bool:
-         return self.skeleton_ok and self.keywords_ok and self.faq_ok and self.length_ok
- 
- 
- def strip_jsonld(text: str) -> str:
-     return _JSONLD_PATTERN.sub("", text, count=1)
- 
- 
- def _length_no_spaces(text: str) -> int:
-     return len(re.sub(r"\s+", "", strip_jsonld(text)))
- 
- 
- def length_no_spaces(text: str) -> int:
-     return _length_no_spaces(text)
- 
- 
- def _faq_pairs(text: str) -> List[str]:
-     if _FAQ_START not in text or _FAQ_END not in text:
-         return []
-     block = text.split(_FAQ_START, 1)[1].split(_FAQ_END, 1)[0]
-     return re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block)
- 
- 
--def _jsonld_valid(text: str) -> bool:
-+def _parse_markdown_faq(text: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
-+    if _FAQ_START not in text or _FAQ_END not in text:
-+        return [], "Блок FAQ в markdown отсутствует."
-+
-+    block = text.split(_FAQ_START, 1)[1].split(_FAQ_END, 1)[0]
-+    entries: List[Dict[str, str]] = []
-+    for match in _FAQ_ENTRY_PATTERN.finditer(block.strip()):
-+        question = match.group("question").strip()
-+        answer = match.group("answer").strip()
-+        index = int(match.group("index"))
-+        if not question or not answer:
-+            return entries, "FAQ содержит пустой вопрос или ответ."
-+        paragraphs = [segment.strip() for segment in re.split(r"\n\s*\n", answer) if segment.strip()]
-+        if not 1 <= len(paragraphs) <= 3:
-+            return entries, f"Ответ на вопрос '{question}' должен состоять из 1–3 абзацев."
-+        entries.append({"index": index, "question": question, "answer": answer})
-+
-+    if len(entries) != 5:
-+        return entries, "FAQ должен содержать ровно 5 вопросов и ответов."
-+
-+    indices = [entry["index"] for entry in entries]
-+    if indices != list(range(1, len(entries) + 1)):
-+        return entries, "Нумерация вопросов в FAQ должна идти последовательно от 1 до 5."
-+
-+    return entries, None
-+
-+
-+def _parse_jsonld_entries(text: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
-     match = _JSONLD_PATTERN.search(text)
-     if not match:
--        return False
-+        return [], "JSON-LD FAQ недействителен или отсутствует."
-     try:
-         payload = json.loads(match.group(1))
-     except json.JSONDecodeError:
--        return False
--    if not isinstance(payload, dict):
--        return False
--    if payload.get("@type") != "FAQPage":
--        return False
-+        return [], "JSON-LD FAQ недействителен или отсутствует."
-+    if not isinstance(payload, dict) or payload.get("@type") != "FAQPage":
-+        return [], "JSON-LD FAQ недействителен или отсутствует."
-     entities = payload.get("mainEntity")
-     if not isinstance(entities, list) or len(entities) != 5:
--        return False
--    for entry in entities:
--        if not isinstance(entry, dict):
--            return False
--        if entry.get("@type") != "Question":
--            return False
-+        return [], "JSON-LD FAQ должен содержать ровно 5 вопросов и ответов."
-+    parsed: List[Dict[str, str]] = []
-+    for idx, entry in enumerate(entities, start=1):
-+        if not isinstance(entry, dict) or entry.get("@type") != "Question":
-+            return [], f"JSON-LD вопрос №{idx} имеет неверный формат."
-         answer = entry.get("acceptedAnswer")
-         if not isinstance(answer, dict) or answer.get("@type") != "Answer":
--            return False
--        if not str(entry.get("name", "")).strip():
--            return False
--        if not str(answer.get("text", "")).strip():
--            return False
--    return True
-+            return [], f"JSON-LD ответ для вопроса №{idx} имеет неверный формат."
-+        question = str(entry.get("name", "")).strip()
-+        answer_text = str(answer.get("text", "")).strip()
-+        if not question or not answer_text:
-+            return [], f"JSON-LD вопрос №{idx} содержит пустые данные."
-+        parsed.append({"index": idx, "question": question, "answer": answer_text})
-+    return parsed, None
- 
- 
- def _skeleton_status(
-     skeleton_payload: Optional[Dict[str, object]],
-     text: str,
- ) -> Tuple[bool, Optional[str]]:
-     if skeleton_payload is None:
-         if "## FAQ" in text and _FAQ_START in text and _FAQ_END in text:
-             return True, None
-         return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
-     if not isinstance(skeleton_payload, dict):
-         return False, "Данные скелета не получены или имеют неверный формат."
- 
-     intro = str(skeleton_payload.get("intro") or "").strip()
-     outro = str(skeleton_payload.get("outro") or "").strip()
-     main = skeleton_payload.get("main")
-     if not intro or not outro or not isinstance(main, list) or not main:
-         return False, "Скелет не содержит обязательных полей intro/main/outro."
+@@ -132,112 +133,137 @@ def _skeleton_status(
      for idx, item in enumerate(main):
          if not isinstance(item, str) or not item.strip():
              return False, f"Блок основной части №{idx + 1} пуст."
@@ -1167,71 +1204,89 @@ index bd422ec787f6ff86947d7770a97d4d7c2cd72fb5..762d07e1443a717452abeb9202ea6c9d
      min_chars: int,
      max_chars: int,
      skeleton_payload: Optional[Dict[str, object]] = None,
++    keyword_coverage_percent: Optional[float] = None,
  ) -> ValidationResult:
      length = _length_no_spaces(text)
      skeleton_ok, skeleton_message = _skeleton_status(skeleton_payload, text)
  
      normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
      missing: List[str] = []
-+    article = strip_jsonld(text)
+     article = strip_jsonld(text)
      for term in normalized_keywords:
-+        pattern = build_term_pattern(term)
-+        if not pattern.search(article):
-+            missing.append(term)
-+            continue
+         pattern = build_term_pattern(term)
+         if not pattern.search(article):
+             missing.append(term)
+             continue
          lock_token = LOCK_START_TEMPLATE.format(term=term)
--        if lock_token not in text:
-+        lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-+        if not lock_pattern.search(text):
+         lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
+         if not lock_pattern.search(text):
              missing.append(term)
      keywords_ok = len(missing) == 0
  
--    faq_pairs = _faq_pairs(text)
--    faq_count = len(faq_pairs)
--    jsonld_ok = _jsonld_valid(text)
--    faq_ok = faq_count == 5 and jsonld_ok
-+    markdown_faq, markdown_error = _parse_markdown_faq(text)
-+    faq_count = len(markdown_faq)
-+    jsonld_entries, jsonld_error = _parse_jsonld_entries(text)
-+    jsonld_ok = jsonld_error is None
-+
-+    faq_ok = False
-+    faq_error: Optional[str] = None
-+    mismatched_questions: List[str] = []
-+    if markdown_error:
-+        faq_error = markdown_error
-+    elif jsonld_error:
-+        faq_error = jsonld_error
-+    else:
-+        faq_ok = True
-+        for idx, entry in enumerate(markdown_faq):
-+            jsonld_entry = jsonld_entries[idx]
-+            if entry["question"] != jsonld_entry["question"] or entry["answer"] != jsonld_entry["answer"]:
-+                faq_ok = False
-+                mismatched_questions.append(entry["question"])
-+        if mismatched_questions:
-+            faq_error = (
-+                "FAQ в markdown не совпадает с JSON-LD (например, вопрос '"
-+                + mismatched_questions[0]
-+                + "')."
-+            )
-+    if not faq_ok and faq_error is None:
-+        faq_error = "FAQ должен содержать ровно 5 вопросов и ответов."
+     markdown_faq, markdown_error = _parse_markdown_faq(text)
+     faq_count = len(markdown_faq)
+     jsonld_entries, jsonld_error = _parse_jsonld_entries(text)
+     jsonld_ok = jsonld_error is None
  
-     length_ok = min_chars <= length <= max_chars
+     faq_ok = False
+     faq_error: Optional[str] = None
+     mismatched_questions: List[str] = []
+     if markdown_error:
+         faq_error = markdown_error
+     elif jsonld_error:
+         faq_error = jsonld_error
+     else:
+         faq_ok = True
+         for idx, entry in enumerate(markdown_faq):
+             jsonld_entry = jsonld_entries[idx]
+             if entry["question"] != jsonld_entry["question"] or entry["answer"] != jsonld_entry["answer"]:
+                 faq_ok = False
+                 mismatched_questions.append(entry["question"])
+         if mismatched_questions:
+             faq_error = (
+                 "FAQ в markdown не совпадает с JSON-LD (например, вопрос '"
+                 + mismatched_questions[0]
+                 + "')."
+             )
+     if not faq_ok and faq_error is None:
+         faq_error = "FAQ должен содержать ровно 5 вопросов и ответов."
+ 
+-    length_ok = min_chars <= length <= max_chars
++    coverage_percent = 100.0 if not normalized_keywords else round(
++        (len(normalized_keywords) - len(missing)) / len(normalized_keywords) * 100,
++        2,
++    )
++
++    length_ok = DEFAULT_MIN_LENGTH <= length <= DEFAULT_MAX_LENGTH
++    requested_range_ok = min_chars <= length <= max_chars
  
      stats: Dict[str, object] = {
          "length_no_spaces": length,
          "keywords_total": len(normalized_keywords),
          "keywords_missing": missing,
          "keywords_found": len(normalized_keywords) - len(missing),
-+        "keywords_coverage": f"{len(normalized_keywords) - len(missing)}/{len(normalized_keywords) if normalized_keywords else 0}",
+         "keywords_coverage": f"{len(normalized_keywords) - len(missing)}/{len(normalized_keywords) if normalized_keywords else 0}",
++        "keywords_coverage_percent": coverage_percent,
++        "keyword_coverage_expected_percent": keyword_coverage_percent,
          "faq_count": faq_count,
-+        "faq_jsonld_count": len(jsonld_entries),
-+        "faq_mismatched_questions": mismatched_questions,
+         "faq_jsonld_count": len(jsonld_entries),
+         "faq_mismatched_questions": mismatched_questions,
          "jsonld_ok": jsonld_ok,
++        "length_requested_range_ok": requested_range_ok,
++        "length_required_min": DEFAULT_MIN_LENGTH,
++        "length_required_max": DEFAULT_MAX_LENGTH,
      }
  
++    if keyword_coverage_percent is not None and keyword_coverage_percent < 100.0:
++        raise ValidationError(
++            "keywords",
++            (
++                "Этап подстановки ключевых слов завершился с покрытием "
++                f"{keyword_coverage_percent:.0f}%, требуется 100%."
++            ),
++            details=stats,
++        )
++
      result = ValidationResult(
          skeleton_ok=skeleton_ok,
          keywords_ok=keywords_ok,
@@ -1250,15 +1305,16 @@ index bd422ec787f6ff86947d7770a97d4d7c2cd72fb5..762d07e1443a717452abeb9202ea6c9d
              details={"missing": missing, **stats},
          )
      if not faq_ok:
--        message = "FAQ должен содержать 5 вопросов и корректный JSON-LD."
--        if not jsonld_ok:
--            message = "JSON-LD FAQ недействителен или отсутствует."
-+        message = faq_error or "FAQ должен содержать 5 вопросов и корректный JSON-LD."
+         message = faq_error or "FAQ должен содержать 5 вопросов и корректный JSON-LD."
          raise ValidationError("faq", message, details=stats)
      if not length_ok:
          raise ValidationError(
              "length",
-             f"Объём статьи {length} зн. без пробелов, требуется {min_chars}-{max_chars}.",
+-            f"Объём статьи {length} зн. без пробелов, требуется {min_chars}-{max_chars}.",
++            (
++                f"Объём статьи {length} зн. без пробелов, требуется "
++                f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH}."
++            ),
              details=stats,
          )
      return result
