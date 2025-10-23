@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-LOCK_START_TEMPLATE = '<!--LOCK_START term="{term}">'
+LOCK_START_TEMPLATE = "<!--LOCK_START term=\"{term}\"-->"
 LOCK_END = "<!--LOCK_END-->"
 _TERMS_SECTION_HEADING = "### Разбираемся в терминах"
 
@@ -12,7 +12,7 @@ _TERMS_SECTION_HEADING = "### Разбираемся в терминах"
 def build_term_pattern(term: str) -> re.Pattern[str]:
     """Return a compiled regex that matches the exact term with word boundaries."""
 
-    return re.compile(rf"(?i)(?<!\w)({re.escape(term)})(?!\w)")
+    return re.compile(rf"(?i)(?<!\w){re.escape(term)}(?!\w)")
 
 
 @dataclass
@@ -23,6 +23,8 @@ class KeywordInjectionResult:
     coverage: Dict[str, bool]
     locked_terms: List[str] = field(default_factory=list)
     inserted_section: bool = False
+    total_terms: int = 0
+    found_terms: int = 0
 
 
 def _normalize_keywords(keywords: Iterable[str]) -> List[str]:
@@ -52,7 +54,7 @@ def _ensure_lock(text: str, term: str) -> str:
     pattern = build_term_pattern(term)
 
     def _replacement(match: re.Match[str]) -> str:
-        return f"{lock_start}{match.group(1)}{LOCK_END}"
+        return f"{lock_start}{match.group(0)}{LOCK_END}"
 
     updated, count = pattern.subn(_replacement, text, count=1)
     if count:
@@ -161,9 +163,13 @@ def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResul
         coverage.setdefault(term, LOCK_START_TEMPLATE.format(term=term) in working)
 
     locked_terms = [term for term in normalized if LOCK_START_TEMPLATE.format(term=term) in working]
+    found_terms = sum(1 for term in normalized if coverage.get(term))
+    total_terms = len(normalized)
     return KeywordInjectionResult(
         text=working,
         coverage=coverage,
         locked_terms=locked_terms,
         inserted_section=inserted_section,
+        total_terms=total_terms,
+        found_terms=found_terms,
     )

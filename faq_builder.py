@@ -23,6 +23,34 @@ def _sanitize_anchor(text: str) -> str:
     return "-" + "-".join(text.lower().split())
 
 
+def _normalize_answer(answer: str) -> str:
+    paragraphs = [part.strip() for part in answer.split("\n\n") if part.strip()]
+    if not paragraphs:
+        raise ValueError("Ответ пустой")
+    if len(paragraphs) > 3:
+        paragraphs = paragraphs[:3]
+    if any(len(p) < 20 for p in paragraphs):
+        raise ValueError("Ответ слишком короткий")
+    return "\n\n".join(paragraphs)
+
+
+def _normalize_question(question: str, seen: set[str]) -> str:
+    normalized = question.strip()
+    if not normalized:
+        raise ValueError("Вопрос пустой")
+    if normalized.lower() in seen:
+        raise ValueError("Дублирующийся вопрос")
+    seen.add(normalized.lower())
+    return normalized
+
+
+def _normalize_entry(raw: Dict[str, str], seen: set[str]) -> FaqEntry:
+    question = _normalize_question(str(raw.get("question", "")), seen)
+    answer = _normalize_answer(str(raw.get("answer", "")))
+    anchor = str(raw.get("anchor") or _sanitize_anchor(question))
+    return FaqEntry(question=question, answer=answer, anchor=anchor)
+
+
 def _generate_generic_entries(topic: str, keywords: Sequence[str]) -> List[FaqEntry]:
     base_topic = topic or "теме"
     key_iter = list(keywords)[:5]
@@ -52,7 +80,7 @@ def _generate_generic_entries(topic: str, keywords: Sequence[str]) -> List[FaqEn
         question = templates[idx].format(topic=base_topic)
         if keyword_hint:
             question = f"{question[:-1]} и {keyword_hint}?"
-        answer = answers[idx]
+        answer = _normalize_answer(answers[idx])
         anchor = _sanitize_anchor(question)
         entries.append(FaqEntry(question=question, answer=answer, anchor=anchor))
     return entries
@@ -96,19 +124,27 @@ def build_faq_block(
     provided_entries: Sequence[Dict[str, str]] | None = None,
 ) -> FaqBuildResult:
     entries: List[FaqEntry] = []
+    seen_questions: set[str] = set()
     if provided_entries:
-        for idx, entry in enumerate(provided_entries, start=1):
-            question = str(entry.get("question", "")).strip()
-            answer = str(entry.get("answer", "")).strip()
-            anchor = str(entry.get("anchor") or _sanitize_anchor(question))
-            if not question or not answer:
+        for entry in provided_entries:
+            try:
+                normalized = _normalize_entry(entry, seen_questions)
+            except ValueError:
                 continue
-            entries.append(FaqEntry(question=question, answer=answer, anchor=anchor))
+            entries.append(normalized)
+            if len(entries) == 5:
+                break
     if len(entries) < 5:
-        extra = _generate_generic_entries(topic, list(keywords))
-        needed = 5 - len(entries)
-        entries.extend(extra[:needed])
-    entries = entries[:5]
+        for candidate in _generate_generic_entries(topic, list(keywords)):
+            if len(entries) == 5:
+                break
+            if candidate.question.lower() in seen_questions:
+                continue
+            seen_questions.add(candidate.question.lower())
+            entries.append(candidate)
+
+    if len(entries) != 5:
+        raise ValueError("Не удалось собрать пять валидных вопросов для FAQ")
 
     rendered = _render_markdown(entries)
     placeholder = "<!--FAQ_START-->"
@@ -123,4 +159,12 @@ def build_faq_block(
         rendered = f"{inside}\n\n{rendered}".strip()
     merged = f"{before}{placeholder}\n{rendered}\n{end_placeholder}{after}"
     jsonld = _build_jsonld(entries)
+    # JSON-LD валидация
+    try:
+        raw_json = jsonld.split("\n", 1)[1].rsplit("\n", 1)[0]
+        payload = json.loads(raw_json)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Некорректный JSON-LD FAQ: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("@type") != "FAQPage" or len(payload.get("mainEntity", [])) != 5:
+        raise ValueError("JSON-LD FAQ не соответствует схеме FAQPage")
     return FaqBuildResult(text=merged, entries=entries, jsonld=jsonld)

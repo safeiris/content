@@ -2,19 +2,15 @@ import json
 import uuid
 from pathlib import Path
 
-from deterministic_pipeline import DeterministicPipeline, PipelineStep
-from faq_builder import build_faq_block
-from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
-import json
-import uuid
-from pathlib import Path
+import pytest
 
 from deterministic_pipeline import DeterministicPipeline, PipelineStep
+from faq_builder import build_faq_block
 from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
 from length_trimmer import trim_text
 from llm_client import GenerationResult
 from orchestrate import generate_article_from_payload, gather_health_status
-from validators import strip_jsonld, validate_article
+from validators import ValidationError, strip_jsonld, validate_article
 
 
 def test_keyword_injection_adds_terms_section():
@@ -66,8 +62,9 @@ def test_validator_detects_missing_keyword():
         '{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": []}'
         "\n</script>"
     )
-    result = validate_article(text, keywords=["ключ"], min_chars=10, max_chars=1000)
-    assert not result.keywords_ok
+    with pytest.raises(ValidationError) as exc:
+        validate_article(text, keywords=["ключ"], min_chars=10, max_chars=1000)
+    assert exc.value.group == "keywords"
 
 
 def test_validator_length_ignores_jsonld():
@@ -124,25 +121,25 @@ def test_validator_length_ignores_jsonld():
 
 
 def _stub_llm(monkeypatch):
-    skeleton_body = "\n\n".join(
-        [
-            "Абзац с анализом показателей и практическими советами для семейного бюджета. "
-            "Расчёт коэффициентов сопровождаем примерами и перечнем действий." for _ in range(45)
-        ]
+    base_paragraph = (
+        "Абзац с анализом показателей и практическими советами для семейного бюджета. "
+        "Расчёт коэффициентов сопровождаем примерами и перечнем действий."
     )
-    skeleton_text = (
-        "## Введение\n\n"
-        "Кратко объясняем, как долговая нагрузка влияет на решения семьи и почему ключ 1 помогает структурировать анализ.\n\n"
-    "## Аналитика\n\n"
-    f"{skeleton_body}\n\n"
-    "## Решения\n\n"
-    "Разбираем стратегии снижения нагрузки, контрольные точки и цифровые инструменты, уделяя внимание тому, как ключ 2 и ключ 3"
-    " помогают планировать шаги.\n\n"
-    "Создаём календарь контроля, в котором ключ 4 и ключ 5 отмечены как приоритетные метрики для семьи.\n\n"
-    "## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n\n"
-    "## Вывод\n\nПодводим итоги и фиксируем шаги для регулярного пересмотра бюджета, подчёркивая, как ключ 2 и ключ 3 помогают контролирова"
-    "ть изменения."
-)
+    outline = ["Введение", "Аналитика", "Решения"]
+    skeleton_sections = []
+    for heading in outline:
+        paragraphs = []
+        for idx in range(6):
+            paragraphs.append(
+                f"{base_paragraph} {heading} блок {idx + 1} раскрывает практическое значение ключевых метрик и указывает конкретные шаги, подкреплённые цифрами и контрольными датами."
+            )
+            paragraphs.append("Расписываем временные рамки, ответственных лиц и цифровые инструменты, которые удерживают контроль над бюджетом и помогают выдерживать долговую нагрузку в безопасных пределах.")
+        skeleton_sections.append({"heading": heading, "paragraphs": paragraphs})
+    skeleton_payload = {
+        "title": "Долговая нагрузка семьи: практическое руководство",
+        "sections": skeleton_sections,
+    }
+    skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
     faq_payload = {
         "faq": [
             {

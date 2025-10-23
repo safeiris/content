@@ -1,100 +1,227 @@
-diff --git a/config.py b/config.py
-index f709b0557068c7e3a5cb81d98c994c0a056d43cf..849294e993752b25b643c263a02583fb676f0d9c 100644
---- a/config.py
-+++ b/config.py
-@@ -15,50 +15,55 @@ def _env_int(name: str, default: int) -> int:
- 
- def _env_float_list(name: str, default: str) -> tuple[float, ...]:
-     raw = str(os.getenv(name, "")).strip()
-     if not raw:
-         raw = default
-     parts = [part.strip() for part in raw.split(",") if part.strip()]
-     delays = []
-     for part in parts:
-         try:
-             delays.append(float(part))
-         except ValueError:
-             continue
-     if not delays:
-         delays = [float(value) for value in default.split(",") if value]
-     return tuple(delays)
- 
- 
- def _env_bool(name: str, default: bool) -> bool:
-     raw = str(os.getenv(name, "")).strip().lower()
-     if not raw:
-         return default
-     return raw not in {"0", "false", "off", "no"}
- 
- OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
- 
-+USE_MOCK_LLM = _env_bool("USE_MOCK_LLM", False)
-+OFFLINE_MODE = _env_bool("OFFLINE_MODE", False)
-+PIPELINE_FAST_PATH = _env_bool("PIPELINE_FAST_PATH", False)
-+MODEL_PROVIDER = str(os.getenv("MODEL_PROVIDER", "openai")).strip() or "openai"
-+
- _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
- FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
- 
- # GPT-5 Responses tuning
- G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1500)
- G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2200)
- G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 2600)
- G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3000)
- _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
- G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
- G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
- G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
- 
- # Дефолтные настройки ядра
- DEFAULT_TONE = "экспертный, дружелюбный"
- DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "Вывод"]
- 
- # Простая «норма» для SEO: ориентир по упоминаниям ключей на ~100 слов
- DEFAULT_SEO_DENSITY = 2
- 
- # Рекомендуемые границы объёма (знаков)
- DEFAULT_MIN_LENGTH = 3500
- DEFAULT_MAX_LENGTH = 6000
- 
- # Максимальный объём пользовательского контекста (символов)
-diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 0e1a3885ff064a454ff9ecc80ab7f10a4be75642..ce8396d6994358a232d3df60d3b7dc86df423f26 100644
---- a/deterministic_pipeline.py
-+++ b/deterministic_pipeline.py
-@@ -1,317 +1,518 @@
-+"""LLM-driven content pipeline with explicit step-level guarantees."""
-+
+diff --git a/artifacts_store.py b/artifacts_store.py
+index 35bb278b987d50e287178a8677387a1c388e8820..fac01878336197a01d70cffaa24b73d0d25fc5ef 100644
+--- a/artifacts_store.py
++++ b/artifacts_store.py
+@@ -1,70 +1,72 @@
+ """Utilities for managing generated artifacts and keeping their index consistent."""
  from __future__ import annotations
  
--import time
+ import json
+ import logging
+ import os
+ from dataclasses import dataclass
+ from datetime import datetime
+ from pathlib import Path
+-from typing import Any, Dict, Iterable, List, Optional, Sequence
++from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+ 
+ LOGGER = logging.getLogger("content_factory.artifacts")
+ 
+ ARTIFACTS_DIR = Path("artifacts").resolve()
+ INDEX_FILENAME = "index.json"
+ LATEST_FILENAME = "latest.json"
+ CHANGELOG_FILENAME = "changelog.json"
+ 
+ 
+ @dataclass
+ class ArtifactRecord:
+     """Normalized representation of an artifact entry."""
+ 
+     id: str
+     path: str
+     metadata_path: Optional[str]
+     name: str
+     updated_at: Optional[str]
+     status: Optional[str]
+     extra: Dict[str, Any]
+ 
+ 
+ def _index_path() -> Path:
+     return ARTIFACTS_DIR / INDEX_FILENAME
+ 
+ 
+ def _ensure_dir() -> None:
+     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+ 
+ 
+-def _atomic_write_text(path: Path, text: str) -> None:
++def _atomic_write_text(path: Path, text: str, *, validator: Optional[Callable[[Path], None]] = None) -> None:
+     _ensure_dir()
+     tmp_path = path.with_suffix(path.suffix + ".tmp")
+     path.parent.mkdir(parents=True, exist_ok=True)
+     tmp_path.write_text(text, encoding="utf-8")
++    if validator is not None:
++        validator(tmp_path)
+     tmp_path.replace(path)
+ 
+ 
+ def resolve_artifact_path(raw_path: str | Path) -> Path:
+     """Return absolute path within the artifacts directory."""
+ 
+     base_dir = ARTIFACTS_DIR
+     if not isinstance(raw_path, Path):
+         candidate = Path(str(raw_path))
+     else:
+         candidate = raw_path
+ 
+     if not candidate.is_absolute():
+         candidate = (base_dir / candidate).resolve()
+     else:
+         candidate = candidate.resolve()
+ 
+     if candidate == base_dir:
+         raise ValueError("Запрошенный путь указывает на каталог artifacts")
+ 
+     try:
+         candidate.relative_to(base_dir)
+     except ValueError as exc:  # noqa: PERF203 - explicit error message helps debugging
+         raise ValueError("Запрошенный путь вне каталога artifacts") from exc
+     return candidate
+@@ -181,92 +183,98 @@ def _build_record_from_entry(entry: Dict[str, Any]) -> ArtifactRecord | None:
+         updated_at=str(updated_at) if updated_at else None,
+         status=str(status) if status else None,
+         extra=extra,
+     )
+ 
+ 
+ def _build_record_from_file(path: Path, metadata: Optional[Dict[str, Any]] = None) -> ArtifactRecord:
+     metadata_path = path.with_suffix(".json")
+     payload = metadata if metadata is not None else _read_metadata(metadata_path)
+     record_id = str(payload.get("id") or payload.get("artifact_id") or path.stem)
+     status = payload.get("status") or ("Ready" if path.exists() else None)
+     updated_at = payload.get("generated_at") or None
+     name = payload.get("name") or path.name
+ 
+     return ArtifactRecord(
+         id=record_id,
+         path=_relative_path(path),
+         metadata_path=_relative_path(metadata_path) if metadata_path.exists() else None,
+         name=name,
+         updated_at=str(updated_at) if updated_at else None,
+         status=str(status) if status else None,
+         extra={},
+     )
+ 
+ 
+-def register_artifact(markdown_path: Path, metadata: Optional[Dict[str, Any]] = None) -> ArtifactRecord:
++def register_artifact(
++    markdown_path: Path,
++    metadata: Optional[Dict[str, Any]] = None,
++    *,
++    finalized: bool = True,
++) -> ArtifactRecord:
+     """Ensure that the artifact index contains an entry for the file."""
+ 
+     resolved = resolve_artifact_path(markdown_path)
+     payload = metadata if metadata is not None else _read_metadata(resolved.with_suffix(".json"))
+     record = _build_record_from_file(resolved, payload)
+     entries = _read_index()
+ 
+     updated = False
+     for idx, entry in enumerate(entries):
+         candidate = _build_record_from_entry(entry)
+         if candidate and (candidate.path == record.path or candidate.id == record.id):
+             merged = dict(entry)
+             merged.update(
+                 {
+                     "id": record.id,
+                     "path": record.path,
+                     "metadata_path": record.metadata_path,
+                     "name": record.name,
+                     "status": record.status,
+                     "updated_at": record.updated_at,
+                 }
+             )
+             entries[idx] = merged
+             updated = True
+             break
+     if not updated:
+         entries.append(
+             {
+                 "id": record.id,
+                 "path": record.path,
+                 "metadata_path": record.metadata_path,
+                 "name": record.name,
+                 "status": record.status,
+                 "updated_at": record.updated_at,
+             }
+         )
+ 
+     entries = _sort_entries(entries)
+     _write_index(entries)
+-    _update_latest(record)
+-    _append_changelog(record)
++    if finalized:
++        _update_latest(record)
++        _append_changelog(record)
+     return record
+ 
+ 
+ def _sort_entries(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+     def _key(entry: Dict[str, Any]) -> tuple:
+         updated_at = entry.get("updated_at")
+         return (str(updated_at) if updated_at else "", str(entry.get("name") or ""))
+ 
+     return sorted(list(entries), key=_key, reverse=True)
+ 
+ 
+ def list_artifacts(theme: Optional[str] = None, *, auto_cleanup: bool = False) -> List[Dict[str, Any]]:
+     """Return artifacts suitable for API output."""
+ 
+     if auto_cleanup:
+         cleanup_index()
+ 
+     entries = _read_index()
+     if entries:
+         records = [rec for rec in (_build_record_from_entry(entry) for entry in entries) if rec]
+     else:
+         records = []
+         artifacts_dir = ARTIFACTS_DIR
+         if artifacts_dir.exists():
+             for path in sorted(artifacts_dir.glob("*.md"), reverse=True):
+diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
+index ce8396d6994358a232d3df60d3b7dc86df423f26..f5bf85a1acba07f953d26b5aedc5ad16b54de6a0 100644
+--- a/deterministic_pipeline.py
++++ b/deterministic_pipeline.py
+@@ -1,83 +1,92 @@
+ """LLM-driven content pipeline with explicit step-level guarantees."""
+ 
+ from __future__ import annotations
+ 
 +import json
-+import logging
+ import json
+ import logging
  import re
-+import time
++import textwrap
+ import time
  from dataclasses import dataclass, field
  from enum import Enum
--from typing import Dict, Iterable, List, Optional
-+from typing import Dict, Iterable, List, Optional, Sequence
+-from typing import Dict, Iterable, List, Optional, Sequence
++from typing import Dict, Iterable, List, Optional, Sequence, Tuple
  
--from faq_builder import FaqBuildResult, build_faq_block
-+from llm_client import GenerationResult, generate as llm_generate
+ from llm_client import GenerationResult, generate as llm_generate
  from keyword_injector import KeywordInjectionResult, build_term_pattern, inject_keywords
  from length_trimmer import TrimResult, trim_text
--from validators import ValidationResult, strip_jsonld, validate_article
-+from validators import ValidationResult, length_no_spaces, strip_jsonld, validate_article
-+
-+
-+LOGGER = logging.getLogger("content_factory.pipeline")
-+
-+FAQ_START = "<!--FAQ_START-->"
-+FAQ_END = "<!--FAQ_END-->"
-+
-+_TEMPLATE_SNIPPETS = [
-+    "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
-+    "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист",
-+    "В выводах собираем план действий, назначаем контрольные даты",
-+]
+-from validators import ValidationResult, length_no_spaces, strip_jsonld, validate_article
++from validators import (
++    ValidationError,
++    ValidationResult,
++    length_no_spaces,
++    strip_jsonld,
++    validate_article,
++)
+ 
+ 
+ LOGGER = logging.getLogger("content_factory.pipeline")
+ 
+ FAQ_START = "<!--FAQ_START-->"
+ FAQ_END = "<!--FAQ_END-->"
+ 
+ _TEMPLATE_SNIPPETS = [
+     "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
+     "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист",
+     "В выводах собираем план действий, назначаем контрольные даты",
+ ]
  
  
  class PipelineStep(str, Enum):
@@ -120,87 +247,74 @@ index 0e1a3885ff064a454ff9ecc80ab7f10a4be75642..ce8396d6994358a232d3df60d3b7dc86
      validation: Optional[ValidationResult]
      logs: List[PipelineLogEntry]
      checkpoints: Dict[PipelineStep, str]
-+    model_used: Optional[str] = None
-+    fallback_used: Optional[str] = None
-+    fallback_reason: Optional[str] = None
-+    api_route: Optional[str] = None
-+    token_usage: Optional[float] = None
-+
-+
-+class PipelineStepError(RuntimeError):
-+    """Raised when a particular pipeline step fails irrecoverably."""
-+
-+    def __init__(self, step: PipelineStep, message: str, *, status_code: int = 500) -> None:
-+        super().__init__(message)
-+        self.step = step
-+        self.status_code = status_code
+     model_used: Optional[str] = None
+     fallback_used: Optional[str] = None
+     fallback_reason: Optional[str] = None
+     api_route: Optional[str] = None
+     token_usage: Optional[float] = None
++    skeleton_payload: Optional[Dict[str, object]] = None
+ 
+ 
+ class PipelineStepError(RuntimeError):
+     """Raised when a particular pipeline step fails irrecoverably."""
+ 
+     def __init__(self, step: PipelineStep, message: str, *, status_code: int = 500) -> None:
+         super().__init__(message)
+         self.step = step
+         self.status_code = status_code
  
  
  class DeterministicPipeline:
-+    """Pipeline that orchestrates LLM calls and post-processing steps."""
-+
+     """Pipeline that orchestrates LLM calls and post-processing steps."""
+ 
      def __init__(
          self,
          *,
          topic: str,
--        base_outline: List[str],
-+        base_outline: Sequence[str],
+         base_outline: Sequence[str],
          keywords: Iterable[str],
          min_chars: int,
          max_chars: int,
-+        messages: Sequence[Dict[str, object]],
-+        model: str,
-+        temperature: float,
-+        max_tokens: int,
-+        timeout_s: int,
-+        backoff_schedule: Optional[List[float]] = None,
-         provided_faq: Optional[List[Dict[str, str]]] = None,
-+        jsonld_requested: bool = True,
+         messages: Sequence[Dict[str, object]],
+         model: str,
+         temperature: float,
+@@ -88,50 +97,51 @@ class DeterministicPipeline:
+         jsonld_requested: bool = True,
      ) -> None:
--        self.topic = topic
--        self.base_outline = base_outline or ["Введение", "Основная часть", "Вывод"]
--        self.keywords = list(keywords)
--        self.normalized_keywords = [
--            term
--            for term in (str(item).strip() for item in self.keywords)
--            if term
--        ]
--        self.min_chars = min_chars
--        self.max_chars = max_chars
-+        if not model or not str(model).strip():
-+            raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
-+
-+        self.topic = topic.strip() or "Тема"
-+        self.base_outline = list(base_outline) if base_outline else ["Введение", "Основная часть", "Вывод"]
-+        self.keywords = [str(term).strip() for term in keywords if str(term).strip()]
-+        self.normalized_keywords = [term for term in self.keywords if term]
-+        self.min_chars = int(min_chars)
-+        self.max_chars = int(max_chars)
-+        self.messages = [dict(message) for message in messages]
-+        self.model = str(model).strip()
-+        self.temperature = float(temperature)
-+        self.max_tokens = int(max_tokens) if max_tokens else 0
-+        self.timeout_s = int(timeout_s)
-+        self.backoff_schedule = list(backoff_schedule) if backoff_schedule else None
+         if not model or not str(model).strip():
+             raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
+ 
+         self.topic = topic.strip() or "Тема"
+         self.base_outline = list(base_outline) if base_outline else ["Введение", "Основная часть", "Вывод"]
+         self.keywords = [str(term).strip() for term in keywords if str(term).strip()]
+         self.normalized_keywords = [term for term in self.keywords if term]
+         self.min_chars = int(min_chars)
+         self.max_chars = int(max_chars)
+         self.messages = [dict(message) for message in messages]
+         self.model = str(model).strip()
+         self.temperature = float(temperature)
+         self.max_tokens = int(max_tokens) if max_tokens else 0
+         self.timeout_s = int(timeout_s)
+         self.backoff_schedule = list(backoff_schedule) if backoff_schedule else None
          self.provided_faq = provided_faq or []
-+        self.jsonld_requested = bool(jsonld_requested)
-+
+         self.jsonld_requested = bool(jsonld_requested)
+ 
          self.logs: List[PipelineLogEntry] = []
          self.checkpoints: Dict[PipelineStep, str] = {}
          self.jsonld: Optional[str] = None
          self.locked_terms: List[str] = []
          self.jsonld_reserve: int = 0
++        self.skeleton_payload: Optional[Dict[str, object]] = None
  
--    # Step helpers -----------------------------------------------------
-+        self._model_used: Optional[str] = None
-+        self._fallback_used: Optional[str] = None
-+        self._fallback_reason: Optional[str] = None
-+        self._api_route: Optional[str] = None
-+        self._token_usage: Optional[float] = None
-+
-+    # ------------------------------------------------------------------
-+    # Internal helpers
-+    # ------------------------------------------------------------------
+         self._model_used: Optional[str] = None
+         self._fallback_used: Optional[str] = None
+         self._fallback_reason: Optional[str] = None
+         self._api_route: Optional[str] = None
+         self._token_usage: Optional[float] = None
+ 
+     # ------------------------------------------------------------------
+     # Internal helpers
+     # ------------------------------------------------------------------
      def _log(self, step: PipelineStep, status: str, **notes: object) -> None:
          entry = PipelineLogEntry(step=step, started_at=time.time(), status=status, notes=dict(notes))
          self.logs.append(entry)
@@ -216,348 +330,352 @@ index 0e1a3885ff064a454ff9ecc80ab7f10a4be75642..ce8396d6994358a232d3df60d3b7dc86
              PipelineLogEntry(step=step, started_at=time.time(), finished_at=time.time(), status=status, notes=dict(notes))
          )
  
--    # Step implementations --------------------------------------------
--    def _run_skeleton(self) -> str:
--        self._log(PipelineStep.SKELETON, "running")
--        intro = self._render_intro()
--        body = self._render_body()
--        outro = self._render_outro()
--        faq_placeholder = "\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n\n"
--        skeleton = f"## Введение\n\n{intro}\n\n## Основная часть\n\n{body}{faq_placeholder}## Вывод\n\n{outro}"
--        self._update_log(
--            PipelineStep.SKELETON,
--            "ok",
--            length=len(skeleton),
--            **self._metrics(skeleton),
-+    def _register_llm_result(self, result: GenerationResult, usage: Optional[float]) -> None:
-+        if result.model_used:
-+            self._model_used = result.model_used
-+        elif self._model_used is None:
-+            self._model_used = self.model
-+        if result.fallback_used:
-+            self._fallback_used = result.fallback_used
-+        if result.fallback_reason:
-+            self._fallback_reason = result.fallback_reason
-+        if result.api_route:
-+            self._api_route = result.api_route
-+        if usage is not None:
-+            self._token_usage = usage
-+
-+    def _prompt_length(self, messages: Sequence[Dict[str, object]]) -> int:
-+        length = 0
-+        for message in messages:
-+            content = message.get("content")
-+            if isinstance(content, str):
-+                length += len(content)
-+        return length
-+
-+    def _extract_usage(self, result: GenerationResult) -> Optional[float]:
-+        metadata = result.metadata or {}
-+        if not isinstance(metadata, dict):
-+            return None
-+        candidates = [
-+            metadata.get("usage_output_tokens"),
-+            metadata.get("token_usage"),
-+            metadata.get("output_tokens"),
-+        ]
-+        usage_block = metadata.get("usage")
-+        if isinstance(usage_block, dict):
-+            candidates.append(usage_block.get("output_tokens"))
-+            candidates.append(usage_block.get("total_tokens"))
-+        for candidate in candidates:
-+            if isinstance(candidate, (int, float)):
-+                return float(candidate)
-+        return None
-+
-+    def _call_llm(
-+        self,
-+        *,
-+        step: PipelineStep,
-+        messages: Sequence[Dict[str, object]],
-+        max_tokens: Optional[int] = None,
-+    ) -> GenerationResult:
-+        prompt_len = self._prompt_length(messages)
-+        LOGGER.info(
-+            "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d keywords_count=%d",
-+            step.value,
-+            self.model,
-+            prompt_len,
-+            len(self.normalized_keywords),
-+        )
-+        limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
-+        if not limit or limit <= 0:
-+            limit = 700
-+        try:
-+            result = llm_generate(
-+                list(messages),
-+                model=self.model,
-+                temperature=self.temperature,
-+                max_tokens=limit,
-+                timeout_s=self.timeout_s,
-+                backoff_schedule=self.backoff_schedule,
-+            )
-+        except Exception as exc:  # noqa: BLE001
-+            LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
-+            raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
-+
-+        usage = self._extract_usage(result)
-+        LOGGER.info(
-+            "LOG:LLM_RESPONSE step=%s token_usage=%s",
-+            step.value,
-+            "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
-         )
--        self.checkpoints[PipelineStep.SKELETON] = skeleton
--        return skeleton
-+        self._register_llm_result(result, usage)
-+        return result
-+
-+    def _check_template_text(self, text: str, step: PipelineStep) -> None:
-+        lowered = text.lower()
-+        if lowered.count("дополнительно рассматривается") >= 3:
-+            raise PipelineStepError(step, "Обнаружен шаблонный текст 'Дополнительно рассматривается'.")
-+        for snippet in _TEMPLATE_SNIPPETS:
-+            if snippet in lowered:
-+                raise PipelineStepError(step, "Найден служебный шаблонный фрагмент, генерация отклонена.")
-+
-+    def _metrics(self, text: str) -> Dict[str, object]:
-+        article = strip_jsonld(text)
-+        chars_no_spaces = length_no_spaces(article)
-+        keywords_found = 0
-+        for term in self.normalized_keywords:
-+            if build_term_pattern(term).search(article):
-+                keywords_found += 1
-+        return {
-+            "chars_no_spaces": chars_no_spaces,
-+            "keywords_found": keywords_found,
-+            "keywords_total": len(self.normalized_keywords),
-+        }
-+
-+    def _resolve_skeleton_tokens(self) -> int:
-+        baseline = max(self.max_tokens, self.max_chars + 400)
-+        if baseline <= 0:
-+            baseline = self.max_chars + 400
-+        return max(600, baseline)
+@@ -161,108 +171,173 @@ class DeterministicPipeline:
+         metadata = result.metadata or {}
+         if not isinstance(metadata, dict):
+             return None
+         candidates = [
+             metadata.get("usage_output_tokens"),
+             metadata.get("token_usage"),
+             metadata.get("output_tokens"),
+         ]
+         usage_block = metadata.get("usage")
+         if isinstance(usage_block, dict):
+             candidates.append(usage_block.get("output_tokens"))
+             candidates.append(usage_block.get("total_tokens"))
+         for candidate in candidates:
+             if isinstance(candidate, (int, float)):
+                 return float(candidate)
+         return None
  
--    def _render_intro(self) -> str:
--        sentences = [
--            f"{self.topic} влияет на финансовое здоровье семьи, поэтому начинаем с оценки текущей нагрузки и распределения платежей.",
--            "Мы фиксируем ключевые показатели, объясняем критерии допустимых значений и даём быстрые советы по сбору данных.",
-+    def _render_faq_markdown(self, entries: Sequence[Dict[str, str]]) -> str:
-+        lines: List[str] = []
-+        for index, entry in enumerate(entries, start=1):
-+            question = entry.get("question", "").strip()
-+            answer = entry.get("answer", "").strip()
-+            lines.append(f"**Вопрос {index}.** {question}")
-+            lines.append(f"**Ответ.** {answer}")
-+            lines.append("")
-+        return "\n".join(lines).strip()
+     def _call_llm(
+         self,
+         *,
+         step: PipelineStep,
+         messages: Sequence[Dict[str, object]],
+         max_tokens: Optional[int] = None,
+     ) -> GenerationResult:
+         prompt_len = self._prompt_length(messages)
+-        LOGGER.info(
+-            "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d keywords_count=%d",
+-            step.value,
+-            self.model,
+-            prompt_len,
+-            len(self.normalized_keywords),
+-        )
++        LOGGER.info("LOG:LLM_REQUEST step=%s model=%s prompt_len=%d", step.value, self.model, prompt_len)
+         limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
+         if not limit or limit <= 0:
+             limit = 700
+         try:
+             result = llm_generate(
+                 list(messages),
+                 model=self.model,
+                 temperature=self.temperature,
+                 max_tokens=limit,
+                 timeout_s=self.timeout_s,
+                 backoff_schedule=self.backoff_schedule,
+             )
+         except Exception as exc:  # noqa: BLE001
+             LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
+             raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
+ 
+         usage = self._extract_usage(result)
++        metadata = result.metadata or {}
++        status = str(metadata.get("status") or "ok")
+         LOGGER.info(
+-            "LOG:LLM_RESPONSE step=%s token_usage=%s",
++            "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
+             step.value,
+             "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
++            status,
+         )
+         self._register_llm_result(result, usage)
+         return result
+ 
+     def _check_template_text(self, text: str, step: PipelineStep) -> None:
+         lowered = text.lower()
+         if lowered.count("дополнительно рассматривается") >= 3:
+             raise PipelineStepError(step, "Обнаружен шаблонный текст 'Дополнительно рассматривается'.")
+         for snippet in _TEMPLATE_SNIPPETS:
+             if snippet in lowered:
+                 raise PipelineStepError(step, "Найден служебный шаблонный фрагмент, генерация отклонена.")
+ 
+     def _metrics(self, text: str) -> Dict[str, object]:
+         article = strip_jsonld(text)
+         chars_no_spaces = length_no_spaces(article)
+         keywords_found = 0
+         for term in self.normalized_keywords:
+             if build_term_pattern(term).search(article):
+                 keywords_found += 1
+         return {
+             "chars_no_spaces": chars_no_spaces,
+             "keywords_found": keywords_found,
+             "keywords_total": len(self.normalized_keywords),
+         }
+ 
+     def _resolve_skeleton_tokens(self) -> int:
+         baseline = max(self.max_tokens, self.max_chars + 400)
+         if baseline <= 0:
+             baseline = self.max_chars + 400
+-        return max(600, baseline)
++        return min(1500, max(600, baseline))
 +
-+    def _build_jsonld(self, entries: Sequence[Dict[str, str]]) -> str:
-+        payload = {
-+            "@context": "https://schema.org",
-+            "@type": "FAQPage",
-+            "mainEntity": [
++    def _skeleton_contract(self) -> Dict[str, object]:
++        outline = [segment.strip() for segment in self.base_outline if segment.strip()]
++        contract = {
++            "title": "Строго один заголовок первого уровня",
++            "sections": [
 +                {
-+                    "@type": "Question",
-+                    "name": entry.get("question", ""),
-+                    "acceptedAnswer": {"@type": "Answer", "text": entry.get("answer", "")},
++                    "heading": item,
++                    "goal": "Краткое назначение секции",
++                    "paragraphs": [
++                        "1-3 насыщенных абзаца без буллитов",
++                    ],
++                    "bullets": [],
 +                }
-+                for entry in entries
++                for item in outline
 +            ],
 +        }
-+        compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-+        return f'<script type="application/ld+json">\n{compact}\n</script>'
++        return contract
 +
-+    def _merge_faq(self, base_text: str, faq_block: str) -> str:
-+        if FAQ_START not in base_text or FAQ_END not in base_text:
-+            raise PipelineStepError(PipelineStep.FAQ, "В тексте нет маркеров FAQ для замены.")
-+        before, remainder = base_text.split(FAQ_START, 1)
-+        inside, after = remainder.split(FAQ_END, 1)
-+        inside = inside.strip()
-+        merged = f"{before}{FAQ_START}\n{faq_block}\n{FAQ_END}{after}"
-+        return merged
-+
-+    def _sanitize_entries(self, entries: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
-+        sanitized: List[Dict[str, str]] = []
-+        for entry in entries:
-+            question = str(entry.get("question", "")).strip()
-+            answer = str(entry.get("answer", "")).strip()
-+            if not question or not answer:
-+                continue
-+            lowered = (question + " " + answer).lower()
-+            if "дополнительно рассматривается" in lowered:
-+                raise PipelineStepError(PipelineStep.FAQ, "FAQ содержит шаблонную фразу 'Дополнительно рассматривается'.")
-+            sanitized.append({"question": question, "answer": answer})
-+        return sanitized
-+
-+    def _parse_faq_entries(self, raw_text: str) -> List[Dict[str, str]]:
-+        candidate = raw_text.strip()
-+        if not candidate:
-+            raise PipelineStepError(PipelineStep.FAQ, "Модель вернула пустой блок FAQ.")
-+        data: Optional[Dict[str, object]] = None
-+        try:
-+            data = json.loads(candidate)
-+        except json.JSONDecodeError:
-+            match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
-+            if match:
-+                data = json.loads(match.group(0))
-+        if not isinstance(data, dict):
-+            raise PipelineStepError(PipelineStep.FAQ, "Ответ модели не является корректным JSON.")
-+        entries = data.get("faq")
-+        if not isinstance(entries, list):
-+            raise PipelineStepError(PipelineStep.FAQ, "В ответе отсутствует массив faq.")
-+        sanitized = self._sanitize_entries(entries)
-+        if len(sanitized) != 5:
-+            raise PipelineStepError(PipelineStep.FAQ, "FAQ должно содержать ровно 5 пар вопросов и ответов.")
-+        return sanitized
-+
-+    def _build_faq_messages(self, base_text: str) -> List[Dict[str, str]]:
-+        hints: List[str] = []
-+        if self.provided_faq:
-+            provided_preview = json.dumps(
-+                [
-+                    {
-+                        "question": str(entry.get("question", "")).strip(),
-+                        "answer": str(entry.get("answer", "")).strip(),
-+                    }
-+                    for entry in self.provided_faq
-+                    if str(entry.get("question", "")).strip() and str(entry.get("answer", "")).strip()
-+                ],
-+                ensure_ascii=False,
-+                indent=2,
-+            )
-+            hints.append(
-+                "Используй следующие пары как ориентир и улучшай формулировки, если нужно:\n" + provided_preview
-+            )
-+        if self.normalized_keywords:
-+            hints.append(
-+                "По возможности вплетай ключевые слова: " + ", ".join(self.normalized_keywords) + "."
-+            )
-+
-+        user_instructions = [
-+            "Ниже приведена статья без блока FAQ. Сформируй пять уникальных вопросов и ответов.",
-+            "Верни результат в формате JSON: {\"faq\": [{\"question\": \"...\", \"answer\": \"...\"}, ...]}.",
-+            "Ответы должны быть развернутыми, практичными и без повторов.",
-+            "Не используй клише вроде 'Дополнительно рассматривается'.",
-         ]
--        return " ".join(sentences)
--
--    def _render_body(self) -> str:
--        if not self.base_outline:
--            sections = ["Понимаем входные данные", "Разбираем метрики", "Готовим решения"]
--        else:
--            sections = [title for title in self.base_outline if title.lower() not in {"введение", "faq", "вывод"}]
--            if not sections:
--                sections = ["Понимаем входные данные", "Разбираем метрики", "Готовим решения"]
--        paragraphs: List[str] = []
--        for heading in sections:
--            paragraphs.append(f"### {heading}")
--            paragraphs.append(self._render_section_block(heading))
--        return "\n\n".join(paragraphs)
--
--    def _render_section_block(self, heading: str) -> str:
--        sentences = [
--            f"{heading} рассматриваем на реальных примерах, чтобы показать связь между цифрами и бытовыми решениями семьи.",
--            "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист действий, который можно выполнять по шагам.",
--            "В конце указываем цифровые сервисы для автоматизации расчётов и напоминаний, чтобы снизить вероятность ошибок.",
-+        if hints:
-+            user_instructions.extend(hints)
-+        payload = "\n".join(user_instructions)
-+        article_block = f"СТАТЬЯ:\n{base_text.strip()}"
-+        return [
-+            {
-+                "role": "system",
-+                "content": (
-+                    "Ты опытный финансовый редактор. Сформируй полезный FAQ без повторов,"
-+                    " обеспечь, чтобы вопросы отличались по фокусу и помогали читателю действовать."
-+                ),
-+            },
-+            {"role": "user", "content": f"{payload}\n\n{article_block}"},
-         ]
--        return " ".join(sentences)
- 
--    def _render_outro(self) -> str:
--        sentences = [
--            "В выводах собираем план действий, назначаем контрольные даты и распределяем ответственность между участниками.",
--            "Дополняем материал рекомендациями по пересмотру стратегии и фиксируем признаки, при которых стоит обратиться к экспертам.",
--        ]
--        return " ".join(sentences)
-+    def _sync_locked_terms(self, text: str) -> None:
-+        pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
-+        self.locked_terms = pattern.findall(text)
-+
-+    # ------------------------------------------------------------------
-+    # Step implementations
-+    # ------------------------------------------------------------------
-+    def _run_skeleton(self) -> str:
-+        self._log(PipelineStep.SKELETON, "running")
++    def _build_skeleton_messages(self) -> List[Dict[str, object]]:
++        outline = [segment.strip() for segment in self.base_outline if segment.strip()]
++        contract = json.dumps(self._skeleton_contract(), ensure_ascii=False, indent=2)
++        user_payload = textwrap.dedent(
++            f"""
++            Сформируй структуру статьи в строгом JSON-формате.
++            Требования:
++            1. Соблюдай следующий порядок разделов: {', '.join(outline)}.
++            2. Верни JSON вида {{"title": str, "sections": [{{"heading": str, "paragraphs": [str, ...]}}]}}.
++            3. Каждый paragraphs содержит 2-3 осмысленных абзаца по 3-4 предложения без приветствий.
++            4. Не добавляй FAQ и маркеры; только данные для отрисовки.
++            5. Не используй Markdown и комментарии.
++            Образец структуры:
++            {contract}
++            """
++        ).strip()
 +        messages = list(self.messages)
-+        messages.append(
-+            {
-+                "role": "user",
-+                "content": (
-+                    "Сгенерируй полную статью по заданной структуре. Для блока FAQ оставь пустое место:"
-+                    f" добавь заголовок '## FAQ', затем отдельными строками {FAQ_START} и {FAQ_END},"
-+                    " без текста между ними. Остальные разделы наполни осмысленными рекомендациями."
-+                ),
-+            }
++        messages.append({"role": "user", "content": user_payload})
++        return messages
++
++    def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
++        if not isinstance(payload, dict):
++            raise ValueError("Структура скелета не является объектом")
++        title = str(payload.get("title") or "").strip()
++        sections = payload.get("sections")
++        if not title or not isinstance(sections, list) or not sections:
++            raise ValueError("Скелет не содержит обязательных полей")
++        outline = []
++        lines: List[str] = [f"# {title}", ""]
++        for section in sections:
++            if not isinstance(section, dict):
++                raise ValueError("Секция имеет некорректный формат")
++            heading = str(section.get("heading") or "").strip()
++            paragraphs = section.get("paragraphs")
++            if not heading or not isinstance(paragraphs, list) or not paragraphs:
++                raise ValueError("Секция неполная")
++            outline.append(heading)
++            lines.append(f"## {heading}")
++            for paragraph in paragraphs:
++                text = str(paragraph).strip()
++                if not text:
++                    continue
++                lines.append(text)
++                lines.append("")
++        lines.append("## FAQ")
++        lines.append(FAQ_START)
++        lines.append(FAQ_END)
++        markdown = "\n".join(lines).strip()
++        return markdown, {"title": title, "outline": outline}
+ 
+     def _render_faq_markdown(self, entries: Sequence[Dict[str, str]]) -> str:
+         lines: List[str] = []
+         for index, entry in enumerate(entries, start=1):
+             question = entry.get("question", "").strip()
+             answer = entry.get("answer", "").strip()
+             lines.append(f"**Вопрос {index}.** {question}")
+             lines.append(f"**Ответ.** {answer}")
+             lines.append("")
+         return "\n".join(lines).strip()
+ 
+     def _build_jsonld(self, entries: Sequence[Dict[str, str]]) -> str:
+         payload = {
+             "@context": "https://schema.org",
+             "@type": "FAQPage",
+             "mainEntity": [
+                 {
+                     "@type": "Question",
+                     "name": entry.get("question", ""),
+                     "acceptedAnswer": {"@type": "Answer", "text": entry.get("answer", "")},
+                 }
+                 for entry in entries
+             ],
+         }
+         compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+@@ -342,177 +417,254 @@ class DeterministicPipeline:
+         ]
+         if hints:
+             user_instructions.extend(hints)
+         payload = "\n".join(user_instructions)
+         article_block = f"СТАТЬЯ:\n{base_text.strip()}"
+         return [
+             {
+                 "role": "system",
+                 "content": (
+                     "Ты опытный финансовый редактор. Сформируй полезный FAQ без повторов,"
+                     " обеспечь, чтобы вопросы отличались по фокусу и помогали читателю действовать."
+                 ),
+             },
+             {"role": "user", "content": f"{payload}\n\n{article_block}"},
+         ]
+ 
+     def _sync_locked_terms(self, text: str) -> None:
+         pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
+         self.locked_terms = pattern.findall(text)
+ 
+     # ------------------------------------------------------------------
+     # Step implementations
+     # ------------------------------------------------------------------
+     def _run_skeleton(self) -> str:
+         self._log(PipelineStep.SKELETON, "running")
+-        messages = list(self.messages)
+-        messages.append(
+-            {
+-                "role": "user",
+-                "content": (
+-                    "Сгенерируй полную статью по заданной структуре. Для блока FAQ оставь пустое место:"
+-                    f" добавь заголовок '## FAQ', затем отдельными строками {FAQ_START} и {FAQ_END},"
+-                    " без текста между ними. Остальные разделы наполни осмысленными рекомендациями."
+-                ),
+-            }
+-        )
++        messages = self._build_skeleton_messages()
+         skeleton_tokens = self._resolve_skeleton_tokens()
+-        result = self._call_llm(step=PipelineStep.SKELETON, messages=messages, max_tokens=skeleton_tokens)
+-        text = result.text.strip()
+-        if not text:
+-            raise PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
+-        if FAQ_START not in text or FAQ_END not in text:
+-            raise PipelineStepError(PipelineStep.SKELETON, "В тексте отсутствуют маркеры FAQ.")
+-        self._check_template_text(text, PipelineStep.SKELETON)
+-        self._update_log(PipelineStep.SKELETON, "ok", length=len(text), **self._metrics(text))
+-        self.checkpoints[PipelineStep.SKELETON] = text
+-        return text
++        attempt = 0
++        last_error: Optional[Exception] = None
++        payload: Optional[Dict[str, object]] = None
++        markdown: Optional[str] = None
++        metadata_snapshot: Dict[str, object] = {}
++        while attempt < 3 and markdown is None:
++            attempt += 1
++            try:
++                result = self._call_llm(
++                    step=PipelineStep.SKELETON,
++                    messages=messages,
++                    max_tokens=skeleton_tokens,
++                )
++            except PipelineStepError:
++                raise
++            metadata_snapshot = result.metadata or {}
++            status = str(metadata_snapshot.get("status") or "ok").lower()
++            if status == "incomplete" or metadata_snapshot.get("incomplete_reason"):
++                LOGGER.warning(
++                    "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
++                    attempt,
++                    status,
++                    metadata_snapshot.get("incomplete_reason") or "",
++                )
++                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
++                continue
++            raw_text = result.text.strip()
++            if not raw_text:
++                last_error = PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
++                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=empty", attempt)
++                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
++                continue
++            try:
++                payload = json.loads(raw_text)
++                LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
++            except json.JSONDecodeError as exc:
++                LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, exc)
++                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
++                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
++                last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
++                continue
++            try:
++                markdown, summary = self._render_skeleton_markdown(payload)
++                self.skeleton_payload = payload
++                LOGGER.info("SKELETON_RENDERED_WITH_MARKERS outline=%s", ",".join(summary.get("outline", [])))
++            except Exception as exc:  # noqa: BLE001
++                last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
++                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=%s", attempt, exc)
++                payload = None
++                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
++                markdown = None
++
++        if markdown is None:
++            if last_error:
++                raise last_error
++            raise PipelineStepError(
++                PipelineStep.SKELETON,
++                "Не удалось получить корректный скелет статьи после нескольких попыток.",
++            )
++
++        if FAQ_START not in markdown or FAQ_END not in markdown:
++            raise PipelineStepError(PipelineStep.SKELETON, "Не удалось вставить маркеры FAQ на этапе скелета.")
++
++        self._check_template_text(markdown, PipelineStep.SKELETON)
++        self._update_log(
++            PipelineStep.SKELETON,
++            "ok",
++            length=len(markdown),
++            metadata_status=metadata_snapshot.get("status") or "ok",
++            **self._metrics(markdown),
 +        )
-+        skeleton_tokens = self._resolve_skeleton_tokens()
-+        result = self._call_llm(step=PipelineStep.SKELETON, messages=messages, max_tokens=skeleton_tokens)
-+        text = result.text.strip()
-+        if not text:
-+            raise PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
-+        if FAQ_START not in text or FAQ_END not in text:
-+            raise PipelineStepError(PipelineStep.SKELETON, "В тексте отсутствуют маркеры FAQ.")
-+        self._check_template_text(text, PipelineStep.SKELETON)
-+        self._update_log(PipelineStep.SKELETON, "ok", length=len(text), **self._metrics(text))
-+        self.checkpoints[PipelineStep.SKELETON] = text
-+        return text
++        self.checkpoints[PipelineStep.SKELETON] = markdown
++        return markdown
  
      def _run_keywords(self, text: str) -> KeywordInjectionResult:
          self._log(PipelineStep.KEYWORDS, "running")
          result = inject_keywords(text, self.keywords)
          self.locked_terms = list(result.locked_terms)
++        total = result.total_terms
++        found = result.found_terms
++        if total and found < total:
++            missing = sorted(term for term, ok in result.coverage.items() if not ok)
++            raise PipelineStepError(
++                PipelineStep.KEYWORDS,
++                "Не удалось обеспечить 100% покрытие ключей: " + ", ".join(missing),
++            )
          self._update_log(
              PipelineStep.KEYWORDS,
              "ok",
-             coverage=result.coverage,
+-            coverage=result.coverage,
++            coverage_summary=f"{found}/{total}",
              inserted_section=result.inserted_section,
              **self._metrics(result.text),
          )
          self.checkpoints[PipelineStep.KEYWORDS] = result.text
          return result
  
--    def _run_faq(self, text: str) -> FaqBuildResult:
-+    def _run_faq(self, text: str) -> str:
+     def _run_faq(self, text: str) -> str:
          self._log(PipelineStep.FAQ, "running")
--        faq_result = build_faq_block(
--            base_text=text,
--            topic=self.topic,
--            keywords=self.keywords,
--            provided_entries=self.provided_faq,
--        )
--        self.jsonld = faq_result.jsonld
--        self.jsonld_reserve = len("".join(self.jsonld.split())) if self.jsonld else 0
-+        messages = self._build_faq_messages(text)
-+        result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=700)
-+        entries = self._parse_faq_entries(result.text)
-+        faq_block = self._render_faq_markdown(entries)
-+        merged_text = self._merge_faq(text, faq_block)
-+        self.jsonld = self._build_jsonld(entries)
-+        self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
+         messages = self._build_faq_messages(text)
+         result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=700)
+         entries = self._parse_faq_entries(result.text)
+         faq_block = self._render_faq_markdown(entries)
+         merged_text = self._merge_faq(text, faq_block)
+         self.jsonld = self._build_jsonld(entries)
+         self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
          self._update_log(
              PipelineStep.FAQ,
              "ok",
--            entries=[entry.question for entry in faq_result.entries],
--            **self._metrics(faq_result.text),
-+            entries=[entry["question"] for entry in entries],
-+            **self._metrics(merged_text),
+             entries=[entry["question"] for entry in entries],
+             **self._metrics(merged_text),
          )
--        self.checkpoints[PipelineStep.FAQ] = faq_result.text
--        return faq_result
-+        self.checkpoints[PipelineStep.FAQ] = merged_text
-+        return merged_text
+         self.checkpoints[PipelineStep.FAQ] = merged_text
+         return merged_text
  
      def _run_trim(self, text: str) -> TrimResult:
          self._log(PipelineStep.TRIM, "running")
@@ -569,6 +687,12 @@ index 0e1a3885ff064a454ff9ecc80ab7f10a4be75642..ce8396d6994358a232d3df60d3b7dc86
              max_chars=target_max,
              protected_blocks=self.locked_terms,
          )
++        current_length = length_no_spaces(result.text)
++        if current_length < self.min_chars or current_length > self.max_chars:
++            raise PipelineStepError(
++                PipelineStep.TRIM,
++                f"Объём после трима вне диапазона {self.min_chars}–{self.max_chars} (без пробелов).",
++            )
          self._update_log(
              PipelineStep.TRIM,
              "ok",
@@ -578,47 +702,45 @@ index 0e1a3885ff064a454ff9ecc80ab7f10a4be75642..ce8396d6994358a232d3df60d3b7dc86
          self.checkpoints[PipelineStep.TRIM] = result.text
          return result
  
--    # Public API -------------------------------------------------------
-+    # ------------------------------------------------------------------
-+    # Public API
-+    # ------------------------------------------------------------------
+     # ------------------------------------------------------------------
+     # Public API
+     # ------------------------------------------------------------------
      def run(self) -> PipelineState:
          text = self._run_skeleton()
          keyword_result = self._run_keywords(text)
--        faq_result = self._run_faq(keyword_result.text)
--        trim_result = self._run_trim(faq_result.text)
-+        faq_text = self._run_faq(keyword_result.text)
-+        trim_result = self._run_trim(faq_text)
+         faq_text = self._run_faq(keyword_result.text)
+         trim_result = self._run_trim(faq_text)
          combined_text = trim_result.text
--        if self.jsonld:
-+        if self.jsonld and self.jsonld_requested:
+         if self.jsonld and self.jsonld_requested:
              combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
-         validation = validate_article(
-             combined_text,
-             keywords=self.keywords,
-             min_chars=self.min_chars,
-             max_chars=self.max_chars,
-         )
--        self.logs.append(
--            PipelineLogEntry(
--                step=PipelineStep.TRIM,
--                started_at=time.time(),
--                finished_at=time.time(),
--                status="validated" if validation.is_valid else "failed",
--                notes={"stats": validation.stats, **self._metrics(combined_text)},
--            )
+-        validation = validate_article(
+-            combined_text,
+-            keywords=self.keywords,
+-            min_chars=self.min_chars,
+-            max_chars=self.max_chars,
 -        )
++        try:
++            validation = validate_article(
++                combined_text,
++                keywords=self.keywords,
++                min_chars=self.min_chars,
++                max_chars=self.max_chars,
++                skeleton_payload=self.skeleton_payload,
++            )
++        except ValidationError as exc:
++            raise PipelineStepError(PipelineStep.TRIM, str(exc), status_code=400) from exc
          return PipelineState(
              text=combined_text,
              jsonld=self.jsonld,
              validation=validation,
              logs=self.logs,
              checkpoints=self.checkpoints,
-+            model_used=self._model_used or self.model,
-+            fallback_used=self._fallback_used,
-+            fallback_reason=self._fallback_reason,
-+            api_route=self._api_route,
-+            token_usage=self._token_usage,
+             model_used=self._model_used or self.model,
+             fallback_used=self._fallback_used,
+             fallback_reason=self._fallback_reason,
+             api_route=self._api_route,
+             token_usage=self._token_usage,
++            skeleton_payload=self.skeleton_payload,
          )
  
      def resume(self, from_step: PipelineStep) -> PipelineState:
@@ -633,41 +755,10 @@ index 0e1a3885ff064a454ff9ecc80ab7f10a4be75642..ce8396d6994358a232d3df60d3b7dc86
              fallback_index -= 1
  
          if fallback_index < 0:
--            message = (
--                f"Чекпоинты отсутствуют для шага {from_step.value}. Полный перезапуск пайплайна."
--            )
--            self.logs.append(
--                PipelineLogEntry(
--                    step=from_step,
--                    started_at=time.time(),
--                    finished_at=time.time(),
--                    status="error",
--                    notes={"message": message},
--                )
--            )
--            return self.run()
-+            raise PipelineStepError(from_step, "Чекпоинты отсутствуют; требуется полный перезапуск.")
+             raise PipelineStepError(from_step, "Чекпоинты отсутствуют; требуется полный перезапуск.")
  
          base_step = order[fallback_index]
          base_text = self.checkpoints[base_step]
--        if fallback_index != base_index:
--            message = (
--                f"Запрошено возобновление с шага {from_step.value}, но найден ближайший чекпоинт {base_step.value}."
--            )
--            self.logs.append(
--                PipelineLogEntry(
--                    step=from_step,
--                    started_at=time.time(),
--                    finished_at=time.time(),
--                    status="error",
--                    notes={
--                        "message": message,
--                        "requested": from_step.value,
--                        "resumed_from": base_step.value,
--                    },
--                )
--            )
--
          self._sync_locked_terms(base_text)
  
          text = base_text
@@ -675,219 +766,618 @@ index 0e1a3885ff064a454ff9ecc80ab7f10a4be75642..ce8396d6994358a232d3df60d3b7dc86
              if step == PipelineStep.KEYWORDS:
                  text = self._run_keywords(text).text
              elif step == PipelineStep.FAQ:
--                text = self._run_faq(text).text
-+                text = self._run_faq(text)
+                 text = self._run_faq(text)
              elif step == PipelineStep.TRIM:
                  text = self._run_trim(text).text
  
          combined_text = text
--        if self.jsonld:
-+        if self.jsonld and self.jsonld_requested:
+         if self.jsonld and self.jsonld_requested:
              combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
-         validation = validate_article(
-             combined_text,
-             keywords=self.keywords,
-             min_chars=self.min_chars,
-             max_chars=self.max_chars,
-         )
+-        validation = validate_article(
+-            combined_text,
+-            keywords=self.keywords,
+-            min_chars=self.min_chars,
+-            max_chars=self.max_chars,
+-        )
++        try:
++            validation = validate_article(
++                combined_text,
++                keywords=self.keywords,
++                min_chars=self.min_chars,
++                max_chars=self.max_chars,
++                skeleton_payload=self.skeleton_payload,
++            )
++        except ValidationError as exc:
++            raise PipelineStepError(step, str(exc), status_code=400) from exc
          return PipelineState(
              text=combined_text,
              jsonld=self.jsonld,
              validation=validation,
              logs=self.logs,
              checkpoints=self.checkpoints,
-+            model_used=self._model_used or self.model,
-+            fallback_used=self._fallback_used,
-+            fallback_reason=self._fallback_reason,
-+            api_route=self._api_route,
-+            token_usage=self._token_usage,
+             model_used=self._model_used or self.model,
+             fallback_used=self._fallback_used,
+             fallback_reason=self._fallback_reason,
+             api_route=self._api_route,
+             token_usage=self._token_usage,
++            skeleton_payload=self.skeleton_payload,
          )
--
--    # Metrics helpers --------------------------------------------------
--    def _sync_locked_terms(self, text: str) -> None:
--        pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
--        self.locked_terms = pattern.findall(text)
--
--    def _count_faq_entries(self, text: str) -> int:
--        if "<!--FAQ_START-->" not in text or "<!--FAQ_END-->" not in text:
--            return 0
--        block = text.split("<!--FAQ_START-->", 1)[1].split("<!--FAQ_END-->", 1)[0]
--        return len(re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block))
--
--    def _metrics(self, text: str) -> Dict[str, object]:
--        article = strip_jsonld(text)
--        chars_no_spaces = len(re.sub(r"\s+", "", article))
--        keywords_found = 0
--        for term in self.normalized_keywords:
--            if build_term_pattern(term).search(article):
--                keywords_found += 1
--        return {
--            "chars_no_spaces": chars_no_spaces,
--            "keywords_found": keywords_found,
--            "keywords_total": len(self.normalized_keywords),
--            "faq_count": self._count_faq_entries(article),
--        }
+diff --git a/faq_builder.py b/faq_builder.py
+index 4686747f19e4058d1fe2c5db1c4dfb4be1011845..e66bf4518c0838ca40cb115a61e7e7982d2fcd70 100644
+--- a/faq_builder.py
++++ b/faq_builder.py
+@@ -1,126 +1,170 @@
+ from __future__ import annotations
+ 
+ import json
+ from dataclasses import dataclass
+ from typing import Dict, Iterable, List, Sequence
+ 
+ 
+ @dataclass
+ class FaqEntry:
+     question: str
+     answer: str
+     anchor: str
+ 
+ 
+ @dataclass
+ class FaqBuildResult:
+     text: str
+     entries: List[FaqEntry]
+     jsonld: str
+ 
+ 
+ def _sanitize_anchor(text: str) -> str:
+     return "-" + "-".join(text.lower().split())
+ 
+ 
++def _normalize_answer(answer: str) -> str:
++    paragraphs = [part.strip() for part in answer.split("\n\n") if part.strip()]
++    if not paragraphs:
++        raise ValueError("Ответ пустой")
++    if len(paragraphs) > 3:
++        paragraphs = paragraphs[:3]
++    if any(len(p) < 20 for p in paragraphs):
++        raise ValueError("Ответ слишком короткий")
++    return "\n\n".join(paragraphs)
++
++
++def _normalize_question(question: str, seen: set[str]) -> str:
++    normalized = question.strip()
++    if not normalized:
++        raise ValueError("Вопрос пустой")
++    if normalized.lower() in seen:
++        raise ValueError("Дублирующийся вопрос")
++    seen.add(normalized.lower())
++    return normalized
++
++
++def _normalize_entry(raw: Dict[str, str], seen: set[str]) -> FaqEntry:
++    question = _normalize_question(str(raw.get("question", "")), seen)
++    answer = _normalize_answer(str(raw.get("answer", "")))
++    anchor = str(raw.get("anchor") or _sanitize_anchor(question))
++    return FaqEntry(question=question, answer=answer, anchor=anchor)
++
++
+ def _generate_generic_entries(topic: str, keywords: Sequence[str]) -> List[FaqEntry]:
+     base_topic = topic or "теме"
+     key_iter = list(keywords)[:5]
+     templates = [
+         "Как оценить основные риски, связанные с {topic}?",
+         "Какие шаги помогут подготовиться к решению вопросов по {topic}?",
+         "Какие цифры считать ориентиром, когда речь заходит о {topic}?",
+         "Как использовать программы поддержки, если речь идёт о {topic}?",
+         "Что делать, если ситуация с {topic} резко меняется?",
+     ]
+     answers = [
+         "Начните с базовой диагностики: опишите текущую ситуацию, посчитайте ключевые показатели и зафиксируйте цели. "
+         "Далее сопоставьте результаты с отраслевыми нормами и составьте план коррекции.",
+         "Сформируйте пошаговый чек-лист. Включите в него анализ документов, консультации с экспертами и список сервисов, которые помогут собрать данные. "
+         "По мере продвижения фиксируйте выводы, чтобы вернуться к ним на этапе принятия решения.",
+         "Используйте диапазон значений из методических материалов и банковской аналитики. "
+         "Сравните собственные показатели с усреднёнными и определите пороги, при которых стоит пересмотреть стратегию.",
+         "Изучите федеральные и региональные программы, подходящие под ваш профиль. "
+         "Составьте список требований, подготовьте пакет документов и оцените сроки рассмотрения, чтобы не потерять время.",
+         "Создайте резервный план действий: определите, какие параметры контролировать ежемесячно, и заранее договоритесь о точках проверки. "
+         "Если изменения превышают допустимый порог, инициируйте пересмотр стратегии и подключите независимую экспертизу.",
+     ]
+ 
+     entries: List[FaqEntry] = []
+     for idx in range(5):
+         keyword_hint = key_iter[idx] if idx < len(key_iter) else ""
+         question = templates[idx].format(topic=base_topic)
+         if keyword_hint:
+             question = f"{question[:-1]} и {keyword_hint}?"
+-        answer = answers[idx]
++        answer = _normalize_answer(answers[idx])
+         anchor = _sanitize_anchor(question)
+         entries.append(FaqEntry(question=question, answer=answer, anchor=anchor))
+     return entries
+ 
+ 
+ def _render_markdown(entries: Sequence[FaqEntry]) -> str:
+     lines: List[str] = []
+     for idx, entry in enumerate(entries, start=1):
+         lines.append(f"**Вопрос {idx}.** {entry.question}")
+         lines.append(
+             "**Ответ.** "
+             + entry.answer
+             + " Это помогает не только понять детали, но и оформить решение в рабочем формате."
+         )
+         lines.append("")
+     return "\n".join(lines).strip()
+ 
+ 
+ def _build_jsonld(entries: Sequence[FaqEntry]) -> str:
+     payload = {
+         "@context": "https://schema.org",
+         "@type": "FAQPage",
+         "mainEntity": [
+             {
+                 "@type": "Question",
+                 "name": entry.question,
+                 "acceptedAnswer": {"@type": "Answer", "text": entry.answer},
+             }
+             for entry in entries
+         ],
+     }
+     compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+     return f'<script type="application/ld+json">\n{compact}\n</script>'
+ 
+ 
+ def build_faq_block(
+     *,
+     base_text: str,
+     topic: str,
+     keywords: Iterable[str],
+     provided_entries: Sequence[Dict[str, str]] | None = None,
+ ) -> FaqBuildResult:
+     entries: List[FaqEntry] = []
++    seen_questions: set[str] = set()
+     if provided_entries:
+-        for idx, entry in enumerate(provided_entries, start=1):
+-            question = str(entry.get("question", "")).strip()
+-            answer = str(entry.get("answer", "")).strip()
+-            anchor = str(entry.get("anchor") or _sanitize_anchor(question))
+-            if not question or not answer:
++        for entry in provided_entries:
++            try:
++                normalized = _normalize_entry(entry, seen_questions)
++            except ValueError:
+                 continue
+-            entries.append(FaqEntry(question=question, answer=answer, anchor=anchor))
++            entries.append(normalized)
++            if len(entries) == 5:
++                break
+     if len(entries) < 5:
+-        extra = _generate_generic_entries(topic, list(keywords))
+-        needed = 5 - len(entries)
+-        entries.extend(extra[:needed])
+-    entries = entries[:5]
++        for candidate in _generate_generic_entries(topic, list(keywords)):
++            if len(entries) == 5:
++                break
++            if candidate.question.lower() in seen_questions:
++                continue
++            seen_questions.add(candidate.question.lower())
++            entries.append(candidate)
++
++    if len(entries) != 5:
++        raise ValueError("Не удалось собрать пять валидных вопросов для FAQ")
+ 
+     rendered = _render_markdown(entries)
+     placeholder = "<!--FAQ_START-->"
+     end_placeholder = "<!--FAQ_END-->"
+     if placeholder not in base_text or end_placeholder not in base_text:
+         raise ValueError("FAQ placeholder missing in base text")
+ 
+     before, remainder = base_text.split(placeholder, 1)
+     inside, after = remainder.split(end_placeholder, 1)
+     inside = inside.strip()
+     if inside:
+         rendered = f"{inside}\n\n{rendered}".strip()
+     merged = f"{before}{placeholder}\n{rendered}\n{end_placeholder}{after}"
+     jsonld = _build_jsonld(entries)
++    # JSON-LD валидация
++    try:
++        raw_json = jsonld.split("\n", 1)[1].rsplit("\n", 1)[0]
++        payload = json.loads(raw_json)
++    except Exception as exc:  # noqa: BLE001
++        raise ValueError(f"Некорректный JSON-LD FAQ: {exc}") from exc
++    if not isinstance(payload, dict) or payload.get("@type") != "FAQPage" or len(payload.get("mainEntity", [])) != 5:
++        raise ValueError("JSON-LD FAQ не соответствует схеме FAQPage")
+     return FaqBuildResult(text=merged, entries=entries, jsonld=jsonld)
 diff --git a/frontend_demo/script.js b/frontend_demo/script.js
-index e8f6028b4389da73fd42ece5c1c101982b202828..f1960b4d2490c8edeebe72d923ed5059aa10f9cc 100644
+index f1960b4d2490c8edeebe72d923ed5059aa10f9cc..516c9d88bb063d62637edfe18ca7b3686880329f 100644
 --- a/frontend_demo/script.js
 +++ b/frontend_demo/script.js
-@@ -1004,50 +1004,54 @@ function updateTemperatureControlState(modelValue) {
-     temperatureHint.hidden = !locked;
+@@ -90,60 +90,70 @@ const advancedSettings = document.getElementById("advanced-settings");
+ const advancedSupportSection = document.querySelector("[data-section='support']");
+ const usedKeywordsSection = document.getElementById("used-keywords");
+ const usedKeywordsList = document.getElementById("used-keywords-list");
+ const usedKeywordsEmpty = document.getElementById("used-keywords-empty");
+ 
+ const ADVANCED_SETTINGS_STORAGE_KEY = "content-demo:advanced-settings-open";
+ 
+ const LOG_STATUS_LABELS = {
+   info: "INFO",
+   success: "SUCCESS",
+   warn: "WARN",
+   error: "ERROR",
+ };
+ 
+ const DEFAULT_PROGRESS_MESSAGE = progressMessage?.textContent?.trim() || "Готовим данные…";
+ const MAX_TOASTS = 3;
+ const MAX_CUSTOM_CONTEXT_CHARS = 20000;
+ const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
+ 
+ const HEALTH_STATUS_MESSAGES = {
+   openai_key: {
+     label: "OpenAI",
+     ok: "активен",
+     fail: "не найден",
+   },
++  llm_ping: {
++    label: "LLM",
++    ok: "отвечает",
++    fail: "нет ответа",
++  },
+   retrieval_index: {
+     label: "Retrieval index",
+     ok: "найден",
+     fail: "не найден",
+   },
+-  artifacts_dir: {
++  artifacts_writable: {
+     label: "Каталог артефактов",
+     ok: "доступен",
+     fail: "недоступен",
+   },
++  theme_index: {
++    label: "Индекс темы",
++    ok: "найден",
++    fail: "не найден",
++  },
+ };
+ 
+ const STYLE_PROFILE_HINTS = {
+   "sravni.ru": "Экспертный, структурный стиль: введение → основная часть → FAQ → вывод.",
+   "tinkoff.ru": "Дружелюбный и прагматичный тон: объясняем шаги на примерах и даём советы.",
+   "banki.ru": "Аналитичный стиль: выделяем выгоды и риски, формулируем выводы по фактам.",
+   off: "Нейтральный деловой стиль без привязки к порталу.",
+ };
+ 
+ const state = {
+   pipes: new Map(),
+   artifacts: [],
+   hasMissingArtifacts: false,
+   currentResult: null,
+ };
+ 
+ const customContextState = {
+   textareaText: "",
+   fileText: "",
+   fileName: "",
+   noticeShown: false,
+ };
+ 
+ function escapeHtml(value) {
+   if (typeof value !== "string") {
+@@ -1061,50 +1071,54 @@ async function handlePromptPreview() {
+     showToast({ message: `Не удалось собрать промпт: ${getErrorMessage(error)}`, type: "error" });
+   } finally {
+     setButtonLoading(previewBtn, false);
+     setInteractiveBusy(false);
+     showProgress(false);
    }
  }
  
- function applyStructurePreset(presetKey) {
-   if (presetKey === "custom") {
-     return;
-   }
-   const preset = STRUCTURE_PRESETS[presetKey];
-   if (preset) {
-     structureInput.value = preset.join("\n");
-   }
- }
- 
- function applyPipeDefaults(pipeId) {
-   const pipe = state.pipes.get(pipeId);
-   if (!pipe) {
-     return;
-   }
-   if (!structureInput.value && Array.isArray(pipe.default_structure)) {
-     structureInput.value = pipe.default_structure.join("\n");
-   }
-   if (!goalInput.value) {
-     goalInput.value = "SEO-статья";
-   }
-+  if (modelInput && !modelInput.value && pipe.default_model) {
-+    modelInput.value = pipe.default_model;
-+    updateTemperatureControlState(pipe.default_model);
-+  }
- }
- 
- async function handlePromptPreview() {
+ async function handleGenerate(event) {
+   event.preventDefault();
    try {
      const payload = buildRequestPayload();
+     toggleRetryButton(false);
      setInteractiveBusy(true);
-     setButtonLoading(previewBtn, true);
-     showProgress(true, "Собираем промпт…");
-     const previewRequest = {
+     setButtonLoading(generateBtn, true);
+     showProgress(true, "Генерируем материалы…");
+     renderUsedKeywords(null);
+     const requestBody = {
        theme: payload.theme,
        data: payload.data,
        k: payload.k,
+       model: payload.model,
+       temperature: payload.temperature,
+       max_tokens: payload.maxTokens,
        context_source: payload.context_source,
++      keywords: Array.isArray(payload.data?.keywords) ? payload.data.keywords : [],
++      length_range: { min: 3500, max: 6000, mode: "no_spaces" },
++      faq_required: true,
++      faq_count: 5,
      };
      if (payload.context_source === "custom") {
-       previewRequest.context_text = payload.context_text;
+       requestBody.context_text = payload.context_text;
        if (payload.context_filename) {
-         previewRequest.context_filename = payload.context_filename;
+         requestBody.context_filename = payload.context_filename;
        }
      }
-     const preview = await fetchJson("/api/prompt/preview", {
+     const response = await fetchJson("/api/generate", {
        method: "POST",
-       body: JSON.stringify(previewRequest),
+       body: JSON.stringify(requestBody),
      });
-     updatePromptPreview(preview);
-@@ -1238,85 +1242,94 @@ function buildRequestPayload() {
- 
-   const kValue = String(kInput?.value ?? "").trim();
-   let k = kValue === "" ? 0 : Number.parseInt(kValue, 10);
-   if (!Number.isInteger(k) || k < 0 || k > 6) {
-     throw new Error("Контекст (k) должен быть целым числом от 0 до 6");
-   }
-   if (contextSource === "off" || contextSource === "custom") {
-     k = 0;
-   }
-   if (kInput) {
-     kInput.value = String(k);
-   }
- 
-   const contextPayload = resolveCustomContextPayload(contextSource);
-   if (contextSource === "custom") {
-     data.context_source = "custom";
-     if (contextPayload.filename) {
-       data.context_filename = contextPayload.filename;
-     } else {
-       delete data.context_filename;
-     }
-   } else {
-     delete data.context_filename;
+     const markdown = response?.markdown ?? "";
+     const meta = (response?.meta_json && typeof response.meta_json === "object") ? response.meta_json : {};
+     const artifactPaths = response?.artifact_paths;
+     const metadataCharacters = typeof meta.characters === "number" ? meta.characters : undefined;
+     const characters = typeof metadataCharacters === "number" ? metadataCharacters : markdown.trim().length;
+     const hasContent = characters > 0;
+     state.currentResult = { markdown, meta, artifactPaths, characters, hasContent };
+     const fallbackModel = response?.fallback_used ?? meta.fallback_used;
+     const fallbackReason = response?.fallback_reason ?? meta.fallback_reason;
+     draftView.innerHTML = markdownToHtml(markdown);
+     resultTitle.textContent = payload.data.theme || "Результат генерации";
+     const metaParts = [];
+     if (hasContent) {
+       metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
+@@ -2023,105 +2037,127 @@ function renderHealthStatus(status) {
+   const checks = status?.checks;
+   if (!checks || typeof checks !== "object" || !Object.keys(checks).length) {
+     renderHealthError("Нет данных", "error");
+     return;
    }
  
--  const model = modelInput.value || undefined;
-+  let model = (modelInput?.value || "").trim();
-+  if (!model) {
-+    const pipeDefaults = state.pipes.get(theme);
-+    if (pipeDefaults?.default_model) {
-+      model = pipeDefaults.default_model;
-+      if (modelInput) {
-+        modelInput.value = model;
-+      }
+   Object.entries(checks).forEach(([key, value], index) => {
+     const normalized = normalizeHealthCheck(value);
+     const tone = normalized.ok ? "success" : "error";
+     const icon = normalized.ok ? "🟢" : "🔴";
+     const dictionary = HEALTH_STATUS_MESSAGES[key] || {};
+     const label = dictionary.label || key.replace(/_/g, " ");
+     const description =
+       normalized.message || (normalized.ok ? dictionary.ok : dictionary.fail) || (normalized.ok ? "активен" : "недоступен");
+ 
+     const card = createHealthCard({
+       tone,
+       icon,
+       label,
+       description,
+       delay: index * 80,
+     });
+     card.dataset.healthKey = key;
+     healthStatus.append(card);
+   });
++  const failingEntry = Object.entries(checks).find(([, value]) => !normalizeHealthCheck(value).ok);
++  const fallbackDictionary = failingEntry ? HEALTH_STATUS_MESSAGES[failingEntry[0]] || {} : {};
++  const reason = failingEntry
++    ? normalizeHealthCheck(failingEntry[1]).message || fallbackDictionary.fail || "Модель недоступна"
++    : "";
++  setGenerateAvailability(Boolean(status?.ok), reason);
+ }
+ 
+ function normalizeHealthCheck(value) {
+   if (value && typeof value === "object") {
+     return {
+       ok: Boolean(value.ok),
+       message: value.message || value.status || "",
+     };
+   }
+   return {
+     ok: Boolean(value),
+     message: "",
+   };
+ }
+ 
+ function renderHealthError(message, tone = "error") {
+   healthStatus.innerHTML = "";
+   const icon = tone === "success" ? "🟢" : tone === "offline" ? "⚪" : "🔴";
+   const card = createHealthCard({
+     tone,
+     icon,
+     label: message,
+     description: tone === "offline" ? "Попробуйте обновить позже" : "",
+   });
+   healthStatus.append(card);
++  setGenerateAvailability(false, message);
+ }
+ 
+ function createHealthCard({ tone, icon, label, description = "", delay = 0 }) {
+   const card = document.createElement("div");
+   card.className = `health-card ${tone}`;
+   card.style.animationDelay = `${delay}ms`;
+ 
+   const iconEl = document.createElement("span");
+   iconEl.className = "health-icon";
+   iconEl.textContent = icon;
+ 
+   const contentEl = document.createElement("div");
+   contentEl.className = "health-content";
+ 
+   const labelEl = document.createElement("div");
+   labelEl.className = "health-label";
+   labelEl.textContent = label;
+   contentEl.append(labelEl);
+ 
+   if (description) {
+     const descriptionEl = document.createElement("div");
+     descriptionEl.className = "health-description";
+     descriptionEl.textContent = description;
+     contentEl.append(descriptionEl);
+   }
+ 
+   card.append(iconEl, contentEl);
+   return card;
+ }
+ 
++function setGenerateAvailability(ok, reason = "") {
++  if (!generateBtn) {
++    return;
++  }
++  if (ok) {
++    generateBtn.disabled = false;
++    generateBtn.removeAttribute("title");
++  } else {
++    generateBtn.disabled = true;
++    if (reason) {
++      generateBtn.title = reason;
 +    }
 +  }
-   const temperatureLocked = isTemperatureLocked(model);
-   let temperature;
-   if (temperatureLocked) {
-     temperature = undefined;
-     if (temperatureInput) {
-       temperatureInput.value = "0.3";
-     }
-   } else {
-     const temperatureValue = String(temperatureInput?.value ?? "").trim();
-     temperature = temperatureValue === "" ? 0.3 : Number.parseFloat(temperatureValue);
-     if (Number.isNaN(temperature) || temperature < 0 || temperature > 1) {
-       throw new Error("Temperature должна быть числом от 0 до 1");
-     }
-     if (temperatureInput) {
-       temperatureInput.value = String(temperature);
-     }
++}
++
+ async function fetchJson(path, options = {}) {
+   const headers = options.headers ? { ...options.headers } : {};
+   if (options.method && options.method !== "GET") {
+     headers["Content-Type"] = "application/json";
    }
  
-   const maxTokensValue = String(maxTokensInput?.value ?? "").trim();
-   let maxTokens = maxTokensValue === "" ? 1400 : Number.parseInt(maxTokensValue, 10);
-   if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
-     throw new Error("Max tokens должно быть положительным целым числом");
-   }
-   if (maxTokensInput) {
-     maxTokensInput.value = String(maxTokens);
+   let response;
+   try {
+     response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+   } catch (error) {
+     throw new Error("Сервер недоступен");
    }
  
-   const payload = {
-     theme,
-     data,
-     k,
-     temperature: temperatureLocked ? undefined : temperature,
-     maxTokens,
--    model,
-+    model: model || undefined,
-     context_source: contextSource,
-   };
- 
-   if (contextSource === "custom") {
-     payload.context_text = contextPayload.text;
-     if (contextPayload.filename) {
-       payload.context_filename = contextPayload.filename;
-     }
+   let text;
+   try {
+     text = await response.text();
+   } catch (error) {
+     throw new Error("Не удалось прочитать ответ сервера");
    }
  
-   let stylePayload;
-   if (useStyleCheckbox) {
-     if (useStyleCheckbox.checked) {
-       const selectedStyle = (styleSelect?.value || "sravni").trim() || "sravni";
-       const strengthRaw = String(styleStrengthInput?.value ?? "").trim();
-       let strength = Number.parseFloat(strengthRaw || "0.6");
-       if (Number.isNaN(strength)) {
-         strength = 0.6;
-       }
-       stylePayload = {
-         enabled: true,
-         style: selectedStyle,
-         strength,
-       };
-     } else {
+   if (!response.ok) {
+     let message = text || `HTTP ${response.status}`;
+     if (text) {
+       try {
+         const data = JSON.parse(text);
+diff --git a/keyword_injector.py b/keyword_injector.py
+index 8139177ab0f69ea467ec39ca170d41b3a3159354..52f5bfddf2eb52abc0d334edac8cf3086fa62d17 100644
+--- a/keyword_injector.py
++++ b/keyword_injector.py
+@@ -1,80 +1,82 @@
+ from __future__ import annotations
+ 
+ import re
+ from dataclasses import dataclass, field
+ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+ 
+-LOCK_START_TEMPLATE = '<!--LOCK_START term="{term}">'
++LOCK_START_TEMPLATE = "<!--LOCK_START term=\"{term}\"-->"
+ LOCK_END = "<!--LOCK_END-->"
+ _TERMS_SECTION_HEADING = "### Разбираемся в терминах"
+ 
+ 
+ def build_term_pattern(term: str) -> re.Pattern[str]:
+     """Return a compiled regex that matches the exact term with word boundaries."""
+ 
+-    return re.compile(rf"(?i)(?<!\w)({re.escape(term)})(?!\w)")
++    return re.compile(rf"(?i)(?<!\w){re.escape(term)}(?!\w)")
+ 
+ 
+ @dataclass
+ class KeywordInjectionResult:
+     """Result of the keyword injection step."""
+ 
+     text: str
+     coverage: Dict[str, bool]
+     locked_terms: List[str] = field(default_factory=list)
+     inserted_section: bool = False
++    total_terms: int = 0
++    found_terms: int = 0
+ 
+ 
+ def _normalize_keywords(keywords: Iterable[str]) -> List[str]:
+     normalized: List[str] = []
+     seen = set()
+     for raw in keywords:
+         term = str(raw).strip()
+         if not term:
+             continue
+         if term in seen:
+             continue
+         seen.add(term)
+         normalized.append(term)
+     return normalized
+ 
+ 
+ def _contains_term(text: str, term: str) -> bool:
+     pattern = build_term_pattern(term)
+     return bool(pattern.search(text))
+ 
+ 
+ def _ensure_lock(text: str, term: str) -> str:
+     lock_start = LOCK_START_TEMPLATE.format(term=term)
+     if lock_start in text:
+         return text
+ 
+     pattern = build_term_pattern(term)
+ 
+     def _replacement(match: re.Match[str]) -> str:
+-        return f"{lock_start}{match.group(1)}{LOCK_END}"
++        return f"{lock_start}{match.group(0)}{LOCK_END}"
+ 
+     updated, count = pattern.subn(_replacement, text, count=1)
+     if count:
+         return updated
+     return text
+ 
+ 
+ def _build_terms_section(terms: Sequence[str]) -> str:
+     lines = [_TERMS_SECTION_HEADING, ""]
+     for term in terms:
+         lines.append(
+             f"{term} — ключевой термин, который раскрывается в материале на практических примерах."
+         )
+     lines.append("")
+     return "\n".join(lines)
+ 
+ 
+ def _insert_terms_section(text: str, terms: Sequence[str]) -> str:
+     section = _build_terms_section(terms)
+     if _TERMS_SECTION_HEADING in text:
+         return text
+ 
+     faq_anchor = "\n## FAQ"
+     anchor_idx = text.find(faq_anchor)
+     if anchor_idx == -1:
+@@ -139,31 +141,35 @@ def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResul
+ 
+         inserted = False
+         working, inserted = _insert_term_into_main_section(working, term)
+         if inserted and _contains_term(working, term):
+             working = _ensure_lock(working, term)
+             coverage[term] = True
+         else:
+             coverage[term] = False
+ 
+         missing_for_section.append(term)
+ 
+     inserted_section = False
+     if missing_for_section:
+         updated = _insert_terms_section(working, missing_for_section)
+         inserted_section = updated != working
+         working = updated
+ 
+     for term in missing_for_section:
+         working = _ensure_lock(working, term)
+         coverage[term] = LOCK_START_TEMPLATE.format(term=term) in working
+ 
+     for term in normalized:
+         coverage.setdefault(term, LOCK_START_TEMPLATE.format(term=term) in working)
+ 
+     locked_terms = [term for term in normalized if LOCK_START_TEMPLATE.format(term=term) in working]
++    found_terms = sum(1 for term in normalized if coverage.get(term))
++    total_terms = len(normalized)
+     return KeywordInjectionResult(
+         text=working,
+         coverage=coverage,
+         locked_terms=locked_terms,
+         inserted_section=inserted_section,
++        total_terms=total_terms,
++        found_terms=found_terms,
+     )
 diff --git a/orchestrate.py b/orchestrate.py
-index 6a291fa5573fe86fa9a0ff896709c8de8bb60f4f..709baf82ed03eca012cd99bf7f36eafb9ef1892e 100644
+index 709baf82ed03eca012cd99bf7f36eafb9ef1892e..d405431dd205933b4222683bf13a4bf009e4d37b 100644
 --- a/orchestrate.py
 +++ b/orchestrate.py
-@@ -1,53 +1,54 @@
+@@ -1,51 +1,51 @@
  from __future__ import annotations
  
  import argparse
@@ -905,20 +1395,20 @@ index 6a291fa5573fe86fa9a0ff896709c8de8bb60f4f..709baf82ed03eca012cd99bf7f36eafb
  from zoneinfo import ZoneInfo
  
  from assemble_messages import ContextBundle, assemble_messages, retrieve_context
- from artifacts_store import register_artifact
+-from artifacts_store import register_artifact
++from artifacts_store import _atomic_write_text as store_atomic_write_text, register_artifact
  from config import (
      DEFAULT_MAX_LENGTH,
      DEFAULT_MIN_LENGTH,
      MAX_CUSTOM_CONTEXT_CHARS,
      OPENAI_API_KEY,
  )
--from deterministic_pipeline import DeterministicPipeline, PipelineStep
-+from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
-+from llm_client import DEFAULT_MODEL
+ from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
+-from llm_client import DEFAULT_MODEL
++from llm_client import DEFAULT_MODEL, generate as llm_generate
  from keywords import parse_manual_keywords
  from length_limits import ResolvedLengthLimits, resolve_length_limits
--from validators import ValidationResult
-+from validators import ValidationResult, length_no_spaces
+ from validators import ValidationResult, length_no_spaces
  
  BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
  TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
@@ -941,56 +1431,67 @@ index 6a291fa5573fe86fa9a0ff896709c8de8bb60f4f..709baf82ed03eca012cd99bf7f36eafb
      custom_context_filename: Optional[str] = None
      custom_context_hash: Optional[str] = None
      custom_context_truncated: bool = False
-     jsonld_requested: bool = False
-     length_limits: Optional[ResolvedLengthLimits] = None
+@@ -239,59 +239,50 @@ def make_generation_context(
+     for message in messages:
+         if message.get("role") == "system" and message.get("style_profile_applied"):
+             style_profile_applied = True
+             style_profile_source = message.get("style_profile_source")
+             style_profile_variant = message.get("style_profile_variant")
+             break
  
-@@ -295,76 +296,91 @@ def _serialize_pipeline_logs(logs: Iterable[Any]) -> List[Dict[str, Any]]:
+     return GenerationContext(
+         data=payload,
+         context_bundle=bundle,
+         messages=messages,
+         clip_texts=clip_texts,
+         style_profile_applied=style_profile_applied,
+         style_profile_source=style_profile_source,
+         style_profile_variant=style_profile_variant,
+         keywords_manual=manual_keywords,
+         context_source=normalized_source,
+         custom_context_text=custom_context_normalized or None,
+         custom_context_len=custom_context_len,
+         custom_context_filename=filename,
+         custom_context_hash=custom_context_hash,
+         custom_context_truncated=custom_context_truncated,
+         jsonld_requested=jsonld_requested,
+         length_limits=length_info,
+     )
+-
+-
+-def _atomic_write_text(path: Path, text: str) -> None:
+-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+-    path.parent.mkdir(parents=True, exist_ok=True)
+-    tmp_path.write_text(text, encoding="utf-8")
+-    tmp_path.replace(path)
+-
+-
+ def _make_output_path(theme: str, outfile: Optional[str]) -> Path:
+     if outfile:
+         return Path(outfile)
+     timestamp = _local_now().strftime("%Y-%m-%d_%H%M")
+     slug = _slugify(theme)
+     filename = f"{timestamp}_{slug}_article.md"
+     return _ensure_artifacts_dir() / filename
+ 
+ 
+ def _serialize_pipeline_logs(logs: Iterable[Any]) -> List[Dict[str, Any]]:
+     serializable: List[Dict[str, Any]] = []
+     for entry in logs:
+         started_at = getattr(entry, "started_at", None)
+         finished_at = getattr(entry, "finished_at", None)
+         if isinstance(started_at, (int, float)):
+             started_at = datetime.fromtimestamp(started_at, tz=ZoneInfo("UTC")).isoformat()
+         if isinstance(finished_at, (int, float)):
+             finished_at = datetime.fromtimestamp(finished_at, tz=ZoneInfo("UTC")).isoformat()
+         payload = {
+             "step": entry.step.value if hasattr(entry, "step") else str(entry),
+             "status": getattr(entry, "status", "unknown"),
+             "started_at": started_at,
+             "finished_at": finished_at,
              "notes": getattr(entry, "notes", {}),
          }
-         serializable.append(payload)
-     return serializable
- 
- 
- def _serialize_checkpoints(checkpoints: Dict[PipelineStep, str]) -> Dict[str, Dict[str, int]]:
-     serialized: Dict[str, Dict[str, int]] = {}
-     for step, text in checkpoints.items():
-         serialized[step.value] = {
-             "chars": len(text),
-             "chars_no_spaces": len("".join(text.split())),
-         }
-     return serialized
- 
- 
- def _build_metadata(
-     *,
-     theme: str,
-     generation_context: GenerationContext,
-     pipeline_state_text: str,
-     validation: ValidationResult,
-     pipeline_logs: Iterable[Any],
-     checkpoints: Dict[PipelineStep, str],
-     duration_seconds: float,
-+    model_used: Optional[str],
-+    fallback_used: Optional[str],
-+    fallback_reason: Optional[str],
-+    api_route: Optional[str],
-+    token_usage: Optional[float],
- ) -> Dict[str, Any]:
-     metadata: Dict[str, Any] = {
-         "schema_version": LATEST_SCHEMA_VERSION,
-         "theme": theme,
-         "generated_at": _local_now().isoformat(),
-         "duration_seconds": round(duration_seconds, 3),
-         "context_source": generation_context.context_source,
-         "context_len": generation_context.custom_context_len,
-         "context_filename": generation_context.custom_context_filename,
-         "context_truncated": generation_context.custom_context_truncated,
-         "style_profile_applied": generation_context.style_profile_applied,
-         "style_profile_source": generation_context.style_profile_source,
-         "style_profile_variant": generation_context.style_profile_variant,
-         "keywords_manual": generation_context.keywords_manual,
-         "length_limits": {
-             "min": generation_context.length_limits.min_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[0],
+@@ -342,53 +333,64 @@ def _build_metadata(
              "max": generation_context.length_limits.max_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[1],
          },
          "pipeline_logs": _serialize_pipeline_logs(pipeline_logs),
@@ -999,27 +1500,39 @@ index 6a291fa5573fe86fa9a0ff896709c8de8bb60f4f..709baf82ed03eca012cd99bf7f36eafb
              "passed": validation.is_valid,
              "stats": validation.stats,
          },
--        "length_no_spaces": len("".join(pipeline_state_text.split())),
-+        "length_no_spaces": length_no_spaces(pipeline_state_text),
+         "length_no_spaces": length_no_spaces(pipeline_state_text),
      }
-+    if model_used:
-+        metadata["model_used"] = model_used
-+    if fallback_used:
-+        metadata["fallback_used"] = fallback_used
-+    if fallback_reason:
-+        metadata["fallback_reason"] = fallback_reason
-+    if api_route:
-+        metadata["api_route"] = api_route
-+    if isinstance(token_usage, (int, float)):
-+        metadata["token_usage"] = float(token_usage)
+     if model_used:
+         metadata["model_used"] = model_used
+     if fallback_used:
+         metadata["fallback_used"] = fallback_used
+     if fallback_reason:
+         metadata["fallback_reason"] = fallback_reason
+     if api_route:
+         metadata["api_route"] = api_route
+     if isinstance(token_usage, (int, float)):
+         metadata["token_usage"] = float(token_usage)
      return metadata
  
  
  def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> Dict[str, Path]:
      markdown_path.parent.mkdir(parents=True, exist_ok=True)
-     _atomic_write_text(markdown_path, text)
+-    _atomic_write_text(markdown_path, text)
++    def _validate_markdown(tmp_path: Path) -> None:
++        if not tmp_path.read_text(encoding="utf-8").strip():
++            raise ValueError("Пустой файл статьи не может быть сохранён.")
++
++    def _validate_metadata(tmp_path: Path) -> None:
++        json.loads(tmp_path.read_text(encoding="utf-8"))
++
++    store_atomic_write_text(markdown_path, text, validator=_validate_markdown)
      metadata_path = markdown_path.with_suffix(".json")
-     _atomic_write_text(metadata_path, json.dumps(metadata, ensure_ascii=False, indent=2))
+-    _atomic_write_text(metadata_path, json.dumps(metadata, ensure_ascii=False, indent=2))
++    store_atomic_write_text(
++        metadata_path,
++        json.dumps(metadata, ensure_ascii=False, indent=2),
++        validator=_validate_metadata,
++    )
      register_artifact(markdown_path, metadata)
      return {"markdown": markdown_path, "metadata": metadata_path}
  
@@ -1037,387 +1550,117 @@ index 6a291fa5573fe86fa9a0ff896709c8de8bb60f4f..709baf82ed03eca012cd99bf7f36eafb
  def _prepare_outline(data: Dict[str, Any]) -> List[str]:
      raw_structure = data.get("structure") or []
      outline: List[str] = []
-@@ -395,102 +411,118 @@ def _generate_variant(
-     context_text: Optional[str] = None,
-     context_filename: Optional[str] = None,
- ) -> Dict[str, Any]:
-     start_time = time.time()
-     payload = deepcopy(data)
+     if isinstance(raw_structure, list):
+         for item in raw_structure:
+             text = str(item).strip()
+             if text:
+                 outline.append(text)
+     return outline
  
-     generation_context = make_generation_context(
-         theme=theme,
-         data=payload,
-         k=k,
-         append_style_profile=append_style_profile,
-         context_source=context_source,
-         custom_context_text=context_text,
-         context_filename=context_filename,
-     )
  
-     prepared_data = generation_context.data
-     length_limits = generation_context.length_limits or resolve_length_limits(theme, prepared_data)
-     min_chars = length_limits.min_chars
-     max_chars = length_limits.max_chars
+@@ -536,50 +538,77 @@ def generate_article_from_payload(
+ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
+     checks: Dict[str, Dict[str, object]] = {}
+     ok = True
  
-     keywords_required = _extract_keywords(prepared_data)
-     outline = _prepare_outline(prepared_data)
-     topic = str(prepared_data.get("theme") or payload.get("theme") or theme).strip() or theme
+     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
+     if not api_key:
+         checks["openai_key"] = {"ok": False, "message": "OPENAI_API_KEY не найден"}
+         ok = False
+     else:
+         masked = f"{api_key[:4]}***{api_key[-4:]}" if len(api_key) > 8 else "*" * len(api_key)
+         try:
+             response = httpx.get(
+                 "https://api.openai.com/v1/models",
+                 headers={"Authorization": f"Bearer {api_key}"},
+                 timeout=5.0,
+             )
+             if response.status_code == 200:
+                 checks["openai_key"] = {"ok": True, "message": f"Ключ активен ({masked})"}
+             else:
+                 ok = False
+                 checks["openai_key"] = {"ok": False, "message": f"HTTP {response.status_code} при проверке ключа ({masked})"}
+         except httpx.HTTPError as exc:
+             ok = False
+             checks["openai_key"] = {"ok": False, "message": f"Ошибка проверки ключа: {exc}"}
  
-+    api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
-+    if not api_key:
-+        raise PipelineStepError(PipelineStep.SKELETON, "OPENAI_API_KEY не найден. Укажите действительный ключ.")
++        if checks.get("openai_key", {}).get("ok"):
++            try:
++                probe_messages = [
++                    {"role": "system", "content": "Ты проверка готовности. Ответь одним словом."},
++                    {"role": "user", "content": "Скажи PING"},
++                ]
++                ping_result = llm_generate(
++                    probe_messages,
++                    model=DEFAULT_MODEL,
++                    temperature=0.0,
++                    max_tokens=4,
++                    timeout_s=10,
++                )
++                reply = (ping_result.text or "").strip().lower()
++                ping_ok = reply.startswith("ping")
++                if not ping_ok:
++                    ok = False
++                    checks["llm_ping"] = {
++                        "ok": False,
++                        "message": f"Неожиданный ответ модели: {ping_result.text[:32]}",
++                    }
++                else:
++                    checks["llm_ping"] = {"ok": True, "message": "Ответ PING получен"}
++            except Exception as exc:  # noqa: BLE001
++                ok = False
++                checks["llm_ping"] = {"ok": False, "message": f"LLM недоступна: {exc}"}
 +
-     pipeline = DeterministicPipeline(
-         topic=topic,
-         base_outline=outline,
-         keywords=keywords_required,
-         min_chars=min_chars,
-         max_chars=max_chars,
-+        messages=generation_context.messages,
-+        model=model_name,
-+        temperature=temperature,
-+        max_tokens=max_tokens,
-+        timeout_s=timeout,
-+        backoff_schedule=backoff_schedule,
-         provided_faq=prepared_data.get("faq_entries") if isinstance(prepared_data.get("faq_entries"), list) else None,
-+        jsonld_requested=generation_context.jsonld_requested,
-     )
-     state = pipeline.run()
-     if not state.validation or not state.validation.is_valid:
-         raise RuntimeError("Pipeline validation failed; artifact not recorded.")
- 
-     final_text = state.text
-     duration_seconds = time.time() - start_time
-     metadata = _build_metadata(
-         theme=theme,
-         generation_context=generation_context,
-         pipeline_state_text=final_text,
-         validation=state.validation,
-         pipeline_logs=state.logs,
-         checkpoints=state.checkpoints,
-         duration_seconds=duration_seconds,
-+        model_used=state.model_used,
-+        fallback_used=state.fallback_used,
-+        fallback_reason=state.fallback_reason,
-+        api_route=state.api_route,
-+        token_usage=state.token_usage,
-     )
- 
-     outputs = _write_outputs(output_path, final_text, metadata)
-     return {
-         "text": final_text,
-         "metadata": metadata,
-         "duration": duration_seconds,
-         "artifact_files": outputs,
-     }
- 
- 
- def generate_article_from_payload(
-     *,
-     theme: str,
-     data: Dict[str, Any],
-     k: int,
-     model: Optional[str] = None,
-     temperature: float = 0.0,
-     max_tokens: int = 0,
-     timeout: Optional[int] = None,
-     mode: Optional[str] = None,
-     backoff_schedule: Optional[List[float]] = None,
-     outfile: Optional[str] = None,
-     append_style_profile: Optional[bool] = None,
-     context_source: Optional[str] = None,
-     context_text: Optional[str] = None,
-     context_filename: Optional[str] = None,
- ) -> Dict[str, Any]:
-     resolved_timeout = timeout if timeout is not None else 60
--    resolved_model = model or "deterministic-pipeline"
-+    resolved_model = (model or DEFAULT_MODEL).strip()
-     output_path = _make_output_path(theme, outfile)
-     result = _generate_variant(
-         theme=theme,
-         data=data,
-         data_path="<inline>",
-         k=k,
-         model_name=resolved_model,
-         temperature=temperature,
-         max_tokens=max_tokens,
-         timeout=resolved_timeout,
-         mode=mode or "final",
-         output_path=output_path,
-         backoff_schedule=backoff_schedule,
-         append_style_profile=append_style_profile,
-         context_source=context_source,
-         context_text=context_text,
-         context_filename=context_filename,
-     )
-     artifact_files = result.get("artifact_files")
-     artifact_paths = None
-     if artifact_files:
-         artifact_paths = {
-             "markdown": artifact_files["markdown"].as_posix(),
-             "metadata": artifact_files["metadata"].as_posix(),
-         }
-@@ -579,45 +611,45 @@ def _parse_args() -> argparse.Namespace:
- 
- def _load_input(path: str) -> Dict[str, Any]:
-     payload_path = Path(path)
-     if not payload_path.exists():
-         raise FileNotFoundError(f"Не найден файл входных данных: {payload_path}")
+     artifacts_dir = Path("artifacts")
      try:
-         return json.loads(payload_path.read_text(encoding="utf-8"))
-     except json.JSONDecodeError as exc:
-         raise ValueError(f"Некорректный JSON в {payload_path}: {exc}") from exc
- 
- 
- def main() -> None:
-     args = _parse_args()
- 
-     if args.check:
-         status = gather_health_status(args.theme)
-         print(json.dumps(status, ensure_ascii=False, indent=2))
-         sys.exit(0 if status.get("ok") else 1)
- 
-     data = _load_input(args.data)
-     result = _generate_variant(
-         theme=args.theme,
-         data=data,
-         data_path=args.data,
-         k=args.k,
--        model_name=args.model or "deterministic-pipeline",
-+        model_name=(args.model or DEFAULT_MODEL).strip(),
-         temperature=args.temperature,
-         max_tokens=args.max_tokens,
-         timeout=args.timeout,
-         mode=args.mode,
-         output_path=_make_output_path(args.theme, args.outfile),
-         append_style_profile=args.append_style_profile,
-         context_source=args.context_source,
-         context_text=args.context_text,
-         context_filename=args.context_filename,
-     )
-     print(result["text"])
- 
- 
- if __name__ == "__main__":  # pragma: no cover
-     try:
-         main()
+         artifacts_dir.mkdir(parents=True, exist_ok=True)
+         probe = artifacts_dir / ".write_check"
+         probe.write_text("ok", encoding="utf-8")
+         probe.unlink()
+         checks["artifacts_writable"] = {"ok": True, "message": "Запись в artifacts/ доступна"}
      except Exception as exc:  # noqa: BLE001
-         print(f"Ошибка: {exc}", file=sys.stderr)
-         sys.exit(1)
-diff --git a/profiles/finance/pipeline.json b/profiles/finance/pipeline.json
-new file mode 100644
-index 0000000000000000000000000000000000000000..a3328cee411966f795505ab622c2fa75c618f756
---- /dev/null
-+++ b/profiles/finance/pipeline.json
-@@ -0,0 +1,3 @@
-+{
-+  "default_model": "gpt-4o"
-+}
-diff --git a/server/__init__.py b/server/__init__.py
-index e037c765347bea99ab0a208ae4a70952f5968a7b..510f86352471c89fcfbdc5b9fcb3d3f0cd720821 100644
---- a/server/__init__.py
-+++ b/server/__init__.py
-@@ -27,50 +27,52 @@ from flask import (
-     url_for,
- )
- from flask_cors import CORS
- from werkzeug.security import check_password_hash
+         ok = False
+         checks["artifacts_writable"] = {"ok": False, "message": f"Нет доступа к artifacts/: {exc}"}
  
- from assemble_messages import invalidate_style_profile_cache
- from config import DEFAULT_STRUCTURE
- from orchestrate import (
-     gather_health_status,
-     generate_article_from_payload,
-     make_generation_context,
- )
- from retrieval import build_index
- from artifacts_store import (
-     cleanup_index as cleanup_artifact_index,
-     delete_artifact as delete_artifact_entry,
-     list_artifacts as list_artifact_cards,
-     resolve_artifact_path,
- )
- 
- load_dotenv()
- 
- LOGGER = logging.getLogger("content_factory.api")
- logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
- 
-+PIPELINE_CONFIG_FILENAME = "pipeline.json"
-+
- USERS: Dict[str, Dict[str, str]] = {
-     "admin": {
-         "display_name": "Admin",
-         "password_hash": (
-             "scrypt:32768:8:1$poFMhgLX1D2jug2W$724005a9a37b1f699ddda576ee89fb022c3bdcd28660826d1f9f5710c3116c6"
-             "b847ea20c926c9124fbcfa9fee55967a26d488e3d04a3b58e2776f002a124d003"
-         ),
-     },
-     "dmitriy": {
-         "display_name": "Dmitriy",
-         "password_hash": (
-             "scrypt:32768:8:1$FRtm9J7DjkoGICbY$4f859f2fecaf592d3cffdec70a6c8ddb598a97e4851aa2f7c80d17ef5d87c02"
-             "0b651cef85d9f82bf112f4ea46de4f25d17952a92c45c347000e3a413a0739af9"
-         ),
-     },
- }
- 
- 
- def login_required(view_func):
-     """Decorator ensuring that a user is authenticated before accessing a view."""
- 
-     @wraps(view_func)
-     def wrapper(*args, **kwargs):
-         if not session.get("user"):
-             next_url = request.full_path if request.query_string else request.path
-@@ -541,100 +543,115 @@ def _extract_context_settings(payload: Dict[str, Any], raw_data: Dict[str, Any])
-             raise ApiError("Поле context_text обязательно для custom")
-         context_text = context_text_raw
-         if not context_text.strip():
-             raise ApiError("Поле context_text обязательно для custom")
-         if context_filename and not _is_allowed_context_file(context_filename):
-             raise ApiError("Поддерживаются только .txt и .json")
-         return context_source, context_text, context_filename
- 
-     return context_source, None, None
- 
- 
- def _collect_pipes() -> List[Dict[str, Any]]:
-     base_dir = Path("profiles")
-     pipes: List[Dict[str, Any]] = []
- 
-     if not base_dir.exists():
-         return pipes
- 
-     for entry in sorted(base_dir.iterdir()):
-         if not entry.is_dir() or entry.name.startswith("."):
-             continue
-         slug = entry.name
-         name = slug.replace("_", " ").title()
-         description, tone = _extract_style(entry / "style_guide.md")
-         keywords = _extract_keywords(entry / "glossary.txt")
--        pipes.append(
--            {
--                "id": slug,
--                "name": name,
--                "description": description or f"Тематика {name}",
--                "tone": tone or "экспертный",
--                "keywords": keywords,
--                "default_structure": DEFAULT_STRUCTURE,
--            }
--        )
-+        pipeline_config = _load_pipeline_config(entry)
-+        pipe_payload: Dict[str, Any] = {
-+            "id": slug,
-+            "name": name,
-+            "description": description or f"Тематика {name}",
-+            "tone": tone or "экспертный",
-+            "keywords": keywords,
-+            "default_structure": DEFAULT_STRUCTURE,
-+        }
-+        default_model = str(pipeline_config.get("default_model", "")).strip()
-+        if default_model:
-+            pipe_payload["default_model"] = default_model
-+        pipes.append(pipe_payload)
-     return pipes
- 
- 
- def _extract_style(style_path: Path) -> Tuple[str, str]:
-     if not style_path.exists():
-         return "", ""
-     lines = [line.strip() for line in style_path.read_text(encoding="utf-8").splitlines()]
-     description = next((line.lstrip("- ") for line in lines if line and not line.startswith("#")), "")
- 
-     tone = ""
-     try:
-         tone_index = lines.index("## Тональность")
-     except ValueError:
-         tone_index = -1
-     if tone_index >= 0:
-         for candidate in lines[tone_index + 1 :]:
-             if candidate.startswith("- "):
-                 tone = candidate.lstrip("- ")
-                 break
-             if candidate.startswith("## "):
-                 break
-     return description, tone
- 
- 
- def _extract_keywords(glossary_path: Path) -> List[str]:
-     if not glossary_path.exists():
-         return []
-     keywords: List[str] = []
-     for line in glossary_path.read_text(encoding="utf-8").splitlines():
-         cleaned = line.strip()
-         if not cleaned:
-             continue
-         keyword = cleaned.split("—", 1)[0].strip()
-         if keyword:
-             keywords.append(keyword)
-         if len(keywords) >= 6:
-             break
-     return keywords
- 
- 
-+def _load_pipeline_config(theme_dir: Path) -> Dict[str, Any]:
-+    config_path = theme_dir / PIPELINE_CONFIG_FILENAME
-+    if not config_path.exists():
-+        return {}
-+    try:
-+        payload = json.loads(config_path.read_text(encoding="utf-8"))
-+    except json.JSONDecodeError:
-+        LOGGER.warning("Повреждён pipeline config: %s", config_path)
-+        return {}
-+    return payload if isinstance(payload, dict) else {}
-+
-+
- def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[str, Any]:
-     topic = str(data.get("theme") or data.get("goal") or theme).strip() or "Тема не указана"
-     markdown = (
-         f"# Черновик (dry run)\n\n"
-         f"Тематика: {theme}\n\n"
-         f"Запрошенная тема: {topic}\n\n"
-         "Этот ответ сформирован без обращения к модели."
-     )
-     generated_at = datetime.utcnow().isoformat()
-     metadata: Dict[str, Any] = {
-         "model_used": "dry-run",
-         "characters": len(markdown),
-         "generated_at": generated_at,
-         "theme": theme,
-         "retrieval_k": k,
-         "input_data": data,
-         "clips": [],
-         "context_used": False,
-         "context_index_missing": False,
-         "context_budget_tokens_est": 0,
-         "context_budget_tokens_limit": 0,
-         "system_prompt_preview": "",
-         "user_prompt_preview": "",
-         "retry_used": False,
-         "plagiarism_detected": False,
+     theme_slug = (theme or "").strip()
+     if not theme_slug:
+         checks["theme_index"] = {"ok": False, "message": "Тема не указана"}
+         ok = False
+     else:
+         index_path = Path("profiles") / theme_slug / "index.json"
+         if not index_path.exists():
+             checks["theme_index"] = {"ok": False, "message": f"Индекс для темы '{theme_slug}' не найден"}
+             ok = False
+         else:
+             try:
+                 json.loads(index_path.read_text(encoding="utf-8"))
+                 checks["theme_index"] = {"ok": True, "message": f"Индекс найден ({index_path})"}
+             except json.JSONDecodeError as exc:
 diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
-index 4a398b149301af186b1670082db7ac4f14fc2eee..9ad4928bf99d5ebd5a3b84648646dffc3702c3d5 100644
+index 9ad4928bf99d5ebd5a3b84648646dffc3702c3d5..876d6b5deb2c0b9af022d102c2b8cabacf7937e2 100644
 --- a/tests/test_orchestrate_utils.py
 +++ b/tests/test_orchestrate_utils.py
-@@ -1,33 +1,40 @@
+@@ -1,42 +1,38 @@
  import json
  import uuid
  from pathlib import Path
  
+-from deterministic_pipeline import DeterministicPipeline, PipelineStep
+-from faq_builder import build_faq_block
+-from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
+-import json
+-import uuid
+-from pathlib import Path
++import pytest
+ 
  from deterministic_pipeline import DeterministicPipeline, PipelineStep
- from faq_builder import build_faq_block
++from faq_builder import build_faq_block
  from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
-+import json
-+import uuid
-+from pathlib import Path
-+
-+from deterministic_pipeline import DeterministicPipeline, PipelineStep
-+from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
  from length_trimmer import trim_text
-+from llm_client import GenerationResult
+ from llm_client import GenerationResult
  from orchestrate import generate_article_from_payload, gather_health_status
- from validators import strip_jsonld, validate_article
+-from validators import strip_jsonld, validate_article
++from validators import ValidationError, strip_jsonld, validate_article
  
  
  def test_keyword_injection_adds_terms_section():
@@ -1441,8 +1684,65 @@ index 4a398b149301af186b1670082db7ac4f14fc2eee..9ad4928bf99d5ebd5a3b84648646dffc
      assert faq_result.text.count("**Вопрос") == 5
      assert faq_result.jsonld.strip().startswith('<script type="application/ld+json">')
      payload = json.loads(faq_result.jsonld.split("\n", 1)[1].rsplit("\n", 1)[0])
-@@ -94,85 +101,169 @@ def test_validator_length_ignores_jsonld():
+     assert payload["@type"] == "FAQPage"
+     assert len(payload["mainEntity"]) == 5
+@@ -44,52 +40,53 @@ def test_faq_builder_produces_jsonld_block():
+ 
+ def test_trim_preserves_locked_and_faq():
+     intro = " ".join(["Параграф с вводной информацией, который можно сократить." for _ in range(4)])
+     removable = "Дополнительный абзац с примерами, который допустимо удалить."
+     article = (
+         f"## Введение\n\n{intro}\n\n"
+         f"{LOCK_START_TEMPLATE.format(term='важный термин')}важный термин<!--LOCK_END-->\n\n"
+         f"{removable}\n\n"
+         "## FAQ\n\n<!--FAQ_START-->\n**Вопрос 1.** Что важно?\n\n**Ответ.** Ответ с деталями.\n\n<!--FAQ_END-->"
+     )
+     trimmed = trim_text(article, min_chars=200, max_chars=400)
+     assert "важный термин" in trimmed.text
+     assert "<!--FAQ_START-->" in trimmed.text
+     assert len("".join(trimmed.text.split())) <= 400
+     assert trimmed.removed_paragraphs
+ 
+ 
+ def test_validator_detects_missing_keyword():
+     text = (
+         "## Введение\n\nТекст без маркеров.\n\n## FAQ\n\n<!--FAQ_START-->\n"
+         "**Вопрос 1.** Как?\n\n**Ответ.** Так.\n\n<!--FAQ_END-->\n"
+         "<script type=\"application/ld+json\">\n"
+         '{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": []}'
+         "\n</script>"
+     )
+-    result = validate_article(text, keywords=["ключ"], min_chars=10, max_chars=1000)
+-    assert not result.keywords_ok
++    with pytest.raises(ValidationError) as exc:
++        validate_article(text, keywords=["ключ"], min_chars=10, max_chars=1000)
++    assert exc.value.group == "keywords"
+ 
+ 
+ def test_validator_length_ignores_jsonld():
+     payload = {
+         "@context": "https://schema.org",
+         "@type": "FAQPage",
+         "mainEntity": [
+             {
+                 "@type": "Question",
+                 "name": f"Вопрос {idx}",
+                 "acceptedAnswer": {"@type": "Answer", "text": f"Ответ {idx}"},
+             }
+             for idx in range(1, 6)
+         ],
+     }
+     faq_block = "\n".join(
+         [
+             "**Вопрос 1.** Что?",
              "**Ответ.** Ответ.",
+             "",
+             "**Вопрос 2.** Что?",
+             "**Ответ.** Ответ.",
+             "",
+             "**Вопрос 3.** Что?",
+             "**Ответ.** Ответ.",
+@@ -102,69 +99,69 @@ def test_validator_length_ignores_jsonld():
              "",
          ]
      )
@@ -1467,172 +1767,84 @@ index 4a398b149301af186b1670082db7ac4f14fc2eee..9ad4928bf99d5ebd5a3b84648646dffc
      assert result.jsonld_ok
  
  
--def test_pipeline_produces_valid_article():
-+def _stub_llm(monkeypatch):
-+    skeleton_body = "\n\n".join(
-+        [
-+            "Абзац с анализом показателей и практическими советами для семейного бюджета. "
-+            "Расчёт коэффициентов сопровождаем примерами и перечнем действий." for _ in range(45)
-+        ]
-+    )
-+    skeleton_text = (
-+        "## Введение\n\n"
-+        "Кратко объясняем, как долговая нагрузка влияет на решения семьи и почему ключ 1 помогает структурировать анализ.\n\n"
-+    "## Аналитика\n\n"
-+    f"{skeleton_body}\n\n"
-+    "## Решения\n\n"
-+    "Разбираем стратегии снижения нагрузки, контрольные точки и цифровые инструменты, уделяя внимание тому, как ключ 2 и ключ 3"
-+    " помогают планировать шаги.\n\n"
-+    "Создаём календарь контроля, в котором ключ 4 и ключ 5 отмечены как приоритетные метрики для семьи.\n\n"
-+    "## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n\n"
-+    "## Вывод\n\nПодводим итоги и фиксируем шаги для регулярного пересмотра бюджета, подчёркивая, как ключ 2 и ключ 3 помогают контролирова"
-+    "ть изменения."
-+)
-+    faq_payload = {
-+        "faq": [
-+            {
-+                "question": "Как определить допустимую долговую нагрузку?",
-+                "answer": "Сравните платежи с ежемесячным доходом и удерживайте коэффициент не выше 30–35%.",
-+            },
-+            {
-+                "question": "Какие данные нужны для расчёта?",
-+                "answer": "Соберите сведения по кредитам, страховым взносам и коммунальным платежам за последний год.",
-+            },
-+            {
-+                "question": "Что делать при превышении порога?",
-+                "answer": "Пересмотрите график платежей, договоритесь о реструктуризации и выделите обязательные траты.",
-+            },
-+            {
-+                "question": "Как планировать резерв?",
-+                "answer": "Откладывайте не менее двух ежемесячных платежей на отдельный счёт с быстрым доступом.",
-+            },
-+            {
-+                "question": "Какие сервисы помогают контролю?",
-+                "answer": "Используйте банковские дашборды и напоминания календаря, чтобы отслеживать даты и суммы.",
-+            },
-+        ]
-+    }
-+
-+    def fake_call(self, *, step, messages, max_tokens=None):
-+        if step == PipelineStep.SKELETON:
-+            return GenerationResult(
-+                text=skeleton_text,
-+                model_used="stub-model",
-+                retry_used=False,
-+                fallback_used=None,
-+                fallback_reason=None,
-+                api_route="chat",
-+                schema="none",
-+                metadata={"usage_output_tokens": 1024},
+ def _stub_llm(monkeypatch):
+-    skeleton_body = "\n\n".join(
+-        [
+-            "Абзац с анализом показателей и практическими советами для семейного бюджета. "
+-            "Расчёт коэффициентов сопровождаем примерами и перечнем действий." for _ in range(45)
+-        ]
++    base_paragraph = (
++        "Абзац с анализом показателей и практическими советами для семейного бюджета. "
++        "Расчёт коэффициентов сопровождаем примерами и перечнем действий."
+     )
+-    skeleton_text = (
+-        "## Введение\n\n"
+-        "Кратко объясняем, как долговая нагрузка влияет на решения семьи и почему ключ 1 помогает структурировать анализ.\n\n"
+-    "## Аналитика\n\n"
+-    f"{skeleton_body}\n\n"
+-    "## Решения\n\n"
+-    "Разбираем стратегии снижения нагрузки, контрольные точки и цифровые инструменты, уделяя внимание тому, как ключ 2 и ключ 3"
+-    " помогают планировать шаги.\n\n"
+-    "Создаём календарь контроля, в котором ключ 4 и ключ 5 отмечены как приоритетные метрики для семьи.\n\n"
+-    "## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n\n"
+-    "## Вывод\n\nПодводим итоги и фиксируем шаги для регулярного пересмотра бюджета, подчёркивая, как ключ 2 и ключ 3 помогают контролирова"
+-    "ть изменения."
+-)
++    outline = ["Введение", "Аналитика", "Решения"]
++    skeleton_sections = []
++    for heading in outline:
++        paragraphs = []
++        for idx in range(6):
++            paragraphs.append(
++                f"{base_paragraph} {heading} блок {idx + 1} раскрывает практическое значение ключевых метрик и указывает конкретные шаги, подкреплённые цифрами и контрольными датами."
 +            )
-+        faq_json = json.dumps(faq_payload, ensure_ascii=False)
-+        return GenerationResult(
-+            text=faq_json,
-+            model_used="stub-model",
-+            retry_used=False,
-+            fallback_used=None,
-+            fallback_reason=None,
-+            api_route="chat",
-+            schema="json",
-+            metadata={"usage_output_tokens": 256},
-+        )
-+
-+    monkeypatch.setattr("deterministic_pipeline.DeterministicPipeline._call_llm", fake_call)
-+
-+
-+def test_pipeline_produces_valid_article(monkeypatch):
-+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-+    _stub_llm(monkeypatch)
-     pipeline = DeterministicPipeline(
-         topic="Долговая нагрузка семьи",
-         base_outline=["Введение", "Аналитика", "Решения"],
-         keywords=[f"ключ {idx}" for idx in range(1, 12)],
-         min_chars=3500,
-         max_chars=6000,
-+        messages=[{"role": "system", "content": "Системный промпт"}],
-+        model="stub-model",
-+        temperature=0.3,
-+        max_tokens=1800,
-+        timeout_s=60,
-     )
-     state = pipeline.run()
-     length_no_spaces = len("".join(strip_jsonld(state.text).split()))
-     assert 3500 <= length_no_spaces <= 6000
-     assert state.validation and state.validation.is_valid
-     assert state.text.count("**Вопрос") == 5
- 
- 
--def test_pipeline_resume_falls_back_to_available_checkpoint():
-+def test_pipeline_resume_falls_back_to_available_checkpoint(monkeypatch):
-+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-+    _stub_llm(monkeypatch)
-     pipeline = DeterministicPipeline(
-         topic="Долговая нагрузка семьи",
-         base_outline=["Введение", "Основная часть", "Вывод"],
-         keywords=[f"ключ {idx}" for idx in range(1, 12)],
-         min_chars=3500,
-         max_chars=6000,
-+        messages=[{"role": "system", "content": "Системный промпт"}],
-+        model="stub-model",
-+        temperature=0.3,
-+        max_tokens=1800,
-+        timeout_s=60,
-     )
-     pipeline._run_skeleton()
-     state = pipeline.resume(PipelineStep.FAQ)
-     assert state.validation and state.validation.is_valid
--    assert any(
--        entry.step == PipelineStep.FAQ
--        and entry.status == "error"
--        and entry.notes.get("resumed_from") == PipelineStep.SKELETON.value
--        for entry in state.logs
--    )
-+    faq_entries = [entry for entry in state.logs if entry.step == PipelineStep.FAQ]
-+    assert faq_entries and faq_entries[-1].status == "ok"
- 
- 
- def test_generate_article_returns_metadata(monkeypatch, tmp_path):
-+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-+    _stub_llm(monkeypatch)
-     unique_name = f"test_{uuid.uuid4().hex}.md"
-     outfile = Path("artifacts") / unique_name
-     data = {
-         "theme": "Долговая нагрузка семьи",
-         "structure": ["Введение", "Основная часть", "Вывод"],
-         "keywords": [f"ключ {idx}" for idx in range(1, 12)],
-         "include_jsonld": True,
-         "context_source": "off",
++            paragraphs.append("Расписываем временные рамки, ответственных лиц и цифровые инструменты, которые удерживают контроль над бюджетом и помогают выдерживать долговую нагрузку в безопасных пределах.")
++        skeleton_sections.append({"heading": heading, "paragraphs": paragraphs})
++    skeleton_payload = {
++        "title": "Долговая нагрузка семьи: практическое руководство",
++        "sections": skeleton_sections,
++    }
++    skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
+     faq_payload = {
+         "faq": [
+             {
+                 "question": "Как определить допустимую долговую нагрузку?",
+                 "answer": "Сравните платежи с ежемесячным доходом и удерживайте коэффициент не выше 30–35%.",
+             },
+             {
+                 "question": "Какие данные нужны для расчёта?",
+                 "answer": "Соберите сведения по кредитам, страховым взносам и коммунальным платежам за последний год.",
+             },
+             {
+                 "question": "Что делать при превышении порога?",
+                 "answer": "Пересмотрите график платежей, договоритесь о реструктуризации и выделите обязательные траты.",
+             },
+             {
+                 "question": "Как планировать резерв?",
+                 "answer": "Откладывайте не менее двух ежемесячных платежей на отдельный счёт с быстрым доступом.",
+             },
+             {
+                 "question": "Какие сервисы помогают контролю?",
+                 "answer": "Используйте банковские дашборды и напоминания календаря, чтобы отслеживать даты и суммы.",
+             },
+         ]
      }
-     result = generate_article_from_payload(
-         theme="finance",
-         data=data,
-         k=0,
-         context_source="off",
-         outfile=str(outfile),
-     )
-     metadata = result["metadata"]
-     assert metadata["validation"]["passed"]
-     assert Path(outfile).exists()
-     assert metadata["pipeline_logs"]
-     # cleanup
-     Path(outfile).unlink(missing_ok=True)
-     Path(outfile.with_suffix(".json")).unlink(missing_ok=True)
- 
  
 diff --git a/validators.py b/validators.py
-index 1b9334cdadff6ae652a0dd2eb365cad83f77174a..bfb0ca99088a5027f2f4de16b388527355f71848 100644
+index bfb0ca99088a5027f2f4de16b388527355f71848..7a2ca00c80a8cacafa1c78643dfb557c0192c34d 100644
 --- a/validators.py
 +++ b/validators.py
-@@ -1,103 +1,140 @@
+@@ -1,54 +1,60 @@
  from __future__ import annotations
  
-+import json
-+import re
-+from dataclasses import dataclass, field
  import json
  import re
  from dataclasses import dataclass, field
- from typing import Dict, Iterable, List
+-import json
+-import re
+-from dataclasses import dataclass, field
+-from typing import Dict, Iterable, List
++from typing import Dict, Iterable, List, Optional, Tuple
  
  from keyword_injector import LOCK_START_TEMPLATE
  
@@ -1641,19 +1853,30 @@ index 1b9334cdadff6ae652a0dd2eb365cad83f77174a..bfb0ca99088a5027f2f4de16b3885273
  _JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">(.*?)</script>", re.DOTALL)
  
  
++class ValidationError(RuntimeError):
++    """Raised when one of the blocking validation groups fails."""
++
++    def __init__(self, group: str, message: str, *, details: Optional[Dict[str, object]] = None) -> None:
++        super().__init__(message)
++        self.group = group
++        self.details = details or {}
++
++
  @dataclass
  class ValidationResult:
-     length_ok: bool
+-    length_ok: bool
++    skeleton_ok: bool
      keywords_ok: bool
      faq_ok: bool
++    length_ok: bool
      jsonld_ok: bool
-+    quality_ok: bool
+-    quality_ok: bool
      stats: Dict[str, object] = field(default_factory=dict)
  
      @property
      def is_valid(self) -> bool:
--        return self.length_ok and self.keywords_ok and self.faq_ok and self.jsonld_ok
-+        return self.length_ok and self.keywords_ok and self.faq_ok and self.jsonld_ok and self.quality_ok
+-        return self.length_ok and self.keywords_ok and self.faq_ok and self.jsonld_ok and self.quality_ok
++        return self.skeleton_ok and self.keywords_ok and self.faq_ok and self.length_ok
  
  
  def strip_jsonld(text: str) -> str:
@@ -1664,10 +1887,10 @@ index 1b9334cdadff6ae652a0dd2eb365cad83f77174a..bfb0ca99088a5027f2f4de16b3885273
      return len(re.sub(r"\s+", "", strip_jsonld(text)))
  
  
-+def length_no_spaces(text: str) -> int:
-+    return _length_no_spaces(text)
-+
-+
+ def length_no_spaces(text: str) -> int:
+     return _length_no_spaces(text)
+ 
+ 
  def _faq_pairs(text: str) -> List[str]:
      if _FAQ_START not in text or _FAQ_END not in text:
          return []
@@ -1679,7 +1902,7 @@ index 1b9334cdadff6ae652a0dd2eb365cad83f77174a..bfb0ca99088a5027f2f4de16b3885273
      match = _JSONLD_PATTERN.search(text)
      if not match:
          return False
-     try:
+@@ -56,85 +62,114 @@ def _jsonld_valid(text: str) -> bool:
          payload = json.loads(match.group(1))
      except json.JSONDecodeError:
          return False
@@ -1705,64 +1928,128 @@ index 1b9334cdadff6ae652a0dd2eb365cad83f77174a..bfb0ca99088a5027f2f4de16b3885273
      return True
  
  
-+def _quality_issues(text: str) -> List[str]:
-+    stripped = strip_jsonld(text)
-+    lowered = stripped.lower()
-+    issues: List[str] = []
-+    if lowered.count("дополнительно рассматривается") >= 3:
-+        issues.append("template_phrase_repetition")
+-def _quality_issues(text: str) -> List[str]:
+-    stripped = strip_jsonld(text)
+-    lowered = stripped.lower()
+-    issues: List[str] = []
+-    if lowered.count("дополнительно рассматривается") >= 3:
+-        issues.append("template_phrase_repetition")
+-
+-    sentences = [segment.strip() for segment in re.split(r"[.!?]\s+", stripped) if segment.strip()]
+-    for first, second in zip(sentences, sentences[1:]):
+-        if first and first == second:
+-            issues.append("duplicate_sentence")
+-            break
+-
+-    lines = stripped.splitlines()
+-    for index, line in enumerate(lines):
+-        if re.match(r"^#{2,6}\s+\S", line):
+-            probe = index + 1
+-            while probe < len(lines) and not lines[probe].strip():
+-                probe += 1
+-            if probe >= len(lines) or lines[probe].startswith("#"):
+-                issues.append("empty_heading")
+-                break
+-    return issues
+-
+-
+-def validate_article(text: str, *, keywords: Iterable[str], min_chars: int, max_chars: int) -> ValidationResult:
++def _skeleton_status(
++    skeleton_payload: Optional[Dict[str, object]],
++    text: str,
++) -> Tuple[bool, Optional[str]]:
++    if skeleton_payload is None:
++        if "## FAQ" in text and _FAQ_START in text and _FAQ_END in text:
++            return True, None
++        return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
++    if not isinstance(skeleton_payload, dict):
++        return False, "Данные скелета не получены или имеют неверный формат."
++    sections = skeleton_payload.get("sections")
++    if not isinstance(sections, list) or not sections:
++        return False, "Скелет не содержит секций."
++    for section in sections:
++        if not isinstance(section, dict):
++            return False, "Секция скелета повреждена."
++        heading = str(section.get("heading") or "").strip()
++        paragraphs = section.get("paragraphs")
++        if not heading or not isinstance(paragraphs, list) or not paragraphs:
++            return False, "Секция скелета заполнена не полностью."
++    if "## FAQ" not in text or _FAQ_START not in text or _FAQ_END not in text:
++        return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
++    return True, None
 +
-+    sentences = [segment.strip() for segment in re.split(r"[.!?]\s+", stripped) if segment.strip()]
-+    for first, second in zip(sentences, sentences[1:]):
-+        if first and first == second:
-+            issues.append("duplicate_sentence")
-+            break
 +
-+    lines = stripped.splitlines()
-+    for index, line in enumerate(lines):
-+        if re.match(r"^#{2,6}\s+\S", line):
-+            probe = index + 1
-+            while probe < len(lines) and not lines[probe].strip():
-+                probe += 1
-+            if probe >= len(lines) or lines[probe].startswith("#"):
-+                issues.append("empty_heading")
-+                break
-+    return issues
-+
-+
- def validate_article(text: str, *, keywords: Iterable[str], min_chars: int, max_chars: int) -> ValidationResult:
++def validate_article(
++    text: str,
++    *,
++    keywords: Iterable[str],
++    min_chars: int,
++    max_chars: int,
++    skeleton_payload: Optional[Dict[str, object]] = None,
++) -> ValidationResult:
      length = _length_no_spaces(text)
-     length_ok = min_chars <= length <= max_chars
+-    length_ok = min_chars <= length <= max_chars
++    skeleton_ok, skeleton_message = _skeleton_status(skeleton_payload, text)
  
      normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
-     keywords_ok = True
+-    keywords_ok = True
      missing: List[str] = []
      for term in normalized_keywords:
          lock_token = LOCK_START_TEMPLATE.format(term=term)
          if lock_token not in text:
-             keywords_ok = False
+-            keywords_ok = False
              missing.append(term)
++    keywords_ok = len(missing) == 0
++
      faq_pairs = _faq_pairs(text)
      faq_count = len(faq_pairs)
-     faq_ok = faq_count == 5
+-    faq_ok = faq_count == 5
      jsonld_ok = _jsonld_valid(text)
++    faq_ok = faq_count == 5 and jsonld_ok
  
-+    quality_issues = _quality_issues(text)
-+
+-    quality_issues = _quality_issues(text)
++    length_ok = min_chars <= length <= max_chars
+ 
      stats: Dict[str, object] = {
          "length_no_spaces": length,
          "keywords_total": len(normalized_keywords),
          "keywords_missing": missing,
          "keywords_found": len(normalized_keywords) - len(missing),
          "faq_count": faq_count,
-+        "quality_issues": quality_issues,
+-        "quality_issues": quality_issues,
++        "jsonld_ok": jsonld_ok,
      }
-     return ValidationResult(
-         length_ok=length_ok,
+-    return ValidationResult(
+-        length_ok=length_ok,
++
++    result = ValidationResult(
++        skeleton_ok=skeleton_ok,
          keywords_ok=keywords_ok,
          faq_ok=faq_ok,
++        length_ok=length_ok,
          jsonld_ok=jsonld_ok,
-+        quality_ok=not quality_issues,
+-        quality_ok=not quality_issues,
          stats=stats,
      )
++
++    if not skeleton_ok:
++        raise ValidationError("skeleton", skeleton_message or "Ошибка структуры статьи.", details=stats)
++    if not keywords_ok:
++        raise ValidationError(
++            "keywords",
++            "Ключевые слова покрыты не полностью.",
++            details={"missing": missing, **stats},
++        )
++    if not faq_ok:
++        message = "FAQ должен содержать 5 вопросов и корректный JSON-LD."
++        if not jsonld_ok:
++            message = "JSON-LD FAQ недействителен или отсутствует."
++        raise ValidationError("faq", message, details=stats)
++    if not length_ok:
++        raise ValidationError(
++            "length",
++            f"Объём статьи {length} зн. без пробелов, требуется {min_chars}-{max_chars}.",
++            details=stats,
++        )
++    return result
 

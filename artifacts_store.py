@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 LOGGER = logging.getLogger("content_factory.artifacts")
 
@@ -38,11 +38,13 @@ def _ensure_dir() -> None:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(path: Path, text: str, *, validator: Optional[Callable[[Path], None]] = None) -> None:
     _ensure_dir()
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path.write_text(text, encoding="utf-8")
+    if validator is not None:
+        validator(tmp_path)
     tmp_path.replace(path)
 
 
@@ -203,7 +205,12 @@ def _build_record_from_file(path: Path, metadata: Optional[Dict[str, Any]] = Non
     )
 
 
-def register_artifact(markdown_path: Path, metadata: Optional[Dict[str, Any]] = None) -> ArtifactRecord:
+def register_artifact(
+    markdown_path: Path,
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    finalized: bool = True,
+) -> ArtifactRecord:
     """Ensure that the artifact index contains an entry for the file."""
 
     resolved = resolve_artifact_path(markdown_path)
@@ -243,8 +250,9 @@ def register_artifact(markdown_path: Path, metadata: Optional[Dict[str, Any]] = 
 
     entries = _sort_entries(entries)
     _write_index(entries)
-    _update_latest(record)
-    _append_changelog(record)
+    if finalized:
+        _update_latest(record)
+        _append_changelog(record)
     return record
 
 

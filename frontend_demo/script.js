@@ -112,15 +112,25 @@ const HEALTH_STATUS_MESSAGES = {
     ok: "активен",
     fail: "не найден",
   },
+  llm_ping: {
+    label: "LLM",
+    ok: "отвечает",
+    fail: "нет ответа",
+  },
   retrieval_index: {
     label: "Retrieval index",
     ok: "найден",
     fail: "не найден",
   },
-  artifacts_dir: {
+  artifacts_writable: {
     label: "Каталог артефактов",
     ok: "доступен",
     fail: "недоступен",
+  },
+  theme_index: {
+    label: "Индекс темы",
+    ok: "найден",
+    fail: "не найден",
   },
 };
 
@@ -1083,6 +1093,10 @@ async function handleGenerate(event) {
       temperature: payload.temperature,
       max_tokens: payload.maxTokens,
       context_source: payload.context_source,
+      keywords: Array.isArray(payload.data?.keywords) ? payload.data.keywords : [],
+      length_range: { min: 3500, max: 6000, mode: "no_spaces" },
+      faq_required: true,
+      faq_count: 5,
     };
     if (payload.context_source === "custom") {
       requestBody.context_text = payload.context_text;
@@ -2045,6 +2059,12 @@ function renderHealthStatus(status) {
     card.dataset.healthKey = key;
     healthStatus.append(card);
   });
+  const failingEntry = Object.entries(checks).find(([, value]) => !normalizeHealthCheck(value).ok);
+  const fallbackDictionary = failingEntry ? HEALTH_STATUS_MESSAGES[failingEntry[0]] || {} : {};
+  const reason = failingEntry
+    ? normalizeHealthCheck(failingEntry[1]).message || fallbackDictionary.fail || "Модель недоступна"
+    : "";
+  setGenerateAvailability(Boolean(status?.ok), reason);
 }
 
 function normalizeHealthCheck(value) {
@@ -2070,6 +2090,7 @@ function renderHealthError(message, tone = "error") {
     description: tone === "offline" ? "Попробуйте обновить позже" : "",
   });
   healthStatus.append(card);
+  setGenerateAvailability(false, message);
 }
 
 function createHealthCard({ tone, icon, label, description = "", delay = 0 }) {
@@ -2098,6 +2119,21 @@ function createHealthCard({ tone, icon, label, description = "", delay = 0 }) {
 
   card.append(iconEl, contentEl);
   return card;
+}
+
+function setGenerateAvailability(ok, reason = "") {
+  if (!generateBtn) {
+    return;
+  }
+  if (ok) {
+    generateBtn.disabled = false;
+    generateBtn.removeAttribute("title");
+  } else {
+    generateBtn.disabled = true;
+    if (reason) {
+      generateBtn.title = reason;
+    }
+  }
 }
 
 async function fetchJson(path, options = {}) {

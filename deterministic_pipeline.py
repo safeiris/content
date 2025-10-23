@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import json
+import json
 import logging
 import re
+import textwrap
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from llm_client import GenerationResult, generate as llm_generate
 from keyword_injector import KeywordInjectionResult, build_term_pattern, inject_keywords
 from length_trimmer import TrimResult, trim_text
-from validators import ValidationResult, length_no_spaces, strip_jsonld, validate_article
+from validators import (
+    ValidationError,
+    ValidationResult,
+    length_no_spaces,
+    strip_jsonld,
+    validate_article,
+)
 
 
 LOGGER = logging.getLogger("content_factory.pipeline")
@@ -56,6 +64,7 @@ class PipelineState:
     fallback_reason: Optional[str] = None
     api_route: Optional[str] = None
     token_usage: Optional[float] = None
+    skeleton_payload: Optional[Dict[str, object]] = None
 
 
 class PipelineStepError(RuntimeError):
@@ -110,6 +119,7 @@ class DeterministicPipeline:
         self.jsonld: Optional[str] = None
         self.locked_terms: List[str] = []
         self.jsonld_reserve: int = 0
+        self.skeleton_payload: Optional[Dict[str, object]] = None
 
         self._model_used: Optional[str] = None
         self._fallback_used: Optional[str] = None
@@ -183,13 +193,7 @@ class DeterministicPipeline:
         max_tokens: Optional[int] = None,
     ) -> GenerationResult:
         prompt_len = self._prompt_length(messages)
-        LOGGER.info(
-            "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d keywords_count=%d",
-            step.value,
-            self.model,
-            prompt_len,
-            len(self.normalized_keywords),
-        )
+        LOGGER.info("LOG:LLM_REQUEST step=%s model=%s prompt_len=%d", step.value, self.model, prompt_len)
         limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
         if not limit or limit <= 0:
             limit = 700
@@ -207,10 +211,13 @@ class DeterministicPipeline:
             raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
 
         usage = self._extract_usage(result)
+        metadata = result.metadata or {}
+        status = str(metadata.get("status") or "ok")
         LOGGER.info(
-            "LOG:LLM_RESPONSE step=%s token_usage=%s",
+            "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
             step.value,
             "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
+            status,
         )
         self._register_llm_result(result, usage)
         return result
@@ -240,7 +247,75 @@ class DeterministicPipeline:
         baseline = max(self.max_tokens, self.max_chars + 400)
         if baseline <= 0:
             baseline = self.max_chars + 400
-        return max(600, baseline)
+        return min(1500, max(600, baseline))
+
+    def _skeleton_contract(self) -> Dict[str, object]:
+        outline = [segment.strip() for segment in self.base_outline if segment.strip()]
+        contract = {
+            "title": "Строго один заголовок первого уровня",
+            "sections": [
+                {
+                    "heading": item,
+                    "goal": "Краткое назначение секции",
+                    "paragraphs": [
+                        "1-3 насыщенных абзаца без буллитов",
+                    ],
+                    "bullets": [],
+                }
+                for item in outline
+            ],
+        }
+        return contract
+
+    def _build_skeleton_messages(self) -> List[Dict[str, object]]:
+        outline = [segment.strip() for segment in self.base_outline if segment.strip()]
+        contract = json.dumps(self._skeleton_contract(), ensure_ascii=False, indent=2)
+        user_payload = textwrap.dedent(
+            f"""
+            Сформируй структуру статьи в строгом JSON-формате.
+            Требования:
+            1. Соблюдай следующий порядок разделов: {', '.join(outline)}.
+            2. Верни JSON вида {{"title": str, "sections": [{{"heading": str, "paragraphs": [str, ...]}}]}}.
+            3. Каждый paragraphs содержит 2-3 осмысленных абзаца по 3-4 предложения без приветствий.
+            4. Не добавляй FAQ и маркеры; только данные для отрисовки.
+            5. Не используй Markdown и комментарии.
+            Образец структуры:
+            {contract}
+            """
+        ).strip()
+        messages = list(self.messages)
+        messages.append({"role": "user", "content": user_payload})
+        return messages
+
+    def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
+        if not isinstance(payload, dict):
+            raise ValueError("Структура скелета не является объектом")
+        title = str(payload.get("title") or "").strip()
+        sections = payload.get("sections")
+        if not title or not isinstance(sections, list) or not sections:
+            raise ValueError("Скелет не содержит обязательных полей")
+        outline = []
+        lines: List[str] = [f"# {title}", ""]
+        for section in sections:
+            if not isinstance(section, dict):
+                raise ValueError("Секция имеет некорректный формат")
+            heading = str(section.get("heading") or "").strip()
+            paragraphs = section.get("paragraphs")
+            if not heading or not isinstance(paragraphs, list) or not paragraphs:
+                raise ValueError("Секция неполная")
+            outline.append(heading)
+            lines.append(f"## {heading}")
+            for paragraph in paragraphs:
+                text = str(paragraph).strip()
+                if not text:
+                    continue
+                lines.append(text)
+                lines.append("")
+        lines.append("## FAQ")
+        lines.append(FAQ_START)
+        lines.append(FAQ_END)
+        markdown = "\n".join(lines).strip()
+        return markdown, {"title": title, "outline": outline}
 
     def _render_faq_markdown(self, entries: Sequence[Dict[str, str]]) -> str:
         lines: List[str] = []
@@ -364,37 +439,98 @@ class DeterministicPipeline:
     # ------------------------------------------------------------------
     def _run_skeleton(self) -> str:
         self._log(PipelineStep.SKELETON, "running")
-        messages = list(self.messages)
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Сгенерируй полную статью по заданной структуре. Для блока FAQ оставь пустое место:"
-                    f" добавь заголовок '## FAQ', затем отдельными строками {FAQ_START} и {FAQ_END},"
-                    " без текста между ними. Остальные разделы наполни осмысленными рекомендациями."
-                ),
-            }
-        )
+        messages = self._build_skeleton_messages()
         skeleton_tokens = self._resolve_skeleton_tokens()
-        result = self._call_llm(step=PipelineStep.SKELETON, messages=messages, max_tokens=skeleton_tokens)
-        text = result.text.strip()
-        if not text:
-            raise PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
-        if FAQ_START not in text or FAQ_END not in text:
-            raise PipelineStepError(PipelineStep.SKELETON, "В тексте отсутствуют маркеры FAQ.")
-        self._check_template_text(text, PipelineStep.SKELETON)
-        self._update_log(PipelineStep.SKELETON, "ok", length=len(text), **self._metrics(text))
-        self.checkpoints[PipelineStep.SKELETON] = text
-        return text
+        attempt = 0
+        last_error: Optional[Exception] = None
+        payload: Optional[Dict[str, object]] = None
+        markdown: Optional[str] = None
+        metadata_snapshot: Dict[str, object] = {}
+        while attempt < 3 and markdown is None:
+            attempt += 1
+            try:
+                result = self._call_llm(
+                    step=PipelineStep.SKELETON,
+                    messages=messages,
+                    max_tokens=skeleton_tokens,
+                )
+            except PipelineStepError:
+                raise
+            metadata_snapshot = result.metadata or {}
+            status = str(metadata_snapshot.get("status") or "ok").lower()
+            if status == "incomplete" or metadata_snapshot.get("incomplete_reason"):
+                LOGGER.warning(
+                    "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
+                    attempt,
+                    status,
+                    metadata_snapshot.get("incomplete_reason") or "",
+                )
+                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                continue
+            raw_text = result.text.strip()
+            if not raw_text:
+                last_error = PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
+                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=empty", attempt)
+                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                continue
+            try:
+                payload = json.loads(raw_text)
+                LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
+            except json.JSONDecodeError as exc:
+                LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, exc)
+                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
+                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
+                continue
+            try:
+                markdown, summary = self._render_skeleton_markdown(payload)
+                self.skeleton_payload = payload
+                LOGGER.info("SKELETON_RENDERED_WITH_MARKERS outline=%s", ",".join(summary.get("outline", [])))
+            except Exception as exc:  # noqa: BLE001
+                last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
+                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=%s", attempt, exc)
+                payload = None
+                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                markdown = None
+
+        if markdown is None:
+            if last_error:
+                raise last_error
+            raise PipelineStepError(
+                PipelineStep.SKELETON,
+                "Не удалось получить корректный скелет статьи после нескольких попыток.",
+            )
+
+        if FAQ_START not in markdown or FAQ_END not in markdown:
+            raise PipelineStepError(PipelineStep.SKELETON, "Не удалось вставить маркеры FAQ на этапе скелета.")
+
+        self._check_template_text(markdown, PipelineStep.SKELETON)
+        self._update_log(
+            PipelineStep.SKELETON,
+            "ok",
+            length=len(markdown),
+            metadata_status=metadata_snapshot.get("status") or "ok",
+            **self._metrics(markdown),
+        )
+        self.checkpoints[PipelineStep.SKELETON] = markdown
+        return markdown
 
     def _run_keywords(self, text: str) -> KeywordInjectionResult:
         self._log(PipelineStep.KEYWORDS, "running")
         result = inject_keywords(text, self.keywords)
         self.locked_terms = list(result.locked_terms)
+        total = result.total_terms
+        found = result.found_terms
+        if total and found < total:
+            missing = sorted(term for term, ok in result.coverage.items() if not ok)
+            raise PipelineStepError(
+                PipelineStep.KEYWORDS,
+                "Не удалось обеспечить 100% покрытие ключей: " + ", ".join(missing),
+            )
         self._update_log(
             PipelineStep.KEYWORDS,
             "ok",
-            coverage=result.coverage,
+            coverage_summary=f"{found}/{total}",
             inserted_section=result.inserted_section,
             **self._metrics(result.text),
         )
@@ -429,6 +565,12 @@ class DeterministicPipeline:
             max_chars=target_max,
             protected_blocks=self.locked_terms,
         )
+        current_length = length_no_spaces(result.text)
+        if current_length < self.min_chars or current_length > self.max_chars:
+            raise PipelineStepError(
+                PipelineStep.TRIM,
+                f"Объём после трима вне диапазона {self.min_chars}–{self.max_chars} (без пробелов).",
+            )
         self._update_log(
             PipelineStep.TRIM,
             "ok",
@@ -449,12 +591,16 @@ class DeterministicPipeline:
         combined_text = trim_result.text
         if self.jsonld and self.jsonld_requested:
             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
-        validation = validate_article(
-            combined_text,
-            keywords=self.keywords,
-            min_chars=self.min_chars,
-            max_chars=self.max_chars,
-        )
+        try:
+            validation = validate_article(
+                combined_text,
+                keywords=self.keywords,
+                min_chars=self.min_chars,
+                max_chars=self.max_chars,
+                skeleton_payload=self.skeleton_payload,
+            )
+        except ValidationError as exc:
+            raise PipelineStepError(PipelineStep.TRIM, str(exc), status_code=400) from exc
         return PipelineState(
             text=combined_text,
             jsonld=self.jsonld,
@@ -466,6 +612,7 @@ class DeterministicPipeline:
             fallback_reason=self._fallback_reason,
             api_route=self._api_route,
             token_usage=self._token_usage,
+            skeleton_payload=self.skeleton_payload,
         )
 
     def resume(self, from_step: PipelineStep) -> PipelineState:
@@ -498,12 +645,16 @@ class DeterministicPipeline:
         combined_text = text
         if self.jsonld and self.jsonld_requested:
             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
-        validation = validate_article(
-            combined_text,
-            keywords=self.keywords,
-            min_chars=self.min_chars,
-            max_chars=self.max_chars,
-        )
+        try:
+            validation = validate_article(
+                combined_text,
+                keywords=self.keywords,
+                min_chars=self.min_chars,
+                max_chars=self.max_chars,
+                skeleton_payload=self.skeleton_payload,
+            )
+        except ValidationError as exc:
+            raise PipelineStepError(step, str(exc), status_code=400) from exc
         return PipelineState(
             text=combined_text,
             jsonld=self.jsonld,
@@ -515,4 +666,5 @@ class DeterministicPipeline:
             fallback_reason=self._fallback_reason,
             api_route=self._api_route,
             token_usage=self._token_usage,
+            skeleton_payload=self.skeleton_payload,
         )

@@ -3,10 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-import json
-import re
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from keyword_injector import LOCK_START_TEMPLATE
 
@@ -15,18 +12,27 @@ _FAQ_END = "<!--FAQ_END-->"
 _JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">(.*?)</script>", re.DOTALL)
 
 
+class ValidationError(RuntimeError):
+    """Raised when one of the blocking validation groups fails."""
+
+    def __init__(self, group: str, message: str, *, details: Optional[Dict[str, object]] = None) -> None:
+        super().__init__(message)
+        self.group = group
+        self.details = details or {}
+
+
 @dataclass
 class ValidationResult:
-    length_ok: bool
+    skeleton_ok: bool
     keywords_ok: bool
     faq_ok: bool
+    length_ok: bool
     jsonld_ok: bool
-    quality_ok: bool
     stats: Dict[str, object] = field(default_factory=dict)
 
     @property
     def is_valid(self) -> bool:
-        return self.length_ok and self.keywords_ok and self.faq_ok and self.jsonld_ok and self.quality_ok
+        return self.skeleton_ok and self.keywords_ok and self.faq_ok and self.length_ok
 
 
 def strip_jsonld(text: str) -> str:
@@ -78,49 +84,56 @@ def _jsonld_valid(text: str) -> bool:
     return True
 
 
-def _quality_issues(text: str) -> List[str]:
-    stripped = strip_jsonld(text)
-    lowered = stripped.lower()
-    issues: List[str] = []
-    if lowered.count("дополнительно рассматривается") >= 3:
-        issues.append("template_phrase_repetition")
+def _skeleton_status(
+    skeleton_payload: Optional[Dict[str, object]],
+    text: str,
+) -> Tuple[bool, Optional[str]]:
+    if skeleton_payload is None:
+        if "## FAQ" in text and _FAQ_START in text and _FAQ_END in text:
+            return True, None
+        return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
+    if not isinstance(skeleton_payload, dict):
+        return False, "Данные скелета не получены или имеют неверный формат."
+    sections = skeleton_payload.get("sections")
+    if not isinstance(sections, list) or not sections:
+        return False, "Скелет не содержит секций."
+    for section in sections:
+        if not isinstance(section, dict):
+            return False, "Секция скелета повреждена."
+        heading = str(section.get("heading") or "").strip()
+        paragraphs = section.get("paragraphs")
+        if not heading or not isinstance(paragraphs, list) or not paragraphs:
+            return False, "Секция скелета заполнена не полностью."
+    if "## FAQ" not in text or _FAQ_START not in text or _FAQ_END not in text:
+        return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
+    return True, None
 
-    sentences = [segment.strip() for segment in re.split(r"[.!?]\s+", stripped) if segment.strip()]
-    for first, second in zip(sentences, sentences[1:]):
-        if first and first == second:
-            issues.append("duplicate_sentence")
-            break
 
-    lines = stripped.splitlines()
-    for index, line in enumerate(lines):
-        if re.match(r"^#{2,6}\s+\S", line):
-            probe = index + 1
-            while probe < len(lines) and not lines[probe].strip():
-                probe += 1
-            if probe >= len(lines) or lines[probe].startswith("#"):
-                issues.append("empty_heading")
-                break
-    return issues
-
-
-def validate_article(text: str, *, keywords: Iterable[str], min_chars: int, max_chars: int) -> ValidationResult:
+def validate_article(
+    text: str,
+    *,
+    keywords: Iterable[str],
+    min_chars: int,
+    max_chars: int,
+    skeleton_payload: Optional[Dict[str, object]] = None,
+) -> ValidationResult:
     length = _length_no_spaces(text)
-    length_ok = min_chars <= length <= max_chars
+    skeleton_ok, skeleton_message = _skeleton_status(skeleton_payload, text)
 
     normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
-    keywords_ok = True
     missing: List[str] = []
     for term in normalized_keywords:
         lock_token = LOCK_START_TEMPLATE.format(term=term)
         if lock_token not in text:
-            keywords_ok = False
             missing.append(term)
+    keywords_ok = len(missing) == 0
+
     faq_pairs = _faq_pairs(text)
     faq_count = len(faq_pairs)
-    faq_ok = faq_count == 5
     jsonld_ok = _jsonld_valid(text)
+    faq_ok = faq_count == 5 and jsonld_ok
 
-    quality_issues = _quality_issues(text)
+    length_ok = min_chars <= length <= max_chars
 
     stats: Dict[str, object] = {
         "length_no_spaces": length,
@@ -128,13 +141,35 @@ def validate_article(text: str, *, keywords: Iterable[str], min_chars: int, max_
         "keywords_missing": missing,
         "keywords_found": len(normalized_keywords) - len(missing),
         "faq_count": faq_count,
-        "quality_issues": quality_issues,
+        "jsonld_ok": jsonld_ok,
     }
-    return ValidationResult(
-        length_ok=length_ok,
+
+    result = ValidationResult(
+        skeleton_ok=skeleton_ok,
         keywords_ok=keywords_ok,
         faq_ok=faq_ok,
+        length_ok=length_ok,
         jsonld_ok=jsonld_ok,
-        quality_ok=not quality_issues,
         stats=stats,
     )
+
+    if not skeleton_ok:
+        raise ValidationError("skeleton", skeleton_message or "Ошибка структуры статьи.", details=stats)
+    if not keywords_ok:
+        raise ValidationError(
+            "keywords",
+            "Ключевые слова покрыты не полностью.",
+            details={"missing": missing, **stats},
+        )
+    if not faq_ok:
+        message = "FAQ должен содержать 5 вопросов и корректный JSON-LD."
+        if not jsonld_ok:
+            message = "JSON-LD FAQ недействителен или отсутствует."
+        raise ValidationError("faq", message, details=stats)
+    if not length_ok:
+        raise ValidationError(
+            "length",
+            f"Объём статьи {length} зн. без пробелов, требуется {min_chars}-{max_chars}.",
+            details=stats,
+        )
+    return result

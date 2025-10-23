@@ -15,7 +15,7 @@ import httpx
 from zoneinfo import ZoneInfo
 
 from assemble_messages import ContextBundle, assemble_messages, retrieve_context
-from artifacts_store import register_artifact
+from artifacts_store import _atomic_write_text as store_atomic_write_text, register_artifact
 from config import (
     DEFAULT_MAX_LENGTH,
     DEFAULT_MIN_LENGTH,
@@ -23,7 +23,7 @@ from config import (
     OPENAI_API_KEY,
 )
 from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
-from llm_client import DEFAULT_MODEL
+from llm_client import DEFAULT_MODEL, generate as llm_generate
 from keywords import parse_manual_keywords
 from length_limits import ResolvedLengthLimits, resolve_length_limits
 from validators import ValidationResult, length_no_spaces
@@ -261,15 +261,6 @@ def make_generation_context(
         jsonld_requested=jsonld_requested,
         length_limits=length_info,
     )
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path.write_text(text, encoding="utf-8")
-    tmp_path.replace(path)
-
-
 def _make_output_path(theme: str, outfile: Optional[str]) -> Path:
     if outfile:
         return Path(outfile)
@@ -364,9 +355,20 @@ def _build_metadata(
 
 def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> Dict[str, Path]:
     markdown_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(markdown_path, text)
+    def _validate_markdown(tmp_path: Path) -> None:
+        if not tmp_path.read_text(encoding="utf-8").strip():
+            raise ValueError("Пустой файл статьи не может быть сохранён.")
+
+    def _validate_metadata(tmp_path: Path) -> None:
+        json.loads(tmp_path.read_text(encoding="utf-8"))
+
+    store_atomic_write_text(markdown_path, text, validator=_validate_markdown)
     metadata_path = markdown_path.with_suffix(".json")
-    _atomic_write_text(metadata_path, json.dumps(metadata, ensure_ascii=False, indent=2))
+    store_atomic_write_text(
+        metadata_path,
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        validator=_validate_metadata,
+    )
     register_artifact(markdown_path, metadata)
     return {"markdown": markdown_path, "metadata": metadata_path}
 
@@ -557,6 +559,33 @@ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
         except httpx.HTTPError as exc:
             ok = False
             checks["openai_key"] = {"ok": False, "message": f"Ошибка проверки ключа: {exc}"}
+
+        if checks.get("openai_key", {}).get("ok"):
+            try:
+                probe_messages = [
+                    {"role": "system", "content": "Ты проверка готовности. Ответь одним словом."},
+                    {"role": "user", "content": "Скажи PING"},
+                ]
+                ping_result = llm_generate(
+                    probe_messages,
+                    model=DEFAULT_MODEL,
+                    temperature=0.0,
+                    max_tokens=4,
+                    timeout_s=10,
+                )
+                reply = (ping_result.text or "").strip().lower()
+                ping_ok = reply.startswith("ping")
+                if not ping_ok:
+                    ok = False
+                    checks["llm_ping"] = {
+                        "ok": False,
+                        "message": f"Неожиданный ответ модели: {ping_result.text[:32]}",
+                    }
+                else:
+                    checks["llm_ping"] = {"ok": True, "message": "Ответ PING получен"}
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                checks["llm_ping"] = {"ok": False, "message": f"LLM недоступна: {exc}"}
 
     artifacts_dir = Path("artifacts")
     try:
