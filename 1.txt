@@ -1,730 +1,407 @@
-diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 41da91d5c3e4e5953cceb371202317852def89a1..03370bcea582bce7cdd3cbc4b5096c21f2c61a8c 100644
---- a/deterministic_pipeline.py
-+++ b/deterministic_pipeline.py
-@@ -1,39 +1,40 @@
- """LLM-driven content pipeline with explicit step-level guarantees."""
- 
- from __future__ import annotations
- 
- import json
- import json
- import logging
- import re
- import textwrap
- import time
- from dataclasses import dataclass, field
- from enum import Enum
- from typing import Dict, Iterable, List, Optional, Sequence, Tuple
- 
-+from config import G5_MAX_OUTPUT_TOKENS_BASE, G5_MAX_OUTPUT_TOKENS_MAX
- from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
- from faq_builder import _normalize_entry
- from keyword_injector import (
-     KeywordInjectionResult,
-     LOCK_END,
-     LOCK_START_TEMPLATE,
-     build_term_pattern,
-     inject_keywords,
- )
- from length_trimmer import TrimResult, TrimValidationError, trim_text
- from prompt_templates import load_template
- from skeleton_utils import normalize_skeleton_payload
- from validators import (
-     ValidationError,
-     ValidationResult,
-     length_no_spaces,
-     strip_jsonld,
-     validate_article,
- )
- 
- 
- LOGGER = logging.getLogger("content_factory.pipeline")
- 
- FAQ_START = "<!--FAQ_START-->"
- FAQ_END = "<!--FAQ_END-->"
-@@ -268,52 +269,59 @@ class DeterministicPipeline:
- 
-         raise PipelineStepError(step, "Не удалось получить ответ от модели.")
- 
-     def _check_template_text(self, text: str, step: PipelineStep) -> None:
-         lowered = text.lower()
-         if lowered.count("дополнительно рассматривается") >= 3:
-             raise PipelineStepError(step, "Обнаружен шаблонный текст 'Дополнительно рассматривается'.")
-         for snippet in _TEMPLATE_SNIPPETS:
-             if snippet in lowered:
-                 raise PipelineStepError(step, "Найден служебный шаблонный фрагмент, генерация отклонена.")
- 
-     def _metrics(self, text: str) -> Dict[str, object]:
-         article = strip_jsonld(text)
-         chars_no_spaces = length_no_spaces(article)
-         keywords_found = 0
-         for term in self.normalized_keywords:
-             if build_term_pattern(term).search(article):
-                 keywords_found += 1
-         return {
-             "chars_no_spaces": chars_no_spaces,
-             "keywords_found": keywords_found,
-             "keywords_total": len(self.normalized_keywords),
-         }
- 
-     def _resolve_skeleton_tokens(self) -> int:
--        baseline = 1200 if self.max_tokens <= 0 else min(self.max_tokens, 1200)
--        return max(800, min(1200, baseline))
-+        if self.max_tokens and self.max_tokens > 0:
-+            baseline = int(self.max_tokens)
-+        else:
-+            fallback = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
-+            baseline = fallback
-+        cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-+        if cap is not None:
-+            baseline = min(baseline, cap)
-+        return max(800, baseline)
- 
-     def _skeleton_contract(self) -> Tuple[Dict[str, object], str]:
-         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
-         intro = outline[0] if outline else "Введение"
-         outro = outline[-1] if len(outline) > 1 else "Вывод"
-         core_sections = [
-             item
-             for item in outline[1:-1]
-             if item.lower() not in {"faq", "f.a.q.", "вопросы и ответы"}
-         ]
-         if not core_sections:
-             core_sections = ["Основная часть"]
-         contract = {
-             "intro": f"один абзац с вводной рамкой для раздела '{intro}'",
-             "main": [
-                 (
-                     "3-5 абзацев раскрывают тему '"
-                     + heading
-                     + "' с примерами, рисками и расчётами"
-                 )
-                 for heading in core_sections
-             ],
-             "faq": [
-                 {"q": "вопрос", "a": "ответ"} for _ in range(5)
-             ],
-@@ -561,51 +569,53 @@ class DeterministicPipeline:
-             article = strip_jsonld(text)
-             found = 0
-             for term in self.normalized_keywords:
-                 lock_token = LOCK_START_TEMPLATE.format(term=term)
-                 lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-                 if lock_pattern.search(text) and build_term_pattern(term).search(article):
-                     found += 1
-             self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
- 
-     # ------------------------------------------------------------------
-     # Step implementations
-     # ------------------------------------------------------------------
-     def _run_skeleton(self) -> str:
-         self._log(PipelineStep.SKELETON, "running")
-         messages = self._build_skeleton_messages()
-         skeleton_tokens = self._resolve_skeleton_tokens()
-         attempt = 0
-         last_error: Optional[Exception] = None
-         payload: Optional[Dict[str, object]] = None
-         markdown: Optional[str] = None
-         metadata_snapshot: Dict[str, object] = {}
-         json_error_count = 0
-         use_fallback = False
-         result: Optional[GenerationResult] = None
-         def _clamp_tokens(value: int) -> int:
--            return max(800, min(1200, value))
-+            cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-+            upper = cap if cap is not None else int(value)
-+            return max(800, min(upper, int(value)))
- 
-         while attempt < 3 and markdown is None:
-             attempt += 1
-             try:
-                 result = self._call_llm(
-                     step=PipelineStep.SKELETON,
-                     messages=messages,
-                     max_tokens=skeleton_tokens,
-                     override_model=FALLBACK_MODEL if use_fallback else None,
-                 )
-             except PipelineStepError:
-                 raise
-             metadata_snapshot = result.metadata or {}
-             status = str(metadata_snapshot.get("status") or "ok").lower()
-             if status == "incomplete" or metadata_snapshot.get("incomplete_reason"):
-                 LOGGER.warning(
-                     "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
-                     attempt,
-                     status,
-                     metadata_snapshot.get("incomplete_reason") or "",
-                 )
-                 skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                 continue
-             raw_text = result.text.strip()
-             if "<response_json>" in raw_text and "</response_json>" in raw_text:
 diff --git a/llm_client.py b/llm_client.py
-index 1f3e175a5cca2b5258a9245eb4071bc247ea3222..07936715e6b13739d2b8a9886abf2056cb53f4f7 100644
+index 07936715e6b13739d2b8a9886abf2056cb53f4f7..89839f76f1d494cfa621956a3575724c22c148cc 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -1,39 +1,39 @@
- # -*- coding: utf-8 -*-
- """Simple wrapper around chat completion providers with retries and sane defaults."""
- from __future__ import annotations
+@@ -1542,69 +1542,107 @@ def generate(
+                 format_type,
+                 format_name,
+                 has_schema,
+             )
  
- import json
- import logging
- import os
- import re
- import sys
- import time
- from copy import deepcopy
- from dataclasses import dataclass
- from pathlib import Path
--from typing import Dict, List, Optional, Tuple
-+from typing import Any, Dict, List, Optional, Tuple
+         def _extract_metadata(payload: Dict[str, object]) -> Dict[str, object]:
+             status_value = payload.get("status")
+             status = str(status_value).strip().lower() if isinstance(status_value, str) else ""
+             incomplete_details = payload.get("incomplete_details")
+             incomplete_reason = ""
+             if isinstance(incomplete_details, dict):
+                 reason = incomplete_details.get("reason")
+                 if isinstance(reason, str):
+                     incomplete_reason = reason.strip().lower()
+             usage_block = payload.get("usage")
+             usage_output_tokens: Optional[float] = None
+             if isinstance(usage_block, dict):
+                 raw_usage = usage_block.get("output_tokens")
+                 if isinstance(raw_usage, (int, float)):
+                     usage_output_tokens = float(raw_usage)
+                 elif isinstance(raw_usage, dict):
+                     for value in raw_usage.values():
+                         if isinstance(value, (int, float)):
+                             usage_output_tokens = float(value)
+                             break
++            response_id = ""
++            raw_response_id = payload.get("id")
++            if isinstance(raw_response_id, str):
++                response_id = raw_response_id.strip()
++            prev_response_id = ""
++            raw_prev = payload.get("previous_response_id")
++            if isinstance(raw_prev, str):
++                prev_response_id = raw_prev.strip()
++            metadata_block = payload.get("metadata")
++            if isinstance(metadata_block, dict):
++                if not prev_response_id:
++                    prev_candidate = metadata_block.get("previous_response_id")
++                    if isinstance(prev_candidate, str):
++                        prev_response_id = prev_candidate.strip()
++            finish_reason = ""
++            finish_block = payload.get("finish_reason")
++            if isinstance(finish_block, str):
++                finish_reason = finish_block.strip().lower()
+             return {
+                 "status": status,
+                 "incomplete_reason": incomplete_reason,
+                 "usage_output_tokens": usage_output_tokens,
++                "response_id": response_id,
++                "previous_response_id": prev_response_id,
++                "finish_reason": finish_reason,
+             }
  
- import httpx
- 
- from config import (
-     FORCE_MODEL,
-     OPENAI_API_KEY,
-     G5_ENABLE_PREVIOUS_ID_FETCH,
-     G5_MAX_OUTPUT_TOKENS_BASE,
-     G5_MAX_OUTPUT_TOKENS_MAX,
-     G5_MAX_OUTPUT_TOKENS_STEP1,
-     G5_MAX_OUTPUT_TOKENS_STEP2,
-     G5_POLL_INTERVALS,
-     G5_POLL_MAX_ATTEMPTS,
- )
- 
- 
- DEFAULT_MODEL = "gpt-5"
- MAX_RETRIES = 3
- BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
- FALLBACK_MODEL = "gpt-4o"
- RESPONSES_API_URL = "https://api.openai.com/v1/responses"
- RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "text")
- RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
- RESPONSES_MAX_ESCALATIONS = 2
- MAX_RESPONSES_POLL_ATTEMPTS = (
-@@ -78,62 +78,133 @@ def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
- RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
- 
- 
- DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
-     "type": "json_schema",
-     "name": RESPONSES_FORMAT_DEFAULT_NAME,
-     "schema": {
-         "type": "object",
-         "properties": {
-             "intro": {"type": "string"},
-             "main": {
-                 "type": "array",
-                 "items": {"type": "string"},
-                 "minItems": 3,
-                 "maxItems": 6,
-             },
-             "faq": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "q": {"type": "string"},
-                         "a": {"type": "string"},
-                     },
-                     "required": ["q", "a"],
-+                    "additionalProperties": False,
-                 },
-                 "minItems": 5,
-                 "maxItems": 5,
-             },
-             "conclusion": {"type": "string"},
-         },
-         "required": ["intro", "main", "faq", "conclusion"],
-         "additionalProperties": False,
-     },
-     "strict": True,
- }
- 
+         attempts = 0
+-        max_attempts = 3
++        max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)
+         current_max = max_tokens_value
+         last_error: Optional[BaseException] = None
+         format_retry_done = False
+         format_name_retry_done = False
+         min_tokens_bump_done = False
+         min_token_floor = 1
+         base_input_text = str(sanitized_payload.get("input", ""))
+         shrunken_input = _shrink_responses_input(base_input_text)
+         shrink_next_attempt = False
+         shrink_applied = False
+         incomplete_retry_count = 0
++        token_escalations = 0
++        resume_from_response_id: Optional[str] = None
 +
-+class SchemaValidationError(ValueError):
-+    """Raised when the provided schema cannot be normalized."""
-+
-+
-+def _iter_schema_children(schema: Dict[str, Any], path: str) -> List[Tuple[str, Dict[str, Any]]]:
-+    children: List[Tuple[str, Dict[str, Any]]] = []
-+    properties = schema.get("properties")
-+    if isinstance(properties, dict):
-+        for key, value in properties.items():
-+            if isinstance(value, dict):
-+                child_path = f"{path}.{key}" if path != "$" else f"$.{key}"
-+                children.append((child_path, value))
-+    pattern_properties = schema.get("patternProperties")
-+    if isinstance(pattern_properties, dict):
-+        for key, value in pattern_properties.items():
-+            if isinstance(value, dict):
-+                child_path = f"{path}.patternProperties[{key!r}]"
-+                children.append((child_path, value))
-+    items = schema.get("items")
-+    if isinstance(items, dict):
-+        children.append((f"{path}['items']", items))
-+    elif isinstance(items, list):
-+        for index, value in enumerate(items):
-+            if isinstance(value, dict):
-+                children.append((f"{path}['items'][{index}]", value))
-+    for keyword in ("allOf", "anyOf", "oneOf"):
-+        collection = schema.get(keyword)
-+        if isinstance(collection, list):
-+            for index, value in enumerate(collection):
-+                if isinstance(value, dict):
-+                    children.append((f"{path}.{keyword}[{index}]", value))
-+    for keyword in ("$defs", "definitions"):
-+        collection = schema.get(keyword)
-+        if isinstance(collection, dict):
-+            for key, value in collection.items():
-+                if isinstance(value, dict):
-+                    child_path = f"{path}.{keyword}[{key!r}]"
-+                    children.append((child_path, value))
-+    return children
-+
-+
-+def _normalize_json_schema(schema: Dict[str, Any], *, path: str = "$") -> Tuple[int, List[str]]:
-+    enforced = 0
-+    errors: List[str] = []
-+
-+    def _walk(node: Dict[str, Any], current_path: str) -> None:
-+        nonlocal enforced
-+        node_type = node.get("type")
-+        properties = node.get("properties") if isinstance(node.get("properties"), dict) else None
-+        has_pattern_properties = bool(node.get("patternProperties"))
-+        if node_type == "object" and properties is not None and not has_pattern_properties:
-+            if "additionalProperties" not in node:
-+                node["additionalProperties"] = False
-+                enforced += 1
-+        required = node.get("required")
-+        if isinstance(required, list):
-+            defined = set(properties.keys()) if isinstance(properties, dict) else set()
-+            missing = [str(name) for name in required if name not in defined]
-+            if missing:
-+                missing_sorted = ", ".join(sorted(missing))
-+                errors.append(
-+                    f"{current_path}: required fields missing from properties: {missing_sorted}"
-+                )
-+        for child_path, child in _iter_schema_children(node, current_path):
-+            _walk(child, child_path)
-+
-+    _walk(schema, path)
-+    return enforced, errors
-+
- MODEL_PROVIDER_MAP = {
-     "gpt-5": "openai",
-     "gpt-4o": "openai",
-     "gpt-4o-mini": "openai",
- }
++        def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
++            candidate = current
++            if step_index == 0:
++                candidate = max(current + 600, int(current * 1.5))
++            elif step_index == 1:
++                candidate = max(current + 600, int(current * 1.35))
++            else:
++                if cap is not None:
++                    candidate = cap
++                else:
++                    candidate = current + 600
++            if cap is not None:
++                candidate = min(candidate, cap)
++            return int(candidate)
  
- PROVIDER_API_URLS = {
-     "openai": "https://api.openai.com/v1/chat/completions",
- }
+         def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
+             poll_attempt = 0
+             while poll_attempt < MAX_RESPONSES_POLL_ATTEMPTS:
+                 poll_attempt += 1
+                 poll_url = f"{RESPONSES_API_URL}/{response_id}"
+                 LOGGER.info("responses poll attempt=%d id=%s", poll_attempt, response_id)
+                 if poll_attempt == 1:
+                     initial_sleep = schedule[0] if schedule else 0.5
+                     LOGGER.info("responses poll initial sleep=%.2f", initial_sleep)
+                     time.sleep(initial_sleep)
+                 try:
+                     poll_response = http_client.get(
+                         poll_url,
+                         headers=headers,
+                         timeout=timeout,
+                     )
+                     poll_response.raise_for_status()
+                 except httpx.HTTPStatusError as poll_error:
+                     _handle_responses_http_error(poll_error, {"poll_id": response_id})
+                     break
+                 except httpx.HTTPError as transport_error:  # pragma: no cover - defensive
+                     LOGGER.warning("responses poll transport error: %s", transport_error)
+                     break
+                 try:
+@@ -1617,121 +1655,173 @@ def generate(
+                 text, poll_parse_flags, _ = _extract_responses_text(payload)
+                 metadata = _extract_metadata(payload)
+                 poll_status = metadata.get("status") or ""
+                 poll_reason = metadata.get("incomplete_reason") or ""
+                 segments = int(poll_parse_flags.get("segments", 0) or 0)
+                 LOGGER.info("RESP_POLL_STATUS=%s|%s", poll_status or "ok", poll_reason or "-")
+                 if poll_status == "completed" and (text or segments > 0):
+                     return payload
+                 if poll_status == "incomplete" and poll_reason == "max_output_tokens":
+                     LOGGER.info(
+                         "RESP_STATUS=incomplete|max_output_tokens=%s",
+                         sanitized_payload.get("max_output_tokens"),
+                     )
+                     break
+                 if poll_attempt >= MAX_RESPONSES_POLL_ATTEMPTS:
+                     break
+                 sleep_for = schedule[min(poll_attempt - 1, len(schedule) - 1)] if schedule else 0.5
+                 LOGGER.info("responses poll sleep=%.2f", sleep_for)
+                 time.sleep(sleep_for)
+             return None
  
- 
- LOGGER = logging.getLogger(__name__)
- RAW_RESPONSE_PATH = Path("artifacts/debug/last_raw_response.json")
- RESPONSES_RESPONSE_PATH = Path("artifacts/debug/last_gpt5_responses_response.json")
- RESPONSES_REQUEST_PATH = Path("artifacts/debug/last_gpt5_responses_request.json")
- 
- 
- @dataclass(frozen=True)
- class GenerationResult:
-     """Container describing the outcome of a text generation call."""
- 
-     text: str
-     model_used: str
-     retry_used: bool
-     fallback_used: Optional[str]
-@@ -242,70 +313,72 @@ def _shrink_responses_input(text_value: str) -> str:
-             continue
-         seen.add(fingerprint)
-         normalized_lines.append(stripped)
- 
-     condensed = "\n\n".join(normalized_lines)
-     if len(condensed) < len(text_value):
-         return condensed
-     target = max(1000, int(len(text_value) * 0.9))
-     return text_value[:target]
- 
- 
- def _coerce_bool(value: object) -> Optional[bool]:
-     if isinstance(value, bool):
-         return value
-     if isinstance(value, (int, float)):
-         return bool(value)
-     if isinstance(value, str):
-         lowered = value.strip().lower()
-         if lowered in {"1", "true", "yes", "on"}:
-             return True
-         if lowered in {"0", "false", "no", "off"}:
-             return False
-     return None
- 
- 
--def _sanitize_text_format_in_place(format_block: Dict[str, object]) -> Tuple[bool, bool]:
-+def _sanitize_text_format_in_place(
-+    format_block: Dict[str, object],
-+    *,
-+    context: str = "-",
-+    log_on_migration: bool = True,
-+) -> Tuple[bool, bool, int]:
-     migrated = False
-     if not isinstance(format_block, dict):
--        return False, False
-+        return False, False, 0
- 
-     allowed_keys = {"type", "name", "schema", "strict"}
- 
--    schema_value = format_block.get("schema")
--    if not isinstance(schema_value, dict):
-+    if not isinstance(format_block.get("schema"), dict):
-         if "schema" in format_block:
-             format_block.pop("schema", None)
-             migrated = True
--        schema_value = None
- 
-     legacy_block = format_block.pop("json_schema", None)
-     if isinstance(legacy_block, dict):
-         schema_candidate = legacy_block.get("schema")
-         if isinstance(schema_candidate, dict):
-             format_block["schema"] = deepcopy(schema_candidate)
--            schema_value = format_block["schema"]
-         strict_candidate = legacy_block.get("strict")
-         strict_value = _coerce_bool(strict_candidate)
-         if strict_value is not None and "strict" not in format_block:
-             format_block["strict"] = strict_value
-         migrated = True
- 
-     type_value = format_block.get("type")
-     if isinstance(type_value, str):
-         trimmed = type_value.strip()
-         if trimmed:
-             if trimmed != type_value:
-                 format_block["type"] = trimmed
-                 migrated = True
-         else:
-             format_block.pop("type", None)
-             migrated = True
-     elif type_value is not None:
-         trimmed = str(type_value).strip()
-         if trimmed:
-             format_block["type"] = trimmed
-             migrated = True
-         else:
-             format_block.pop("type", None)
-             migrated = True
- 
-@@ -322,69 +395,106 @@ def _sanitize_text_format_in_place(format_block: Dict[str, object]) -> Tuple[boo
-     elif name_value is not None:
-         trimmed = str(name_value).strip()
-         if trimmed:
-             format_block["name"] = trimmed
-             migrated = True
-         else:
-             format_block.pop("name", None)
-             migrated = True
- 
-     strict_value = format_block.get("strict")
-     strict_bool = _coerce_bool(strict_value)
-     if strict_bool is None:
-         if "strict" in format_block:
-             format_block.pop("strict", None)
-             migrated = True
-     else:
-         if strict_value is not strict_bool:
-             format_block["strict"] = strict_bool
-             migrated = True
- 
-     for key in list(format_block.keys()):
-         if key not in allowed_keys:
-             format_block.pop(key, None)
-             migrated = True
- 
-+    if "type" not in format_block and isinstance(format_block.get("schema"), dict):
-+        format_block["type"] = "json_schema"
-+        migrated = True
-+
-+    schema_dict = format_block.get("schema")
-+    enforced_count = 0
-+    if isinstance(schema_dict, dict):
-+        enforced_count, errors = _normalize_json_schema(schema_dict)
-+        if errors:
-+            details = "; ".join(errors)
-+            raise SchemaValidationError(
-+                f"Invalid schema for text.format ({context}): {details}"
-+            )
-+
-     has_schema = isinstance(format_block.get("schema"), dict)
--    return migrated, has_schema
-+    fmt_type = str(format_block.get("type", "")).strip() or "-"
-+    fmt_name = str(format_block.get("name", "")).strip() or "-"
-+
-+    if migrated and log_on_migration:
-+        LOGGER.info(
-+            "LOG:RESP_SCHEMA_MIGRATION_APPLIED context=%s type=%s name=%s",
-+            context,
-+            fmt_type,
-+            fmt_name,
-+        )
-+    if enforced_count > 0:
-+        LOGGER.info(
-+            "LOG:RESP_SCHEMA_ADDITIONAL_PROPS_ENFORCED context=%s type=%s name=%s count=%d",
-+            context,
-+            fmt_type,
-+            fmt_name,
-+            enforced_count,
-+        )
-+
-+    return migrated, has_schema, enforced_count
- 
- 
- def _prepare_text_format_for_request(
-     template: Optional[Dict[str, object]],
-     *,
-     context: str,
-     log_on_migration: bool = True,
- ) -> Tuple[Dict[str, object], bool, bool]:
-     if not isinstance(template, dict):
-         return {}, False, False
-     working_copy: Dict[str, object] = deepcopy(template)
--    migrated, has_schema = _sanitize_text_format_in_place(working_copy)
--    if migrated and log_on_migration:
-+    migrated, has_schema, enforced_count = _sanitize_text_format_in_place(
-+        working_copy,
-+        context=context,
-+        log_on_migration=log_on_migration,
-+    )
-+    if not migrated and enforced_count <= 0 and log_on_migration:
-         fmt_type = str(working_copy.get("type", "")).strip() or "-"
-         fmt_name = str(working_copy.get("name", "")).strip() or "-"
--        LOGGER.info(
--            "LOG:RESP_FORMAT_MIGRATED context=%s type=%s name=%s has_schema=%s",
-+        LOGGER.debug(
-+            "LOG:RESP_SCHEMA_NORMALIZED context=%s type=%s name=%s has_schema=%s",
-             context,
-             fmt_type,
-             fmt_name,
-             has_schema,
-         )
-     return working_copy, migrated, has_schema
- 
- 
- def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, object]]:
-     if not isinstance(text_value, dict):
-         return None
-     format_block = text_value.get("format")
-     if not isinstance(format_block, dict):
-         return None
-     sanitized_format, _, _ = _prepare_text_format_for_request(
-         format_block,
-         context="sanitize_payload",
-         log_on_migration=True,
-     )
-     if not sanitized_format:
-         return None
-     return {"format": sanitized_format}
- 
- 
- def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str, object], int]:
-@@ -1283,119 +1393,133 @@ def generate(
-         system_text = "\n\n".join(system_segments)
-         user_text = "\n\n".join(user_segments)
- 
-         base_payload = build_responses_payload(
-             target_model,
-             system_text,
-             user_text,
-             max_tokens,
-             text_format=responses_text_format,
-         )
-         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
- 
-         raw_format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
-         format_template, _, _ = _prepare_text_format_for_request(
-             raw_format_template,
-             context="template",
-             log_on_migration=False,
-         )
-         text_block_candidate = sanitized_payload.get("text")
-         if isinstance(text_block_candidate, dict):
-             format_candidate = text_block_candidate.get("format")
-             if isinstance(format_candidate, dict) and format_candidate:
-                 format_template = deepcopy(format_candidate)
-         if not isinstance(format_template, dict):
-             format_template = {}
--        _sanitize_text_format_in_place(format_template)
-+        _sanitize_text_format_in_place(
-+            format_template,
-+            context="template_normalize",
-+            log_on_migration=False,
-+        )
-         fmt_template_type = str(format_template.get("type", "")).strip().lower()
-         if fmt_template_type == "json_schema":
-             current_name = str(format_template.get("name", "")).strip()
-             if current_name != RESPONSES_FORMAT_DEFAULT_NAME:
-                 format_template["name"] = RESPONSES_FORMAT_DEFAULT_NAME
- 
-         def _clone_text_format() -> Dict[str, object]:
-             return deepcopy(format_template)
- 
-         def _apply_text_format(target: Dict[str, object]) -> None:
-             target.pop("response_format", None)
-             target["text"] = {"format": _clone_text_format()}
- 
-         def _normalize_format_block(
-             format_block: Optional[Dict[str, object]]
-         ) -> Tuple[str, str, bool, bool]:
-             fmt_type = "-"
-             fmt_name = "-"
-             has_schema = False
-             fixed = False
+         while attempts < max_attempts:
+             attempts += 1
+             current_payload = dict(sanitized_payload)
+             current_payload["text"] = {"format": _clone_text_format()}
++            if resume_from_response_id:
++                current_payload["previous_response_id"] = resume_from_response_id
++                LOGGER.info("RESP_CONTINUE previous_response_id=%s", resume_from_response_id)
+             if shrink_applied and shrunken_input:
+                 current_payload["input"] = shrunken_input
+             elif shrink_next_attempt:
+                 shrink_next_attempt = False
+                 if shrunken_input and shrunken_input != base_input_text:
+                     current_payload["input"] = shrunken_input
+                     shrink_applied = True
+                     LOGGER.info(
+                         "RESP_PROMPT_SHRINK original_len=%d shrunk_len=%d",
+                         len(base_input_text),
+                         len(shrunken_input),
+                     )
+             current_payload["max_output_tokens"] = max(min_token_floor, int(current_max))
+             if attempts > 1:
+                 retry_used = True
+             format_block, fmt_type, fmt_name, has_schema, fixed_name = _ensure_format_name(current_payload)
+             suffix = " (fixed=name)" if fixed_name else ""
+             LOGGER.info(
+                 "LOG:RESP_PAYLOAD_FORMAT type=%s name=%s has_schema=%s%s",
+                 fmt_type,
+                 fmt_name or "-",
+                 has_schema,
+                 suffix,
+             )
              if isinstance(format_block, dict):
--                _sanitize_text_format_in_place(format_block)
-+                _sanitize_text_format_in_place(
-+                    format_block,
-+                    context="normalize_format_block",
-+                    log_on_migration=False,
-+                )
-                 fmt_type = str(format_block.get("type", "")).strip() or "-"
-                 has_schema = isinstance(format_block.get("schema"), dict)
-                 current_name = str(format_block.get("name", "")).strip()
-                 if fmt_type.lower() == "json_schema":
-                     desired = RESPONSES_FORMAT_DEFAULT_NAME
-                     if current_name != desired:
-                         format_block["name"] = desired
-                         current_name = desired
-                         fixed = True
-                 if current_name:
-                     fmt_name = current_name
-             return fmt_type, fmt_name, has_schema, fixed
- 
-         def _ensure_format_name(
-             target: Dict[str, object]
-         ) -> Tuple[Optional[Dict[str, object]], str, str, bool, bool]:
-             text_block = target.get("text")
-             if not isinstance(text_block, dict):
-                 text_block = {}
-                 target["text"] = text_block
-             format_block = text_block.get("format")
-             if not isinstance(format_block, dict):
-                 format_block = _clone_text_format()
-                 text_block["format"] = format_block
-             fmt_type, fmt_name, has_schema, fixed = _normalize_format_block(format_block)
-             return format_block, fmt_type, fmt_name, has_schema, fixed
- 
-         _apply_text_format(sanitized_payload)
- 
-         raw_max_tokens = sanitized_payload.get("max_output_tokens")
-         try:
-             max_tokens_value = int(raw_max_tokens)
-         except (TypeError, ValueError):
-             max_tokens_value = 0
-         if max_tokens_value <= 0:
-             fallback_default = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
-             max_tokens_value = fallback_default
-         upper_cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-         if upper_cap is not None and max_tokens_value > upper_cap:
-             LOGGER.info(
-                 "responses max_output_tokens clamped requested=%s limit=%s",
-                 raw_max_tokens,
-                 upper_cap,
-             )
-             max_tokens_value = upper_cap
-         sanitized_payload["max_output_tokens"] = max_tokens_value
-+        LOGGER.info(
-+            "resolved max_output_tokens=%s (requested=%s, cap=%s)",
-+            max_tokens_value,
-+            raw_max_tokens if raw_max_tokens is not None else "-",
-+            upper_cap if upper_cap is not None else "-",
-+        )
- 
-         supports_temperature = _supports_temperature(target_model)
-         if supports_temperature:
-             raw_temperature = sanitized_payload.get("temperature", temperature)
-             if raw_temperature is None:
-                 raw_temperature = 0.3
+                 try:
+                     format_snapshot = json.dumps(format_block, ensure_ascii=False, sort_keys=True)
+                 except (TypeError, ValueError):
+                     format_snapshot = str(format_block)
+                 LOGGER.debug("DEBUG:payload.text.format = %s", format_snapshot)
+             else:
+                 LOGGER.debug("DEBUG:payload.text.format = null")
+             _log_payload(current_payload)
              try:
-                 sanitized_payload["temperature"] = float(raw_temperature)
-             except (TypeError, ValueError):
-                 sanitized_payload["temperature"] = 0.3
-         else:
-             if "temperature" in sanitized_payload:
-                 sanitized_payload.pop("temperature", None)
-             LOGGER.info(
-                 "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
-                 target_model,
-             )
- 
-         def _log_payload(snapshot: Dict[str, object]) -> None:
-             keys = sorted(snapshot.keys())
-             LOGGER.info("responses payload_keys=%s", keys)
-             input_candidate = snapshot.get("input", "")
-             length = len(input_candidate) if isinstance(input_candidate, str) else 0
-             LOGGER.info("responses input_len=%d", length)
-             LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
-diff --git a/tests/test_responses_client.py b/tests/test_responses_client.py
-index 94b33cb983d6d0f7094eecac0368229cb2baff61..013732f5fe1858914e4ca9d782efb63a27445da8 100644
---- a/tests/test_responses_client.py
-+++ b/tests/test_responses_client.py
-@@ -113,51 +113,55 @@ def test_build_responses_payload_for_gpt5_includes_required_fields():
- def test_sanitize_payload_converts_legacy_json_schema():
-     legacy_schema = {
-         "type": "object",
-         "properties": {
-             "intro": {"type": "string"},
-         },
-         "required": ["intro"],
-     }
-     payload = {
-         "model": "gpt-5",
-         "input": "hello",
-         "max_output_tokens": 256,
-         "text": {
-             "format": {
-                 "type": "json_schema",
-                 "name": "legacy",
-                 "json_schema": {"schema": legacy_schema, "strict": True},
+                 _store_responses_request_snapshot(current_payload)
+                 response = http_client.post(
+                     RESPONSES_API_URL,
+                     headers=headers,
+                     json=current_payload,
+                     timeout=timeout,
+                 )
+                 response.raise_for_status()
+                 data = response.json()
+                 if not isinstance(data, dict):
+                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
+                 _store_responses_response_snapshot(data)
+                 text, parse_flags, schema_label = _extract_responses_text(data)
+                 metadata = _extract_metadata(data)
++                if isinstance(parse_flags, dict):
++                    parse_flags["metadata"] = metadata
+                 status = metadata.get("status") or ""
+                 reason = metadata.get("incomplete_reason") or ""
+                 segments = int(parse_flags.get("segments", 0) or 0)
+                 LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
+                 if status in {"in_progress", "queued"}:
+                     response_id = data.get("id")
+                     if isinstance(response_id, str) and response_id.strip():
+                         polled_payload = _poll_responses_payload(response_id.strip())
+                         if polled_payload is None:
+                             last_error = RuntimeError("responses_incomplete")
+                             continue
+                         data = polled_payload
+                         text, parse_flags, schema_label = _extract_responses_text(data)
+                         metadata = _extract_metadata(data)
++                        if isinstance(parse_flags, dict):
++                            parse_flags["metadata"] = metadata
+                         status = metadata.get("status") or ""
+                         reason = metadata.get("incomplete_reason") or ""
+                         segments = int(parse_flags.get("segments", 0) or 0)
+                         LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
+-                if status == "incomplete" and reason == "max_output_tokens":
+-                    LOGGER.info(
+-                        "RESP_STATUS=incomplete|max_output_tokens=%s",
+-                        current_payload.get("max_output_tokens"),
+-                    )
++                if status == "incomplete":
++                    if reason == "max_output_tokens":
++                        LOGGER.info(
++                            "RESP_STATUS=incomplete|max_output_tokens=%s",
++                            current_payload.get("max_output_tokens"),
++                        )
++                        last_error = RuntimeError("responses_incomplete")
++                        response_id_value = metadata.get("response_id") or ""
++                        prev_field_present = "previous_response_id" in data or (
++                            isinstance(metadata.get("previous_response_id"), str)
++                            and metadata.get("previous_response_id")
++                        )
++                        if (
++                            response_id_value
++                            and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
++                        ):
++                            resume_from_response_id = str(response_id_value)
++                        if upper_cap is not None and int(current_max) >= upper_cap:
++                            message = (
++                                f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
++                                "Увеличь кап или упростите ТЗ/схему."
++                            )
++                            raise RuntimeError(message)
++                        if token_escalations >= RESPONSES_MAX_ESCALATIONS:
++                            break
++                        next_max = _compute_next_max_tokens(
++                            int(current_max), token_escalations, upper_cap
++                        )
++                        if next_max <= int(current_max):
++                            if upper_cap is not None and int(current_max) >= upper_cap:
++                                message = (
++                                    f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
++                                    "Увеличь кап или упростите ТЗ/схему."
++                                )
++                                raise RuntimeError(message)
++                            break
++                        cap_label = upper_cap if upper_cap is not None else "-"
++                        LOGGER.info(
++                            "RESP_ESCALATE_TOKENS reason=max_output_tokens from=%s to=%s cap=%s",
++                            current_payload.get("max_output_tokens"),
++                            next_max,
++                            cap_label,
++                        )
++                        token_escalations += 1
++                        current_max = next_max
++                        sanitized_payload["max_output_tokens"] = max(
++                            min_token_floor, int(current_max)
++                        )
++                        shrink_next_attempt = False
++                        continue
+                     last_error = RuntimeError("responses_incomplete")
+                     incomplete_retry_count += 1
+                     if incomplete_retry_count >= 2:
+                         break
+                     shrink_next_attempt = True
+                     continue
+                 if not text:
+                     last_error = EmptyCompletionError(
+                         "Модель вернула пустой ответ",
+                         raw_response=data,
+                         parse_flags=parse_flags,
+                     )
+                     LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
+                     continue
+                 _persist_raw_response(data)
+                 return text, parse_flags, data, schema_label
+             except EmptyCompletionError as exc:
+                 last_error = exc
+             except httpx.HTTPStatusError as exc:
+                 response_obj = exc.response
+                 status = response_obj.status_code if response_obj is not None else None
+                 if response_obj is not None and _needs_format_name_retry(response_obj):
+                     setattr(exc, "responses_no_fallback", True)
+                 if (
+                     status == 400
+diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
+index 66fa20261eb3e06fdf76a26a65a0c2dbd8ba0dd1..a073b3a5082c508679e00a7de574137e755b1201 100644
+--- a/tests/test_llm_client.py
++++ b/tests/test_llm_client.py
+@@ -406,77 +406,106 @@ def test_generate_falls_back_when_gpt5_unavailable(monkeypatch):
+             {
+                 "message": {
+                     "content": "fallback ok",
+                 }
              }
-         },
+         ]
      }
+     client = DummyClient(payloads=[fallback_payload], availability=[403])
+     with patch("llm_client.httpx.Client", return_value=client):
+         result = generate(
+             messages=[{"role": "user", "content": "ping"}],
+             model="gpt-5",
+             temperature=0.2,
+             max_tokens=42,
+         )
  
-     sanitized, _ = sanitize_payload_for_responses(payload)
-     format_block = sanitized["text"]["format"]
- 
-     assert "json_schema" not in format_block
--    assert format_block["schema"] == legacy_schema
-+    sanitized_schema = format_block["schema"]
-+    assert sanitized_schema is not legacy_schema
-+    assert sanitized_schema["additionalProperties"] is False
-+    assert sanitized_schema["properties"] == legacy_schema["properties"]
-+    assert legacy_schema.get("additionalProperties") is None
-     assert format_block["strict"] is True
+     assert result.model_used == "gpt-4o"
+     assert result.fallback_used == "gpt-4o"
+     assert result.retry_used is False
+     assert result.text == "fallback ok"
+     assert result.fallback_reason == "model_unavailable"
  
  
- def test_generate_retries_with_min_token_bump(monkeypatch):
-     error_payload = {
-         "__error__": "http",
-         "status": 400,
-         "payload": {
-             "error": {
-                 "message": "Invalid 'max_output_tokens': Expected a value >= 16",
-                 "type": "invalid_request_error",
-             }
-         },
-     }
-     success_payload = {
+ def test_generate_escalates_max_tokens_when_truncated():
+     initial_payload = {
++        "id": "resp-1",
+         "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
          "output": [
              {
                  "content": [
-                     {"type": "text", "text": "ok"},
+                     {"type": "text", "text": ""},
                  ]
              }
-         ]
+         ],
      }
-     dummy_client = DummyClient(payloads=[error_payload, success_payload])
+     final_payload = {
+         "status": "completed",
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "expanded"},
+                 ]
+             }
+         ],
+     }
+     client = DummyClient(payloads=[initial_payload, final_payload])
+     with patch("llm_client.httpx.Client", return_value=client):
+         result = generate(
+             messages=[{"role": "user", "content": "ping"}],
+             model="gpt-5",
+             temperature=0.1,
+         )
  
+     assert isinstance(result, GenerationResult)
+     assert result.text == "expanded"
+     assert result.retry_used is True
+     assert client.call_count == 2
+     first_tokens = client.requests[0]["json"]["max_output_tokens"]
+     second_tokens = client.requests[1]["json"]["max_output_tokens"]
+-    assert second_tokens >= first_tokens
+-    if G5_MAX_OUTPUT_TOKENS_MAX > 0:
+-        assert second_tokens <= G5_MAX_OUTPUT_TOKENS_MAX
++    cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
++    expected_second = max(first_tokens + 600, int(first_tokens * 1.5))
++    if cap is not None:
++        expected_second = min(expected_second, cap)
++    assert second_tokens == expected_second
++    assert client.requests[1]["json"].get("previous_response_id") == "resp-1"
++    assert client.requests[0]["json"].get("previous_response_id") is None
++
++
++def test_generate_raises_when_incomplete_at_cap(monkeypatch):
++    monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 1800)
++    initial_payload = {
++        "id": "resp-init",
++        "status": "incomplete",
++        "incomplete_details": {"reason": "max_output_tokens"},
++    }
++    second_payload = {
++        "id": "resp-second",
++        "status": "incomplete",
++        "incomplete_details": {"reason": "max_output_tokens"},
++    }
++    client = DummyClient(payloads=[initial_payload, second_payload])
++    with patch("llm_client.httpx.Client", return_value=client):
++        with pytest.raises(RuntimeError) as excinfo:
++            generate(
++                messages=[{"role": "user", "content": "ping"}],
++                model="gpt-5",
++                temperature=0.1,
++            )
++
++    assert "Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX=1800" in str(excinfo.value)
+ 
+ 
+ def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):
+     monkeypatch.setattr("llm_client.FORCE_MODEL", True)
+     client = DummyClient(payloads=[], availability=[403])
+     with patch("llm_client.httpx.Client", return_value=client):
+         with pytest.raises(RuntimeError) as excinfo:
+             generate(
+                 messages=[{"role": "user", "content": "ping"}],
+                 model="gpt-5",
+                 temperature=0.1,
+                 max_tokens=42,
+             )
+ 
+     assert "Model GPT-5 not available for this key/plan" in str(excinfo.value)
 

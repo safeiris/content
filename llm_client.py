@@ -1564,14 +1564,35 @@ def generate(
                         if isinstance(value, (int, float)):
                             usage_output_tokens = float(value)
                             break
+            response_id = ""
+            raw_response_id = payload.get("id")
+            if isinstance(raw_response_id, str):
+                response_id = raw_response_id.strip()
+            prev_response_id = ""
+            raw_prev = payload.get("previous_response_id")
+            if isinstance(raw_prev, str):
+                prev_response_id = raw_prev.strip()
+            metadata_block = payload.get("metadata")
+            if isinstance(metadata_block, dict):
+                if not prev_response_id:
+                    prev_candidate = metadata_block.get("previous_response_id")
+                    if isinstance(prev_candidate, str):
+                        prev_response_id = prev_candidate.strip()
+            finish_reason = ""
+            finish_block = payload.get("finish_reason")
+            if isinstance(finish_block, str):
+                finish_reason = finish_block.strip().lower()
             return {
                 "status": status,
                 "incomplete_reason": incomplete_reason,
                 "usage_output_tokens": usage_output_tokens,
+                "response_id": response_id,
+                "previous_response_id": prev_response_id,
+                "finish_reason": finish_reason,
             }
 
         attempts = 0
-        max_attempts = 3
+        max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)
         current_max = max_tokens_value
         last_error: Optional[BaseException] = None
         format_retry_done = False
@@ -1583,6 +1604,23 @@ def generate(
         shrink_next_attempt = False
         shrink_applied = False
         incomplete_retry_count = 0
+        token_escalations = 0
+        resume_from_response_id: Optional[str] = None
+
+        def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
+            candidate = current
+            if step_index == 0:
+                candidate = max(current + 600, int(current * 1.5))
+            elif step_index == 1:
+                candidate = max(current + 600, int(current * 1.35))
+            else:
+                if cap is not None:
+                    candidate = cap
+                else:
+                    candidate = current + 600
+            if cap is not None:
+                candidate = min(candidate, cap)
+            return int(candidate)
 
         def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
             poll_attempt = 0
@@ -1639,6 +1677,9 @@ def generate(
             attempts += 1
             current_payload = dict(sanitized_payload)
             current_payload["text"] = {"format": _clone_text_format()}
+            if resume_from_response_id:
+                current_payload["previous_response_id"] = resume_from_response_id
+                LOGGER.info("RESP_CONTINUE previous_response_id=%s", resume_from_response_id)
             if shrink_applied and shrunken_input:
                 current_payload["input"] = shrunken_input
             elif shrink_next_attempt:
@@ -1687,6 +1728,8 @@ def generate(
                 _store_responses_response_snapshot(data)
                 text, parse_flags, schema_label = _extract_responses_text(data)
                 metadata = _extract_metadata(data)
+                if isinstance(parse_flags, dict):
+                    parse_flags["metadata"] = metadata
                 status = metadata.get("status") or ""
                 reason = metadata.get("incomplete_reason") or ""
                 segments = int(parse_flags.get("segments", 0) or 0)
@@ -1701,15 +1744,62 @@ def generate(
                         data = polled_payload
                         text, parse_flags, schema_label = _extract_responses_text(data)
                         metadata = _extract_metadata(data)
+                        if isinstance(parse_flags, dict):
+                            parse_flags["metadata"] = metadata
                         status = metadata.get("status") or ""
                         reason = metadata.get("incomplete_reason") or ""
                         segments = int(parse_flags.get("segments", 0) or 0)
                         LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
-                if status == "incomplete" and reason == "max_output_tokens":
-                    LOGGER.info(
-                        "RESP_STATUS=incomplete|max_output_tokens=%s",
-                        current_payload.get("max_output_tokens"),
-                    )
+                if status == "incomplete":
+                    if reason == "max_output_tokens":
+                        LOGGER.info(
+                            "RESP_STATUS=incomplete|max_output_tokens=%s",
+                            current_payload.get("max_output_tokens"),
+                        )
+                        last_error = RuntimeError("responses_incomplete")
+                        response_id_value = metadata.get("response_id") or ""
+                        prev_field_present = "previous_response_id" in data or (
+                            isinstance(metadata.get("previous_response_id"), str)
+                            and metadata.get("previous_response_id")
+                        )
+                        if (
+                            response_id_value
+                            and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
+                        ):
+                            resume_from_response_id = str(response_id_value)
+                        if upper_cap is not None and int(current_max) >= upper_cap:
+                            message = (
+                                f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
+                                "Увеличь кап или упростите ТЗ/схему."
+                            )
+                            raise RuntimeError(message)
+                        if token_escalations >= RESPONSES_MAX_ESCALATIONS:
+                            break
+                        next_max = _compute_next_max_tokens(
+                            int(current_max), token_escalations, upper_cap
+                        )
+                        if next_max <= int(current_max):
+                            if upper_cap is not None and int(current_max) >= upper_cap:
+                                message = (
+                                    f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
+                                    "Увеличь кап или упростите ТЗ/схему."
+                                )
+                                raise RuntimeError(message)
+                            break
+                        cap_label = upper_cap if upper_cap is not None else "-"
+                        LOGGER.info(
+                            "RESP_ESCALATE_TOKENS reason=max_output_tokens from=%s to=%s cap=%s",
+                            current_payload.get("max_output_tokens"),
+                            next_max,
+                            cap_label,
+                        )
+                        token_escalations += 1
+                        current_max = next_max
+                        sanitized_payload["max_output_tokens"] = max(
+                            min_token_floor, int(current_max)
+                        )
+                        shrink_next_attempt = False
+                        continue
                     last_error = RuntimeError("responses_incomplete")
                     incomplete_retry_count += 1
                     if incomplete_retry_count >= 2:

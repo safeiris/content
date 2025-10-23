@@ -428,6 +428,7 @@ def test_generate_falls_back_when_gpt5_unavailable(monkeypatch):
 
 def test_generate_escalates_max_tokens_when_truncated():
     initial_payload = {
+        "id": "resp-1",
         "status": "incomplete",
         "incomplete_details": {"reason": "max_output_tokens"},
         "output": [
@@ -462,9 +463,37 @@ def test_generate_escalates_max_tokens_when_truncated():
     assert client.call_count == 2
     first_tokens = client.requests[0]["json"]["max_output_tokens"]
     second_tokens = client.requests[1]["json"]["max_output_tokens"]
-    assert second_tokens >= first_tokens
-    if G5_MAX_OUTPUT_TOKENS_MAX > 0:
-        assert second_tokens <= G5_MAX_OUTPUT_TOKENS_MAX
+    cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+    expected_second = max(first_tokens + 600, int(first_tokens * 1.5))
+    if cap is not None:
+        expected_second = min(expected_second, cap)
+    assert second_tokens == expected_second
+    assert client.requests[1]["json"].get("previous_response_id") == "resp-1"
+    assert client.requests[0]["json"].get("previous_response_id") is None
+
+
+def test_generate_raises_when_incomplete_at_cap(monkeypatch):
+    monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 1800)
+    initial_payload = {
+        "id": "resp-init",
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+    }
+    second_payload = {
+        "id": "resp-second",
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+    }
+    client = DummyClient(payloads=[initial_payload, second_payload])
+    with patch("llm_client.httpx.Client", return_value=client):
+        with pytest.raises(RuntimeError) as excinfo:
+            generate(
+                messages=[{"role": "user", "content": "ping"}],
+                model="gpt-5",
+                temperature=0.1,
+            )
+
+    assert "Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX=1800" in str(excinfo.value)
 
 
 def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):
