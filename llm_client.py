@@ -11,7 +11,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -100,6 +100,7 @@ DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
                         "a": {"type": "string"},
                     },
                     "required": ["q", "a"],
+                    "additionalProperties": False,
                 },
                 "minItems": 5,
                 "maxItems": 5,
@@ -111,6 +112,76 @@ DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
     },
     "strict": True,
 }
+
+
+class SchemaValidationError(ValueError):
+    """Raised when the provided schema cannot be normalized."""
+
+
+def _iter_schema_children(schema: Dict[str, Any], path: str) -> List[Tuple[str, Dict[str, Any]]]:
+    children: List[Tuple[str, Dict[str, Any]]] = []
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for key, value in properties.items():
+            if isinstance(value, dict):
+                child_path = f"{path}.{key}" if path != "$" else f"$.{key}"
+                children.append((child_path, value))
+    pattern_properties = schema.get("patternProperties")
+    if isinstance(pattern_properties, dict):
+        for key, value in pattern_properties.items():
+            if isinstance(value, dict):
+                child_path = f"{path}.patternProperties[{key!r}]"
+                children.append((child_path, value))
+    items = schema.get("items")
+    if isinstance(items, dict):
+        children.append((f"{path}['items']", items))
+    elif isinstance(items, list):
+        for index, value in enumerate(items):
+            if isinstance(value, dict):
+                children.append((f"{path}['items'][{index}]", value))
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        collection = schema.get(keyword)
+        if isinstance(collection, list):
+            for index, value in enumerate(collection):
+                if isinstance(value, dict):
+                    children.append((f"{path}.{keyword}[{index}]", value))
+    for keyword in ("$defs", "definitions"):
+        collection = schema.get(keyword)
+        if isinstance(collection, dict):
+            for key, value in collection.items():
+                if isinstance(value, dict):
+                    child_path = f"{path}.{keyword}[{key!r}]"
+                    children.append((child_path, value))
+    return children
+
+
+def _normalize_json_schema(schema: Dict[str, Any], *, path: str = "$") -> Tuple[int, List[str]]:
+    enforced = 0
+    errors: List[str] = []
+
+    def _walk(node: Dict[str, Any], current_path: str) -> None:
+        nonlocal enforced
+        node_type = node.get("type")
+        properties = node.get("properties") if isinstance(node.get("properties"), dict) else None
+        has_pattern_properties = bool(node.get("patternProperties"))
+        if node_type == "object" and properties is not None and not has_pattern_properties:
+            if "additionalProperties" not in node:
+                node["additionalProperties"] = False
+                enforced += 1
+        required = node.get("required")
+        if isinstance(required, list):
+            defined = set(properties.keys()) if isinstance(properties, dict) else set()
+            missing = [str(name) for name in required if name not in defined]
+            if missing:
+                missing_sorted = ", ".join(sorted(missing))
+                errors.append(
+                    f"{current_path}: required fields missing from properties: {missing_sorted}"
+                )
+        for child_path, child in _iter_schema_children(node, current_path):
+            _walk(child, child_path)
+
+    _walk(schema, path)
+    return enforced, errors
 
 MODEL_PROVIDER_MAP = {
     "gpt-5": "openai",
@@ -264,26 +335,28 @@ def _coerce_bool(value: object) -> Optional[bool]:
     return None
 
 
-def _sanitize_text_format_in_place(format_block: Dict[str, object]) -> Tuple[bool, bool]:
+def _sanitize_text_format_in_place(
+    format_block: Dict[str, object],
+    *,
+    context: str = "-",
+    log_on_migration: bool = True,
+) -> Tuple[bool, bool, int]:
     migrated = False
     if not isinstance(format_block, dict):
-        return False, False
+        return False, False, 0
 
     allowed_keys = {"type", "name", "schema", "strict"}
 
-    schema_value = format_block.get("schema")
-    if not isinstance(schema_value, dict):
+    if not isinstance(format_block.get("schema"), dict):
         if "schema" in format_block:
             format_block.pop("schema", None)
             migrated = True
-        schema_value = None
 
     legacy_block = format_block.pop("json_schema", None)
     if isinstance(legacy_block, dict):
         schema_candidate = legacy_block.get("schema")
         if isinstance(schema_candidate, dict):
             format_block["schema"] = deepcopy(schema_candidate)
-            schema_value = format_block["schema"]
         strict_candidate = legacy_block.get("strict")
         strict_value = _coerce_bool(strict_candidate)
         if strict_value is not None and "strict" not in format_block:
@@ -344,8 +417,41 @@ def _sanitize_text_format_in_place(format_block: Dict[str, object]) -> Tuple[boo
             format_block.pop(key, None)
             migrated = True
 
+    if "type" not in format_block and isinstance(format_block.get("schema"), dict):
+        format_block["type"] = "json_schema"
+        migrated = True
+
+    schema_dict = format_block.get("schema")
+    enforced_count = 0
+    if isinstance(schema_dict, dict):
+        enforced_count, errors = _normalize_json_schema(schema_dict)
+        if errors:
+            details = "; ".join(errors)
+            raise SchemaValidationError(
+                f"Invalid schema for text.format ({context}): {details}"
+            )
+
     has_schema = isinstance(format_block.get("schema"), dict)
-    return migrated, has_schema
+    fmt_type = str(format_block.get("type", "")).strip() or "-"
+    fmt_name = str(format_block.get("name", "")).strip() or "-"
+
+    if migrated and log_on_migration:
+        LOGGER.info(
+            "LOG:RESP_SCHEMA_MIGRATION_APPLIED context=%s type=%s name=%s",
+            context,
+            fmt_type,
+            fmt_name,
+        )
+    if enforced_count > 0:
+        LOGGER.info(
+            "LOG:RESP_SCHEMA_ADDITIONAL_PROPS_ENFORCED context=%s type=%s name=%s count=%d",
+            context,
+            fmt_type,
+            fmt_name,
+            enforced_count,
+        )
+
+    return migrated, has_schema, enforced_count
 
 
 def _prepare_text_format_for_request(
@@ -357,12 +463,16 @@ def _prepare_text_format_for_request(
     if not isinstance(template, dict):
         return {}, False, False
     working_copy: Dict[str, object] = deepcopy(template)
-    migrated, has_schema = _sanitize_text_format_in_place(working_copy)
-    if migrated and log_on_migration:
+    migrated, has_schema, enforced_count = _sanitize_text_format_in_place(
+        working_copy,
+        context=context,
+        log_on_migration=log_on_migration,
+    )
+    if not migrated and enforced_count <= 0 and log_on_migration:
         fmt_type = str(working_copy.get("type", "")).strip() or "-"
         fmt_name = str(working_copy.get("name", "")).strip() or "-"
-        LOGGER.info(
-            "LOG:RESP_FORMAT_MIGRATED context=%s type=%s name=%s has_schema=%s",
+        LOGGER.debug(
+            "LOG:RESP_SCHEMA_NORMALIZED context=%s type=%s name=%s has_schema=%s",
             context,
             fmt_type,
             fmt_name,
@@ -1305,7 +1415,11 @@ def generate(
                 format_template = deepcopy(format_candidate)
         if not isinstance(format_template, dict):
             format_template = {}
-        _sanitize_text_format_in_place(format_template)
+        _sanitize_text_format_in_place(
+            format_template,
+            context="template_normalize",
+            log_on_migration=False,
+        )
         fmt_template_type = str(format_template.get("type", "")).strip().lower()
         if fmt_template_type == "json_schema":
             current_name = str(format_template.get("name", "")).strip()
@@ -1327,7 +1441,11 @@ def generate(
             has_schema = False
             fixed = False
             if isinstance(format_block, dict):
-                _sanitize_text_format_in_place(format_block)
+                _sanitize_text_format_in_place(
+                    format_block,
+                    context="normalize_format_block",
+                    log_on_migration=False,
+                )
                 fmt_type = str(format_block.get("type", "")).strip() or "-"
                 has_schema = isinstance(format_block.get("schema"), dict)
                 current_name = str(format_block.get("name", "")).strip()
@@ -1374,6 +1492,12 @@ def generate(
             )
             max_tokens_value = upper_cap
         sanitized_payload["max_output_tokens"] = max_tokens_value
+        LOGGER.info(
+            "resolved max_output_tokens=%s (requested=%s, cap=%s)",
+            max_tokens_value,
+            raw_max_tokens if raw_max_tokens is not None else "-",
+            upper_cap if upper_cap is not None else "-",
+        )
 
         supports_temperature = _supports_temperature(target_model)
         if supports_temperature:

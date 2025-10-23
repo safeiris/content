@@ -135,7 +135,11 @@ def test_sanitize_payload_converts_legacy_json_schema():
     format_block = sanitized["text"]["format"]
 
     assert "json_schema" not in format_block
-    assert format_block["schema"] == legacy_schema
+    sanitized_schema = format_block["schema"]
+    assert sanitized_schema is not legacy_schema
+    assert sanitized_schema["additionalProperties"] is False
+    assert sanitized_schema["properties"] == legacy_schema["properties"]
+    assert legacy_schema.get("additionalProperties") is None
     assert format_block["strict"] is True
 
 

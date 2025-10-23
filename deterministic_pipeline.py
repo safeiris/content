@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from config import G5_MAX_OUTPUT_TOKENS_BASE, G5_MAX_OUTPUT_TOKENS_MAX
 from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
 from faq_builder import _normalize_entry
 from keyword_injector import (
@@ -290,8 +291,15 @@ class DeterministicPipeline:
         }
 
     def _resolve_skeleton_tokens(self) -> int:
-        baseline = 1200 if self.max_tokens <= 0 else min(self.max_tokens, 1200)
-        return max(800, min(1200, baseline))
+        if self.max_tokens and self.max_tokens > 0:
+            baseline = int(self.max_tokens)
+        else:
+            fallback = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
+            baseline = fallback
+        cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+        if cap is not None:
+            baseline = min(baseline, cap)
+        return max(800, baseline)
 
     def _skeleton_contract(self) -> Tuple[Dict[str, object], str]:
         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
@@ -583,7 +591,9 @@ class DeterministicPipeline:
         use_fallback = False
         result: Optional[GenerationResult] = None
         def _clamp_tokens(value: int) -> int:
-            return max(800, min(1200, value))
+            cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+            upper = cap if cap is not None else int(value)
+            return max(800, min(upper, int(value)))
 
         while attempt < 3 and markdown is None:
             attempt += 1
