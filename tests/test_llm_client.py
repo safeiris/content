@@ -324,15 +324,15 @@ def test_generate_logs_responses_error_and_artifacts():
     ) as mock_store_request, patch(
         "llm_client._store_responses_response_snapshot"
     ) as mock_store_response, patch("llm_client.LOGGER") as mock_logger:
-        result = generate(
-            messages=[{"role": "user", "content": "ping"}],
-            model="gpt-5",  # ensure Responses route
-            temperature=0.2,
-            max_tokens=42,
-        )
+        with pytest.raises(RuntimeError) as excinfo:
+            generate(
+                messages=[{"role": "user", "content": "ping"}],
+                model="gpt-5",  # ensure Responses route
+                temperature=0.2,
+                max_tokens=42,
+            )
 
-    assert result.model_used == "gpt-4o"
-    assert result.fallback_reason == "api_error_gpt5_responses"
+    assert "HTTP 400" in str(excinfo.value)
     mock_store_request.assert_called()
     mock_store_response.assert_called()
     logged_errors = [call for call in mock_logger.error.call_args_list if "Responses API error" in call[0][0]]

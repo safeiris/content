@@ -23,6 +23,7 @@ from keyword_injector import (
 )
 from length_trimmer import TrimResult, TrimValidationError, trim_text
 from prompt_templates import load_template
+from skeleton_utils import normalize_skeleton_payload
 from validators import (
     ValidationError,
     ValidationResult,
@@ -619,6 +620,7 @@ class DeterministicPipeline:
                 continue
             try:
                 payload = json.loads(raw_text)
+                payload = normalize_skeleton_payload(payload)
                 LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
             except json.JSONDecodeError as exc:
                 LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, exc)

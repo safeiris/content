@@ -8,7 +8,11 @@ import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from llm_client import build_responses_payload, generate
+from llm_client import (
+    RESPONSES_FORMAT_DEFAULT_NAME,
+    build_responses_payload,
+    generate,
+)
 
 
 class DummyResponse:
@@ -139,3 +143,48 @@ def test_generate_retries_with_min_token_bump(monkeypatch):
     assert first_request["max_output_tokens"] == 8
     assert second_request["max_output_tokens"] >= 24
     mock_logger.warning.assert_any_call("LOG:RESP_RETRY_REASON=max_tokens_min_bump")
+
+
+def test_generate_retries_on_missing_format_name(monkeypatch):
+    error_payload = {
+        "__error__": "http",
+        "status": 400,
+        "payload": {
+            "error": {
+                "message": "Missing required field text.format.name",
+                "type": "invalid_request_error",
+            }
+        },
+    }
+    success_payload = {
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "ok"},
+                ]
+            }
+        ]
+    }
+    dummy_client = DummyClient(payloads=[error_payload, success_payload])
+
+    with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
+        "llm_client.LOGGER"
+    ) as mock_logger:
+        result = generate(
+            messages=[{"role": "user", "content": "ping"}],
+            model="gpt-5", 
+            temperature=0.0,
+            max_tokens=64,
+        )
+
+    assert result.text == "ok"
+    assert dummy_client.call_count == 2
+    first_format = dummy_client.requests[0]["json"]["text"]["format"]
+    second_format = dummy_client.requests[1]["json"]["text"]["format"]
+    assert first_format["name"] == RESPONSES_FORMAT_DEFAULT_NAME
+    assert second_format["name"] == RESPONSES_FORMAT_DEFAULT_NAME
+    assert "name" not in first_format.get("json_schema", {})
+    mock_logger.warning.assert_any_call(
+        "RESP_RETRY_REASON=format_name_missing route=responses attempt=%d",
+        1,
+    )

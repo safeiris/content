@@ -75,10 +75,13 @@ def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
         return False
     return "expected" in normalized and ">=" in normalized and "16" in normalized
 
+RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
+
+
 DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
     "type": "json_schema",
+    "name": RESPONSES_FORMAT_DEFAULT_NAME,
     "json_schema": {
-        "name": "seo_article_skeleton",
         "schema": {
             "type": "object",
             "properties": {
@@ -255,6 +258,9 @@ def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, ob
     fmt_type = format_block.get("type")
     if isinstance(fmt_type, str) and fmt_type.strip():
         sanitized_format["type"] = fmt_type.strip()
+    name_value = format_block.get("name")
+    if isinstance(name_value, str) and name_value.strip():
+        sanitized_format["name"] = name_value.strip()
     json_schema_value = format_block.get("json_schema")
     if isinstance(json_schema_value, dict):
         sanitized_format["json_schema"] = json_schema_value
@@ -840,8 +846,16 @@ def _is_responses_fallback_allowed(exc: BaseException) -> bool:
         if isinstance(current, httpx.HTTPStatusError):
             response = current.response
             status = response.status_code if response is not None else None
-            if status and (status >= 500 or status in {408, 409, 425, 429, 400}):
+            if getattr(current, "responses_no_fallback", False):
+                return False
+            if status and status >= 500:
                 return True
+            if status in {408, 409, 425, 429}:
+                return True
+            if status == 400 and response is not None:
+                message = _extract_error_message(response).lower()
+                if "text.format" in message or "max_output_tokens" in message:
+                    return False
         current = getattr(current, "__cause__", None)
     return False
 
@@ -885,18 +899,7 @@ def _raise_for_last_error(last_error: BaseException) -> None:
 
 
 def _extract_unknown_parameter_name(response: httpx.Response) -> Optional[str]:
-    message: str = ""
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = None
-    if isinstance(payload, dict):
-        error_block = payload.get("error")
-        if isinstance(error_block, dict):
-            message = str(error_block.get("message", ""))
-    if not message:
-        message = response.text or ""
-    message = message.strip()
+    message = _extract_error_message(response)
     if not message:
         return None
     lowered = message.lower()
@@ -912,7 +915,7 @@ def _extract_unknown_parameter_name(response: httpx.Response) -> Optional[str]:
     return remainder.split()[0].strip("'\"") or None
 
 
-def _has_text_format_migration_hint(response: httpx.Response) -> bool:
+def _extract_error_message(response: httpx.Response) -> str:
     message: str = ""
     try:
         payload = response.json()
@@ -924,10 +927,31 @@ def _has_text_format_migration_hint(response: httpx.Response) -> bool:
             message = str(error_block.get("message", ""))
     if not message:
         message = response.text or ""
-    message = message.strip()
+    return (message or "").strip()
+
+
+def _has_text_format_migration_hint(response: httpx.Response) -> bool:
+    message: str = ""
+    message = _extract_error_message(response)
     if not message:
         return False
     return "moved to 'text.format'" in message.lower()
+
+
+def _needs_format_name_retry(response: httpx.Response) -> bool:
+    message = _extract_error_message(response)
+    if not message:
+        return False
+    lowered = message.lower()
+    if "text.format.name" in lowered:
+        return True
+    if "text.format" in lowered and "missing" in lowered and "name" in lowered:
+        return True
+    if "unsupported parameter" in lowered and "text.format" in lowered:
+        return True
+    if "moved to text.format" in lowered and "name" in lowered:
+        return True
+    return False
 
 
 def _make_request(
@@ -1128,7 +1152,14 @@ def generate(
         )
         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
 
-        format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
+        raw_format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
+        if isinstance(raw_format_template, dict):
+            format_template = deepcopy(raw_format_template)
+        else:
+            format_template = deepcopy(DEFAULT_RESPONSES_TEXT_FORMAT)
+        fmt_template_type = str(format_template.get("type", "")).strip().lower()
+        if fmt_template_type == "json_schema":
+            format_template["name"] = RESPONSES_FORMAT_DEFAULT_NAME
 
         def _clone_text_format() -> Dict[str, object]:
             return deepcopy(format_template)
@@ -1136,6 +1167,47 @@ def generate(
         def _apply_text_format(target: Dict[str, object]) -> None:
             target.pop("response_format", None)
             target["text"] = {"format": _clone_text_format()}
+
+        def _normalize_format_block(
+            format_block: Optional[Dict[str, object]]
+        ) -> Tuple[str, str, bool, bool]:
+            fmt_type = "-"
+            fmt_name = "-"
+            has_schema = False
+            fixed = False
+            if isinstance(format_block, dict):
+                fmt_type = str(format_block.get("type", "")).strip() or "-"
+                has_schema = isinstance(format_block.get("json_schema"), dict)
+                if fmt_type.lower() == "json_schema":
+                    current_name = str(format_block.get("name", "")).strip()
+                    desired = RESPONSES_FORMAT_DEFAULT_NAME
+                    if current_name != desired:
+                        format_block["name"] = desired
+                        current_name = desired
+                        fixed = True
+                    schema_block = format_block.get("json_schema")
+                    if isinstance(schema_block, dict) and "name" in schema_block:
+                        schema_block.pop("name", None)
+                    fmt_name = current_name or desired
+                else:
+                    current_name = str(format_block.get("name", "")).strip()
+                    if current_name:
+                        fmt_name = current_name
+            return fmt_type, fmt_name, has_schema, fixed
+
+        def _ensure_format_name(
+            target: Dict[str, object]
+        ) -> Tuple[Optional[Dict[str, object]], str, str, bool, bool]:
+            text_block = target.get("text")
+            if not isinstance(text_block, dict):
+                text_block = {}
+                target["text"] = text_block
+            format_block = text_block.get("format")
+            if not isinstance(format_block, dict):
+                format_block = _clone_text_format()
+                text_block["format"] = format_block
+            fmt_type, fmt_name, has_schema, fixed = _normalize_format_block(format_block)
+            return format_block, fmt_type, fmt_name, has_schema, fixed
 
         _apply_text_format(sanitized_payload)
 
@@ -1219,6 +1291,7 @@ def generate(
         current_max = max_tokens_value
         last_error: Optional[BaseException] = None
         format_retry_done = False
+        format_name_retry_done = False
         min_tokens_bump_done = False
         min_token_floor = 1
         base_input_text = str(sanitized_payload.get("input", ""))
@@ -1297,6 +1370,23 @@ def generate(
             current_payload["max_output_tokens"] = max(min_token_floor, int(current_max))
             if attempts > 1:
                 retry_used = True
+            format_block, fmt_type, fmt_name, has_schema, fixed_name = _ensure_format_name(current_payload)
+            suffix = " (fixed=name)" if fixed_name else ""
+            LOGGER.info(
+                "LOG:RESP_PAYLOAD_FORMAT type=%s name=%s has_schema=%s%s",
+                fmt_type,
+                fmt_name or "-",
+                has_schema,
+                suffix,
+            )
+            if isinstance(format_block, dict):
+                try:
+                    format_snapshot = json.dumps(format_block, ensure_ascii=False, sort_keys=True)
+                except (TypeError, ValueError):
+                    format_snapshot = str(format_block)
+                LOGGER.debug("DEBUG:payload.text.format = %s", format_snapshot)
+            else:
+                LOGGER.debug("DEBUG:payload.text.format = null")
             _log_payload(current_payload)
             try:
                 _store_responses_request_snapshot(current_payload)
@@ -1357,6 +1447,8 @@ def generate(
             except httpx.HTTPStatusError as exc:
                 response_obj = exc.response
                 status = response_obj.status_code if response_obj is not None else None
+                if response_obj is not None and _needs_format_name_retry(response_obj):
+                    setattr(exc, "responses_no_fallback", True)
                 if (
                     status == 400
                     and not format_retry_done
@@ -1368,6 +1460,21 @@ def generate(
                     LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
                     _apply_text_format(sanitized_payload)
                     continue
+                if (
+                    status == 400
+                    and response_obj is not None
+                    and _needs_format_name_retry(response_obj)
+                ):
+                    if not format_name_retry_done:
+                        format_name_retry_done = True
+                        retry_used = True
+                        LOGGER.warning(
+                            "RESP_RETRY_REASON=format_name_missing route=responses attempt=%d",
+                            attempts,
+                        )
+                        _apply_text_format(sanitized_payload)
+                        _ensure_format_name(sanitized_payload)
+                        continue
                 if (
                     status == 400
                     and not min_tokens_bump_done

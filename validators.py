@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from skeleton_utils import normalize_skeleton_payload
+
 from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
 from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
 
@@ -126,13 +128,36 @@ def _skeleton_status(
         return False, "Данные скелета не получены или имеют неверный формат."
 
     intro = str(skeleton_payload.get("intro") or "").strip()
-    outro = str(skeleton_payload.get("outro") or "").strip()
     main = skeleton_payload.get("main")
-    if not intro or not outro or not isinstance(main, list) or not main:
-        return False, "Скелет не содержит обязательных полей intro/main/outro."
+    faq = skeleton_payload.get("faq")
+    conclusion = str(skeleton_payload.get("conclusion") or "").strip()
+
+    missing: List[str] = []
+    if not intro:
+        missing.append("intro")
+    if not isinstance(main, list) or not main:
+        missing.append("main[]")
+    if not isinstance(faq, list) or not faq:
+        missing.append("faq[]")
+    if not conclusion:
+        missing.append("conclusion")
+    if missing:
+        return (
+            False,
+            "Отсутствуют обязательные поля после нормализации: " + ", ".join(missing),
+        )
+
     for idx, item in enumerate(main):
         if not isinstance(item, str) or not item.strip():
             return False, f"Блок основной части №{idx + 1} пуст."
+
+    for idx, entry in enumerate(faq, start=1):
+        if not isinstance(entry, dict):
+            return False, f"FAQ элемент №{idx} имеет неверный формат."
+        question = str(entry.get("q") or entry.get("question") or "").strip()
+        answer = str(entry.get("a") or entry.get("answer") or "").strip()
+        if not question or not answer:
+            return False, f"FAQ элемент №{idx} пуст."
 
     outline = skeleton_payload.get("outline")
     if outline and isinstance(outline, list):
@@ -158,7 +183,12 @@ def validate_article(
     keyword_coverage_percent: Optional[float] = None,
 ) -> ValidationResult:
     length = _length_no_spaces(text)
-    skeleton_ok, skeleton_message = _skeleton_status(skeleton_payload, text)
+    normalized_skeleton = (
+        normalize_skeleton_payload(skeleton_payload)
+        if skeleton_payload is not None
+        else None
+    )
+    skeleton_ok, skeleton_message = _skeleton_status(normalized_skeleton, text)
 
     normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
     missing: List[str] = []
