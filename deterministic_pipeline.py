@@ -559,8 +559,13 @@ class DeterministicPipeline:
         self.locked_terms = list(result.locked_terms)
         total = result.total_terms
         found = result.found_terms
+        missing = sorted(result.missing_terms)
+        LOGGER.info(
+            "KEYWORDS_COVERAGE=%s missing=%s",
+            result.coverage_report,
+            ",".join(missing) if missing else "-",
+        )
         if total and found < total:
-            missing = sorted(term for term, ok in result.coverage.items() if not ok)
             raise PipelineStepError(
                 PipelineStep.KEYWORDS,
                 "Не удалось обеспечить 100% покрытие ключей: " + ", ".join(missing),
@@ -568,7 +573,8 @@ class DeterministicPipeline:
         self._update_log(
             PipelineStep.KEYWORDS,
             "ok",
-            coverage_summary=f"{found}/{total}",
+            KEYWORDS_COVERAGE=result.coverage_report,
+            KEYWORDS_MISSING=missing,
             inserted_section=result.inserted_section,
             **self._metrics(result.text),
         )
@@ -578,20 +584,51 @@ class DeterministicPipeline:
     def _run_faq(self, text: str) -> str:
         self._log(PipelineStep.FAQ, "running")
         messages = self._build_faq_messages(text)
-        result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=700)
-        entries = self._parse_faq_entries(result.text)
-        faq_block = self._render_faq_markdown(entries)
-        merged_text = self._merge_faq(text, faq_block)
-        self.jsonld = self._build_jsonld(entries)
-        self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
-        self._update_log(
-            PipelineStep.FAQ,
-            "ok",
-            entries=[entry["question"] for entry in entries],
-            **self._metrics(merged_text),
-        )
-        self.checkpoints[PipelineStep.FAQ] = merged_text
-        return merged_text
+        faq_tokens = 700
+        attempt = 0
+        last_error: Optional[Exception] = None
+        while attempt < 3:
+            attempt += 1
+            try:
+                result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=faq_tokens)
+            except PipelineStepError:
+                raise
+            metadata = result.metadata or {}
+            status = str(metadata.get("status") or "").lower()
+            if status == "incomplete" or metadata.get("incomplete_reason"):
+                LOGGER.warning(
+                    "FAQ_RETRY_incomplete attempt=%d status=%s reason=%s",
+                    attempt,
+                    status or "incomplete",
+                    metadata.get("incomplete_reason") or "",
+                )
+                faq_tokens = max(300, int(faq_tokens * 0.9))
+                last_error = PipelineStepError(PipelineStep.FAQ, "Модель не завершила формирование FAQ.")
+                continue
+            try:
+                entries = self._parse_faq_entries(result.text)
+            except PipelineStepError as exc:
+                last_error = exc
+                LOGGER.warning("FAQ_RETRY_parse_error attempt=%d error=%s", attempt, exc)
+                faq_tokens = max(300, int(faq_tokens * 0.9))
+                continue
+            faq_block = self._render_faq_markdown(entries)
+            merged_text = self._merge_faq(text, faq_block)
+            self.jsonld = self._build_jsonld(entries)
+            self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
+            LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in entries))
+            self._update_log(
+                PipelineStep.FAQ,
+                "ok",
+                entries=[entry["question"] for entry in entries],
+                **self._metrics(merged_text),
+            )
+            self.checkpoints[PipelineStep.FAQ] = merged_text
+            return merged_text
+
+        if last_error:
+            raise last_error
+        raise PipelineStepError(PipelineStep.FAQ, "Не удалось сформировать блок FAQ после нескольких попыток.")
 
     def _run_trim(self, text: str) -> TrimResult:
         self._log(PipelineStep.TRIM, "running")
@@ -630,6 +667,11 @@ class DeterministicPipeline:
                 PipelineStep.TRIM,
                 "FAQ должен содержать ровно 5 вопросов после тримминга.",
             )
+        LOGGER.info(
+            "TRIM_OK chars_no_spaces=%d removed_paragraphs=%d",
+            current_length,
+            len(result.removed_paragraphs),
+        )
         self._update_log(
             PipelineStep.TRIM,
             "ok",

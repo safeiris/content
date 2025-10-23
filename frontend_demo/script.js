@@ -1085,11 +1085,12 @@ async function handleGenerate(event) {
     setButtonLoading(generateBtn, true);
     showProgress(true, "Генерируем материалы…");
     renderUsedKeywords(null);
+    const requestModel = payload.model || null;
     const requestBody = {
       theme: payload.theme,
       data: payload.data,
       k: payload.k,
-      model: payload.model,
+      model: requestModel,
       temperature: payload.temperature,
       max_tokens: payload.maxTokens,
       context_source: payload.context_source,
@@ -1110,6 +1111,16 @@ async function handleGenerate(event) {
     });
     const markdown = response?.markdown ?? "";
     const meta = (response?.meta_json && typeof response.meta_json === "object") ? response.meta_json : {};
+    const responseStatus = typeof response?.status === "string" ? response.status.trim().toLowerCase() : "";
+    const metaStatus = typeof meta?.status === "string" ? meta.status.trim().toLowerCase() : "";
+    if (["failed", "error"].includes(responseStatus) || ["failed", "error"].includes(metaStatus)) {
+      const backendError = typeof response?.error === "string" && response.error.trim()
+        ? response.error.trim()
+        : typeof meta?.error === "string" && meta.error.trim()
+          ? meta.error.trim()
+          : "Генерация завершилась с ошибкой.";
+      throw new Error(backendError);
+    }
     const artifactPaths = response?.artifact_paths;
     const metadataCharacters = typeof meta.characters === "number" ? meta.characters : undefined;
     const characters = typeof metadataCharacters === "number" ? metadataCharacters : markdown.trim().length;

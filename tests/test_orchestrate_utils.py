@@ -13,19 +13,36 @@ from orchestrate import generate_article_from_payload, gather_health_status
 from validators import ValidationError, strip_jsonld, validate_article
 
 
-def test_keyword_injection_adds_terms_section():
+def test_keyword_injection_protects_terms_and_locks_all_occurrences():
     base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
     result = inject_keywords(base_text, ["ключевая фраза", "дополнительный термин"])
-    assert "### Разбираемся в терминах" in result.text
-    assert LOCK_START_TEMPLATE.format(term="ключевая фраза") in result.text
-    assert result.coverage["дополнительный термин"]
+    assert result.coverage_report == "2/2"
+    assert result.missing_terms == []
     main_section = result.text.split("## FAQ", 1)[0]
-    expected_phrase = (
+    first_phrase = (
         "Дополнительно рассматривается "
         + f"{LOCK_START_TEMPLATE.format(term='ключевая фраза')}ключевая фраза<!--LOCK_END-->"
         + " через прикладные сценарии."
     )
-    assert expected_phrase in main_section
+    second_phrase = (
+        "Дополнительно рассматривается "
+        + f"{LOCK_START_TEMPLATE.format(term='дополнительный термин')}дополнительный термин<!--LOCK_END-->"
+        + " через прикладные сценарии."
+    )
+    assert first_phrase in main_section
+    assert second_phrase in main_section
+    assert "### Разбираемся в терминах" not in result.text
+    assert not result.inserted_section
+
+
+def test_keyword_injection_adds_terms_inset_when_needed():
+    base_text = "# Заголовок\n\nВступление.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
+    result = inject_keywords(base_text, ["редкий термин"])
+    assert result.inserted_section is True
+    assert "### Разбираемся в терминах" in result.text
+    lock_token = LOCK_START_TEMPLATE.format(term="редкий термин")
+    assert lock_token in result.text
+    assert result.coverage_report == "1/1"
 
 
 def test_faq_builder_produces_jsonld_block():
@@ -74,7 +91,7 @@ def test_validator_length_ignores_jsonld():
         "mainEntity": [
             {
                 "@type": "Question",
-                "name": f"Вопрос {idx}",
+                "name": f"Вопрос {idx}?",
                 "acceptedAnswer": {"@type": "Answer", "text": f"Ответ {idx}"},
             }
             for idx in range(1, 6)
@@ -82,20 +99,20 @@ def test_validator_length_ignores_jsonld():
     }
     faq_block = "\n".join(
         [
-            "**Вопрос 1.** Что?",
-            "**Ответ.** Ответ.",
+            "**Вопрос 1.** Вопрос 1?",
+            "**Ответ.** Ответ 1",
             "",
-            "**Вопрос 2.** Что?",
-            "**Ответ.** Ответ.",
+            "**Вопрос 2.** Вопрос 2?",
+            "**Ответ.** Ответ 2",
             "",
-            "**Вопрос 3.** Что?",
-            "**Ответ.** Ответ.",
+            "**Вопрос 3.** Вопрос 3?",
+            "**Ответ.** Ответ 3",
             "",
-            "**Вопрос 4.** Что?",
-            "**Ответ.** Ответ.",
+            "**Вопрос 4.** Вопрос 4?",
+            "**Ответ.** Ответ 4",
             "",
-            "**Вопрос 5.** Что?",
-            "**Ответ.** Ответ.",
+            "**Вопрос 5.** Вопрос 5?",
+            "**Ответ.** Ответ 5",
             "",
         ]
     )

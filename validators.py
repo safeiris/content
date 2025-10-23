@@ -5,11 +5,15 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from keyword_injector import LOCK_START_TEMPLATE
+from keyword_injector import LOCK_END, LOCK_START_TEMPLATE, build_term_pattern
 
 _FAQ_START = "<!--FAQ_START-->"
 _FAQ_END = "<!--FAQ_END-->"
 _JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">(.*?)</script>", re.DOTALL)
+_FAQ_ENTRY_PATTERN = re.compile(
+    r"\*\*Вопрос\s+(?P<index>\d+)\.\*\*\s*(?P<question>.+?)\s*\n\*\*Ответ\.\*\*\s*(?P<answer>.*?)(?=\n\*\*Вопрос\s+\d+\.\*\*|\Z)",
+    re.DOTALL,
+)
 
 
 class ValidationError(RuntimeError):
@@ -54,34 +58,59 @@ def _faq_pairs(text: str) -> List[str]:
     return re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block)
 
 
-def _jsonld_valid(text: str) -> bool:
+def _parse_markdown_faq(text: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    if _FAQ_START not in text or _FAQ_END not in text:
+        return [], "Блок FAQ в markdown отсутствует."
+
+    block = text.split(_FAQ_START, 1)[1].split(_FAQ_END, 1)[0]
+    entries: List[Dict[str, str]] = []
+    for match in _FAQ_ENTRY_PATTERN.finditer(block.strip()):
+        question = match.group("question").strip()
+        answer = match.group("answer").strip()
+        index = int(match.group("index"))
+        if not question or not answer:
+            return entries, "FAQ содержит пустой вопрос или ответ."
+        paragraphs = [segment.strip() for segment in re.split(r"\n\s*\n", answer) if segment.strip()]
+        if not 1 <= len(paragraphs) <= 3:
+            return entries, f"Ответ на вопрос '{question}' должен состоять из 1–3 абзацев."
+        entries.append({"index": index, "question": question, "answer": answer})
+
+    if len(entries) != 5:
+        return entries, "FAQ должен содержать ровно 5 вопросов и ответов."
+
+    indices = [entry["index"] for entry in entries]
+    if indices != list(range(1, len(entries) + 1)):
+        return entries, "Нумерация вопросов в FAQ должна идти последовательно от 1 до 5."
+
+    return entries, None
+
+
+def _parse_jsonld_entries(text: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
     match = _JSONLD_PATTERN.search(text)
     if not match:
-        return False
+        return [], "JSON-LD FAQ недействителен или отсутствует."
     try:
         payload = json.loads(match.group(1))
     except json.JSONDecodeError:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("@type") != "FAQPage":
-        return False
+        return [], "JSON-LD FAQ недействителен или отсутствует."
+    if not isinstance(payload, dict) or payload.get("@type") != "FAQPage":
+        return [], "JSON-LD FAQ недействителен или отсутствует."
     entities = payload.get("mainEntity")
     if not isinstance(entities, list) or len(entities) != 5:
-        return False
-    for entry in entities:
-        if not isinstance(entry, dict):
-            return False
-        if entry.get("@type") != "Question":
-            return False
+        return [], "JSON-LD FAQ должен содержать ровно 5 вопросов и ответов."
+    parsed: List[Dict[str, str]] = []
+    for idx, entry in enumerate(entities, start=1):
+        if not isinstance(entry, dict) or entry.get("@type") != "Question":
+            return [], f"JSON-LD вопрос №{idx} имеет неверный формат."
         answer = entry.get("acceptedAnswer")
         if not isinstance(answer, dict) or answer.get("@type") != "Answer":
-            return False
-        if not str(entry.get("name", "")).strip():
-            return False
-        if not str(answer.get("text", "")).strip():
-            return False
-    return True
+            return [], f"JSON-LD ответ для вопроса №{idx} имеет неверный формат."
+        question = str(entry.get("name", "")).strip()
+        answer_text = str(answer.get("text", "")).strip()
+        if not question or not answer_text:
+            return [], f"JSON-LD вопрос №{idx} содержит пустые данные."
+        parsed.append({"index": idx, "question": question, "answer": answer_text})
+    return parsed, None
 
 
 def _skeleton_status(
@@ -131,16 +160,45 @@ def validate_article(
 
     normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
     missing: List[str] = []
+    article = strip_jsonld(text)
     for term in normalized_keywords:
+        pattern = build_term_pattern(term)
+        if not pattern.search(article):
+            missing.append(term)
+            continue
         lock_token = LOCK_START_TEMPLATE.format(term=term)
-        if lock_token not in text:
+        lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
+        if not lock_pattern.search(text):
             missing.append(term)
     keywords_ok = len(missing) == 0
 
-    faq_pairs = _faq_pairs(text)
-    faq_count = len(faq_pairs)
-    jsonld_ok = _jsonld_valid(text)
-    faq_ok = faq_count == 5 and jsonld_ok
+    markdown_faq, markdown_error = _parse_markdown_faq(text)
+    faq_count = len(markdown_faq)
+    jsonld_entries, jsonld_error = _parse_jsonld_entries(text)
+    jsonld_ok = jsonld_error is None
+
+    faq_ok = False
+    faq_error: Optional[str] = None
+    mismatched_questions: List[str] = []
+    if markdown_error:
+        faq_error = markdown_error
+    elif jsonld_error:
+        faq_error = jsonld_error
+    else:
+        faq_ok = True
+        for idx, entry in enumerate(markdown_faq):
+            jsonld_entry = jsonld_entries[idx]
+            if entry["question"] != jsonld_entry["question"] or entry["answer"] != jsonld_entry["answer"]:
+                faq_ok = False
+                mismatched_questions.append(entry["question"])
+        if mismatched_questions:
+            faq_error = (
+                "FAQ в markdown не совпадает с JSON-LD (например, вопрос '"
+                + mismatched_questions[0]
+                + "')."
+            )
+    if not faq_ok and faq_error is None:
+        faq_error = "FAQ должен содержать ровно 5 вопросов и ответов."
 
     length_ok = min_chars <= length <= max_chars
 
@@ -149,7 +207,10 @@ def validate_article(
         "keywords_total": len(normalized_keywords),
         "keywords_missing": missing,
         "keywords_found": len(normalized_keywords) - len(missing),
+        "keywords_coverage": f"{len(normalized_keywords) - len(missing)}/{len(normalized_keywords) if normalized_keywords else 0}",
         "faq_count": faq_count,
+        "faq_jsonld_count": len(jsonld_entries),
+        "faq_mismatched_questions": mismatched_questions,
         "jsonld_ok": jsonld_ok,
     }
 
@@ -171,9 +232,7 @@ def validate_article(
             details={"missing": missing, **stats},
         )
     if not faq_ok:
-        message = "FAQ должен содержать 5 вопросов и корректный JSON-LD."
-        if not jsonld_ok:
-            message = "JSON-LD FAQ недействителен или отсутствует."
+        message = faq_error or "FAQ должен содержать 5 вопросов и корректный JSON-LD."
         raise ValidationError("faq", message, details=stats)
     if not length_ok:
         raise ValidationError(

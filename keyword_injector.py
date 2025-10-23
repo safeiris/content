@@ -25,6 +25,8 @@ class KeywordInjectionResult:
     inserted_section: bool = False
     total_terms: int = 0
     found_terms: int = 0
+    missing_terms: List[str] = field(default_factory=list)
+    coverage_report: str = "0/0"
 
 
 def _normalize_keywords(keywords: Iterable[str]) -> List[str]:
@@ -46,42 +48,62 @@ def _contains_term(text: str, term: str) -> bool:
     return bool(pattern.search(text))
 
 
+def _existing_lock_spans(text: str, term: str) -> List[Tuple[int, int]]:
+    lock_start = re.escape(LOCK_START_TEMPLATE.format(term=term))
+    block_pattern = re.compile(rf"{lock_start}(.*?){re.escape(LOCK_END)}", re.DOTALL)
+    return [(match.start(), match.end()) for match in block_pattern.finditer(text)]
+
+
 def _ensure_lock(text: str, term: str) -> str:
+    pattern = build_term_pattern(term)
     lock_start = LOCK_START_TEMPLATE.format(term=term)
-    if lock_start in text:
+    locked_spans = _existing_lock_spans(text, term)
+    if not pattern.search(text):
         return text
 
-    pattern = build_term_pattern(term)
+    result: List[str] = []
+    cursor = 0
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        if any(span_start <= start < span_end for span_start, span_end in locked_spans):
+            continue
+        result.append(text[cursor:start])
+        result.append(f"{lock_start}{match.group(0)}{LOCK_END}")
+        cursor = end
+    result.append(text[cursor:])
+    updated = "".join(result)
+    return updated
 
-    def _replacement(match: re.Match[str]) -> str:
-        return f"{lock_start}{match.group(0)}{LOCK_END}"
 
-    updated, count = pattern.subn(_replacement, text, count=1)
-    if count:
-        return updated
-    return text
-
-
-def _build_terms_section(terms: Sequence[str]) -> str:
+def _build_terms_inset(terms: Sequence[str]) -> str:
+    items = ", ".join(terms)
     lines = [_TERMS_SECTION_HEADING, ""]
-    for term in terms:
-        lines.append(
-            f"{term} — ключевой термин, который раскрывается в материале на практических примерах."
-        )
+    lines.append(
+        "Разбираемся в терминах: фиксируем ключевые формулировки, которые должны остаться неизменными."
+    )
+    lines.append(
+        f"В материале используем {items} в исходном написании, чтобы автоматические проверки проходили без расхождений."
+    )
+    lines.append("Просим не редактировать эти формулировки при дальнейшей работе с текстом.")
     lines.append("")
     return "\n".join(lines)
 
 
-def _insert_terms_section(text: str, terms: Sequence[str]) -> str:
-    section = _build_terms_section(terms)
-    if _TERMS_SECTION_HEADING in text:
-        return text
-
+def _insert_terms_inset(text: str, terms: Sequence[str]) -> Tuple[str, bool]:
+    if not terms:
+        return text, False
+    inset = _build_terms_inset(terms)
+    bounds = _find_main_section_bounds(text)
+    if bounds:
+        start, end = bounds
+        section = text[start:end].rstrip()
+        updated_section = f"{section}\n\n{inset}" if section else inset
+        return f"{text[:start]}{updated_section}\n{text[end:]}" if updated_section else text, True
     faq_anchor = "\n## FAQ"
     anchor_idx = text.find(faq_anchor)
     if anchor_idx == -1:
-        return f"{text.rstrip()}\n\n{section}\n"
-    return f"{text[:anchor_idx].rstrip()}\n\n{section}\n\n{text[anchor_idx:]}"
+        return f"{text.rstrip()}\n\n{inset}\n", True
+    return f"{text[:anchor_idx].rstrip()}\n\n{inset}\n\n{text[anchor_idx:]}", True
 
 
 def _find_main_section_bounds(text: str) -> Optional[Tuple[int, int]]:
@@ -128,7 +150,7 @@ def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResul
 
     coverage: Dict[str, bool] = {}
     working = text
-    missing_for_section: List[str] = []
+    missing_terms: List[str] = []
 
     for term in normalized:
         if not term:
@@ -136,35 +158,38 @@ def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResul
 
         if _contains_term(working, term):
             working = _ensure_lock(working, term)
-            coverage[term] = True
             continue
 
-        inserted = False
         working, inserted = _insert_term_into_main_section(working, term)
         if inserted and _contains_term(working, term):
             working = _ensure_lock(working, term)
-            coverage[term] = True
-        else:
-            coverage[term] = False
+            continue
 
-        missing_for_section.append(term)
+        missing_terms.append(term)
 
     inserted_section = False
-    if missing_for_section:
-        updated = _insert_terms_section(working, missing_for_section)
-        inserted_section = updated != working
-        working = updated
+    if missing_terms:
+        working, inserted_section = _insert_terms_inset(working, missing_terms)
 
-    for term in missing_for_section:
+    for term in missing_terms:
         working = _ensure_lock(working, term)
-        coverage[term] = LOCK_START_TEMPLATE.format(term=term) in working
 
+    locked_terms: List[str] = []
+    missing_report: List[str] = []
     for term in normalized:
-        coverage.setdefault(term, LOCK_START_TEMPLATE.format(term=term) in working)
+        lock_token = LOCK_START_TEMPLATE.format(term=term)
+        lock_present = bool(re.search(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", working, re.DOTALL))
+        present = bool(build_term_pattern(term).search(working))
+        ok = present and lock_present
+        coverage[term] = ok
+        if ok:
+            locked_terms.append(term)
+        else:
+            missing_report.append(term)
 
-    locked_terms = [term for term in normalized if LOCK_START_TEMPLATE.format(term=term) in working]
-    found_terms = sum(1 for term in normalized if coverage.get(term))
     total_terms = len(normalized)
+    found_terms = total_terms - len(missing_report)
+    coverage_report = f"{found_terms}/{total_terms}" if total_terms else "0/0"
     return KeywordInjectionResult(
         text=working,
         coverage=coverage,
@@ -172,4 +197,6 @@ def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResul
         inserted_section=inserted_section,
         total_terms=total_terms,
         found_terms=found_terms,
+        missing_terms=missing_report,
+        coverage_report=coverage_report,
     )

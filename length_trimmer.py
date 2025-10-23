@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Iterable, List, Sequence
 
 from keyword_injector import LOCK_START_TEMPLATE, LOCK_END
+from validators import strip_jsonld
 
 _FAQ_START = "<!--FAQ_START-->"
 _FAQ_END = "<!--FAQ_END-->"
@@ -67,7 +68,8 @@ def trim_text(
     protect_patterns = list(protected_blocks or [])
 
     def _length(current: str) -> int:
-        return len(re.sub(r"\s+", "", current))
+        article = strip_jsonld(current)
+        return len(re.sub(r"\s+", "", article))
 
     while _length(working) > max_chars:
         paragraphs = _split_paragraphs(working)

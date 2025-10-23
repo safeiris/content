@@ -43,33 +43,41 @@ def _atomic_write_text(path: Path, text: str, *, validator: Optional[Callable[[P
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path.write_text(text, encoding="utf-8")
-    if validator is not None:
-        validator(tmp_path)
-    tmp_path.replace(path)
+    try:
+        if validator is not None:
+            validator(tmp_path)
+        tmp_path.replace(path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def resolve_artifact_path(raw_path: str | Path) -> Path:
     """Return absolute path within the artifacts directory."""
 
-    base_dir = ARTIFACTS_DIR
-    if not isinstance(raw_path, Path):
-        candidate = Path(str(raw_path))
+    base_dir = ARTIFACTS_DIR.resolve()
+    candidate = Path(raw_path) if not isinstance(raw_path, Path) else raw_path
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
     else:
-        candidate = raw_path
+        tentative = (Path.cwd() / candidate).resolve()
+        try:
+            tentative.relative_to(base_dir)
+            resolved = tentative
+        except ValueError:
+            resolved = (base_dir / candidate).resolve()
 
-    if not candidate.is_absolute():
-        candidate = (base_dir / candidate).resolve()
-    else:
-        candidate = candidate.resolve()
-
-    if candidate == base_dir:
+    if resolved == base_dir:
         raise ValueError("Запрошенный путь указывает на каталог artifacts")
 
     try:
-        candidate.relative_to(base_dir)
+        resolved.relative_to(base_dir)
     except ValueError as exc:  # noqa: PERF203 - explicit error message helps debugging
         raise ValueError("Запрошенный путь вне каталога artifacts") from exc
-    return candidate
+    return resolved
 
 
 def _read_index() -> List[Dict[str, Any]]:
@@ -214,7 +222,11 @@ def register_artifact(
     """Ensure that the artifact index contains an entry for the file."""
 
     resolved = resolve_artifact_path(markdown_path)
-    payload = metadata if metadata is not None else _read_metadata(resolved.with_suffix(".json"))
+    if not resolved.exists():
+        raise FileNotFoundError(f"Артефакт {resolved} не найден и не может быть зарегистрирован.")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dictionary")
+    payload = dict(metadata) if isinstance(metadata, dict) else _read_metadata(resolved.with_suffix(".json"))
     record = _build_record_from_file(resolved, payload)
     entries = _read_index()
 
@@ -281,7 +293,7 @@ def list_artifacts(theme: Optional[str] = None, *, auto_cleanup: bool = False) -
                 metadata = _read_metadata(path.with_suffix(".json"))
                 record = _build_record_from_file(path, metadata)
                 try:
-                    register_artifact(path, metadata)
+                    register_artifact(path, metadata, finalized=False)
                 except Exception as exc:  # noqa: BLE001 - keep listing even if index update fails
                     LOGGER.warning("Не удалось обновить индекс для %s: %s", path, exc)
                 records.append(record)
