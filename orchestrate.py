@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import httpx
 import os
 import sys
 import time
@@ -22,7 +23,7 @@ from config import (
     OPENAI_API_KEY,
 )
 from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
-from llm_client import DEFAULT_MODEL, generate as llm_generate
+from llm_client import DEFAULT_MODEL, RESPONSES_API_URL
 from keywords import parse_manual_keywords
 from length_limits import ResolvedLengthLimits, resolve_length_limits
 from validators import ValidationResult, length_no_spaces
@@ -615,64 +616,126 @@ def _mask_openai_key(raw_key: str) -> str:
 
 
 def _run_health_ping() -> Dict[str, object]:
-    probe_messages = [
-        {
-            "role": "system",
-            "content": "Ты сервис проверки доступности. Ответь словом PONG.",
-        },
-        {"role": "user", "content": "Пожалуйста, ответь строго словом PONG."},
-    ]
+    payload: Dict[str, object] = {
+        "model": DEFAULT_MODEL,
+        "input": "Ответь ровно словом: PONG",
+        "max_output_tokens": 8,
+        "text": {"format": {"type": "text"}},
+    }
 
+    api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
+    if not api_key:
+        return {
+            "ok": False,
+            "message": "Responses недоступен: ключ не задан",
+            "route": "responses",
+            "fallback_used": False,
+        }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    route = "responses"
+    fallback_used = False
+
+    start = time.perf_counter()
     try:
-        ping_result = llm_generate(
-            probe_messages,
-            model=DEFAULT_MODEL,
-            temperature=0.0,
-            max_tokens=32,
-            timeout_s=10,
-            responses_text_format={"type": "text"},
-        )
-    except Exception as exc:  # noqa: BLE001
-        reason = str(exc).strip() or "ошибка вызова"
+        with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
+            response = client.post(RESPONSES_API_URL, json=payload, headers=headers)
+    except httpx.TimeoutException:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        return {
+            "ok": False,
+            "message": "Responses недоступен: таймаут",
+            "route": route,
+            "fallback_used": fallback_used,
+            "latency_ms": latency_ms,
+        }
+    except httpx.HTTPError as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        reason = str(exc).strip() or exc.__class__.__name__
         return {
             "ok": False,
             "message": f"Responses недоступен: {reason}",
-            "route": "responses",
-            "fallback_used": False,
+            "route": route,
+            "fallback_used": fallback_used,
+            "latency_ms": latency_ms,
         }
 
-    reply = (ping_result.text or "").strip()
-    reply_lower = reply.lower()
-    route = (ping_result.api_route or "").strip() or "responses"
-    fallback_used = bool(ping_result.fallback_used)
+    latency_ms = int((time.perf_counter() - start) * 1000)
 
-    if reply_lower.startswith("pong") and route == "responses" and not fallback_used:
-        model_used = (ping_result.model_used or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    if response.status_code != 200:
+        detail = response.text.strip()
+        if len(detail) > 120:
+            detail = f"{detail[:117]}..."
         return {
-            "ok": True,
-            "message": f"Responses OK ({model_used}, 32 токена)",
-            "route": "responses",
-            "fallback_used": False,
+            "ok": False,
+            "message": f"Responses недоступен: HTTP {response.status_code} — {detail or 'ошибка'}",
+            "route": route,
+            "fallback_used": fallback_used,
+            "latency_ms": latency_ms,
         }
 
-    if fallback_used:
-        reason = f"использован fallback {ping_result.fallback_used}"
-    elif route != "responses":
-        reason = f"маршрут {route}"
-    elif reply:
-        truncated = reply.replace("\n", " ")
-        if len(truncated) > 60:
-            truncated = f"{truncated[:57]}..."
-        reason = f"ответ: {truncated}"
-    else:
-        reason = "пустой ответ"
+    try:
+        data = response.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "message": "Responses недоступен: некорректный JSON",
+            "route": route,
+            "fallback_used": fallback_used,
+            "latency_ms": latency_ms,
+        }
 
-    return {
-        "ok": False,
-        "message": f"Responses недоступен: {reason}",
-        "route": route or "responses",
+    status = str(data.get("status", "")).strip().lower()
+    incomplete_reason = ""
+    incomplete_details = data.get("incomplete_details")
+    if isinstance(incomplete_details, dict):
+        reason_value = incomplete_details.get("reason")
+        if isinstance(reason_value, str):
+            incomplete_reason = reason_value.strip().lower()
+
+    got_output = False
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        got_output = True
+    elif isinstance(data.get("output"), list) or isinstance(data.get("outputs"), list):
+        got_output = True
+
+    if status == "completed":
+        message = "Responses OK"
+        ok = True
+    elif status == "incomplete" and incomplete_reason == "max_output_tokens":
+        message = "Responses OK (incomplete из-за маленького max_output_tokens)"
+        ok = True
+    else:
+        if not status:
+            reason = "неизвестный статус"
+        else:
+            reason = status
+            if incomplete_reason:
+                reason = f"{reason} ({incomplete_reason})"
+        return {
+            "ok": False,
+            "message": f"Responses недоступен: статус {reason}",
+            "route": route,
+            "fallback_used": fallback_used,
+            "latency_ms": latency_ms,
+            "status": status or "",
+        }
+
+    result: Dict[str, object] = {
+        "ok": ok,
+        "message": message,
+        "route": route,
         "fallback_used": fallback_used,
+        "latency_ms": latency_ms,
+        "status": status or "ok",
     }
+    result["got_output"] = bool(got_output)
+    return result
 
 
 def _parse_args() -> argparse.Namespace:

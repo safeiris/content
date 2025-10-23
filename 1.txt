@@ -1,398 +1,272 @@
-diff --git a/llm_client.py b/llm_client.py
-index 1fe4d2a59d4cebba0e10d55a063e21f99b38cf4c..9eb7118a8c642296d52e6890e6c39b3a37df71cd 100644
---- a/llm_client.py
-+++ b/llm_client.py
-@@ -21,50 +21,57 @@ from config import (
-     G5_ENABLE_PREVIOUS_ID_FETCH,
-     G5_MAX_OUTPUT_TOKENS_BASE,
-     G5_MAX_OUTPUT_TOKENS_MAX,
-     G5_MAX_OUTPUT_TOKENS_STEP1,
-     G5_MAX_OUTPUT_TOKENS_STEP2,
-     G5_POLL_INTERVALS,
-     G5_POLL_MAX_ATTEMPTS,
+diff --git a/orchestrate.py b/orchestrate.py
+index d93bf012d23f7d0a68c13767b14ce9bab7c11571..0a2e821d379e229de4b0c716165512b9d0fdeaf0 100644
+--- a/orchestrate.py
++++ b/orchestrate.py
+@@ -1,50 +1,51 @@
+ from __future__ import annotations
+ 
+ import argparse
+ import json
++import httpx
+ import os
+ import sys
+ import time
+ from copy import deepcopy
+ from dataclasses import dataclass, field
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Any, Dict, Iterable, List, Optional, Tuple
+ 
+ from zoneinfo import ZoneInfo
+ 
+ from assemble_messages import ContextBundle, assemble_messages, retrieve_context
+ from artifacts_store import _atomic_write_text as store_atomic_write_text, register_artifact
+ from config import (
+     DEFAULT_MAX_LENGTH,
+     DEFAULT_MIN_LENGTH,
+     MAX_CUSTOM_CONTEXT_CHARS,
+     OPENAI_API_KEY,
  )
+ from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
+-from llm_client import DEFAULT_MODEL, generate as llm_generate
++from llm_client import DEFAULT_MODEL, RESPONSES_API_URL
+ from keywords import parse_manual_keywords
+ from length_limits import ResolvedLengthLimits, resolve_length_limits
+ from validators import ValidationResult, length_no_spaces
+ 
+ BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
+ TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
+ LATEST_SCHEMA_VERSION = "2024-06"
  
  
- DEFAULT_MODEL = "gpt-5"
- MAX_RETRIES = 3
- BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
- FALLBACK_MODEL = "gpt-4o"
- RESPONSES_API_URL = "https://api.openai.com/v1/responses"
- RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "text")
- RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
- RESPONSES_MAX_ESCALATIONS = 2
- MAX_RESPONSES_POLL_ATTEMPTS = (
-     G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
- )
- if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
-     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
- GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
+ @dataclass
+ class GenerationContext:
+     data: Dict[str, Any]
+     context_bundle: ContextBundle
+     messages: List[Dict[str, Any]]
+     clip_texts: List[str]
+     style_profile_applied: bool = False
+     style_profile_source: Optional[str] = None
+     style_profile_variant: Optional[str] = None
+     keywords_manual: List[str] = field(default_factory=list)
+     context_source: str = "index.json"
+     custom_context_text: Optional[str] = None
+     custom_context_len: int = 0
+     custom_context_filename: Optional[str] = None
+     custom_context_hash: Optional[str] = None
+     custom_context_truncated: bool = False
+@@ -593,108 +594,170 @@ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
+                     "ok": True,
+                     "message": f"Профиль темы загружен ({index_path.as_posix()})",
+                 }
+             except json.JSONDecodeError as exc:
+                 checks["theme_index"] = {
+                     "ok": False,
+                     "message": f"Индекс повреждён: {exc}",
+                 }
  
-+
-+def _supports_temperature(model: str) -> bool:
-+    """Return True if the target model accepts the temperature parameter."""
-+
-+    model_name = (model or "").strip().lower()
-+    return not model_name.startswith("gpt-5")
-+
- DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
-     "type": "json_schema",
-     "json_schema": {
-         "name": "seo_article_skeleton",
-         "schema": {
-             "type": "object",
-             "properties": {
-                 "intro": {"type": "string"},
-                 "main": {
-                     "type": "array",
-                     "items": {"type": "string"},
-                     "minItems": 3,
-                     "maxItems": 6,
-                 },
-                 "faq": {
-                     "type": "array",
-                     "items": {
-                         "type": "object",
-                         "properties": {
-                             "q": {"type": "string"},
-                             "a": {"type": "string"},
-                         },
-                         "required": ["q", "a"],
-                     },
-                     "minItems": 5,
-@@ -159,53 +166,54 @@ def build_responses_payload(
-     *,
-     text_format: Optional[Dict[str, object]] = None,
- ) -> Dict[str, object]:
-     """Construct a minimal Responses API payload for GPT-5 models."""
- 
-     sections: List[str] = []
- 
-     system_block = (system_text or "").strip()
-     if system_block:
-         sections.append(system_block)
- 
-     user_block = (user_text or "").strip()
-     if user_block:
-         sections.append(user_block)
- 
-     joined_input = "\n\n".join(section for section in sections if section)
-     joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
-     joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
- 
-     format_block = deepcopy(text_format or DEFAULT_RESPONSES_TEXT_FORMAT)
- 
-     payload: Dict[str, object] = {
-         "model": str(model).strip(),
-         "input": joined_input.strip(),
-         "max_output_tokens": int(max_tokens),
--        "temperature": 0.3,
-         "text": {"format": format_block},
-     }
-+    if _supports_temperature(model):
-+        payload["temperature"] = 0.3
-     return payload
+     ok = all(check.get("ok") is True for check in checks.values())
+     return {"ok": ok, "checks": checks}
  
  
- def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, object]]:
-     if not isinstance(text_value, dict):
-         return None
-     format_block = text_value.get("format")
-     if not isinstance(format_block, dict):
-         return None
-     sanitized_format: Dict[str, object] = {}
-     fmt_type = format_block.get("type")
-     if isinstance(fmt_type, str) and fmt_type.strip():
-         sanitized_format["type"] = fmt_type.strip()
-     json_schema_value = format_block.get("json_schema")
-     if isinstance(json_schema_value, dict):
-         sanitized_format["json_schema"] = json_schema_value
-     if not sanitized_format:
-         return None
-     return {"format": sanitized_format}
+ def _mask_openai_key(raw_key: str) -> str:
+     key = (raw_key or "").strip()
+     if not key:
+         return "****"
+     if key.startswith("sk-") and len(key) > 6:
+         return f"sk-****{key[-4:]}"
+     if len(key) <= 4:
+         return "*" * len(key)
+     return f"{key[:2]}***{key[-2:]}"
  
  
- def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str, object], int]:
-     """Restrict Responses payload to the documented whitelist and types."""
- 
-     sanitized: Dict[str, object] = {}
-@@ -1067,51 +1075,67 @@ def generate(
-             user_text,
-             max_tokens,
-             text_format=responses_text_format,
-         )
-         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
- 
-         format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
- 
-         def _clone_text_format() -> Dict[str, object]:
-             return deepcopy(format_template)
- 
-         def _apply_text_format(target: Dict[str, object]) -> None:
-             target.pop("response_format", None)
-             target["text"] = {"format": _clone_text_format()}
- 
-         _apply_text_format(sanitized_payload)
- 
-         try:
-             max_tokens_value = int(sanitized_payload.get("max_output_tokens", 1200))
-         except (TypeError, ValueError):
-             max_tokens_value = 1200
-         if max_tokens_value <= 0:
-             max_tokens_value = 1200
-         max_tokens_value = min(max_tokens_value, 1200)
-         sanitized_payload["max_output_tokens"] = max_tokens_value
--        sanitized_payload["temperature"] = 0.3
-+
-+        supports_temperature = _supports_temperature(target_model)
-+        if supports_temperature:
-+            raw_temperature = sanitized_payload.get("temperature", temperature)
-+            if raw_temperature is None:
-+                raw_temperature = 0.3
-+            try:
-+                sanitized_payload["temperature"] = float(raw_temperature)
-+            except (TypeError, ValueError):
-+                sanitized_payload["temperature"] = 0.3
-+        else:
-+            if "temperature" in sanitized_payload:
-+                sanitized_payload.pop("temperature", None)
-+            LOGGER.info(
-+                "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
-+                target_model,
-+            )
- 
-         def _log_payload(snapshot: Dict[str, object]) -> None:
-             keys = sorted(snapshot.keys())
-             LOGGER.info("responses payload_keys=%s", keys)
-             input_candidate = snapshot.get("input", "")
-             length = len(input_candidate) if isinstance(input_candidate, str) else 0
-             LOGGER.info("responses input_len=%d", length)
-             LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
-             text_block = snapshot.get("text")
-             format_type = "-"
-             schema_name = "-"
-             if isinstance(text_block, dict):
-                 format_block = text_block.get("format")
-                 if isinstance(format_block, dict):
-                     fmt = format_block.get("type")
-                     if isinstance(fmt, str) and fmt.strip():
-                         format_type = fmt.strip()
-                     schema_block = format_block.get("json_schema")
-                     if isinstance(schema_block, dict):
-                         schema_candidate = schema_block.get("name")
-                         if isinstance(schema_candidate, str) and schema_candidate.strip():
-                             schema_name = schema_candidate.strip()
-             LOGGER.info("responses text_format type=%s schema=%s", format_type, schema_name)
- 
-         def _extract_metadata(payload: Dict[str, object]) -> Dict[str, object]:
-@@ -1211,52 +1235,50 @@ def generate(
-                 last_error = exc
-                 _handle_responses_http_error(exc, current_payload)
-                 break
-             except Exception as exc:  # noqa: BLE001
-                 if isinstance(exc, KeyboardInterrupt):
-                     raise
-                 last_error = exc
-             if attempts >= 3:
-                 break
-             sleep_for = schedule[min(attempts - 1, len(schedule) - 1)] if schedule else 0.5
-             LOGGER.warning("responses retry attempt=%d sleep=%.2f", attempts, sleep_for)
-             time.sleep(sleep_for)
- 
-         if last_error:
-             if isinstance(last_error, httpx.HTTPStatusError):
-                 _raise_for_last_error(last_error)
-             if isinstance(last_error, (httpx.TimeoutException, httpx.TransportError)):
-                 _raise_for_last_error(last_error)
-             raise last_error
- 
-         raise RuntimeError("Модель не вернула ответ.")
- 
- 
-     lower_model = model_name.lower()
-     is_gpt5_model = lower_model.startswith("gpt-5")
--    if is_gpt5_model:
--        LOGGER.info("temperature is ignored for GPT-5; using default")
- 
-     retry_used = False
-     fallback_used: Optional[str] = None
-     fallback_reason: Optional[str] = None
- 
-     try:
-         if is_gpt5_model:
-             available = _check_model_availability(
-                 http_client,
-                 provider=provider,
-                 headers=headers,
-                 model_name=model_name,
-             )
-             if not available:
-                 error_message = "Model GPT-5 not available for this key/plan"
-                 LOGGER.warning("primary model %s unavailable — considering fallback", model_name)
-                 if FORCE_MODEL:
-                     raise RuntimeError(error_message)
-                 fallback_used = FALLBACK_MODEL
-                 fallback_reason = "model_unavailable"
-                 LOGGER.warning(
-                     "switching to fallback model %s (primary=%s, reason=%s: %s)",
-                     fallback_used,
-                     model_name,
-                     fallback_reason,
-diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index d4e620eb4ddbc5f33bb481c5475338d8356b3bae..c4fbc40d9f3d918697f06732c4ffd50cdf440ff3 100644
---- a/tests/test_llm_client.py
-+++ b/tests/test_llm_client.py
-@@ -137,78 +137,89 @@ def test_generate_uses_max_tokens_for_non_gpt5():
-     assert "max_completion_tokens" not in request_payload["json"]
-     assert request_payload["json"]["temperature"] == 0
-     assert "tool_choice" not in request_payload["json"]
-     assert "modalities" not in request_payload["json"]
-     assert "response_format" not in request_payload["json"]
-     assert request_payload["url"].endswith("/chat/completions")
- 
- 
- def test_generate_uses_responses_payload_for_gpt5():
-     responses_payload = {
-         "output": [
-             {
-                 "content": [
-                     {"type": "text", "text": "ok"},
-                 ]
-             }
-         ]
-     }
-     result, request_payload = _run_and_capture_request("gpt-5-preview", payloads=[responses_payload])
-     assert isinstance(result, GenerationResult)
-     assert result.api_route == "responses"
-     assert result.schema == "responses.output_text"
-     payload = request_payload["json"]
-     assert payload["max_output_tokens"] == 42
-     assert "modalities" not in payload
--    assert payload["temperature"] == 0.3
-     assert "messages" not in payload
-     assert payload["model"] == "gpt-5-preview"
-     assert payload["input"] == "ping"
-     assert "text" in payload
-     assert payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
--    assert set(payload.keys()) == {"input", "max_output_tokens", "model", "temperature", "text"}
-+    assert "temperature" not in payload
-+    assert set(payload.keys()) == {"input", "max_output_tokens", "model", "text"}
-     assert request_payload["url"].endswith("/responses")
- 
- 
- def test_generate_logs_about_temperature_for_gpt5():
--    dummy_client = DummyClient()
-+    responses_payload = {
-+        "output": [
-+            {
-+                "content": [
-+                    {"type": "text", "text": "ok"},
-+                ]
-+            }
-+        ]
+ def _run_health_ping() -> Dict[str, object]:
+-    probe_messages = [
+-        {
+-            "role": "system",
+-            "content": "Ты сервис проверки доступности. Ответь словом PONG.",
+-        },
+-        {"role": "user", "content": "Пожалуйста, ответь строго словом PONG."},
+-    ]
++    payload: Dict[str, object] = {
++        "model": DEFAULT_MODEL,
++        "input": "Ответь ровно словом: PONG",
++        "max_output_tokens": 8,
++        "text": {"format": {"type": "text"}},
 +    }
-+    dummy_client = DummyClient(payloads=[responses_payload])
-     with patch("llm_client.httpx.Client", return_value=dummy_client), patch("llm_client.LOGGER") as mock_logger:
-         generate(
-             messages=[{"role": "user", "content": "ping"}],
-             model="gpt-5-super",
-             temperature=0.7,
-             max_tokens=42,
-         )
  
--    mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
-     mock_logger.info.assert_any_call(
-         "responses payload_keys=%s",
--        ["input", "max_output_tokens", "model", "temperature", "text"],
-+        ["input", "max_output_tokens", "model", "text"],
-     )
-     mock_logger.info.assert_any_call("responses input_len=%d", 4)
-     mock_logger.info.assert_any_call("responses max_output_tokens=%s", 42)
--    mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
-+    mock_logger.info.assert_any_call(
-+        "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
-+        "gpt-5-super",
-+    )
+-    try:
+-        ping_result = llm_generate(
+-            probe_messages,
+-            model=DEFAULT_MODEL,
+-            temperature=0.0,
+-            max_tokens=32,
+-            timeout_s=10,
+-            responses_text_format={"type": "text"},
+-        )
+-    except Exception as exc:  # noqa: BLE001
+-        reason = str(exc).strip() or "ошибка вызова"
++    api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
++    if not api_key:
+         return {
+             "ok": False,
+-            "message": f"Responses недоступен: {reason}",
++            "message": "Responses недоступен: ключ не задан",
+             "route": "responses",
+             "fallback_used": False,
+         }
  
+-    reply = (ping_result.text or "").strip()
+-    reply_lower = reply.lower()
+-    route = (ping_result.api_route or "").strip() or "responses"
+-    fallback_used = bool(ping_result.fallback_used)
++    headers = {
++        "Authorization": f"Bearer {api_key}",
++        "Content-Type": "application/json",
++    }
++
++    route = "responses"
++    fallback_used = False
  
- def test_generate_polls_for_incomplete_responses_status():
-     initial_payload = {
-         "status": "in_progress",
-         "id": "resp-123",
-         "output": [
-             {
-                 "content": [
-                     {"type": "text", "text": ""},
-                 ]
-             }
-         ],
+-    if reply_lower.startswith("pong") and route == "responses" and not fallback_used:
+-        model_used = (ping_result.model_used or DEFAULT_MODEL).strip() or DEFAULT_MODEL
++    start = time.perf_counter()
++    try:
++        with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
++            response = client.post(RESPONSES_API_URL, json=payload, headers=headers)
++    except httpx.TimeoutException:
++        latency_ms = int((time.perf_counter() - start) * 1000)
+         return {
+-            "ok": True,
+-            "message": f"Responses OK ({model_used}, 32 токена)",
+-            "route": "responses",
+-            "fallback_used": False,
++            "ok": False,
++            "message": "Responses недоступен: таймаут",
++            "route": route,
++            "fallback_used": fallback_used,
++            "latency_ms": latency_ms,
++        }
++    except httpx.HTTPError as exc:
++        latency_ms = int((time.perf_counter() - start) * 1000)
++        reason = str(exc).strip() or exc.__class__.__name__
++        return {
++            "ok": False,
++            "message": f"Responses недоступен: {reason}",
++            "route": route,
++            "fallback_used": fallback_used,
++            "latency_ms": latency_ms,
+         }
+ 
+-    if fallback_used:
+-        reason = f"использован fallback {ping_result.fallback_used}"
+-    elif route != "responses":
+-        reason = f"маршрут {route}"
+-    elif reply:
+-        truncated = reply.replace("\n", " ")
+-        if len(truncated) > 60:
+-            truncated = f"{truncated[:57]}..."
+-        reason = f"ответ: {truncated}"
++    latency_ms = int((time.perf_counter() - start) * 1000)
++
++    if response.status_code != 200:
++        detail = response.text.strip()
++        if len(detail) > 120:
++            detail = f"{detail[:117]}..."
++        return {
++            "ok": False,
++            "message": f"Responses недоступен: HTTP {response.status_code} — {detail or 'ошибка'}",
++            "route": route,
++            "fallback_used": fallback_used,
++            "latency_ms": latency_ms,
++        }
++
++    try:
++        data = response.json()
++    except ValueError:
++        return {
++            "ok": False,
++            "message": "Responses недоступен: некорректный JSON",
++            "route": route,
++            "fallback_used": fallback_used,
++            "latency_ms": latency_ms,
++        }
++
++    status = str(data.get("status", "")).strip().lower()
++    incomplete_reason = ""
++    incomplete_details = data.get("incomplete_details")
++    if isinstance(incomplete_details, dict):
++        reason_value = incomplete_details.get("reason")
++        if isinstance(reason_value, str):
++            incomplete_reason = reason_value.strip().lower()
++
++    got_output = False
++    output_text = data.get("output_text")
++    if isinstance(output_text, str) and output_text.strip():
++        got_output = True
++    elif isinstance(data.get("output"), list) or isinstance(data.get("outputs"), list):
++        got_output = True
++
++    if status == "completed":
++        message = "Responses OK"
++        ok = True
++    elif status == "incomplete" and incomplete_reason == "max_output_tokens":
++        message = "Responses OK (incomplete из-за маленького max_output_tokens)"
++        ok = True
+     else:
+-        reason = "пустой ответ"
++        if not status:
++            reason = "неизвестный статус"
++        else:
++            reason = status
++            if incomplete_reason:
++                reason = f"{reason} ({incomplete_reason})"
++        return {
++            "ok": False,
++            "message": f"Responses недоступен: статус {reason}",
++            "route": route,
++            "fallback_used": fallback_used,
++            "latency_ms": latency_ms,
++            "status": status or "",
++        }
+ 
+-    return {
+-        "ok": False,
+-        "message": f"Responses недоступен: {reason}",
+-        "route": route or "responses",
++    result: Dict[str, object] = {
++        "ok": ok,
++        "message": message,
++        "route": route,
+         "fallback_used": fallback_used,
++        "latency_ms": latency_ms,
++        "status": status or "ok",
      }
-     final_payload = {
-         "status": "completed",
-         "output": [
-             {
-                 "content": [
-                     {"type": "output_text", "text": "done"},
-                 ]
-             }
-         ],
-     }
-     dummy_client = DummyClient(payloads=[initial_payload], poll_payloads=[final_payload])
-@@ -226,54 +237,56 @@ def test_generate_polls_for_incomplete_responses_status():
-     assert isinstance(result, GenerationResult)
-     assert result.text == "done"
-     assert result.api_route == "responses"
-     assert result.schema == "responses.output_text"
-     assert dummy_client.poll_count == 1
-     assert dummy_client.last_poll["url"].endswith("/responses/resp-123")
-     mock_sleep.assert_called()
++    result["got_output"] = bool(got_output)
++    return result
  
  
- def test_generate_sends_minimal_payload_for_gpt5():
-     responses_payload = {
-         "output": [
-             {
-                 "content": [
-                     {"type": "text", "text": "ok"},
-                 ]
-             }
-         ]
-     }
-     _, request_payload = _run_and_capture_request("gpt-5-turbo", payloads=[responses_payload])
-     payload = request_payload["json"]
-     assert payload["model"] == "gpt-5-turbo"
-     assert "modalities" not in payload
-     assert payload["max_output_tokens"] == 42
-     assert payload["input"] == "ping"
-+    assert "temperature" not in payload
-     assert set(payload.keys()) == {
-         "model",
-         "input",
-         "max_output_tokens",
-+        "text",
-     }
+ def _parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="Deterministic content pipeline")
+     parser.add_argument("--theme", required=True, help="Theme slug (profiles/<theme>)")
+     parser.add_argument("--data", required=True, help="Path to JSON brief")
+     parser.add_argument("--outfile", help="Override output path")
+     parser.add_argument("--k", type=int, default=0, help="Number of exemplar clips")
+     parser.add_argument("--model", help="Optional model label for metadata")
+     parser.add_argument("--temperature", type=float, default=0.0)
+     parser.add_argument("--max-tokens", type=int, default=0, dest="max_tokens")
+     parser.add_argument("--timeout", type=int, default=60)
+     parser.add_argument("--mode", default="final")
+     parser.add_argument("--retry-backoff", help="Retry schedule (unused)")
+     parser.add_argument("--append-style-profile", action="store_true")
+     parser.add_argument("--context-source")
+     parser.add_argument("--context-text")
+     parser.add_argument("--context-filename")
+     parser.add_argument("--check", action="store_true")
+     return parser.parse_args()
  
  
- def test_generate_retries_when_unknown_parameter_reported():
-     error_entry = {
-         "__error__": "http",
-         "status": 400,
-         "payload": {"error": {"message": "Unknown parameter: 'modalities'"}},
-     }
-     success_payload = {
-         "output": [
-             {
-                 "content": [
-                     {"type": "text", "text": "ok"},
-                 ]
-             }
-         ]
-     }
-     dummy_client = DummyClient(payloads=[error_entry, success_payload])
-     with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
-         "llm_client.LOGGER"
-     ) as mock_logger:
-         result = generate(
-             messages=[{"role": "user", "content": "ping"}],
-             model="gpt-5",  # ensure responses route
+ def _load_input(path: str) -> Dict[str, Any]:
+     payload_path = Path(path)
+     if not payload_path.exists():
 
