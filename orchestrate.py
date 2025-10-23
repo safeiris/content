@@ -22,10 +22,11 @@ from config import (
     MAX_CUSTOM_CONTEXT_CHARS,
     OPENAI_API_KEY,
 )
-from deterministic_pipeline import DeterministicPipeline, PipelineStep
+from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
+from llm_client import DEFAULT_MODEL
 from keywords import parse_manual_keywords
 from length_limits import ResolvedLengthLimits, resolve_length_limits
-from validators import ValidationResult
+from validators import ValidationResult, length_no_spaces
 
 BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
 TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
@@ -317,6 +318,11 @@ def _build_metadata(
     pipeline_logs: Iterable[Any],
     checkpoints: Dict[PipelineStep, str],
     duration_seconds: float,
+    model_used: Optional[str],
+    fallback_used: Optional[str],
+    fallback_reason: Optional[str],
+    api_route: Optional[str],
+    token_usage: Optional[float],
 ) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {
         "schema_version": LATEST_SCHEMA_VERSION,
@@ -341,8 +347,18 @@ def _build_metadata(
             "passed": validation.is_valid,
             "stats": validation.stats,
         },
-        "length_no_spaces": len("".join(pipeline_state_text.split())),
+        "length_no_spaces": length_no_spaces(pipeline_state_text),
     }
+    if model_used:
+        metadata["model_used"] = model_used
+    if fallback_used:
+        metadata["fallback_used"] = fallback_used
+    if fallback_reason:
+        metadata["fallback_reason"] = fallback_reason
+    if api_route:
+        metadata["api_route"] = api_route
+    if isinstance(token_usage, (int, float)):
+        metadata["token_usage"] = float(token_usage)
     return metadata
 
 
@@ -417,13 +433,24 @@ def _generate_variant(
     outline = _prepare_outline(prepared_data)
     topic = str(prepared_data.get("theme") or payload.get("theme") or theme).strip() or theme
 
+    api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
+    if not api_key:
+        raise PipelineStepError(PipelineStep.SKELETON, "OPENAI_API_KEY не найден. Укажите действительный ключ.")
+
     pipeline = DeterministicPipeline(
         topic=topic,
         base_outline=outline,
         keywords=keywords_required,
         min_chars=min_chars,
         max_chars=max_chars,
+        messages=generation_context.messages,
+        model=model_name,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout_s=timeout,
+        backoff_schedule=backoff_schedule,
         provided_faq=prepared_data.get("faq_entries") if isinstance(prepared_data.get("faq_entries"), list) else None,
+        jsonld_requested=generation_context.jsonld_requested,
     )
     state = pipeline.run()
     if not state.validation or not state.validation.is_valid:
@@ -439,6 +466,11 @@ def _generate_variant(
         pipeline_logs=state.logs,
         checkpoints=state.checkpoints,
         duration_seconds=duration_seconds,
+        model_used=state.model_used,
+        fallback_used=state.fallback_used,
+        fallback_reason=state.fallback_reason,
+        api_route=state.api_route,
+        token_usage=state.token_usage,
     )
 
     outputs = _write_outputs(output_path, final_text, metadata)
@@ -468,7 +500,7 @@ def generate_article_from_payload(
     context_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     resolved_timeout = timeout if timeout is not None else 60
-    resolved_model = model or "deterministic-pipeline"
+    resolved_model = (model or DEFAULT_MODEL).strip()
     output_path = _make_output_path(theme, outfile)
     result = _generate_variant(
         theme=theme,
@@ -601,7 +633,7 @@ def main() -> None:
         data=data,
         data_path=args.data,
         k=args.k,
-        model_name=args.model or "deterministic-pipeline",
+        model_name=(args.model or DEFAULT_MODEL).strip(),
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         timeout=args.timeout,

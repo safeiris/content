@@ -1,15 +1,31 @@
+"""LLM-driven content pipeline with explicit step-level guarantees."""
+
 from __future__ import annotations
 
-import time
+import json
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
-from faq_builder import FaqBuildResult, build_faq_block
+from llm_client import GenerationResult, generate as llm_generate
 from keyword_injector import KeywordInjectionResult, build_term_pattern, inject_keywords
 from length_trimmer import TrimResult, trim_text
-from validators import ValidationResult, strip_jsonld, validate_article
+from validators import ValidationResult, length_no_spaces, strip_jsonld, validate_article
+
+
+LOGGER = logging.getLogger("content_factory.pipeline")
+
+FAQ_START = "<!--FAQ_START-->"
+FAQ_END = "<!--FAQ_END-->"
+
+_TEMPLATE_SNIPPETS = [
+    "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
+    "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист",
+    "В выводах собираем план действий, назначаем контрольные даты",
+]
 
 
 class PipelineStep(str, Enum):
@@ -35,37 +51,75 @@ class PipelineState:
     validation: Optional[ValidationResult]
     logs: List[PipelineLogEntry]
     checkpoints: Dict[PipelineStep, str]
+    model_used: Optional[str] = None
+    fallback_used: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    api_route: Optional[str] = None
+    token_usage: Optional[float] = None
+
+
+class PipelineStepError(RuntimeError):
+    """Raised when a particular pipeline step fails irrecoverably."""
+
+    def __init__(self, step: PipelineStep, message: str, *, status_code: int = 500) -> None:
+        super().__init__(message)
+        self.step = step
+        self.status_code = status_code
 
 
 class DeterministicPipeline:
+    """Pipeline that orchestrates LLM calls and post-processing steps."""
+
     def __init__(
         self,
         *,
         topic: str,
-        base_outline: List[str],
+        base_outline: Sequence[str],
         keywords: Iterable[str],
         min_chars: int,
         max_chars: int,
+        messages: Sequence[Dict[str, object]],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        timeout_s: int,
+        backoff_schedule: Optional[List[float]] = None,
         provided_faq: Optional[List[Dict[str, str]]] = None,
+        jsonld_requested: bool = True,
     ) -> None:
-        self.topic = topic
-        self.base_outline = base_outline or ["Введение", "Основная часть", "Вывод"]
-        self.keywords = list(keywords)
-        self.normalized_keywords = [
-            term
-            for term in (str(item).strip() for item in self.keywords)
-            if term
-        ]
-        self.min_chars = min_chars
-        self.max_chars = max_chars
+        if not model or not str(model).strip():
+            raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
+
+        self.topic = topic.strip() or "Тема"
+        self.base_outline = list(base_outline) if base_outline else ["Введение", "Основная часть", "Вывод"]
+        self.keywords = [str(term).strip() for term in keywords if str(term).strip()]
+        self.normalized_keywords = [term for term in self.keywords if term]
+        self.min_chars = int(min_chars)
+        self.max_chars = int(max_chars)
+        self.messages = [dict(message) for message in messages]
+        self.model = str(model).strip()
+        self.temperature = float(temperature)
+        self.max_tokens = int(max_tokens) if max_tokens else 0
+        self.timeout_s = int(timeout_s)
+        self.backoff_schedule = list(backoff_schedule) if backoff_schedule else None
         self.provided_faq = provided_faq or []
+        self.jsonld_requested = bool(jsonld_requested)
+
         self.logs: List[PipelineLogEntry] = []
         self.checkpoints: Dict[PipelineStep, str] = {}
         self.jsonld: Optional[str] = None
         self.locked_terms: List[str] = []
         self.jsonld_reserve: int = 0
 
-    # Step helpers -----------------------------------------------------
+        self._model_used: Optional[str] = None
+        self._fallback_used: Optional[str] = None
+        self._fallback_reason: Optional[str] = None
+        self._api_route: Optional[str] = None
+        self._token_usage: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
     def _log(self, step: PipelineStep, status: str, **notes: object) -> None:
         entry = PipelineLogEntry(step=step, started_at=time.time(), status=status, notes=dict(notes))
         self.logs.append(entry)
@@ -81,57 +135,257 @@ class DeterministicPipeline:
             PipelineLogEntry(step=step, started_at=time.time(), finished_at=time.time(), status=status, notes=dict(notes))
         )
 
-    # Step implementations --------------------------------------------
+    def _register_llm_result(self, result: GenerationResult, usage: Optional[float]) -> None:
+        if result.model_used:
+            self._model_used = result.model_used
+        elif self._model_used is None:
+            self._model_used = self.model
+        if result.fallback_used:
+            self._fallback_used = result.fallback_used
+        if result.fallback_reason:
+            self._fallback_reason = result.fallback_reason
+        if result.api_route:
+            self._api_route = result.api_route
+        if usage is not None:
+            self._token_usage = usage
+
+    def _prompt_length(self, messages: Sequence[Dict[str, object]]) -> int:
+        length = 0
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str):
+                length += len(content)
+        return length
+
+    def _extract_usage(self, result: GenerationResult) -> Optional[float]:
+        metadata = result.metadata or {}
+        if not isinstance(metadata, dict):
+            return None
+        candidates = [
+            metadata.get("usage_output_tokens"),
+            metadata.get("token_usage"),
+            metadata.get("output_tokens"),
+        ]
+        usage_block = metadata.get("usage")
+        if isinstance(usage_block, dict):
+            candidates.append(usage_block.get("output_tokens"))
+            candidates.append(usage_block.get("total_tokens"))
+        for candidate in candidates:
+            if isinstance(candidate, (int, float)):
+                return float(candidate)
+        return None
+
+    def _call_llm(
+        self,
+        *,
+        step: PipelineStep,
+        messages: Sequence[Dict[str, object]],
+        max_tokens: Optional[int] = None,
+    ) -> GenerationResult:
+        prompt_len = self._prompt_length(messages)
+        LOGGER.info(
+            "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d keywords_count=%d",
+            step.value,
+            self.model,
+            prompt_len,
+            len(self.normalized_keywords),
+        )
+        limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
+        if not limit or limit <= 0:
+            limit = 700
+        try:
+            result = llm_generate(
+                list(messages),
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=limit,
+                timeout_s=self.timeout_s,
+                backoff_schedule=self.backoff_schedule,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
+            raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
+
+        usage = self._extract_usage(result)
+        LOGGER.info(
+            "LOG:LLM_RESPONSE step=%s token_usage=%s",
+            step.value,
+            "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
+        )
+        self._register_llm_result(result, usage)
+        return result
+
+    def _check_template_text(self, text: str, step: PipelineStep) -> None:
+        lowered = text.lower()
+        if lowered.count("дополнительно рассматривается") >= 3:
+            raise PipelineStepError(step, "Обнаружен шаблонный текст 'Дополнительно рассматривается'.")
+        for snippet in _TEMPLATE_SNIPPETS:
+            if snippet in lowered:
+                raise PipelineStepError(step, "Найден служебный шаблонный фрагмент, генерация отклонена.")
+
+    def _metrics(self, text: str) -> Dict[str, object]:
+        article = strip_jsonld(text)
+        chars_no_spaces = length_no_spaces(article)
+        keywords_found = 0
+        for term in self.normalized_keywords:
+            if build_term_pattern(term).search(article):
+                keywords_found += 1
+        return {
+            "chars_no_spaces": chars_no_spaces,
+            "keywords_found": keywords_found,
+            "keywords_total": len(self.normalized_keywords),
+        }
+
+    def _resolve_skeleton_tokens(self) -> int:
+        baseline = max(self.max_tokens, self.max_chars + 400)
+        if baseline <= 0:
+            baseline = self.max_chars + 400
+        return max(600, baseline)
+
+    def _render_faq_markdown(self, entries: Sequence[Dict[str, str]]) -> str:
+        lines: List[str] = []
+        for index, entry in enumerate(entries, start=1):
+            question = entry.get("question", "").strip()
+            answer = entry.get("answer", "").strip()
+            lines.append(f"**Вопрос {index}.** {question}")
+            lines.append(f"**Ответ.** {answer}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _build_jsonld(self, entries: Sequence[Dict[str, str]]) -> str:
+        payload = {
+            "@context": "https://schema.org",
+            "@type": "FAQPage",
+            "mainEntity": [
+                {
+                    "@type": "Question",
+                    "name": entry.get("question", ""),
+                    "acceptedAnswer": {"@type": "Answer", "text": entry.get("answer", "")},
+                }
+                for entry in entries
+            ],
+        }
+        compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return f'<script type="application/ld+json">\n{compact}\n</script>'
+
+    def _merge_faq(self, base_text: str, faq_block: str) -> str:
+        if FAQ_START not in base_text or FAQ_END not in base_text:
+            raise PipelineStepError(PipelineStep.FAQ, "В тексте нет маркеров FAQ для замены.")
+        before, remainder = base_text.split(FAQ_START, 1)
+        inside, after = remainder.split(FAQ_END, 1)
+        inside = inside.strip()
+        merged = f"{before}{FAQ_START}\n{faq_block}\n{FAQ_END}{after}"
+        return merged
+
+    def _sanitize_entries(self, entries: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+        sanitized: List[Dict[str, str]] = []
+        for entry in entries:
+            question = str(entry.get("question", "")).strip()
+            answer = str(entry.get("answer", "")).strip()
+            if not question or not answer:
+                continue
+            lowered = (question + " " + answer).lower()
+            if "дополнительно рассматривается" in lowered:
+                raise PipelineStepError(PipelineStep.FAQ, "FAQ содержит шаблонную фразу 'Дополнительно рассматривается'.")
+            sanitized.append({"question": question, "answer": answer})
+        return sanitized
+
+    def _parse_faq_entries(self, raw_text: str) -> List[Dict[str, str]]:
+        candidate = raw_text.strip()
+        if not candidate:
+            raise PipelineStepError(PipelineStep.FAQ, "Модель вернула пустой блок FAQ.")
+        data: Optional[Dict[str, object]] = None
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+        if not isinstance(data, dict):
+            raise PipelineStepError(PipelineStep.FAQ, "Ответ модели не является корректным JSON.")
+        entries = data.get("faq")
+        if not isinstance(entries, list):
+            raise PipelineStepError(PipelineStep.FAQ, "В ответе отсутствует массив faq.")
+        sanitized = self._sanitize_entries(entries)
+        if len(sanitized) != 5:
+            raise PipelineStepError(PipelineStep.FAQ, "FAQ должно содержать ровно 5 пар вопросов и ответов.")
+        return sanitized
+
+    def _build_faq_messages(self, base_text: str) -> List[Dict[str, str]]:
+        hints: List[str] = []
+        if self.provided_faq:
+            provided_preview = json.dumps(
+                [
+                    {
+                        "question": str(entry.get("question", "")).strip(),
+                        "answer": str(entry.get("answer", "")).strip(),
+                    }
+                    for entry in self.provided_faq
+                    if str(entry.get("question", "")).strip() and str(entry.get("answer", "")).strip()
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+            hints.append(
+                "Используй следующие пары как ориентир и улучшай формулировки, если нужно:\n" + provided_preview
+            )
+        if self.normalized_keywords:
+            hints.append(
+                "По возможности вплетай ключевые слова: " + ", ".join(self.normalized_keywords) + "."
+            )
+
+        user_instructions = [
+            "Ниже приведена статья без блока FAQ. Сформируй пять уникальных вопросов и ответов.",
+            "Верни результат в формате JSON: {\"faq\": [{\"question\": \"...\", \"answer\": \"...\"}, ...]}.",
+            "Ответы должны быть развернутыми, практичными и без повторов.",
+            "Не используй клише вроде 'Дополнительно рассматривается'.",
+        ]
+        if hints:
+            user_instructions.extend(hints)
+        payload = "\n".join(user_instructions)
+        article_block = f"СТАТЬЯ:\n{base_text.strip()}"
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Ты опытный финансовый редактор. Сформируй полезный FAQ без повторов,"
+                    " обеспечь, чтобы вопросы отличались по фокусу и помогали читателю действовать."
+                ),
+            },
+            {"role": "user", "content": f"{payload}\n\n{article_block}"},
+        ]
+
+    def _sync_locked_terms(self, text: str) -> None:
+        pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
+        self.locked_terms = pattern.findall(text)
+
+    # ------------------------------------------------------------------
+    # Step implementations
+    # ------------------------------------------------------------------
     def _run_skeleton(self) -> str:
         self._log(PipelineStep.SKELETON, "running")
-        intro = self._render_intro()
-        body = self._render_body()
-        outro = self._render_outro()
-        faq_placeholder = "\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n\n"
-        skeleton = f"## Введение\n\n{intro}\n\n## Основная часть\n\n{body}{faq_placeholder}## Вывод\n\n{outro}"
-        self._update_log(
-            PipelineStep.SKELETON,
-            "ok",
-            length=len(skeleton),
-            **self._metrics(skeleton),
+        messages = list(self.messages)
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Сгенерируй полную статью по заданной структуре. Для блока FAQ оставь пустое место:"
+                    f" добавь заголовок '## FAQ', затем отдельными строками {FAQ_START} и {FAQ_END},"
+                    " без текста между ними. Остальные разделы наполни осмысленными рекомендациями."
+                ),
+            }
         )
-        self.checkpoints[PipelineStep.SKELETON] = skeleton
-        return skeleton
-
-    def _render_intro(self) -> str:
-        sentences = [
-            f"{self.topic} влияет на финансовое здоровье семьи, поэтому начинаем с оценки текущей нагрузки и распределения платежей.",
-            "Мы фиксируем ключевые показатели, объясняем критерии допустимых значений и даём быстрые советы по сбору данных.",
-        ]
-        return " ".join(sentences)
-
-    def _render_body(self) -> str:
-        if not self.base_outline:
-            sections = ["Понимаем входные данные", "Разбираем метрики", "Готовим решения"]
-        else:
-            sections = [title for title in self.base_outline if title.lower() not in {"введение", "faq", "вывод"}]
-            if not sections:
-                sections = ["Понимаем входные данные", "Разбираем метрики", "Готовим решения"]
-        paragraphs: List[str] = []
-        for heading in sections:
-            paragraphs.append(f"### {heading}")
-            paragraphs.append(self._render_section_block(heading))
-        return "\n\n".join(paragraphs)
-
-    def _render_section_block(self, heading: str) -> str:
-        sentences = [
-            f"{heading} рассматриваем на реальных примерах, чтобы показать связь между цифрами и бытовыми решениями семьи.",
-            "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист действий, который можно выполнять по шагам.",
-            "В конце указываем цифровые сервисы для автоматизации расчётов и напоминаний, чтобы снизить вероятность ошибок.",
-        ]
-        return " ".join(sentences)
-
-    def _render_outro(self) -> str:
-        sentences = [
-            "В выводах собираем план действий, назначаем контрольные даты и распределяем ответственность между участниками.",
-            "Дополняем материал рекомендациями по пересмотру стратегии и фиксируем признаки, при которых стоит обратиться к экспертам.",
-        ]
-        return " ".join(sentences)
+        skeleton_tokens = self._resolve_skeleton_tokens()
+        result = self._call_llm(step=PipelineStep.SKELETON, messages=messages, max_tokens=skeleton_tokens)
+        text = result.text.strip()
+        if not text:
+            raise PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
+        if FAQ_START not in text or FAQ_END not in text:
+            raise PipelineStepError(PipelineStep.SKELETON, "В тексте отсутствуют маркеры FAQ.")
+        self._check_template_text(text, PipelineStep.SKELETON)
+        self._update_log(PipelineStep.SKELETON, "ok", length=len(text), **self._metrics(text))
+        self.checkpoints[PipelineStep.SKELETON] = text
+        return text
 
     def _run_keywords(self, text: str) -> KeywordInjectionResult:
         self._log(PipelineStep.KEYWORDS, "running")
@@ -147,24 +401,23 @@ class DeterministicPipeline:
         self.checkpoints[PipelineStep.KEYWORDS] = result.text
         return result
 
-    def _run_faq(self, text: str) -> FaqBuildResult:
+    def _run_faq(self, text: str) -> str:
         self._log(PipelineStep.FAQ, "running")
-        faq_result = build_faq_block(
-            base_text=text,
-            topic=self.topic,
-            keywords=self.keywords,
-            provided_entries=self.provided_faq,
-        )
-        self.jsonld = faq_result.jsonld
-        self.jsonld_reserve = len("".join(self.jsonld.split())) if self.jsonld else 0
+        messages = self._build_faq_messages(text)
+        result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=700)
+        entries = self._parse_faq_entries(result.text)
+        faq_block = self._render_faq_markdown(entries)
+        merged_text = self._merge_faq(text, faq_block)
+        self.jsonld = self._build_jsonld(entries)
+        self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
         self._update_log(
             PipelineStep.FAQ,
             "ok",
-            entries=[entry.question for entry in faq_result.entries],
-            **self._metrics(faq_result.text),
+            entries=[entry["question"] for entry in entries],
+            **self._metrics(merged_text),
         )
-        self.checkpoints[PipelineStep.FAQ] = faq_result.text
-        return faq_result
+        self.checkpoints[PipelineStep.FAQ] = merged_text
+        return merged_text
 
     def _run_trim(self, text: str) -> TrimResult:
         self._log(PipelineStep.TRIM, "running")
@@ -185,14 +438,16 @@ class DeterministicPipeline:
         self.checkpoints[PipelineStep.TRIM] = result.text
         return result
 
-    # Public API -------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def run(self) -> PipelineState:
         text = self._run_skeleton()
         keyword_result = self._run_keywords(text)
-        faq_result = self._run_faq(keyword_result.text)
-        trim_result = self._run_trim(faq_result.text)
+        faq_text = self._run_faq(keyword_result.text)
+        trim_result = self._run_trim(faq_text)
         combined_text = trim_result.text
-        if self.jsonld:
+        if self.jsonld and self.jsonld_requested:
             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
         validation = validate_article(
             combined_text,
@@ -200,21 +455,17 @@ class DeterministicPipeline:
             min_chars=self.min_chars,
             max_chars=self.max_chars,
         )
-        self.logs.append(
-            PipelineLogEntry(
-                step=PipelineStep.TRIM,
-                started_at=time.time(),
-                finished_at=time.time(),
-                status="validated" if validation.is_valid else "failed",
-                notes={"stats": validation.stats, **self._metrics(combined_text)},
-            )
-        )
         return PipelineState(
             text=combined_text,
             jsonld=self.jsonld,
             validation=validation,
             logs=self.logs,
             checkpoints=self.checkpoints,
+            model_used=self._model_used or self.model,
+            fallback_used=self._fallback_used,
+            fallback_reason=self._fallback_reason,
+            api_route=self._api_route,
+            token_usage=self._token_usage,
         )
 
     def resume(self, from_step: PipelineStep) -> PipelineState:
@@ -229,40 +480,10 @@ class DeterministicPipeline:
             fallback_index -= 1
 
         if fallback_index < 0:
-            message = (
-                f"Чекпоинты отсутствуют для шага {from_step.value}. Полный перезапуск пайплайна."
-            )
-            self.logs.append(
-                PipelineLogEntry(
-                    step=from_step,
-                    started_at=time.time(),
-                    finished_at=time.time(),
-                    status="error",
-                    notes={"message": message},
-                )
-            )
-            return self.run()
+            raise PipelineStepError(from_step, "Чекпоинты отсутствуют; требуется полный перезапуск.")
 
         base_step = order[fallback_index]
         base_text = self.checkpoints[base_step]
-        if fallback_index != base_index:
-            message = (
-                f"Запрошено возобновление с шага {from_step.value}, но найден ближайший чекпоинт {base_step.value}."
-            )
-            self.logs.append(
-                PipelineLogEntry(
-                    step=from_step,
-                    started_at=time.time(),
-                    finished_at=time.time(),
-                    status="error",
-                    notes={
-                        "message": message,
-                        "requested": from_step.value,
-                        "resumed_from": base_step.value,
-                    },
-                )
-            )
-
         self._sync_locked_terms(base_text)
 
         text = base_text
@@ -270,12 +491,12 @@ class DeterministicPipeline:
             if step == PipelineStep.KEYWORDS:
                 text = self._run_keywords(text).text
             elif step == PipelineStep.FAQ:
-                text = self._run_faq(text).text
+                text = self._run_faq(text)
             elif step == PipelineStep.TRIM:
                 text = self._run_trim(text).text
 
         combined_text = text
-        if self.jsonld:
+        if self.jsonld and self.jsonld_requested:
             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
         validation = validate_article(
             combined_text,
@@ -289,29 +510,9 @@ class DeterministicPipeline:
             validation=validation,
             logs=self.logs,
             checkpoints=self.checkpoints,
+            model_used=self._model_used or self.model,
+            fallback_used=self._fallback_used,
+            fallback_reason=self._fallback_reason,
+            api_route=self._api_route,
+            token_usage=self._token_usage,
         )
-
-    # Metrics helpers --------------------------------------------------
-    def _sync_locked_terms(self, text: str) -> None:
-        pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
-        self.locked_terms = pattern.findall(text)
-
-    def _count_faq_entries(self, text: str) -> int:
-        if "<!--FAQ_START-->" not in text or "<!--FAQ_END-->" not in text:
-            return 0
-        block = text.split("<!--FAQ_START-->", 1)[1].split("<!--FAQ_END-->", 1)[0]
-        return len(re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block))
-
-    def _metrics(self, text: str) -> Dict[str, object]:
-        article = strip_jsonld(text)
-        chars_no_spaces = len(re.sub(r"\s+", "", article))
-        keywords_found = 0
-        for term in self.normalized_keywords:
-            if build_term_pattern(term).search(article):
-                keywords_found += 1
-        return {
-            "chars_no_spaces": chars_no_spaces,
-            "keywords_found": keywords_found,
-            "keywords_total": len(self.normalized_keywords),
-            "faq_count": self._count_faq_entries(article),
-        }

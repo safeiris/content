@@ -37,6 +37,11 @@ def _env_bool(name: str, default: bool) -> bool:
 
 OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
 
+USE_MOCK_LLM = _env_bool("USE_MOCK_LLM", False)
+OFFLINE_MODE = _env_bool("OFFLINE_MODE", False)
+PIPELINE_FAST_PATH = _env_bool("PIPELINE_FAST_PATH", False)
+MODEL_PROVIDER = str(os.getenv("MODEL_PROVIDER", "openai")).strip() or "openai"
+
 _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
 FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
 

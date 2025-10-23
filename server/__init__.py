@@ -49,6 +49,8 @@ load_dotenv()
 LOGGER = logging.getLogger("content_factory.api")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
+PIPELINE_CONFIG_FILENAME = "pipeline.json"
+
 USERS: Dict[str, Dict[str, str]] = {
     "admin": {
         "display_name": "Admin",
@@ -563,16 +565,19 @@ def _collect_pipes() -> List[Dict[str, Any]]:
         name = slug.replace("_", " ").title()
         description, tone = _extract_style(entry / "style_guide.md")
         keywords = _extract_keywords(entry / "glossary.txt")
-        pipes.append(
-            {
-                "id": slug,
-                "name": name,
-                "description": description or f"Тематика {name}",
-                "tone": tone or "экспертный",
-                "keywords": keywords,
-                "default_structure": DEFAULT_STRUCTURE,
-            }
-        )
+        pipeline_config = _load_pipeline_config(entry)
+        pipe_payload: Dict[str, Any] = {
+            "id": slug,
+            "name": name,
+            "description": description or f"Тематика {name}",
+            "tone": tone or "экспертный",
+            "keywords": keywords,
+            "default_structure": DEFAULT_STRUCTURE,
+        }
+        default_model = str(pipeline_config.get("default_model", "")).strip()
+        if default_model:
+            pipe_payload["default_model"] = default_model
+        pipes.append(pipe_payload)
     return pipes
 
 
@@ -611,6 +616,18 @@ def _extract_keywords(glossary_path: Path) -> List[str]:
         if len(keywords) >= 6:
             break
     return keywords
+
+
+def _load_pipeline_config(theme_dir: Path) -> Dict[str, Any]:
+    config_path = theme_dir / PIPELINE_CONFIG_FILENAME
+    if not config_path.exists():
+        return {}
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        LOGGER.warning("Повреждён pipeline config: %s", config_path)
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[str, Any]:

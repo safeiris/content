@@ -1026,6 +1026,10 @@ function applyPipeDefaults(pipeId) {
   if (!goalInput.value) {
     goalInput.value = "SEO-статья";
   }
+  if (modelInput && !modelInput.value && pipe.default_model) {
+    modelInput.value = pipe.default_model;
+    updateTemperatureControlState(pipe.default_model);
+  }
 }
 
 async function handlePromptPreview() {
@@ -1260,7 +1264,16 @@ function buildRequestPayload() {
     delete data.context_filename;
   }
 
-  const model = modelInput.value || undefined;
+  let model = (modelInput?.value || "").trim();
+  if (!model) {
+    const pipeDefaults = state.pipes.get(theme);
+    if (pipeDefaults?.default_model) {
+      model = pipeDefaults.default_model;
+      if (modelInput) {
+        modelInput.value = model;
+      }
+    }
+  }
   const temperatureLocked = isTemperatureLocked(model);
   let temperature;
   if (temperatureLocked) {
@@ -1294,7 +1307,7 @@ function buildRequestPayload() {
     k,
     temperature: temperatureLocked ? undefined : temperature,
     maxTokens,
-    model,
+    model: model || undefined,
     context_source: contextSource,
   };
 

@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+import json
+import re
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List
 
 from keyword_injector import LOCK_START_TEMPLATE
@@ -18,11 +21,12 @@ class ValidationResult:
     keywords_ok: bool
     faq_ok: bool
     jsonld_ok: bool
+    quality_ok: bool
     stats: Dict[str, object] = field(default_factory=dict)
 
     @property
     def is_valid(self) -> bool:
-        return self.length_ok and self.keywords_ok and self.faq_ok and self.jsonld_ok
+        return self.length_ok and self.keywords_ok and self.faq_ok and self.jsonld_ok and self.quality_ok
 
 
 def strip_jsonld(text: str) -> str:
@@ -31,6 +35,10 @@ def strip_jsonld(text: str) -> str:
 
 def _length_no_spaces(text: str) -> int:
     return len(re.sub(r"\s+", "", strip_jsonld(text)))
+
+
+def length_no_spaces(text: str) -> int:
+    return _length_no_spaces(text)
 
 
 def _faq_pairs(text: str) -> List[str]:
@@ -70,6 +78,31 @@ def _jsonld_valid(text: str) -> bool:
     return True
 
 
+def _quality_issues(text: str) -> List[str]:
+    stripped = strip_jsonld(text)
+    lowered = stripped.lower()
+    issues: List[str] = []
+    if lowered.count("дополнительно рассматривается") >= 3:
+        issues.append("template_phrase_repetition")
+
+    sentences = [segment.strip() for segment in re.split(r"[.!?]\s+", stripped) if segment.strip()]
+    for first, second in zip(sentences, sentences[1:]):
+        if first and first == second:
+            issues.append("duplicate_sentence")
+            break
+
+    lines = stripped.splitlines()
+    for index, line in enumerate(lines):
+        if re.match(r"^#{2,6}\s+\S", line):
+            probe = index + 1
+            while probe < len(lines) and not lines[probe].strip():
+                probe += 1
+            if probe >= len(lines) or lines[probe].startswith("#"):
+                issues.append("empty_heading")
+                break
+    return issues
+
+
 def validate_article(text: str, *, keywords: Iterable[str], min_chars: int, max_chars: int) -> ValidationResult:
     length = _length_no_spaces(text)
     length_ok = min_chars <= length <= max_chars
@@ -87,17 +120,21 @@ def validate_article(text: str, *, keywords: Iterable[str], min_chars: int, max_
     faq_ok = faq_count == 5
     jsonld_ok = _jsonld_valid(text)
 
+    quality_issues = _quality_issues(text)
+
     stats: Dict[str, object] = {
         "length_no_spaces": length,
         "keywords_total": len(normalized_keywords),
         "keywords_missing": missing,
         "keywords_found": len(normalized_keywords) - len(missing),
         "faq_count": faq_count,
+        "quality_issues": quality_issues,
     }
     return ValidationResult(
         length_ok=length_ok,
         keywords_ok=keywords_ok,
         faq_ok=faq_ok,
         jsonld_ok=jsonld_ok,
+        quality_ok=not quality_issues,
         stats=stats,
     )
