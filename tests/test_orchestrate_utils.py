@@ -315,10 +315,7 @@ def test_generate_article_returns_metadata(monkeypatch, tmp_path):
 
 
 def test_gather_health_status_handles_missing_theme(monkeypatch):
-    class DummyResponse:
-        status_code = 200
-
-    monkeypatch.setattr("orchestrate.httpx.get", lambda *args, **kwargs: DummyResponse())
+    monkeypatch.setenv("OPENAI_API_KEY", "")
     status = gather_health_status(theme="")
     assert not status["ok"]
     assert not status["checks"]["theme_index"]["ok"]

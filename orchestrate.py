@@ -11,7 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import httpx
 from zoneinfo import ZoneInfo
 
 from assemble_messages import ContextBundle, assemble_messages, retrieve_context
@@ -545,47 +544,38 @@ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
         ok = False
     else:
         masked = f"{api_key[:4]}***{api_key[-4:]}" if len(api_key) > 8 else "*" * len(api_key)
+        checks["openai_key"] = {"ok": True, "message": f"Ключ найден ({masked})"}
+
         try:
-            response = httpx.get(
-                "https://api.openai.com/v1/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=5.0,
+            probe_messages = [
+                {"role": "system", "content": "Ты проверка готовности. Ответь строго словом PING."},
+                {"role": "user", "content": "Ответь словом PING"},
+            ]
+            ping_result = llm_generate(
+                probe_messages,
+                model=DEFAULT_MODEL,
+                temperature=0.0,
+                max_tokens=32,
+                timeout_s=10,
             )
-            if response.status_code == 200:
-                checks["openai_key"] = {"ok": True, "message": f"Ключ активен ({masked})"}
+            reply = (ping_result.text or "").strip().lower()
+            route = (ping_result.api_route or "").strip().lower()
+            used_fallback = bool(ping_result.fallback_used)
+            ping_ok = reply.startswith("ping") and route == "responses" and not used_fallback
+            if ping_ok:
+                checks["openai_key"]["message"] = f"Ключ активен ({masked})"
+                checks["llm_ping"] = {"ok": True, "message": "Ответ PING получен"}
             else:
                 ok = False
-                checks["openai_key"] = {"ok": False, "message": f"HTTP {response.status_code} при проверке ключа ({masked})"}
-        except httpx.HTTPError as exc:
+                message = "OpenAI API недоступен"
+                if reply and not reply.startswith("ping"):
+                    message = f"OpenAI API недоступен (ответ: {ping_result.text[:32]})"
+                elif route != "responses" or used_fallback:
+                    message = "OpenAI API недоступен (fallback)"
+                checks["llm_ping"] = {"ok": False, "message": message}
+        except Exception:  # noqa: BLE001
             ok = False
-            checks["openai_key"] = {"ok": False, "message": f"Ошибка проверки ключа: {exc}"}
-
-        if checks.get("openai_key", {}).get("ok"):
-            try:
-                probe_messages = [
-                    {"role": "system", "content": "Ты проверка готовности. Ответь строго словом PING."},
-                    {"role": "user", "content": "Ответь словом PING"},
-                ]
-                ping_result = llm_generate(
-                    probe_messages,
-                    model=DEFAULT_MODEL,
-                    temperature=0.0,
-                    max_tokens=12,
-                    timeout_s=10,
-                )
-                reply = (ping_result.text or "").strip().lower()
-                ping_ok = reply.startswith("ping")
-                if not ping_ok:
-                    ok = False
-                    checks["llm_ping"] = {
-                        "ok": False,
-                        "message": f"Неожиданный ответ модели: {ping_result.text[:32]}",
-                    }
-                else:
-                    checks["llm_ping"] = {"ok": True, "message": "Ответ PING получен"}
-            except Exception as exc:  # noqa: BLE001
-                ok = False
-                checks["llm_ping"] = {"ok": False, "message": f"LLM недоступна: {exc}"}
+            checks["llm_ping"] = {"ok": False, "message": "OpenAI API недоступен"}
 
     artifacts_dir = Path("artifacts")
     try:

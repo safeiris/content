@@ -1,68 +1,8 @@
-diff --git a/artifacts_store.py b/artifacts_store.py
-index 47d2441cd3fd40562d9abd139bfaf4404fe42b04..a2d15bc772a0fc6f6a71388487e1fe5f7552049e 100644
---- a/artifacts_store.py
-+++ b/artifacts_store.py
-@@ -243,50 +243,55 @@ def register_artifact(
-                     "name": record.name,
-                     "status": record.status,
-                     "updated_at": record.updated_at,
-                 }
-             )
-             entries[idx] = merged
-             updated = True
-             break
-     if not updated:
-         entries.append(
-             {
-                 "id": record.id,
-                 "path": record.path,
-                 "metadata_path": record.metadata_path,
-                 "name": record.name,
-                 "status": record.status,
-                 "updated_at": record.updated_at,
-             }
-         )
- 
-     entries = _sort_entries(entries)
-     _write_index(entries)
-     if finalized:
-         _update_latest(record)
-         _append_changelog(record)
-+        LOGGER.info(
-+            "ARTIFACT_SAVED path=%s metadata=%s",
-+            record.path,
-+            record.metadata_path or "-",
-+        )
-     return record
- 
- 
- def _sort_entries(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-     def _key(entry: Dict[str, Any]) -> tuple:
-         updated_at = entry.get("updated_at")
-         return (str(updated_at) if updated_at else "", str(entry.get("name") or ""))
- 
-     return sorted(list(entries), key=_key, reverse=True)
- 
- 
- def list_artifacts(theme: Optional[str] = None, *, auto_cleanup: bool = False) -> List[Dict[str, Any]]:
-     """Return artifacts suitable for API output."""
- 
-     if auto_cleanup:
-         cleanup_index()
- 
-     entries = _read_index()
-     if entries:
-         records = [rec for rec in (_build_record_from_entry(entry) for entry in entries) if rec]
-     else:
-         records = []
-         artifacts_dir = ARTIFACTS_DIR
-         if artifacts_dir.exists():
-             for path in sorted(artifacts_dir.glob("*.md"), reverse=True):
 diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f7d8e322f 100644
+index 65387db424d2e38ef6f561281d6d295f7d8e322f..eb5d247923925232b21d30f3395be4e26c3db437 100644
 --- a/deterministic_pipeline.py
 +++ b/deterministic_pipeline.py
-@@ -1,47 +1,48 @@
+@@ -1,48 +1,50 @@
  """LLM-driven content pipeline with explicit step-level guarantees."""
  
  from __future__ import annotations
@@ -77,16 +17,18 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
  from enum import Enum
  from typing import Dict, Iterable, List, Optional, Sequence, Tuple
  
- from llm_client import GenerationResult, generate as llm_generate
+-from llm_client import GenerationResult, generate as llm_generate
++from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
++from faq_builder import _normalize_entry
  from keyword_injector import (
      KeywordInjectionResult,
-+    LOCK_END,
+     LOCK_END,
      LOCK_START_TEMPLATE,
      build_term_pattern,
      inject_keywords,
  )
--from length_trimmer import TrimResult, trim_text
-+from length_trimmer import TrimResult, TrimValidationError, trim_text
+ from length_trimmer import TrimResult, TrimValidationError, trim_text
++from prompt_templates import load_template
  from validators import (
      ValidationError,
      ValidationResult,
@@ -112,7 +54,7 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
      SKELETON = "skeleton"
      KEYWORDS = "keywords"
      FAQ = "faq"
-@@ -103,50 +104,51 @@ class DeterministicPipeline:
+@@ -104,50 +106,51 @@ class DeterministicPipeline:
      ) -> None:
          if not model or not str(model).strip():
              raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
@@ -138,7 +80,8 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
          self.locked_terms: List[str] = []
          self.jsonld_reserve: int = 0
          self.skeleton_payload: Optional[Dict[str, object]] = None
-+        self.keywords_coverage_percent: float = 0.0
++        self._skeleton_faq_entries: List[Dict[str, str]] = []
+         self.keywords_coverage_percent: float = 0.0
  
          self._model_used: Optional[str] = None
          self._fallback_used: Optional[str] = None
@@ -163,8 +106,9 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
          self.logs.append(
              PipelineLogEntry(step=step, started_at=time.time(), finished_at=time.time(), status=status, notes=dict(notes))
          )
+@@ -176,70 +179,72 @@ class DeterministicPipeline:
  
-@@ -176,78 +178,111 @@ class DeterministicPipeline:
+     def _extract_usage(self, result: GenerationResult) -> Optional[float]:
          metadata = result.metadata or {}
          if not isinstance(metadata, dict):
              return None
@@ -188,92 +132,58 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
          step: PipelineStep,
          messages: Sequence[Dict[str, object]],
          max_tokens: Optional[int] = None,
++        override_model: Optional[str] = None,
      ) -> GenerationResult:
          prompt_len = self._prompt_length(messages)
--        LOGGER.info("LOG:LLM_REQUEST step=%s model=%s prompt_len=%d", step.value, self.model, prompt_len)
          limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
          if not limit or limit <= 0:
              limit = 700
--        try:
--            result = llm_generate(
--                list(messages),
--                model=self.model,
--                temperature=self.temperature,
--                max_tokens=limit,
--                timeout_s=self.timeout_s,
--                backoff_schedule=self.backoff_schedule,
-+        attempt = 0
-+        while attempt < 3:
-+            attempt += 1
-+            LOGGER.info(
-+                "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d attempt=%d max_tokens=%d",
-+                step.value,
-+                self.model,
-+                prompt_len,
-+                attempt,
-+                limit,
+         attempt = 0
++        model_to_use = (override_model or self.model).strip()
+         while attempt < 3:
+             attempt += 1
+             LOGGER.info(
+                 "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d attempt=%d max_tokens=%d",
+                 step.value,
+-                self.model,
++                model_to_use,
+                 prompt_len,
+                 attempt,
+                 limit,
              )
--        except Exception as exc:  # noqa: BLE001
--            LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
--            raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
-+            try:
-+                result = llm_generate(
-+                    list(messages),
-+                    model=self.model,
-+                    temperature=self.temperature,
-+                    max_tokens=limit,
-+                    timeout_s=self.timeout_s,
-+                    backoff_schedule=self.backoff_schedule,
-+                )
-+            except Exception as exc:  # noqa: BLE001
-+                LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
-+                raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
+             try:
+                 result = llm_generate(
+                     list(messages),
+-                    model=self.model,
++                    model=model_to_use,
+                     temperature=self.temperature,
+                     max_tokens=limit,
+                     timeout_s=self.timeout_s,
+                     backoff_schedule=self.backoff_schedule,
+                 )
+             except Exception as exc:  # noqa: BLE001
+                 LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
+                 raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
  
--        usage = self._extract_usage(result)
--        metadata = result.metadata or {}
--        status = str(metadata.get("status") or "ok")
--        LOGGER.info(
--            "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
--            step.value,
--            "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
--            status,
--        )
--        self._register_llm_result(result, usage)
--        return result
-+            usage = self._extract_usage(result)
-+            metadata = result.metadata or {}
-+            status = str(metadata.get("status") or "ok")
-+            incomplete_reason = metadata.get("incomplete_reason") or ""
-+            LOGGER.info(
-+                "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
-+                step.value,
-+                "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
-+                status,
-+            )
-+            if status.lower() != "incomplete" and not incomplete_reason:
-+                self._register_llm_result(result, usage)
-+                return result
-+
-+            if attempt >= 3:
-+                message = "Модель не завершила генерацию (incomplete)."
-+                LOGGER.error(
-+                    "LLM_INCOMPLETE_ABORT step=%s status=%s reason=%s",
-+                    step.value,
-+                    status or "incomplete",
-+                    incomplete_reason or "",
-+                )
-+                raise PipelineStepError(step, message)
-+
-+            LOGGER.warning(
-+                "LLM_RETRY_incomplete step=%s attempt=%d status=%s reason=%s",
-+                step.value,
-+                attempt,
-+                status or "incomplete",
-+                incomplete_reason or "",
-+            )
-+            limit = max(200, int(limit * 0.9))
-+
-+        raise PipelineStepError(step, "Не удалось получить ответ от модели.")
+             usage = self._extract_usage(result)
+             metadata = result.metadata or {}
+             status = str(metadata.get("status") or "ok")
+             incomplete_reason = metadata.get("incomplete_reason") or ""
+             LOGGER.info(
+                 "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
+                 step.value,
+                 "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
+                 status,
+             )
+             if status.lower() != "incomplete" and not incomplete_reason:
+                 self._register_llm_result(result, usage)
+                 return result
+ 
+             if attempt >= 3:
+                 message = "Модель не завершила генерацию (incomplete)."
+@@ -262,199 +267,246 @@ class DeterministicPipeline:
+ 
+         raise PipelineStepError(step, "Не удалось получить ответ от модели.")
  
      def _check_template_text(self, text: str, step: PipelineStep) -> None:
          lowered = text.lower()
@@ -297,43 +207,276 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
          }
  
      def _resolve_skeleton_tokens(self) -> int:
-         baseline = max(self.max_tokens, self.max_chars + 400)
-         if baseline <= 0:
-@@ -447,50 +482,59 @@ class DeterministicPipeline:
+-        baseline = max(self.max_tokens, self.max_chars + 400)
+-        if baseline <= 0:
+-            baseline = self.max_chars + 400
+-        return min(1500, max(600, baseline))
++        baseline = 1200 if self.max_tokens <= 0 else min(self.max_tokens, 1200)
++        return max(600, baseline)
  
-         user_instructions = [
-             "Ниже приведена статья без блока FAQ. Сформируй пять уникальных вопросов и ответов.",
-             "Верни результат в формате JSON: {\"faq\": [{\"question\": \"...\", \"answer\": \"...\"}, ...]}.",
-             "Ответы должны быть развернутыми, практичными и без повторов.",
-             "Не используй клише вроде 'Дополнительно рассматривается'.",
+-    def _skeleton_contract(self) -> Dict[str, object]:
++    def _skeleton_contract(self) -> Tuple[Dict[str, object], str]:
+         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
+         intro = outline[0] if outline else "Введение"
+         outro = outline[-1] if len(outline) > 1 else "Вывод"
+         core_sections = [
+             item
+             for item in outline[1:-1]
+             if item.lower() not in {"faq", "f.a.q.", "вопросы и ответы"}
          ]
-         if hints:
-             user_instructions.extend(hints)
-         payload = "\n".join(user_instructions)
-         article_block = f"СТАТЬЯ:\n{base_text.strip()}"
-         return [
-             {
-                 "role": "system",
-                 "content": (
-                     "Ты опытный финансовый редактор. Сформируй полезный FAQ без повторов,"
-                     " обеспечь, чтобы вопросы отличались по фокусу и помогали читателю действовать."
-                 ),
-             },
-             {"role": "user", "content": f"{payload}\n\n{article_block}"},
-         ]
+         if not core_sections:
+             core_sections = ["Основная часть"]
+         contract = {
+-            "intro": f"2-3 плотных абзаца для раздела '{intro}'",
++            "intro": f"один абзац с вводной рамкой для раздела '{intro}'",
+             "main": [
+-                f"2-3 абзаца раскрывают тему '{heading}' на практических примерах"
++                (
++                    "3-5 абзацев раскрывают тему '"
++                    + heading
++                    + "' с примерами, рисками и расчётами"
++                )
+                 for heading in core_sections
+             ],
+-            "outro": f"1-2 абзаца с выводами и призывом к действию для блока '{outro}'",
++            "faq": [
++                {"q": "вопрос", "a": "ответ"} for _ in range(5)
++            ],
++            "conclusion": f"один абзац выводов и призыва к действию для блока '{outro}'",
+         }
+-        return contract
++        template_example = load_template("json_contract.txt").strip()
++        return contract, template_example
  
+     def _build_skeleton_messages(self) -> List[Dict[str, object]]:
+         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
+-        contract_payload = self._skeleton_contract()
++        contract_payload, contract_template = self._skeleton_contract()
+         contract = json.dumps(contract_payload, ensure_ascii=False, indent=2)
+-        main_expected = max(1, len(contract_payload.get("main") or []))
++        keywords_clause = "Используй ключевые слова: " + ", ".join(self.normalized_keywords)
++        if not self.normalized_keywords:
++            keywords_clause = "Используй все предоставленные ключевые слова в точных формах."
++        sections_clause = ", ".join(outline) if outline else "Введение, Основная часть, FAQ, Вывод"
+         user_payload = textwrap.dedent(
+             f"""
+-            Сформируй структуру статьи в строгом JSON-формате.
+-            Требования:
+-            1. Соблюдай порядок разделов: {', '.join(outline) if outline else 'Введение, Основная часть, Вывод'}.
+-            2. Верни JSON вида {{"intro": str, "main": [str, ...], "outro": str}} без дополнительных ключей.
+-            3. main должен содержать {main_expected} элемента — по одному на каждый раздел основной части.
+-            4. Каждый элемент intro/main/outro содержит 2-3 осмысленных абзаца по 3-4 предложения, без Markdown и приветствий.
+-            5. Не добавляй FAQ, разметку, комментарии и служебные подписи.
+-            Образец структуры:
++            Ты создаёшь детерминированный SEO-текст. Соблюдай требования UI:
++            • Верни строго JSON-объект с ключами intro, main, faq, conclusion.
++            • intro и conclusion — по одному абзацу без приветствий.
++            • main — список из 3–6 элементов, каждый элемент содержит 3–5 абзацев по 3–4 предложения.
++            • faq — массив из 5 объектов {{"q": str, "a": str}}. Ответы FAQ развернутые (минимум 2 предложения) и прикладные.
++            • Общий объём статьи (intro + main + conclusion + ответы FAQ) — 3500–6000 символов без пробелов.
++            • {keywords_clause}
++            • Соблюдай последовательность разделов: {sections_clause}.
++            • Не добавляй ничего, кроме требуемого JSON. Не используй Markdown, комментарии и пояснения.
++
++            Оберни ответ маркерами <response_json> и </response_json> без дополнительного текста.
++            Пример целевого формата:
++            {contract_template}
++
++            Каркас с подсказками для содержания:
+             {contract}
+             """
+         ).strip()
+         messages = list(self.messages)
+         messages.append({"role": "user", "content": user_payload})
+         return messages
+ 
+     def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
+         if not isinstance(payload, dict):
+             raise ValueError("Структура скелета не является объектом")
+ 
+         intro = str(payload.get("intro") or "").strip()
+         main = payload.get("main")
+-        outro = str(payload.get("outro") or "").strip()
+-        if not intro or not outro or not isinstance(main, list) or not main:
+-            raise ValueError("Скелет не содержит обязательных полей")
++        conclusion = str(payload.get("conclusion") or "").strip()
++        faq = payload.get("faq")
++        if not intro or not conclusion or not isinstance(main, list) or len(main) == 0:
++            raise ValueError("Скелет не содержит обязательных полей intro/main/conclusion")
+ 
++        if not 3 <= len(main) <= 6:
++            raise ValueError("Скелет основной части должен содержать 3–6 блоков")
++
++        normalized_main: List[str] = []
+         for idx, item in enumerate(main):
+             if not isinstance(item, str) or not item.strip():
+                 raise ValueError(f"Элемент основной части №{idx + 1} пуст")
++            normalized_main.append(item.strip())
++
++        if not isinstance(faq, list) or len(faq) != 5:
++            raise ValueError("Скелет FAQ должен содержать ровно 5 элементов")
++
++        normalized_faq: List[Dict[str, str]] = []
++        for idx, entry in enumerate(faq, start=1):
++            if not isinstance(entry, dict):
++                raise ValueError(f"FAQ элемент №{idx} имеет неверный формат")
++            question = str(entry.get("q") or "").strip()
++            answer = str(entry.get("a") or "").strip()
++            if not question or not answer:
++                raise ValueError(f"FAQ элемент №{idx} пуст")
++            normalized_faq.append({"question": question, "answer": answer})
+ 
+         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
+         outline = [
+             entry
+             for entry in outline
+             if entry.lower() not in {"faq", "f.a.q.", "вопросы и ответы"}
+         ]
+         if len(outline) < 3:
+             outline = ["Введение", "Основная часть", "Вывод"]
+ 
+         intro_heading = outline[0]
+-        outro_heading = outline[-1]
++        conclusion_heading = outline[-1]
+         main_headings = outline[1:-1]
+         if not main_headings:
+             main_headings = ["Основная часть"]
+-        if len(main_headings) != len(main):
+-            raise ValueError(
+-                "Количество блоков в основной части не совпадает с ожиданиями по структуре"
+-            )
++        if len(main_headings) < len(normalized_main):
++            extra = len(normalized_main) - len(main_headings)
++            for index in range(extra):
++                main_headings.append(f"Блок {len(main_headings) + 1}")
++        elif len(main_headings) > len(normalized_main):
++            main_headings = main_headings[: len(normalized_main)]
+ 
+         lines: List[str] = [f"# {self.topic}", ""]
+ 
+         def _append_section(heading: str, content: str) -> None:
+             paragraphs = [part.strip() for part in re.split(r"\n{2,}", content) if part.strip()]
+             if not paragraphs:
+                 raise ValueError(f"Раздел '{heading}' пуст")
+             lines.append(f"## {heading}")
+             for paragraph in paragraphs:
+                 lines.append(paragraph)
+                 lines.append("")
+ 
+         _append_section(intro_heading, intro)
+-        for heading, body in zip(main_headings, main):
++        for heading, body in zip(main_headings, normalized_main):
+             _append_section(heading, body)
+-        _append_section(outro_heading, outro)
++        _append_section(conclusion_heading, conclusion)
+ 
+         lines.append("## FAQ")
+         lines.append(FAQ_START)
+         lines.append(FAQ_END)
+         markdown = "\n".join(lines).strip()
+-        outline_summary = [intro_heading, *main_headings, outro_heading]
+-        return markdown, {"outline": outline_summary}
++        outline_summary = [intro_heading, *main_headings, conclusion_heading]
++        self._skeleton_faq_entries = normalized_faq
++        return markdown, {"outline": outline_summary, "faq": normalized_faq}
+ 
+     def _render_faq_markdown(self, entries: Sequence[Dict[str, str]]) -> str:
+         lines: List[str] = []
+         for index, entry in enumerate(entries, start=1):
+             question = entry.get("question", "").strip()
+             answer = entry.get("answer", "").strip()
+             lines.append(f"**Вопрос {index}.** {question}")
+             lines.append(f"**Ответ.** {answer}")
+             lines.append("")
+         return "\n".join(lines).strip()
+ 
+     def _build_jsonld(self, entries: Sequence[Dict[str, str]]) -> str:
+         payload = {
+             "@context": "https://schema.org",
+             "@type": "FAQPage",
+             "mainEntity": [
+                 {
+                     "@type": "Question",
+                     "name": entry.get("question", ""),
+                     "acceptedAnswer": {"@type": "Answer", "text": entry.get("answer", "")},
+                 }
+                 for entry in entries
+             ],
+         }
+         compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+         return f'<script type="application/ld+json">\n{compact}\n</script>'
+ 
+     def _merge_faq(self, base_text: str, faq_block: str) -> str:
+         if FAQ_START not in base_text or FAQ_END not in base_text:
+             raise PipelineStepError(PipelineStep.FAQ, "В тексте нет маркеров FAQ для замены.")
+         before, remainder = base_text.split(FAQ_START, 1)
+         inside, after = remainder.split(FAQ_END, 1)
+         inside = inside.strip()
+         merged = f"{before}{FAQ_START}\n{faq_block}\n{FAQ_END}{after}"
+         return merged
+ 
+     def _sanitize_entries(self, entries: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+         sanitized: List[Dict[str, str]] = []
++        seen_questions: set[str] = set()
+         for entry in entries:
+-            question = str(entry.get("question", "")).strip()
+-            answer = str(entry.get("answer", "")).strip()
+-            if not question or not answer:
+-                continue
++            try:
++                normalized = _normalize_entry(dict(entry), seen_questions)
++            except ValueError as exc:
++                raise PipelineStepError(
++                    PipelineStep.FAQ,
++                    f"Некорректный FAQ: {exc}.",
++                ) from exc
++            question = normalized.question.strip()
++            answer = normalized.answer.strip()
+             lowered = (question + " " + answer).lower()
+             if "дополнительно рассматривается" in lowered:
+-                raise PipelineStepError(PipelineStep.FAQ, "FAQ содержит шаблонную фразу 'Дополнительно рассматривается'.")
++                raise PipelineStepError(
++                    PipelineStep.FAQ,
++                    "FAQ содержит шаблонную фразу 'Дополнительно рассматривается'.",
++                )
+             sanitized.append({"question": question, "answer": answer})
+         return sanitized
+ 
+     def _parse_faq_entries(self, raw_text: str) -> List[Dict[str, str]]:
+         candidate = raw_text.strip()
+         if not candidate:
+             raise PipelineStepError(PipelineStep.FAQ, "Модель вернула пустой блок FAQ.")
+         data: Optional[Dict[str, object]] = None
+         try:
+             data = json.loads(candidate)
+         except json.JSONDecodeError:
+             match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+             if match:
+                 data = json.loads(match.group(0))
+         if not isinstance(data, dict):
+             raise PipelineStepError(PipelineStep.FAQ, "Ответ модели не является корректным JSON.")
+         entries = data.get("faq")
+         if not isinstance(entries, list):
+             raise PipelineStepError(PipelineStep.FAQ, "В ответе отсутствует массив faq.")
+         sanitized = self._sanitize_entries(entries)
+         if len(sanitized) != 5:
+             raise PipelineStepError(PipelineStep.FAQ, "FAQ должно содержать ровно 5 пар вопросов и ответов.")
+         return sanitized
+ 
+     def _build_faq_messages(self, base_text: str) -> List[Dict[str, str]]:
+@@ -504,200 +556,211 @@ class DeterministicPipeline:
      def _sync_locked_terms(self, text: str) -> None:
          pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
          self.locked_terms = pattern.findall(text)
-+        if self.normalized_keywords:
-+            article = strip_jsonld(text)
-+            found = 0
-+            for term in self.normalized_keywords:
-+                lock_token = LOCK_START_TEMPLATE.format(term=term)
-+                lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-+                if lock_pattern.search(text) and build_term_pattern(term).search(article):
-+                    found += 1
-+            self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
+         if self.normalized_keywords:
+             article = strip_jsonld(text)
+             found = 0
+             for term in self.normalized_keywords:
+                 lock_token = LOCK_START_TEMPLATE.format(term=term)
+                 lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
+                 if lock_pattern.search(text) and build_term_pattern(term).search(article):
+                     found += 1
+             self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
  
      # ------------------------------------------------------------------
      # Step implementations
@@ -347,6 +490,9 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
          payload: Optional[Dict[str, object]] = None
          markdown: Optional[str] = None
          metadata_snapshot: Dict[str, object] = {}
++        json_error_count = 0
++        use_fallback = False
++        result: Optional[GenerationResult] = None
          while attempt < 3 and markdown is None:
              attempt += 1
              try:
@@ -354,12 +500,63 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
                      step=PipelineStep.SKELETON,
                      messages=messages,
                      max_tokens=skeleton_tokens,
++                    override_model=FALLBACK_MODEL if use_fallback else None,
                  )
              except PipelineStepError:
                  raise
              metadata_snapshot = result.metadata or {}
              status = str(metadata_snapshot.get("status") or "ok").lower()
-@@ -535,67 +579,70 @@ class DeterministicPipeline:
+             if status == "incomplete" or metadata_snapshot.get("incomplete_reason"):
+                 LOGGER.warning(
+                     "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
+                     attempt,
+                     status,
+                     metadata_snapshot.get("incomplete_reason") or "",
+                 )
+                 skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                 continue
+             raw_text = result.text.strip()
++            if "<response_json>" in raw_text and "</response_json>" in raw_text:
++                try:
++                    raw_text = raw_text.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
++                except Exception:  # pragma: no cover - defensive
++                    raw_text = raw_text
+             if not raw_text:
+                 last_error = PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
+                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=empty", attempt)
+                 skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                 continue
+             try:
+                 payload = json.loads(raw_text)
+                 LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
+             except json.JSONDecodeError as exc:
+                 LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, exc)
+                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
+                 skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                 last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
++                json_error_count += 1
++                if not use_fallback and json_error_count >= 2:
++                    LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
++                    use_fallback = True
++                    attempt = 0
++                    continue
+                 continue
+             try:
+                 markdown, summary = self._render_skeleton_markdown(payload)
+                 snapshot = dict(payload)
+                 snapshot["outline"] = summary.get("outline", [])
++                if "faq" in summary:
++                    snapshot["faq"] = summary.get("faq", [])
+                 self.skeleton_payload = snapshot
+                 LOGGER.info("SKELETON_RENDERED_WITH_MARKERS outline=%s", ",".join(summary.get("outline", [])))
+             except Exception as exc:  # noqa: BLE001
+                 last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
+                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=%s", attempt, exc)
+                 payload = None
+                 skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                 markdown = None
+ 
+         if markdown is None:
              if last_error:
                  raise last_error
              raise PipelineStepError(
@@ -371,6 +568,11 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
              raise PipelineStepError(PipelineStep.SKELETON, "Не удалось вставить маркеры FAQ на этапе скелета.")
  
          self._check_template_text(markdown, PipelineStep.SKELETON)
++        if result is not None:
++            route = result.api_route or ("chat" if use_fallback else "responses")
++        else:
++            route = "responses"
++        LOGGER.info("SKELETON_OK route=%s", route)
          self._update_log(
              PipelineStep.SKELETON,
              "ok",
@@ -385,15 +587,13 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
          self._log(PipelineStep.KEYWORDS, "running")
          result = inject_keywords(text, self.keywords)
          self.locked_terms = list(result.locked_terms)
-+        self.keywords_coverage_percent = result.coverage_percent
+         self.keywords_coverage_percent = result.coverage_percent
          total = result.total_terms
          found = result.found_terms
          missing = sorted(result.missing_terms)
          LOGGER.info(
--            "KEYWORDS_COVERAGE=%s missing=%s",
--            result.coverage_report,
-+            "KEYWORDS_COVERAGE=%.0f%% missing=%s",
-+            result.coverage_percent,
+             "KEYWORDS_COVERAGE=%.0f%% missing=%s",
+             result.coverage_percent,
              ",".join(missing) if missing else "-",
          )
          if total and found < total:
@@ -401,12 +601,12 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
                  PipelineStep.KEYWORDS,
                  "Не удалось обеспечить 100% покрытие ключей: " + ", ".join(missing),
              )
-+        LOGGER.info("KEYWORDS_OK coverage=%.2f%%", result.coverage_percent)
+         LOGGER.info("KEYWORDS_OK coverage=%.2f%%", result.coverage_percent)
          self._update_log(
              PipelineStep.KEYWORDS,
              "ok",
              KEYWORDS_COVERAGE=result.coverage_report,
-+            KEYWORDS_COVERAGE_PERCENT=result.coverage_percent,
+             KEYWORDS_COVERAGE_PERCENT=result.coverage_percent,
              KEYWORDS_MISSING=missing,
              inserted_section=result.inserted_section,
              **self._metrics(result.text),
@@ -416,63 +616,90 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
  
      def _run_faq(self, text: str) -> str:
          self._log(PipelineStep.FAQ, "running")
-         messages = self._build_faq_messages(text)
-         faq_tokens = 700
-         attempt = 0
-         last_error: Optional[Exception] = None
-         while attempt < 3:
-             attempt += 1
-             try:
-                 result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=faq_tokens)
-             except PipelineStepError:
-                 raise
-             metadata = result.metadata or {}
-             status = str(metadata.get("status") or "").lower()
-             if status == "incomplete" or metadata.get("incomplete_reason"):
-                 LOGGER.warning(
-                     "FAQ_RETRY_incomplete attempt=%d status=%s reason=%s",
-                     attempt,
-@@ -612,56 +659,59 @@ class DeterministicPipeline:
-                 LOGGER.warning("FAQ_RETRY_parse_error attempt=%d error=%s", attempt, exc)
-                 faq_tokens = max(300, int(faq_tokens * 0.9))
-                 continue
-             faq_block = self._render_faq_markdown(entries)
+-        messages = self._build_faq_messages(text)
+-        faq_tokens = 700
+-        attempt = 0
+-        last_error: Optional[Exception] = None
+-        while attempt < 3:
+-            attempt += 1
+-            try:
+-                result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=faq_tokens)
+-            except PipelineStepError:
+-                raise
+-            metadata = result.metadata or {}
+-            status = str(metadata.get("status") or "").lower()
+-            if status == "incomplete" or metadata.get("incomplete_reason"):
+-                LOGGER.warning(
+-                    "FAQ_RETRY_incomplete attempt=%d status=%s reason=%s",
+-                    attempt,
+-                    status or "incomplete",
+-                    metadata.get("incomplete_reason") or "",
++        entries_source: List[Dict[str, str]] = []
++        if self._skeleton_faq_entries:
++            entries_source = list(self._skeleton_faq_entries)
++        elif self.provided_faq:
++            entries_source = [
++                {"question": str(item.get("question", "")).strip(), "answer": str(item.get("answer", "")).strip()}
++                for item in self.provided_faq
++                if isinstance(item, dict)
++            ]
++
++        if entries_source:
++            sanitized = self._sanitize_entries(entries_source)
++            if len(sanitized) != 5:
++                raise PipelineStepError(
++                    PipelineStep.FAQ,
++                    "FAQ должно содержать ровно 5 пар вопросов и ответов.",
+                 )
+-                faq_tokens = max(300, int(faq_tokens * 0.9))
+-                last_error = PipelineStepError(PipelineStep.FAQ, "Модель не завершила формирование FAQ.")
+-                continue
+-            try:
+-                entries = self._parse_faq_entries(result.text)
+-            except PipelineStepError as exc:
+-                last_error = exc
+-                LOGGER.warning("FAQ_RETRY_parse_error attempt=%d error=%s", attempt, exc)
+-                faq_tokens = max(300, int(faq_tokens * 0.9))
+-                continue
+-            faq_block = self._render_faq_markdown(entries)
++            faq_block = self._render_faq_markdown(sanitized)
              merged_text = self._merge_faq(text, faq_block)
-             self.jsonld = self._build_jsonld(entries)
+-            self.jsonld = self._build_jsonld(entries)
++            self.jsonld = self._build_jsonld(sanitized)
              self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
-             LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in entries))
+-            LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in entries))
++            LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in sanitized))
              self._update_log(
                  PipelineStep.FAQ,
                  "ok",
-                 entries=[entry["question"] for entry in entries],
+-                entries=[entry["question"] for entry in entries],
++                entries=[entry["question"] for entry in sanitized],
                  **self._metrics(merged_text),
              )
              self.checkpoints[PipelineStep.FAQ] = merged_text
              return merged_text
  
-         if last_error:
-             raise last_error
-         raise PipelineStepError(PipelineStep.FAQ, "Не удалось сформировать блок FAQ после нескольких попыток.")
+-        if last_error:
+-            raise last_error
+-        raise PipelineStepError(PipelineStep.FAQ, "Не удалось сформировать блок FAQ после нескольких попыток.")
++        raise PipelineStepError(
++            PipelineStep.FAQ,
++            "Не удалось сформировать блок FAQ: отсутствуют подготовленные данные.",
++        )
  
      def _run_trim(self, text: str) -> TrimResult:
          self._log(PipelineStep.TRIM, "running")
          reserve = self.jsonld_reserve if self.jsonld else 0
          target_max = max(self.min_chars, self.max_chars - reserve)
--        result = trim_text(
--            text,
--            min_chars=self.min_chars,
--            max_chars=target_max,
--            protected_blocks=self.locked_terms,
--        )
-+        try:
-+            result = trim_text(
-+                text,
-+                min_chars=self.min_chars,
-+                max_chars=target_max,
-+                protected_blocks=self.locked_terms,
-+            )
-+        except TrimValidationError as exc:
-+            raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
+         try:
+             result = trim_text(
+                 text,
+                 min_chars=self.min_chars,
+                 max_chars=target_max,
+                 protected_blocks=self.locked_terms,
+             )
+         except TrimValidationError as exc:
+             raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
          current_length = length_no_spaces(result.text)
          if current_length < self.min_chars or current_length > self.max_chars:
              raise PipelineStepError(
@@ -484,667 +711,1223 @@ index f291c6569cdfbc1103878756ce674c0f9ee5dc9d..65387db424d2e38ef6f561281d6d295f
              term
              for term in self.normalized_keywords
              if LOCK_START_TEMPLATE.format(term=term) not in result.text
-         ]
-         if missing_locks:
-             raise PipelineStepError(
-                 PipelineStep.TRIM,
-                 "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing_locks)),
-             )
- 
-         faq_block = ""
-         if FAQ_START in result.text and FAQ_END in result.text:
-             faq_block = result.text.split(FAQ_START, 1)[1].split(FAQ_END, 1)[0]
-         faq_pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", faq_block)
-         if len(faq_pairs) != 5:
-             raise PipelineStepError(
-                 PipelineStep.TRIM,
-@@ -677,53 +727,59 @@ class DeterministicPipeline:
-             "ok",
-             removed=len(result.removed_paragraphs),
-             **self._metrics(result.text),
-         )
-         self.checkpoints[PipelineStep.TRIM] = result.text
-         return result
- 
-     # ------------------------------------------------------------------
-     # Public API
-     # ------------------------------------------------------------------
-     def run(self) -> PipelineState:
-         text = self._run_skeleton()
-         keyword_result = self._run_keywords(text)
-         faq_text = self._run_faq(keyword_result.text)
-         trim_result = self._run_trim(faq_text)
-         combined_text = trim_result.text
-         if self.jsonld and self.jsonld_requested:
-             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
-         try:
-             validation = validate_article(
-                 combined_text,
-                 keywords=self.keywords,
-                 min_chars=self.min_chars,
-                 max_chars=self.max_chars,
-                 skeleton_payload=self.skeleton_payload,
-+                keyword_coverage_percent=self.keywords_coverage_percent,
-             )
-         except ValidationError as exc:
-             raise PipelineStepError(PipelineStep.TRIM, str(exc), status_code=400) from exc
-+        LOGGER.info(
-+            "VALIDATION_OK length=%s keywords=%.0f%%",
-+            validation.stats.get("length_no_spaces"),
-+            float(validation.stats.get("keywords_coverage_percent") or 0.0),
-+        )
-         return PipelineState(
-             text=combined_text,
-             jsonld=self.jsonld,
-             validation=validation,
-             logs=self.logs,
-             checkpoints=self.checkpoints,
-             model_used=self._model_used or self.model,
-             fallback_used=self._fallback_used,
-             fallback_reason=self._fallback_reason,
-             api_route=self._api_route,
-             token_usage=self._token_usage,
-             skeleton_payload=self.skeleton_payload,
-         )
- 
-     def resume(self, from_step: PipelineStep) -> PipelineState:
-         order = [PipelineStep.SKELETON, PipelineStep.KEYWORDS, PipelineStep.FAQ, PipelineStep.TRIM]
-         if from_step == PipelineStep.SKELETON:
-             return self.run()
- 
-         requested_index = order.index(from_step)
-         base_index = requested_index - 1
-         fallback_index = base_index
-         while fallback_index >= 0 and order[fallback_index] not in self.checkpoints:
-             fallback_index -= 1
- 
-@@ -731,41 +787,47 @@ class DeterministicPipeline:
-             raise PipelineStepError(from_step, "Чекпоинты отсутствуют; требуется полный перезапуск.")
- 
-         base_step = order[fallback_index]
-         base_text = self.checkpoints[base_step]
-         self._sync_locked_terms(base_text)
- 
-         text = base_text
-         for step in order[fallback_index + 1 :]:
-             if step == PipelineStep.KEYWORDS:
-                 text = self._run_keywords(text).text
-             elif step == PipelineStep.FAQ:
-                 text = self._run_faq(text)
-             elif step == PipelineStep.TRIM:
-                 text = self._run_trim(text).text
- 
-         combined_text = text
-         if self.jsonld and self.jsonld_requested:
-             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
-         try:
-             validation = validate_article(
-                 combined_text,
-                 keywords=self.keywords,
-                 min_chars=self.min_chars,
-                 max_chars=self.max_chars,
-                 skeleton_payload=self.skeleton_payload,
-+                keyword_coverage_percent=self.keywords_coverage_percent,
-             )
-         except ValidationError as exc:
-             raise PipelineStepError(step, str(exc), status_code=400) from exc
-+        LOGGER.info(
-+            "VALIDATION_OK length=%s keywords=%.0f%%",
-+            validation.stats.get("length_no_spaces"),
-+            float(validation.stats.get("keywords_coverage_percent") or 0.0),
-+        )
-         return PipelineState(
-             text=combined_text,
-             jsonld=self.jsonld,
-             validation=validation,
-             logs=self.logs,
-             checkpoints=self.checkpoints,
-             model_used=self._model_used or self.model,
-             fallback_used=self._fallback_used,
-             fallback_reason=self._fallback_reason,
-             api_route=self._api_route,
-             token_usage=self._token_usage,
-             skeleton_payload=self.skeleton_payload,
-         )
-diff --git a/frontend_demo/script.js b/frontend_demo/script.js
-index d5a3708d25e4d9b5f62d23e4e7a7b37e62818ac6..ba7487ce8c7a152a82b1c4b9ed9857c3c0088e3b 100644
---- a/frontend_demo/script.js
-+++ b/frontend_demo/script.js
-@@ -1096,52 +1096,61 @@ async function handleGenerate(event) {
-       context_source: payload.context_source,
-       keywords: Array.isArray(payload.data?.keywords) ? payload.data.keywords : [],
-       length_range: { min: 3500, max: 6000, mode: "no_spaces" },
-       faq_required: true,
-       faq_count: 5,
-     };
-     if (payload.context_source === "custom") {
-       requestBody.context_text = payload.context_text;
-       if (payload.context_filename) {
-         requestBody.context_filename = payload.context_filename;
-       }
-     }
-     const response = await fetchJson("/api/generate", {
-       method: "POST",
-       body: JSON.stringify(requestBody),
-     });
-     const markdown = response?.markdown ?? "";
-     const meta = (response?.meta_json && typeof response.meta_json === "object") ? response.meta_json : {};
-     const responseStatus = typeof response?.status === "string" ? response.status.trim().toLowerCase() : "";
-     const metaStatus = typeof meta?.status === "string" ? meta.status.trim().toLowerCase() : "";
-     if (["failed", "error"].includes(responseStatus) || ["failed", "error"].includes(metaStatus)) {
-       const backendError = typeof response?.error === "string" && response.error.trim()
-         ? response.error.trim()
-         : typeof meta?.error === "string" && meta.error.trim()
-           ? meta.error.trim()
--          : "Генерация завершилась с ошибкой.";
--      throw new Error(backendError);
-+          : "";
-+      const backendMessage = typeof response?.backend_message === "string" && response.backend_message.trim()
-+        ? response.backend_message.trim()
-+        : typeof meta?.backend_message === "string" && meta.backend_message.trim()
-+          ? meta.backend_message.trim()
-+          : "";
-+      const messageParts = [backendMessage, backendError].filter(Boolean);
-+      const failureMessage = messageParts.length > 0
-+        ? messageParts.join(" ")
-+        : "Генерация завершилась с ошибкой.";
-+      throw new Error(failureMessage);
-     }
-     const artifactPaths = response?.artifact_paths;
-     const metadataCharacters = typeof meta.characters === "number" ? meta.characters : undefined;
-     const characters = typeof metadataCharacters === "number" ? metadataCharacters : markdown.trim().length;
-     const hasContent = characters > 0;
-     state.currentResult = { markdown, meta, artifactPaths, characters, hasContent };
-     const fallbackModel = response?.fallback_used ?? meta.fallback_used;
-     const fallbackReason = response?.fallback_reason ?? meta.fallback_reason;
-     draftView.innerHTML = markdownToHtml(markdown);
-     resultTitle.textContent = payload.data.theme || "Результат генерации";
-     const metaParts = [];
-     if (hasContent) {
-       metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
-     }
-     metaParts.push(`Модель: ${meta.model_used ?? "—"}`);
-     resultMeta.textContent = metaParts.join(" · ");
-     renderMetadata(meta);
-     renderUsedKeywords(meta);
-     updateResultBadges(meta);
-     toggleRetryButton(!hasContent);
-     updatePromptPreview({
-       system: meta.system_prompt_preview,
-       context: meta.clips || [],
-       user: meta.user_prompt_preview,
-       context_used: meta.context_used,
-diff --git a/keyword_injector.py b/keyword_injector.py
-index e358b0596df31a374f173a0d3f8e34b620cc2457..70d594d09bde55ef2131c160b3969bf45b750908 100644
---- a/keyword_injector.py
-+++ b/keyword_injector.py
-@@ -5,50 +5,51 @@ from dataclasses import dataclass, field
- from typing import Dict, Iterable, List, Optional, Sequence, Tuple
- 
- LOCK_START_TEMPLATE = "<!--LOCK_START term=\"{term}\"-->"
- LOCK_END = "<!--LOCK_END-->"
- _TERMS_SECTION_HEADING = "### Разбираемся в терминах"
+diff --git a/faq_builder.py b/faq_builder.py
+index e66bf4518c0838ca40cb115a61e7e7982d2fcd70..9ee6da4705f704083d4fd7cc0f4bef2d5d24d0a4 100644
+--- a/faq_builder.py
++++ b/faq_builder.py
+@@ -23,52 +23,54 @@ def _sanitize_anchor(text: str) -> str:
+     return "-" + "-".join(text.lower().split())
  
  
- def build_term_pattern(term: str) -> re.Pattern[str]:
-     """Return a compiled regex that matches the exact term with word boundaries."""
- 
-     return re.compile(rf"(?i)(?<!\w){re.escape(term)}(?!\w)")
- 
- 
- @dataclass
- class KeywordInjectionResult:
-     """Result of the keyword injection step."""
- 
-     text: str
-     coverage: Dict[str, bool]
-     locked_terms: List[str] = field(default_factory=list)
-     inserted_section: bool = False
-     total_terms: int = 0
-     found_terms: int = 0
-     missing_terms: List[str] = field(default_factory=list)
-     coverage_report: str = "0/0"
-+    coverage_percent: float = 0.0
+ def _normalize_answer(answer: str) -> str:
+     paragraphs = [part.strip() for part in answer.split("\n\n") if part.strip()]
+     if not paragraphs:
+         raise ValueError("Ответ пустой")
+     if len(paragraphs) > 3:
+         paragraphs = paragraphs[:3]
+     if any(len(p) < 20 for p in paragraphs):
+         raise ValueError("Ответ слишком короткий")
+     return "\n\n".join(paragraphs)
  
  
- def _normalize_keywords(keywords: Iterable[str]) -> List[str]:
-     normalized: List[str] = []
-     seen = set()
-     for raw in keywords:
-         term = str(raw).strip()
-         if not term:
-             continue
-         if term in seen:
-             continue
-         seen.add(term)
-         normalized.append(term)
+ def _normalize_question(question: str, seen: set[str]) -> str:
+     normalized = question.strip()
+     if not normalized:
+         raise ValueError("Вопрос пустой")
+     if normalized.lower() in seen:
+         raise ValueError("Дублирующийся вопрос")
+     seen.add(normalized.lower())
      return normalized
  
  
- def _contains_term(text: str, term: str) -> bool:
-     pattern = build_term_pattern(term)
-     return bool(pattern.search(text))
+ def _normalize_entry(raw: Dict[str, str], seen: set[str]) -> FaqEntry:
+-    question = _normalize_question(str(raw.get("question", "")), seen)
+-    answer = _normalize_answer(str(raw.get("answer", "")))
++    question_raw = raw.get("question") if "question" in raw else raw.get("q")
++    answer_raw = raw.get("answer") if "answer" in raw else raw.get("a")
++    question = _normalize_question(str(question_raw or ""), seen)
++    answer = _normalize_answer(str(answer_raw or ""))
+     anchor = str(raw.get("anchor") or _sanitize_anchor(question))
+     return FaqEntry(question=question, answer=answer, anchor=anchor)
  
  
- def _existing_lock_spans(text: str, term: str) -> List[Tuple[int, int]]:
-     lock_start = re.escape(LOCK_START_TEMPLATE.format(term=term))
-     block_pattern = re.compile(rf"{lock_start}(.*?){re.escape(LOCK_END)}", re.DOTALL)
-     return [(match.start(), match.end()) for match in block_pattern.finditer(text)]
-@@ -168,35 +169,37 @@ def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResul
-         missing_terms.append(term)
+ def _generate_generic_entries(topic: str, keywords: Sequence[str]) -> List[FaqEntry]:
+     base_topic = topic or "теме"
+     key_iter = list(keywords)[:5]
+     templates = [
+         "Как оценить основные риски, связанные с {topic}?",
+         "Какие шаги помогут подготовиться к решению вопросов по {topic}?",
+         "Какие цифры считать ориентиром, когда речь заходит о {topic}?",
+         "Как использовать программы поддержки, если речь идёт о {topic}?",
+         "Что делать, если ситуация с {topic} резко меняется?",
+     ]
+     answers = [
+         "Начните с базовой диагностики: опишите текущую ситуацию, посчитайте ключевые показатели и зафиксируйте цели. "
+         "Далее сопоставьте результаты с отраслевыми нормами и составьте план коррекции.",
+         "Сформируйте пошаговый чек-лист. Включите в него анализ документов, консультации с экспертами и список сервисов, которые помогут собрать данные. "
+         "По мере продвижения фиксируйте выводы, чтобы вернуться к ним на этапе принятия решения.",
+         "Используйте диапазон значений из методических материалов и банковской аналитики. "
+         "Сравните собственные показатели с усреднёнными и определите пороги, при которых стоит пересмотреть стратегию.",
+         "Изучите федеральные и региональные программы, подходящие под ваш профиль. "
+         "Составьте список требований, подготовьте пакет документов и оцените сроки рассмотрения, чтобы не потерять время.",
+         "Создайте резервный план действий: определите, какие параметры контролировать ежемесячно, и заранее договоритесь о точках проверки. "
+         "Если изменения превышают допустимый порог, инициируйте пересмотр стратегии и подключите независимую экспертизу.",
+diff --git a/llm_client.py b/llm_client.py
+index 3c51b6b2661a9ab73f8e513eab01a45d582ed099..3c1bf5bd3e842880ab661e1534bcaefb9a427025 100644
+--- a/llm_client.py
++++ b/llm_client.py
+@@ -10,51 +10,51 @@ import sys
+ import time
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Dict, List, Optional, Tuple
  
-     inserted_section = False
-     if missing_terms:
-         working, inserted_section = _insert_terms_inset(working, missing_terms)
+ import httpx
  
-     for term in missing_terms:
-         working = _ensure_lock(working, term)
+ from config import (
+     FORCE_MODEL,
+     OPENAI_API_KEY,
+     G5_ENABLE_PREVIOUS_ID_FETCH,
+     G5_MAX_OUTPUT_TOKENS_BASE,
+     G5_MAX_OUTPUT_TOKENS_MAX,
+     G5_MAX_OUTPUT_TOKENS_STEP1,
+     G5_MAX_OUTPUT_TOKENS_STEP2,
+     G5_POLL_INTERVALS,
+     G5_POLL_MAX_ATTEMPTS,
+ )
  
-     locked_terms: List[str] = []
-     missing_report: List[str] = []
-     for term in normalized:
-         lock_token = LOCK_START_TEMPLATE.format(term=term)
-         lock_present = bool(re.search(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", working, re.DOTALL))
-         present = bool(build_term_pattern(term).search(working))
-         ok = present and lock_present
-         coverage[term] = ok
-         if ok:
-             locked_terms.append(term)
+ 
+ DEFAULT_MODEL = "gpt-5"
+ MAX_RETRIES = 3
+ BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
+ FALLBACK_MODEL = "gpt-4o"
+ RESPONSES_API_URL = "https://api.openai.com/v1/responses"
+-RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens")
++RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "response_format")
+ RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
+ RESPONSES_MAX_ESCALATIONS = 2
+ MAX_RESPONSES_POLL_ATTEMPTS = (
+     G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
+ )
+ if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
+     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
+ GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
+ 
+ MODEL_PROVIDER_MAP = {
+     "gpt-5": "openai",
+     "gpt-4o": "openai",
+     "gpt-4o-mini": "openai",
+ }
+ 
+ PROVIDER_API_URLS = {
+     "openai": "https://api.openai.com/v1/chat/completions",
+ }
+ 
+ 
+ LOGGER = logging.getLogger(__name__)
+ RAW_RESPONSE_PATH = Path("artifacts/debug/last_raw_response.json")
+ RESPONSES_RESPONSE_PATH = Path("artifacts/debug/last_gpt5_responses_response.json")
+ RESPONSES_REQUEST_PATH = Path("artifacts/debug/last_gpt5_responses_request.json")
+ 
+@@ -118,89 +118,103 @@ def build_responses_payload(
+     model: str,
+     system_text: Optional[str],
+     user_text: Optional[str],
+     max_tokens: int,
+ ) -> Dict[str, object]:
+     """Construct a minimal Responses API payload for GPT-5 models."""
+ 
+     sections: List[str] = []
+ 
+     system_block = (system_text or "").strip()
+     if system_block:
+         sections.append(system_block)
+ 
+     user_block = (user_text or "").strip()
+     if user_block:
+         sections.append(user_block)
+ 
+     joined_input = "\n\n".join(section for section in sections if section)
+     joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
+     joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
+ 
+     payload: Dict[str, object] = {
+         "model": str(model).strip(),
+         "input": joined_input.strip(),
+         "max_output_tokens": int(max_tokens),
++        "temperature": 0.3,
++        "response_format": {"type": "json_object"},
+     }
+     return payload
+ 
+ 
+ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str, object], int]:
+     """Restrict Responses payload to the documented whitelist and types."""
+ 
+     sanitized: Dict[str, object] = {}
+     for key in RESPONSES_ALLOWED_KEYS:
+         if key not in payload:
+             continue
+         value = payload.get(key)
+         if value is None:
+             continue
+         if isinstance(value, str):
+             trimmed = value.strip()
+             if not trimmed:
+                 continue
+             if key == "model":
+                 sanitized[key] = trimmed
+                 continue
+             if key == "input":
+                 sanitized[key] = trimmed
+                 continue
+         if key == "input" and not isinstance(value, str):
+             if isinstance(value, (list, dict)):
+                 converted = json.dumps(value, ensure_ascii=False)
+             else:
+                 converted = str(value)
+             converted = converted.strip()
+             if converted:
+                 sanitized[key] = converted
+             continue
+         if key == "max_output_tokens":
+             try:
+                 sanitized[key] = int(value)
+             except (TypeError, ValueError):
+                 continue
+             continue
++        if key == "temperature":
++            try:
++                sanitized[key] = float(value)
++            except (TypeError, ValueError):
++                continue
++            continue
++        if key == "response_format":
++            if isinstance(value, dict):
++                sanitized[key] = {"type": str(value.get("type", "")).strip() or "json_object"}
++            else:
++                sanitized[key] = {"type": "json_object"}
++            continue
+     input_value = sanitized.get("input", "")
+     input_length = len(input_value) if isinstance(input_value, str) else 0
+     return sanitized, input_length
+ 
+ 
+ def _store_responses_request_snapshot(payload: Dict[str, object]) -> None:
+     """Persist a sanitized snapshot of the latest Responses API request."""
+ 
+     try:
+         RESPONSES_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+         snapshot = dict(payload)
+         input_value = snapshot.pop("input", "")
+         if isinstance(input_value, str):
+             preview = input_value[:200]
          else:
-             missing_report.append(term)
+             preview = str(input_value)[:200]
+         snapshot["input_preview"] = preview
+         RESPONSES_REQUEST_PATH.write_text(
+             json.dumps(snapshot, ensure_ascii=False, indent=2),
+             encoding="utf-8",
+         )
+     except Exception as exc:  # pragma: no cover - diagnostics only
+         LOGGER.debug("failed to persist Responses request snapshot: %s", exc)
  
-     total_terms = len(normalized)
-     found_terms = total_terms - len(missing_report)
-     coverage_report = f"{found_terms}/{total_terms}" if total_terms else "0/0"
-+    coverage_percent = 100.0 if total_terms == 0 else round(found_terms / total_terms * 100, 2)
-     return KeywordInjectionResult(
-         text=working,
-         coverage=coverage,
-         locked_terms=locked_terms,
-         inserted_section=inserted_section,
-         total_terms=total_terms,
-         found_terms=found_terms,
-         missing_terms=missing_report,
-         coverage_report=coverage_report,
-+        coverage_percent=coverage_percent,
+ 
+@@ -462,99 +476,115 @@ def _extract_choice_content(choice: Dict[str, object]) -> Tuple[str, Dict[str, o
+         if joined:
+             parse_flags["output_text"] = 1
+             parse_flags["parts"] = 1
+             parse_flags["schema"] = schema_label
+             return joined, parse_flags, schema_label
+     elif isinstance(exotic_content, dict):
+         extracted, used_parts = _extract_from_dict(exotic_content)
+         if extracted:
+             parse_flags["output_text"] = 1
+             parse_flags["content_dict"] = 1
+             if used_parts:
+                 parse_flags["parts"] = 1
+             parse_flags["schema"] = schema_label
+             return extracted, parse_flags, schema_label
+ 
+     parse_flags["schema"] = schema_label
+     return "", parse_flags, schema_label
+ 
+ 
+ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, object], str]:
+     parse_flags: Dict[str, object] = {}
+ 
+     resp_keys = sorted(str(key) for key in data.keys())
+     parse_flags["resp_keys"] = resp_keys
+ 
++    output_text_raw = data.get("output_text")
++    if isinstance(output_text_raw, str):
++        output_text_value = output_text_raw.strip()
++    else:
++        output_text_value = ""
++
+     def _iter_segments(container: object) -> List[str]:
+         collected: List[str] = []
+         if isinstance(container, list):
+             for item in container:
+                 collected.extend(_iter_segments(item))
+         elif isinstance(container, dict):
+             content = container.get("content")
+             if isinstance(content, list):
+                 for part in content:
+                     if not isinstance(part, dict):
+                         continue
+                     part_type = str(part.get("type", "")).strip()
+                     if part_type not in {"text", "output_text"}:
+                         continue
+                     text_value = part.get("text")
+                     if isinstance(text_value, str):
+                         stripped = text_value.strip()
+                         if stripped:
+                             collected.append(stripped)
+             for key in ("output", "outputs"):
+                 nested = container.get(key)
+                 if nested is not None:
+                     collected.extend(_iter_segments(nested))
+         return collected
+ 
+     segments: List[str] = []
+     root_used: Optional[str] = None
+     for root_key in ("output", "outputs"):
+         root_value = data.get(root_key)
+         if root_value is None:
+             continue
+         extracted = _iter_segments(root_value)
+         if extracted:
+             segments.extend(extracted)
+             root_used = root_key
+ 
+-    schema_label = "responses.output_text" if segments else "responses.none"
++    content_text = "\n\n".join(segments) if segments else ""
++    schema_label = "responses.output_text" if (segments or output_text_value) else "responses.none"
+     parse_flags["schema"] = schema_label
+     parse_flags["segments"] = len(segments)
++    parse_flags["output_text_len"] = len(output_text_value)
++    parse_flags["content_text_len"] = len(content_text)
+ 
+-    text = "\n\n".join(segments) if segments else ""
+     LOGGER.info(
+-        "responses parse resp_keys=%s root=%s segments=%d len=%d schema=%s",
++        "RESP_PARSE=output_text:%d|content_text:%d",
++        parse_flags["output_text_len"],
++        parse_flags["content_text_len"],
++    )
++    LOGGER.info(
++        "responses parse resp_keys=%s root=%s segments=%d schema=%s",
+         resp_keys,
+         root_used,
+         parse_flags.get("segments", 0),
+-        len(text),
+         schema_label,
      )
-diff --git a/length_trimmer.py b/length_trimmer.py
-index 8b98554d963d046b88fa92c331cbc1d824805c46..6bed24ceee4420c4e121f96d9d953688f460ab1b 100644
---- a/length_trimmer.py
-+++ b/length_trimmer.py
-@@ -1,101 +1,165 @@
++
++    text = output_text_value or content_text
++    if text:
++        LOGGER.info("RESP_PARSE_OK schema=%s len=%d", schema_label, len(text))
+     return text, parse_flags, schema_label
+ 
+ 
+ def _resolve_model_name(model: Optional[str]) -> str:
+     env_model = os.getenv("LLM_MODEL")
+     candidate = (model or env_model or DEFAULT_MODEL).strip()
+     return candidate or DEFAULT_MODEL
+ 
+ 
+ def _resolve_provider(model_name: str) -> str:
+     return MODEL_PROVIDER_MAP.get(model_name, "openai")
+ 
+ 
+ def _resolve_api_key(provider: str) -> str:
+     api_key = os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY
+     if api_key:
+         api_key = api_key.strip()
+     if not api_key:
+         raise RuntimeError(
+             "Не задан API-ключ для OpenAI. Установите переменную окружения OPENAI_API_KEY."
+         )
+     return api_key
+ 
+ 
+ def _resolve_backoff_schedule(override: Optional[List[float]]) -> List[float]:
+@@ -903,549 +933,174 @@ def generate(
+             )
+         _persist_raw_response(data)
+         return text, parse_flags, data, schema_label
+ 
+     def _call_responses_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
+         nonlocal retry_used
+ 
+         payload_messages = _messages_for_model(target_model)
+         system_segments: List[str] = []
+         user_segments: List[str] = []
+         for item in payload_messages:
+             role = str(item.get("role", "")).strip().lower()
+             content = str(item.get("content", "")).strip()
+             if not content:
+                 continue
+             if role == "system":
+                 system_segments.append(content)
+             elif role == "user":
+                 user_segments.append(content)
+             else:
+                 user_segments.append(f"{role.upper()}:\n{content}")
+ 
+         system_text = "\n\n".join(system_segments)
+         user_text = "\n\n".join(user_segments)
+ 
+-        payload = build_responses_payload(target_model, system_text, user_text, max_tokens)
+-        sanitized_payload, _ = sanitize_payload_for_responses(payload)
++        base_payload = build_responses_payload(target_model, system_text, user_text, max_tokens)
++        sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
+ 
+-        def _coerce_positive_int(value: object, fallback: int) -> int:
+-            try:
+-                coerced = int(value)
+-            except (TypeError, ValueError):
+-                coerced = fallback
+-            if coerced <= 0:
+-                coerced = fallback
+-            return min(coerced, G5_MAX_OUTPUT_TOKENS_MAX)
+-
+-        base_max_output_tokens = _coerce_positive_int(
+-            sanitized_payload.get("max_output_tokens"),
+-            _coerce_positive_int(max_tokens, G5_MAX_OUTPUT_TOKENS_BASE),
+-        )
+-        sanitized_payload["max_output_tokens"] = base_max_output_tokens
+-
+-        escalation_candidates = [
+-            value
+-            for value in (
+-                G5_MAX_OUTPUT_TOKENS_STEP1,
+-                G5_MAX_OUTPUT_TOKENS_STEP2,
+-                G5_MAX_OUTPUT_TOKENS_MAX,
+-            )
+-            if value > base_max_output_tokens
+-        ]
+-        max_escalations_allowed = min(RESPONSES_MAX_ESCALATIONS, len(escalation_candidates))
+-        escalation_index = 0
+-        escalations_used = 0
+-
+-        LOGGER.info("dispatch route=responses model=%s", target_model)
+-
+-        def _log_payload_state(payload_snapshot: Dict[str, object]) -> None:
+-            keys = sorted(payload_snapshot.keys())
++        try:
++            max_tokens_value = int(sanitized_payload.get("max_output_tokens", 1200))
++        except (TypeError, ValueError):
++            max_tokens_value = 1200
++        if max_tokens_value <= 0:
++            max_tokens_value = 1200
++        max_tokens_value = min(max_tokens_value, 1200)
++        sanitized_payload["max_output_tokens"] = max_tokens_value
++        sanitized_payload["temperature"] = 0.3
++        sanitized_payload["response_format"] = {"type": "json_object"}
++
++        def _log_payload(snapshot: Dict[str, object]) -> None:
++            keys = sorted(snapshot.keys())
+             LOGGER.info("responses payload_keys=%s", keys)
+-            input_candidate = payload_snapshot.get("input", "")
++            input_candidate = snapshot.get("input", "")
+             length = len(input_candidate) if isinstance(input_candidate, str) else 0
+             LOGGER.info("responses input_len=%d", length)
+-            LOGGER.info(
+-                "responses max_output_tokens=%s",
+-                payload_snapshot.get("max_output_tokens"),
+-            )
++            LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
+ 
+-        def _search_finish_reason(container: object) -> Optional[str]:
+-            if isinstance(container, dict):
+-                finish_value = container.get("finish_reason")
+-                if isinstance(finish_value, str) and finish_value.strip():
+-                    return finish_value.strip()
+-                for value in container.values():
+-                    found = _search_finish_reason(value)
+-                    if found:
+-                        return found
+-            elif isinstance(container, list):
+-                for item in container:
+-                    found = _search_finish_reason(item)
+-                    if found:
+-                        return found
+-            return None
+-
+-        def _extract_responses_metadata(payload: Dict[str, object]) -> Dict[str, object]:
++        def _extract_metadata(payload: Dict[str, object]) -> Dict[str, object]:
+             status_value = payload.get("status")
+             status = str(status_value).strip().lower() if isinstance(status_value, str) else ""
+             incomplete_details = payload.get("incomplete_details")
+             incomplete_reason = ""
+             if isinstance(incomplete_details, dict):
+                 reason = incomplete_details.get("reason")
+                 if isinstance(reason, str):
+                     incomplete_reason = reason.strip().lower()
+-            usage_output_tokens: Optional[float] = None
+             usage_block = payload.get("usage")
++            usage_output_tokens: Optional[float] = None
+             if isinstance(usage_block, dict):
+-                output_tokens = usage_block.get("output_tokens")
+-                if isinstance(output_tokens, (int, float)):
+-                    usage_output_tokens = float(output_tokens)
+-                elif isinstance(output_tokens, dict):
+-                    for value in output_tokens.values():
++                raw_usage = usage_block.get("output_tokens")
++                if isinstance(raw_usage, (int, float)):
++                    usage_output_tokens = float(raw_usage)
++                elif isinstance(raw_usage, dict):
++                    for value in raw_usage.values():
+                         if isinstance(value, (int, float)):
+                             usage_output_tokens = float(value)
+                             break
+-            finish_reason_value = _search_finish_reason(payload)
+-            finish_reason = (
+-                finish_reason_value.strip().lower()
+-                if isinstance(finish_reason_value, str)
+-                else ""
+-            )
+-            previous_response_id = ""
+-            candidate = payload.get("previous_response_id")
+-            if isinstance(candidate, str) and candidate.strip():
+-                previous_response_id = candidate.strip()
+-            else:
+-                metadata_block = payload.get("metadata")
+-                if isinstance(metadata_block, dict):
+-                    meta_candidate = metadata_block.get("previous_response_id")
+-                    if isinstance(meta_candidate, str) and meta_candidate.strip():
+-                        previous_response_id = meta_candidate.strip()
+             return {
+                 "status": status,
+                 "incomplete_reason": incomplete_reason,
+                 "usage_output_tokens": usage_output_tokens,
+-                "finish_reason": finish_reason,
+-                "previous_response_id": previous_response_id,
+-            }
+-
+-        def _detect_truncation_signals(
+-            metadata: Dict[str, object],
+-            *,
+-            max_output_tokens_value: Optional[int],
+-        ) -> List[str]:
+-            signals: List[str] = []
+-            if metadata.get("incomplete_reason") == "max_output_tokens":
+-                signals.append("incomplete_reason=max_output_tokens")
+-            usage_output_tokens = metadata.get("usage_output_tokens")
+-            if (
+-                isinstance(max_output_tokens_value, int)
+-                and isinstance(usage_output_tokens, (int, float))
+-                and max_output_tokens_value > 0
+-                and usage_output_tokens >= max_output_tokens_value * 0.98
+-            ):
+-                signals.append("usage_output_tokens>=98pct")
+-            if metadata.get("finish_reason") == "length":
+-                signals.append("finish_reason=length")
+-            return signals
+-
+-        def _process_responses_payload(
+-            payload: Dict[str, object],
+-            *,
+-            max_output_tokens_value: Optional[int],
+-            source: str,
+-        ) -> Dict[str, object]:
+-            text, parse_flags, schema_label = _extract_responses_text(payload)
+-            segments = int(parse_flags.get("segments", 0) or 0)
+-            metadata = _extract_responses_metadata(payload)
+-            signals = _detect_truncation_signals(
+-                metadata, max_output_tokens_value=max_output_tokens_value
+-            )
+-            LOGGER.info(
+-                "responses meta status=%s incomplete_reason=%s usage_output_tokens=%s max_output_tokens=%s previous_response_id=%s",
+-                metadata.get("status") or "",
+-                metadata.get("incomplete_reason") or "",
+-                metadata.get("usage_output_tokens"),
+-                max_output_tokens_value,
+-                metadata.get("previous_response_id") or "",
+-            )
+-            LOGGER.info(
+-                "responses parse segments=%d signals=%s source=%s",
+-                segments,
+-                ",".join(signals) if signals else "none",
+-                source,
+-            )
+-            return {
+-                "data": payload,
+-                "text": text,
+-                "parse_flags": parse_flags,
+-                "schema": schema_label,
+-                "segments": segments,
+-                "metadata": metadata,
+-                "signals": signals,
+-                "source": source,
+             }
+ 
+-        current_payload = dict(sanitized_payload)
+-        base_payload = dict(sanitized_payload)
+-        attempt_index = 0
+-        shimmed_param: Optional[str] = None
++        attempts = 0
++        current_max = max_tokens_value
+         last_error: Optional[BaseException] = None
+-        hint_retry_used = False
+-        text_format_retry_used = False
+ 
+-        while attempt_index < MAX_RETRIES:
+-            attempt_index += 1
+-            if attempt_index > 1:
++        while attempts < 3:
++            attempts += 1
++            current_payload = dict(sanitized_payload)
++            current_payload["max_output_tokens"] = max(32, int(current_max))
++            if attempts > 1:
+                 retry_used = True
+-            _log_payload_state(current_payload)
++            _log_payload(current_payload)
+             try:
+                 _store_responses_request_snapshot(current_payload)
+                 response = http_client.post(
+                     RESPONSES_API_URL,
+                     headers=headers,
+                     json=current_payload,
++                    timeout=timeout,
+                 )
+                 response.raise_for_status()
+                 data = response.json()
+                 if not isinstance(data, dict):
+                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
+-
+-                try:
+-                    max_output_tokens_value: Optional[int] = int(
+-                        current_payload.get("max_output_tokens", 0)
+-                    )
+-                except (TypeError, ValueError):
+-                    max_output_tokens_value = None
+-
+-                response_id = data.get("id") if isinstance(data.get("id"), str) else None
+-                LOGGER.info(
+-                    "responses status=%s id=%s",
+-                    data.get("status"),
+-                    response_id,
+-                )
+-
+-                records: List[Dict[str, object]] = []
+-                best_record: Optional[Dict[str, object]] = None
+-                best_record_no_trunc: Optional[Dict[str, object]] = None
+-                last_record: Optional[Dict[str, object]] = None
+-
+-                def _consider_record(record: Dict[str, object]) -> None:
+-                    nonlocal best_record, best_record_no_trunc, last_record
+-                    last_record = record
+-                    records.append(record)
+-                    if record["segments"] > 0:
+-                        if best_record is None or record["segments"] >= best_record["segments"]:
+-                            best_record = record
+-                        if not record["signals"] and best_record_no_trunc is None:
+-                            best_record_no_trunc = record
+-
+-                initial_record = _process_responses_payload(
+-                    data,
+-                    max_output_tokens_value=max_output_tokens_value,
+-                    source="initial",
+-                )
+-                _consider_record(initial_record)
+-
+-                poll_attempt = 0
+-                previous_fetch_done = False
+-                current_record = initial_record
+-
+-                while True:
+-                    status = current_record["metadata"].get("status")
+-                    ready_without_trunc = (
+-                        current_record["segments"] > 0 and not current_record["signals"]
+-                    )
+-                    if status == "completed" or ready_without_trunc:
+-                        break
+-                    if poll_attempt >= MAX_RESPONSES_POLL_ATTEMPTS or not response_id:
+-                        break
+-                    delay_index = min(
+-                        poll_attempt,
+-                        len(RESPONSES_POLL_SCHEDULE) - 1,
+-                    ) if RESPONSES_POLL_SCHEDULE else 0
+-                    delay = (
+-                        RESPONSES_POLL_SCHEDULE[delay_index]
+-                        if RESPONSES_POLL_SCHEDULE
+-                        else 0.5
+-                    )
+-                    poll_attempt += 1
+-                    LOGGER.info(
+-                        "responses poll attempt=%d delay=%.3f id=%s",
+-                        poll_attempt,
+-                        delay,
+-                        response_id,
+-                    )
+-                    time.sleep(delay)
+-                    try:
+-                        poll_response = http_client.get(
+-                            f"{RESPONSES_API_URL}/{response_id}",
+-                            headers=headers,
+-                        )
+-                        poll_response.raise_for_status()
+-                        polled_data = poll_response.json()
+-                        if not isinstance(polled_data, dict):
+-                            LOGGER.warning(
+-                                "responses poll unexpected payload id=%s", response_id
+-                            )
+-                            break
+-                        response_id = (
+-                            polled_data.get("id")
+-                            if isinstance(polled_data.get("id"), str)
+-                            else response_id
+-                        )
+-                        LOGGER.info(
+-                            "responses status=%s id=%s (poll)",
+-                            polled_data.get("status"),
+-                            response_id,
+-                        )
+-                        current_record = _process_responses_payload(
+-                            polled_data,
+-                            max_output_tokens_value=max_output_tokens_value,
+-                            source=f"poll#{poll_attempt}",
+-                        )
+-                        _consider_record(current_record)
+-                    except Exception as poll_error:  # noqa: BLE001
+-                        LOGGER.warning(
+-                            "responses poll failed id=%s error=%s",
+-                            response_id,
+-                            poll_error,
+-                        )
+-                        break
+-
+-                current_metadata = current_record["metadata"] if current_record else {}
+-                previous_response_id = (
+-                    current_metadata.get("previous_response_id") if current_metadata else ""
+-                )
+-                if (
+-                    G5_ENABLE_PREVIOUS_ID_FETCH
+-                    and previous_response_id
+-                    and current_metadata.get("status") != "completed"
+-                    and not previous_fetch_done
+-                ):
++                _store_responses_response_snapshot(data)
++                text, parse_flags, schema_label = _extract_responses_text(data)
++                metadata = _extract_metadata(data)
++                status = metadata.get("status") or ""
++                reason = metadata.get("incomplete_reason") or ""
++                segments = int(parse_flags.get("segments", 0) or 0)
++                LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
++                if status == "incomplete" or segments == 0:
+                     LOGGER.info(
+-                        "responses fetch previous_response_id=%s", previous_response_id
++                        "RESP_STATUS=incomplete|max_output_tokens=%s",
++                        current_payload.get("max_output_tokens"),
+                     )
+-                    previous_fetch_done = True
+-                    try:
+-                        prev_response = http_client.get(
+-                            f"{RESPONSES_API_URL}/{previous_response_id}",
+-                            headers=headers,
+-                        )
+-                        prev_response.raise_for_status()
+-                        prev_data = prev_response.json()
+-                        if isinstance(prev_data, dict):
+-                            current_record = _process_responses_payload(
+-                                prev_data,
+-                                max_output_tokens_value=max_output_tokens_value,
+-                                source="previous_response",
+-                            )
+-                            _consider_record(current_record)
+-                        else:
+-                            LOGGER.warning(
+-                                "responses previous_response unexpected payload id=%s",
+-                                previous_response_id,
+-                            )
+-                    except Exception as prev_error:  # noqa: BLE001
+-                        LOGGER.warning(
+-                            "responses previous_response fetch failed id=%s error=%s",
+-                            previous_response_id,
+-                            prev_error,
+-                        )
+-
+-                record_to_use = best_record_no_trunc or best_record or current_record
+-                if record_to_use is None:
+-                    record_to_use = initial_record
+-
+-                if record_to_use["text"]:
+-                    selected_segments = record_to_use["segments"]
+-                else:
+-                    selected_segments = 0
+-
+-                last_signals = current_record["signals"] if current_record else []
+-
+-                if best_record_no_trunc is not None:
+-                    LOGGER.info(
+-                        "responses restart skipped reason=segments_without_truncation segments=%d",
+-                        best_record_no_trunc["segments"],
+-                    )
+-                elif last_signals:
+-                    signals_label = ",".join(last_signals)
+-                    LOGGER.warning(
+-                        "responses restart triggered signals=%s",
+-                        signals_label,
+-                    )
+-                    if selected_segments == 0:
+-                        can_escalate = (
+-                            escalation_index < max_escalations_allowed
+-                            and escalation_index < len(escalation_candidates)
+-                            and escalations_used < RESPONSES_MAX_ESCALATIONS
+-                        )
+-                        if can_escalate:
+-                            current_max_value = _coerce_positive_int(
+-                                current_payload.get("max_output_tokens"),
+-                                base_max_output_tokens,
+-                            )
+-                            next_value = escalation_candidates[escalation_index]
+-                            if next_value > current_max_value:
+-                                LOGGER.info(
+-                                    "escalate max_output_tokens: %s -> %s",
+-                                    current_max_value,
+-                                    next_value,
+-                                )
+-                                updated_payload = dict(current_payload)
+-                                updated_payload["max_output_tokens"] = next_value
+-                                current_payload, _ = sanitize_payload_for_responses(
+-                                    updated_payload
+-                                )
+-                                base_payload = dict(current_payload)
+-                                base_max_output_tokens = next_value
+-                                escalation_index += 1
+-                                escalations_used += 1
+-                                retry_used = True
+-                                continue
+-                            LOGGER.info(
+-                                "responses restart skipped reason=escalation_target_not_higher current=%s target=%s",
+-                                current_max_value,
+-                                next_value,
+-                            )
+-                        LOGGER.info(
+-                            "responses restart skipped reason=max_output_tokens_exhausted segments=%d signals=%s",
+-                            selected_segments,
+-                            signals_label,
+-                        )
+-                    else:
+-                        LOGGER.info(
+-                            "responses restart skipped reason=segments_present segments=%d signals=%s",
+-                            selected_segments,
+-                            signals_label,
+-                        )
+-                else:
+-                    LOGGER.info(
+-                        "responses restart skipped reason=no_truncation_signals status=%s segments=%d",
+-                        (current_record["metadata"].get("status") if current_record else ""),
+-                        selected_segments,
+-                    )
+-
+-                if isinstance(record_to_use.get("data"), dict):
+-                    _store_responses_response_snapshot(record_to_use["data"])
+-
+-                text = record_to_use["text"]
+-                parse_flags = dict(record_to_use["parse_flags"])
+-                parse_flags.setdefault("metadata", record_to_use.get("metadata", {}))
+-                schema_label = record_to_use["schema"]
+-
++                    last_error = RuntimeError("responses_incomplete")
++                    current_max = max(32, int(current_payload["max_output_tokens"] * 0.85))
++                    continue
+                 if not text:
+-                    LOGGER.warning(
+-                        "Пустой ответ от Responses API %s (schema=%s)",
+-                        target_model,
+-                        schema_label,
+-                    )
+-                    raise EmptyCompletionError(
+-                        "Responses API вернул пустой ответ",
+-                        raw_response=record_to_use.get("data", {}),
++                    last_error = EmptyCompletionError(
++                        "Модель вернула пустой ответ",
++                        raw_response=data,
+                         parse_flags=parse_flags,
+                     )
+-
+-                _persist_raw_response(record_to_use.get("data", {}))
+-                return text, parse_flags, record_to_use.get("data", {}), schema_label
+-            except EmptyCompletionError:
+-                raise
++                    LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
++                    current_max = max(32, int(current_payload["max_output_tokens"] * 0.85))
++                    continue
++                _persist_raw_response(data)
++                return text, parse_flags, data, schema_label
++            except EmptyCompletionError as exc:
++                last_error = exc
++                current_max = max(32, int(current_payload.get("max_output_tokens", 32) * 0.85))
+             except httpx.HTTPStatusError as exc:
+-                status_code = exc.response.status_code if exc.response is not None else None
+-                error_message = ""
+-                if exc.response is not None:
+-                    try:
+-                        payload_json = exc.response.json()
+-                    except ValueError:
+-                        payload_json = None
+-                    if isinstance(payload_json, dict):
+-                        error_block = payload_json.get("error")
+-                        if isinstance(error_block, dict):
+-                            error_message = str(error_block.get("message", ""))
+-                    if not error_message:
+-                        error_message = exc.response.text or ""
+-                _handle_responses_http_error(exc, current_payload)
+-                lowered_message = error_message.lower()
+-                if status_code == 400:
+-                    if shimmed_param is None:
+-                        param_name = _extract_unknown_parameter_name(exc.response)
+-                        if param_name:
+-                            next_payload = dict(current_payload)
+-                            if param_name in next_payload:
+-                                next_payload.pop(param_name, None)
+-                            current_payload, _ = sanitize_payload_for_responses(next_payload)
+-                            shimmed_param = param_name
+-                            retry_used = True
+-                            LOGGER.warning(
+-                                "retry=shim_unknown_param stripped='%s'",
+-                                param_name,
+-                            )
+-                            continue
+-                    if not hint_retry_used and "response_format" in lowered_message:
+-                        current_payload = dict(base_payload)
+-                        hint_retry_used = True
+-                        LOGGER.warning("retry=shim_hint_response_format")
+-                        continue
+-                    if (
+-                        not text_format_retry_used
+-                        and (
+-                            "invalid type for text.format" in lowered_message
+-                            or "must specify text.format" in lowered_message
+-                            or "expected a text format" in lowered_message
+-                            or "specify text.format" in lowered_message
+-                        )
+-                    ):
+-                        current_payload = dict(base_payload)
+-                        text_format_retry_used = True
+-                        LOGGER.warning("retry=shim_text_format")
+-                        continue
+                 last_error = exc
++                _handle_responses_http_error(exc, current_payload)
++                break
+             except Exception as exc:  # noqa: BLE001
+-                if isinstance(exc, KeyboardInterrupt):  # pragma: no cover - respect interrupts
++                if isinstance(exc, KeyboardInterrupt):
+                     raise
+                 last_error = exc
+-            if attempt_index >= MAX_RETRIES or not _should_retry(last_error):
++            if attempts >= 3:
+                 break
+-            sleep_for = schedule[min(attempt_index - 1, len(schedule) - 1)]
+-            reason = _describe_error(last_error)
+-            print(
+-                f"[llm_client] retry #{attempt_index} reason: {reason}; sleeping {sleep_for}s",
+-                file=sys.stderr,
+-            )
++            sleep_for = schedule[min(attempts - 1, len(schedule) - 1)] if schedule else 0.5
++            LOGGER.warning("responses retry attempt=%d sleep=%.2f", attempts, sleep_for)
+             time.sleep(sleep_for)
+ 
+         if last_error:
+             if isinstance(last_error, httpx.HTTPStatusError):
+                 _raise_for_last_error(last_error)
+             if isinstance(last_error, (httpx.TimeoutException, httpx.TransportError)):
+                 _raise_for_last_error(last_error)
+             raise last_error
+ 
+         raise RuntimeError("Модель не вернула ответ.")
+ 
++
+     lower_model = model_name.lower()
+     is_gpt5_model = lower_model.startswith("gpt-5")
+     if is_gpt5_model:
+         LOGGER.info("temperature is ignored for GPT-5; using default")
+ 
+     retry_used = False
+     fallback_used: Optional[str] = None
+     fallback_reason: Optional[str] = None
+ 
+     try:
+         if is_gpt5_model:
+             available = _check_model_availability(
+                 http_client,
+                 provider=provider,
+                 headers=headers,
+                 model_name=model_name,
+             )
+             if not available:
+                 error_message = "Model GPT-5 not available for this key/plan"
+                 LOGGER.warning("primary model %s unavailable — considering fallback", model_name)
+                 if FORCE_MODEL:
+                     raise RuntimeError(error_message)
+                 fallback_used = FALLBACK_MODEL
+                 fallback_reason = "model_unavailable"
+                 LOGGER.warning(
+diff --git a/orchestrate.py b/orchestrate.py
+index 2eb014a27ae2fbba18a14bbdf8999ed311e717f5..81a33fdcc602f453f87ed335e4a509a8a909fac9 100644
+--- a/orchestrate.py
++++ b/orchestrate.py
+@@ -1,39 +1,38 @@
  from __future__ import annotations
  
- import re
- from dataclasses import dataclass
--from typing import Iterable, List, Sequence
-+from typing import Iterable, List, Sequence, Set, Tuple
+ import argparse
+ import json
+ import os
+ import sys
+ import time
+ from copy import deepcopy
+ from dataclasses import dataclass, field
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Any, Dict, Iterable, List, Optional, Tuple
  
- from keyword_injector import LOCK_START_TEMPLATE, LOCK_END
- from validators import strip_jsonld
+-import httpx
+ from zoneinfo import ZoneInfo
  
- _FAQ_START = "<!--FAQ_START-->"
- _FAQ_END = "<!--FAQ_END-->"
-+_JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">.*?</script>", re.DOTALL)
-+
-+
-+class TrimValidationError(RuntimeError):
-+    """Raised when trimming corrupts protected content."""
-+
-+    pass
+ from assemble_messages import ContextBundle, assemble_messages, retrieve_context
+ from artifacts_store import _atomic_write_text as store_atomic_write_text, register_artifact
+ from config import (
+     DEFAULT_MAX_LENGTH,
+     DEFAULT_MIN_LENGTH,
+     MAX_CUSTOM_CONTEXT_CHARS,
+     OPENAI_API_KEY,
+ )
+ from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
+ from llm_client import DEFAULT_MODEL, generate as llm_generate
+ from keywords import parse_manual_keywords
+ from length_limits import ResolvedLengthLimits, resolve_length_limits
+ from validators import ValidationResult, length_no_spaces
+ 
+ BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
+ TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
+ LATEST_SCHEMA_VERSION = "2024-06"
  
  
  @dataclass
- class TrimResult:
-     text: str
-     removed_paragraphs: List[str]
+ class GenerationContext:
+     data: Dict[str, Any]
+     context_bundle: ContextBundle
+@@ -523,91 +522,82 @@ def generate_article_from_payload(
+     )
+     artifact_files = result.get("artifact_files")
+     artifact_paths = None
+     if artifact_files:
+         artifact_paths = {
+             "markdown": artifact_files["markdown"].as_posix(),
+             "metadata": artifact_files["metadata"].as_posix(),
+         }
+     return {
+         "text": result["text"],
+         "metadata": result["metadata"],
+         "artifact_paths": artifact_paths,
+     }
  
  
- def _split_paragraphs(text: str) -> List[str]:
-     parts = re.split(r"\n\s*\n", text)
--    return [part for part in (part.strip("\n") for part in parts)]
-+    return [part.strip("\n") for part in parts]
+ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
+     checks: Dict[str, Dict[str, object]] = {}
+     ok = True
  
+     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
+     if not api_key:
+         checks["openai_key"] = {"ok": False, "message": "OPENAI_API_KEY не найден"}
+         ok = False
+     else:
+         masked = f"{api_key[:4]}***{api_key[-4:]}" if len(api_key) > 8 else "*" * len(api_key)
++        checks["openai_key"] = {"ok": True, "message": f"Ключ найден ({masked})"}
++
+         try:
+-            response = httpx.get(
+-                "https://api.openai.com/v1/models",
+-                headers={"Authorization": f"Bearer {api_key}"},
+-                timeout=5.0,
++            probe_messages = [
++                {"role": "system", "content": "Ты проверка готовности. Ответь строго словом PING."},
++                {"role": "user", "content": "Ответь словом PING"},
++            ]
++            ping_result = llm_generate(
++                probe_messages,
++                model=DEFAULT_MODEL,
++                temperature=0.0,
++                max_tokens=32,
++                timeout_s=10,
+             )
+-            if response.status_code == 200:
+-                checks["openai_key"] = {"ok": True, "message": f"Ключ активен ({masked})"}
++            reply = (ping_result.text or "").strip().lower()
++            route = (ping_result.api_route or "").strip().lower()
++            used_fallback = bool(ping_result.fallback_used)
++            ping_ok = reply.startswith("ping") and route == "responses" and not used_fallback
++            if ping_ok:
++                checks["openai_key"]["message"] = f"Ключ активен ({masked})"
++                checks["llm_ping"] = {"ok": True, "message": "Ответ PING получен"}
+             else:
+                 ok = False
+-                checks["openai_key"] = {"ok": False, "message": f"HTTP {response.status_code} при проверке ключа ({masked})"}
+-        except httpx.HTTPError as exc:
++                message = "OpenAI API недоступен"
++                if reply and not reply.startswith("ping"):
++                    message = f"OpenAI API недоступен (ответ: {ping_result.text[:32]})"
++                elif route != "responses" or used_fallback:
++                    message = "OpenAI API недоступен (fallback)"
++                checks["llm_ping"] = {"ok": False, "message": message}
++        except Exception:  # noqa: BLE001
+             ok = False
+-            checks["openai_key"] = {"ok": False, "message": f"Ошибка проверки ключа: {exc}"}
+-
+-        if checks.get("openai_key", {}).get("ok"):
+-            try:
+-                probe_messages = [
+-                    {"role": "system", "content": "Ты проверка готовности. Ответь строго словом PING."},
+-                    {"role": "user", "content": "Ответь словом PING"},
+-                ]
+-                ping_result = llm_generate(
+-                    probe_messages,
+-                    model=DEFAULT_MODEL,
+-                    temperature=0.0,
+-                    max_tokens=12,
+-                    timeout_s=10,
+-                )
+-                reply = (ping_result.text or "").strip().lower()
+-                ping_ok = reply.startswith("ping")
+-                if not ping_ok:
+-                    ok = False
+-                    checks["llm_ping"] = {
+-                        "ok": False,
+-                        "message": f"Неожиданный ответ модели: {ping_result.text[:32]}",
+-                    }
+-                else:
+-                    checks["llm_ping"] = {"ok": True, "message": "Ответ PING получен"}
+-            except Exception as exc:  # noqa: BLE001
+-                ok = False
+-                checks["llm_ping"] = {"ok": False, "message": f"LLM недоступна: {exc}"}
++            checks["llm_ping"] = {"ok": False, "message": "OpenAI API недоступен"}
  
--def _is_protected(paragraph: str) -> bool:
-+def _is_protected(paragraph: str, lock_tokens: Set[str]) -> bool:
-     if not paragraph.strip():
-         return True
-     if paragraph.strip().startswith("##"):
-         return True
--    if LOCK_START_TEMPLATE.split("{term}")[0] in paragraph:
-+    if "<!--LOCK_START" in paragraph:
-         return True
-     if LOCK_END in paragraph:
-         return True
-     if _FAQ_START in paragraph or _FAQ_END in paragraph:
-         return True
-     if paragraph.lower().startswith(("**вопрос", "**ответ")):
-         return True
-+    if any(token in paragraph for token in lock_tokens):
-+        return True
-     return False
+     artifacts_dir = Path("artifacts")
+     try:
+         artifacts_dir.mkdir(parents=True, exist_ok=True)
+         probe = artifacts_dir / ".write_check"
+         probe.write_text("ok", encoding="utf-8")
+         probe.unlink()
+         checks["artifacts_writable"] = {"ok": True, "message": "Запись в artifacts/ доступна"}
+     except Exception as exc:  # noqa: BLE001
+         ok = False
+         checks["artifacts_writable"] = {"ok": False, "message": f"Нет доступа к artifacts/: {exc}"}
  
- 
- def _score_paragraph(paragraph: str) -> float:
-     if not paragraph.strip():
-         return 1e9
-     lowered = paragraph.lower()
-     penalties = 0.0
-     if any(token in lowered for token in ["во-первых", "во-вторых", "таким образом", "в целом"]):
-         penalties += 2.5
-     if len(paragraph) < 220:
-         penalties += 1.5
-     if paragraph.endswith(":"):
-         penalties += 1.0
-     return penalties + len(paragraph) / 400.0
- 
- 
- def _rebuild_text(paragraphs: Sequence[str]) -> str:
-     return "\n\n".join(paragraphs).strip() + "\n"
- 
- 
-+def _extract_jsonld(text: str) -> Tuple[str, str]:
-+    match = _JSONLD_PATTERN.search(text)
-+    if not match:
-+        return text, ""
-+    jsonld_block = match.group(0)
-+    before = text[: match.start()].rstrip()
-+    after = text[match.end() :].lstrip()
-+    article = before
-+    if after:
-+        article = f"{article}\n\n{after}" if article else after
-+    return article, jsonld_block.strip()
+     theme_slug = (theme or "").strip()
+     if not theme_slug:
+         checks["theme_index"] = {"ok": False, "message": "Тема не указана"}
+         ok = False
+     else:
+         index_path = Path("profiles") / theme_slug / "index.json"
+         if not index_path.exists():
+             checks["theme_index"] = {"ok": False, "message": f"Индекс для темы '{theme_slug}' не найден"}
+             ok = False
+         else:
+             try:
+                 json.loads(index_path.read_text(encoding="utf-8"))
+                 checks["theme_index"] = {"ok": True, "message": f"Индекс найден ({index_path})"}
+diff --git a/prompt_templates/__init__.py b/prompt_templates/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d0d27d44b9f1e303551f8afe69ec283b806cb97
+--- /dev/null
++++ b/prompt_templates/__init__.py
+@@ -0,0 +1,25 @@
++"""Prompt templates for article generation contracts."""
++from __future__ import annotations
++
++from importlib import resources
++from typing import Final
++
++_TEMPLATE_PACKAGE: Final[str] = __name__
 +
 +
-+def _paragraph_signature(paragraph: str) -> str:
-+    normalized = re.sub(r"\s+", " ", paragraph.strip().lower())
-+    return normalized
++def load_template(name: str) -> str:
++    """Return the contents of the template identified by ``name``.
 +
++    Parameters
++    ----------
++    name:
++        File name within the :mod:`prompt_templates` package.
 +
-+def _validate_locked_terms(text: str, terms: Sequence[str]) -> None:
-+    if not terms:
-+        return
-+    missing: List[str] = []
-+    for term in terms:
-+        if not term:
-+            continue
-+        lock_token = LOCK_START_TEMPLATE.format(term=term)
-+        pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-+        if not pattern.search(text):
-+            missing.append(term)
-+    if missing:
-+        raise TrimValidationError(
-+            "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing))
-+        )
++    Raises
++    ------
++    FileNotFoundError
++        If the requested template does not exist.
++    """
 +
-+
-+def _validate_faq(text: str) -> None:
-+    if _FAQ_START not in text or _FAQ_END not in text:
-+        raise TrimValidationError("После тримминга нарушена структура блока FAQ.")
-+    block = text.split(_FAQ_START, 1)[1].split(_FAQ_END, 1)[0]
-+    pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block)
-+    if len(pairs) != 5:
-+        raise TrimValidationError("FAQ должен содержать ровно 5 вопросов и ответов.")
-+
-+
- def trim_text(
-     text: str,
-     *,
-     min_chars: int,
-     max_chars: int,
-     protected_blocks: Iterable[str] | None = None,
- ) -> TrimResult:
--    working = text
-+    article, jsonld_block = _extract_jsonld(text)
-+    working = article
-     removed: List[str] = []
--    protect_patterns = list(protected_blocks or [])
-+    protected_terms = [str(term).strip() for term in (protected_blocks or []) if str(term).strip()]
-+    lock_tokens: Set[str] = {LOCK_START_TEMPLATE.format(term=term) for term in protected_terms}
-+    skip_signatures: Set[str] = set()
- 
-     def _length(current: str) -> int:
--        article = strip_jsonld(current)
--        return len(re.sub(r"\s+", "", article))
-+        return len(re.sub(r"\s+", "", strip_jsonld(current)))
- 
-     while _length(working) > max_chars:
-         paragraphs = _split_paragraphs(working)
-         candidates: List[tuple[float, int]] = []
-         faq_zone = False
-         for idx, paragraph in enumerate(paragraphs):
-             if _FAQ_START in paragraph:
-                 faq_zone = True
-             if _FAQ_END in paragraph:
-                 faq_zone = False
--            if faq_zone or _is_protected(paragraph):
--                continue
--            if any(pattern in paragraph for pattern in protect_patterns):
-+            signature = _paragraph_signature(paragraph)
-+            if faq_zone or _is_protected(paragraph, lock_tokens) or signature in skip_signatures:
-                 continue
-             score = _score_paragraph(paragraph)
-             candidates.append((score, idx))
-         if not candidates:
-             break
-         candidates.sort()
-         _, drop_idx = candidates[0]
-         removed_para = paragraphs.pop(drop_idx)
-         removed.append(removed_para)
--        working = _rebuild_text(paragraphs)
--        if _length(working) < min_chars:
-+        updated = _rebuild_text(paragraphs)
-+        if _length(updated) < min_chars:
-             paragraphs.insert(drop_idx, removed.pop())
-+            skip_signatures.add(_paragraph_signature(paragraphs[drop_idx]))
-             working = _rebuild_text(paragraphs)
--            protect_patterns.append(removed_para[:40])
-             continue
--    return TrimResult(text=working, removed_paragraphs=removed)
-+        skip_signatures.add(_paragraph_signature(removed_para))
-+        working = updated
-+
-+    working = working.rstrip() + "\n"
-+    _validate_locked_terms(working, protected_terms)
-+    _validate_faq(working)
-+
-+    final_text = working
-+    if jsonld_block:
-+        final_text = f"{final_text.rstrip()}\n\n{jsonld_block}\n"
-+    return TrimResult(text=final_text, removed_paragraphs=removed)
++    with resources.files(_TEMPLATE_PACKAGE).joinpath(name).open("r", encoding="utf-8") as stream:
++        return stream.read()
+diff --git a/prompt_templates/json_contract.txt b/prompt_templates/json_contract.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..eff4ecdc2828bac8aee7bde9501e0416221e741a
+--- /dev/null
++++ b/prompt_templates/json_contract.txt
+@@ -0,0 +1,18 @@
++<contract_example>
++{
++  "intro": "Раскрывающий вводный абзац без приветствий.",
++  "main": [
++    "1-й блок основной части. Каждый блок содержит 3-5 абзацев по 3-4 предложения.",
++    "2-й блок основной части. Абзацы связаны логически и содержат конкретику.",
++    "3-й блок основной части. Избегай повторов и воды."
++  ],
++  "faq": [
++    {"q": "Вопрос 1?", "a": "Развернутый ответ минимум из двух предложений."},
++    {"q": "Вопрос 2?", "a": "Четкий, прикладной ответ без общих слов."},
++    {"q": "Вопрос 3?", "a": "Ответ, который помогает действовать."},
++    {"q": "Вопрос 4?", "a": "Ответ, учитывающий практику и риски."},
++    {"q": "Вопрос 5?", "a": "Ответ с конкретными рекомендациями."}
++  ],
++  "conclusion": "Итоговый абзац с выводами и призывом к действию."
++}
++</contract_example>
 diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
-index 06f532c2307baacddae3de8cb62d3f2e04c94011..5d80024450602e0ef05a351c04847b07a839ca18 100644
+index 5d80024450602e0ef05a351c04847b07a839ca18..2d4c961763f8789837ecef390c41e60191ecc73c 100644
 --- a/tests/test_orchestrate_utils.py
 +++ b/tests/test_orchestrate_utils.py
-@@ -1,90 +1,100 @@
- import json
- import uuid
- from pathlib import Path
- 
- import pytest
- 
- from deterministic_pipeline import DeterministicPipeline, PipelineStep
- from faq_builder import build_faq_block
- from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
- from length_trimmer import trim_text
- from llm_client import GenerationResult
- from orchestrate import generate_article_from_payload, gather_health_status
- from validators import ValidationError, strip_jsonld, validate_article
- 
-+MIN_REQUIRED = 3500
-+MAX_REQUIRED = 6000
- 
- def test_keyword_injection_protects_terms_and_locks_all_occurrences():
-     base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
-     result = inject_keywords(base_text, ["ключевая фраза", "дополнительный термин"])
-     assert result.coverage_report == "2/2"
-     assert result.missing_terms == []
-     main_section = result.text.split("## FAQ", 1)[0]
-     first_phrase = (
-         "Дополнительно рассматривается "
-         + f"{LOCK_START_TEMPLATE.format(term='ключевая фраза')}ключевая фраза<!--LOCK_END-->"
-         + " через прикладные сценарии."
-     )
-     second_phrase = (
-         "Дополнительно рассматривается "
-         + f"{LOCK_START_TEMPLATE.format(term='дополнительный термин')}дополнительный термин<!--LOCK_END-->"
-         + " через прикладные сценарии."
-     )
-     assert first_phrase in main_section
-     assert second_phrase in main_section
-     assert "### Разбираемся в терминах" not in result.text
-     assert not result.inserted_section
- 
- 
- def test_keyword_injection_adds_terms_inset_when_needed():
-     base_text = "# Заголовок\n\nВступление.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
-     result = inject_keywords(base_text, ["редкий термин"])
-     assert result.inserted_section is True
-     assert "### Разбираемся в терминах" in result.text
-     lock_token = LOCK_START_TEMPLATE.format(term="редкий термин")
-     assert lock_token in result.text
-     assert result.coverage_report == "1/1"
- 
- 
- def test_faq_builder_produces_jsonld_block():
-     base_text = "## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
-     faq_result = build_faq_block(base_text=base_text, topic="Долговая нагрузка", keywords=["платёж"])
-     assert faq_result.text.count("**Вопрос") == 5
-     assert faq_result.jsonld.strip().startswith('<script type="application/ld+json">')
-     payload = json.loads(faq_result.jsonld.split("\n", 1)[1].rsplit("\n", 1)[0])
-     assert payload["@type"] == "FAQPage"
-     assert len(payload["mainEntity"]) == 5
- 
- 
- def test_trim_preserves_locked_and_faq():
-     intro = " ".join(["Параграф с вводной информацией, который можно сократить." for _ in range(4)])
-     removable = "Дополнительный абзац с примерами, который допустимо удалить."
-+    faq_lines = []
-+    for idx in range(1, 6):
-+        faq_lines.append(f"**Вопрос {idx}.** Что важно?")
-+        faq_lines.append("**Ответ.** Ответ с деталями.")
-+        faq_lines.append("")
-+    faq_block = "\n".join(faq_lines).strip()
-     article = (
-         f"## Введение\n\n{intro}\n\n"
-         f"{LOCK_START_TEMPLATE.format(term='важный термин')}важный термин<!--LOCK_END-->\n\n"
-         f"{removable}\n\n"
--        "## FAQ\n\n<!--FAQ_START-->\n**Вопрос 1.** Что важно?\n\n**Ответ.** Ответ с деталями.\n\n<!--FAQ_END-->"
-+        "## FAQ\n\n<!--FAQ_START-->\n"
-+        f"{faq_block}\n"
-+        "<!--FAQ_END-->"
-     )
-     trimmed = trim_text(article, min_chars=200, max_chars=400)
-     assert "важный термин" in trimmed.text
-     assert "<!--FAQ_START-->" in trimmed.text
-     assert len("".join(trimmed.text.split())) <= 400
-     assert trimmed.removed_paragraphs
- 
- 
- def test_validator_detects_missing_keyword():
-     text = (
-         "## Введение\n\nТекст без маркеров.\n\n## FAQ\n\n<!--FAQ_START-->\n"
-         "**Вопрос 1.** Как?\n\n**Ответ.** Так.\n\n<!--FAQ_END-->\n"
-         "<script type=\"application/ld+json\">\n"
-         '{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": []}'
-         "\n</script>"
-     )
-     with pytest.raises(ValidationError) as exc:
-         validate_article(text, keywords=["ключ"], min_chars=10, max_chars=1000)
-     assert exc.value.group == "keywords"
- 
- 
- def test_validator_length_ignores_jsonld():
-     payload = {
-         "@context": "https://schema.org",
-         "@type": "FAQPage",
-@@ -94,67 +104,77 @@ def test_validator_length_ignores_jsonld():
-                 "name": f"Вопрос {idx}?",
-                 "acceptedAnswer": {"@type": "Answer", "text": f"Ответ {idx}"},
-             }
-             for idx in range(1, 6)
-         ],
+@@ -293,32 +293,29 @@ def test_generate_article_returns_metadata(monkeypatch, tmp_path):
+     outfile = Path("artifacts") / unique_name
+     data = {
+         "theme": "Долговая нагрузка семьи",
+         "structure": ["Введение", "Основная часть", "Вывод"],
+         "keywords": [f"ключ {idx}" for idx in range(1, 12)],
+         "include_jsonld": True,
+         "context_source": "off",
      }
-     faq_block = "\n".join(
-         [
-             "**Вопрос 1.** Вопрос 1?",
-             "**Ответ.** Ответ 1",
-             "",
-             "**Вопрос 2.** Вопрос 2?",
-             "**Ответ.** Ответ 2",
-             "",
-             "**Вопрос 3.** Вопрос 3?",
-             "**Ответ.** Ответ 3",
-             "",
-             "**Вопрос 4.** Вопрос 4?",
-             "**Ответ.** Ответ 4",
-             "",
-             "**Вопрос 5.** Вопрос 5?",
-             "**Ответ.** Ответ 5",
-             "",
-         ]
+     result = generate_article_from_payload(
+         theme="finance",
+         data=data,
+         k=0,
+         context_source="off",
+         outfile=str(outfile),
      )
-+    intro_paragraph = (
-+        "Содержательный абзац с фактами и цифрами, объясняющий контекст и приводящий примеры. "
-+        "Практические советы включают последовательность действий, промежуточные выводы и точные формулировки."
-+    )
-+    intro = "\n\n".join([intro_paragraph for _ in range(22)])
-     article = (
-         "## Введение\n\n"
-+        f"{intro}\n\n"
-         f"{LOCK_START_TEMPLATE.format(term='ключ')}ключ<!--LOCK_END--> фиксирует термин.\n\n"
-         "## FAQ\n\n<!--FAQ_START-->\n"
-         f"{faq_block}\n"
-         "<!--FAQ_END-->\n"
-         "<script type=\"application/ld+json\">\n"
-         f"{json.dumps(payload, ensure_ascii=False)}\n"
-         "</script>"
-     )
-     article_no_jsonld = strip_jsonld(article)
-     base_length = len("".join(article_no_jsonld.split()))
-     full_length = len("".join(article.split()))
-     assert full_length > base_length
--    min_chars = max(10, base_length - 5)
--    max_chars = base_length + 5
--    result = validate_article(article, keywords=["ключ"], min_chars=min_chars, max_chars=max_chars)
-+    assert MIN_REQUIRED <= base_length <= MAX_REQUIRED
-+    result = validate_article(
-+        article,
-+        keywords=["ключ"],
-+        min_chars=MIN_REQUIRED,
-+        max_chars=MAX_REQUIRED,
-+    )
-     assert result.length_ok
-     assert result.jsonld_ok
+     metadata = result["metadata"]
+     assert metadata["validation"]["passed"]
+     assert Path(outfile).exists()
+     assert metadata["pipeline_logs"]
+     # cleanup
+     Path(outfile).unlink(missing_ok=True)
+     Path(outfile.with_suffix(".json")).unlink(missing_ok=True)
  
  
- def _stub_llm(monkeypatch):
-     base_paragraph = (
-         "Абзац с анализом показателей и практическими советами для семейного бюджета. "
-         "Расчёт коэффициентов сопровождаем примерами и перечнем действий."
-     )
-     outline = ["Введение", "Аналитика", "Решения"]
-     intro_block = []
-     for idx in range(4):
-         intro_block.append(
-             f"{base_paragraph} Введение блок {idx + 1} показывает, как сформировать картину текущей ситуации и определить безопасные пределы долга."
-         )
-     intro_text = "\n\n".join(intro_block)
- 
-     main_blocks = []
-     for idx in range(5):
-         main_blocks.append(
-             f"{base_paragraph} Аналитика блок {idx + 1} фокусируется на цифрах, добавляет формулы и объясняет, как применять их на практике."
-         )
-     main_text = "\n\n".join(main_blocks)
- 
-     outro_parts = []
+ def test_gather_health_status_handles_missing_theme(monkeypatch):
+-    class DummyResponse:
+-        status_code = 200
+-
+-    monkeypatch.setattr("orchestrate.httpx.get", lambda *args, **kwargs: DummyResponse())
++    monkeypatch.setenv("OPENAI_API_KEY", "")
+     status = gather_health_status(theme="")
+     assert not status["ok"]
+     assert not status["checks"]["theme_index"]["ok"]
 diff --git a/validators.py b/validators.py
-index 762d07e1443a717452abeb9202ea6c9d5dbb4393..85b884a5b8d70e92bb7b498525e886995217e654 100644
+index 85b884a5b8d70e92bb7b498525e886995217e654..44ed8ee8378c37407ed0bc52d7c524c9797d1dd5 100644
 --- a/validators.py
 +++ b/validators.py
-@@ -1,32 +1,33 @@
+@@ -1,34 +1,34 @@
  from __future__ import annotations
  
  import json
@@ -1152,8 +1935,9 @@ index 762d07e1443a717452abeb9202ea6c9d5dbb4393..85b884a5b8d70e92bb7b498525e88699
  from dataclasses import dataclass, field
  from typing import Dict, Iterable, List, Optional, Tuple
  
-+from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
- from keyword_injector import LOCK_END, LOCK_START_TEMPLATE, build_term_pattern
+ from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
+-from keyword_injector import LOCK_END, LOCK_START_TEMPLATE, build_term_pattern
++from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
  
  _FAQ_START = "<!--FAQ_START-->"
  _FAQ_END = "<!--FAQ_END-->"
@@ -1178,16 +1962,8 @@ index 762d07e1443a717452abeb9202ea6c9d5dbb4393..85b884a5b8d70e92bb7b498525e88699
      skeleton_ok: bool
      keywords_ok: bool
      faq_ok: bool
-@@ -132,112 +133,137 @@ def _skeleton_status(
-     for idx, item in enumerate(main):
-         if not isinstance(item, str) or not item.strip():
-             return False, f"Блок основной части №{idx + 1} пуст."
- 
-     outline = skeleton_payload.get("outline")
-     if outline and isinstance(outline, list):
-         normalized_outline = [str(entry).strip() for entry in outline if str(entry).strip()]
-     else:
-         normalized_outline = []
+     length_ok: bool
+@@ -142,51 +142,51 @@ def _skeleton_status(
  
      expected_main = max(1, len(normalized_outline) - 2) if normalized_outline else len(main)
      if len(main) != expected_main:
@@ -1204,7 +1980,7 @@ index 762d07e1443a717452abeb9202ea6c9d5dbb4393..85b884a5b8d70e92bb7b498525e88699
      min_chars: int,
      max_chars: int,
      skeleton_payload: Optional[Dict[str, object]] = None,
-+    keyword_coverage_percent: Optional[float] = None,
+     keyword_coverage_percent: Optional[float] = None,
  ) -> ValidationResult:
      length = _length_no_spaces(text)
      skeleton_ok, skeleton_message = _skeleton_status(skeleton_payload, text)
@@ -1213,7 +1989,8 @@ index 762d07e1443a717452abeb9202ea6c9d5dbb4393..85b884a5b8d70e92bb7b498525e88699
      missing: List[str] = []
      article = strip_jsonld(text)
      for term in normalized_keywords:
-         pattern = build_term_pattern(term)
+-        pattern = build_term_pattern(term)
++        pattern = _keyword_regex(term)
          if not pattern.search(article):
              missing.append(term)
              continue
@@ -1239,59 +2016,7 @@ index 762d07e1443a717452abeb9202ea6c9d5dbb4393..85b884a5b8d70e92bb7b498525e88699
          faq_ok = True
          for idx, entry in enumerate(markdown_faq):
              jsonld_entry = jsonld_entries[idx]
-             if entry["question"] != jsonld_entry["question"] or entry["answer"] != jsonld_entry["answer"]:
-                 faq_ok = False
-                 mismatched_questions.append(entry["question"])
-         if mismatched_questions:
-             faq_error = (
-                 "FAQ в markdown не совпадает с JSON-LD (например, вопрос '"
-                 + mismatched_questions[0]
-                 + "')."
-             )
-     if not faq_ok and faq_error is None:
-         faq_error = "FAQ должен содержать ровно 5 вопросов и ответов."
- 
--    length_ok = min_chars <= length <= max_chars
-+    coverage_percent = 100.0 if not normalized_keywords else round(
-+        (len(normalized_keywords) - len(missing)) / len(normalized_keywords) * 100,
-+        2,
-+    )
-+
-+    length_ok = DEFAULT_MIN_LENGTH <= length <= DEFAULT_MAX_LENGTH
-+    requested_range_ok = min_chars <= length <= max_chars
- 
-     stats: Dict[str, object] = {
-         "length_no_spaces": length,
-         "keywords_total": len(normalized_keywords),
-         "keywords_missing": missing,
-         "keywords_found": len(normalized_keywords) - len(missing),
-         "keywords_coverage": f"{len(normalized_keywords) - len(missing)}/{len(normalized_keywords) if normalized_keywords else 0}",
-+        "keywords_coverage_percent": coverage_percent,
-+        "keyword_coverage_expected_percent": keyword_coverage_percent,
-         "faq_count": faq_count,
-         "faq_jsonld_count": len(jsonld_entries),
-         "faq_mismatched_questions": mismatched_questions,
-         "jsonld_ok": jsonld_ok,
-+        "length_requested_range_ok": requested_range_ok,
-+        "length_required_min": DEFAULT_MIN_LENGTH,
-+        "length_required_max": DEFAULT_MAX_LENGTH,
-     }
- 
-+    if keyword_coverage_percent is not None and keyword_coverage_percent < 100.0:
-+        raise ValidationError(
-+            "keywords",
-+            (
-+                "Этап подстановки ключевых слов завершился с покрытием "
-+                f"{keyword_coverage_percent:.0f}%, требуется 100%."
-+            ),
-+            details=stats,
-+        )
-+
-     result = ValidationResult(
-         skeleton_ok=skeleton_ok,
-         keywords_ok=keywords_ok,
-         faq_ok=faq_ok,
-         length_ok=length_ok,
+@@ -245,25 +245,29 @@ def validate_article(
          jsonld_ok=jsonld_ok,
          stats=stats,
      )
@@ -1310,12 +2035,15 @@ index 762d07e1443a717452abeb9202ea6c9d5dbb4393..85b884a5b8d70e92bb7b498525e88699
      if not length_ok:
          raise ValidationError(
              "length",
--            f"Объём статьи {length} зн. без пробелов, требуется {min_chars}-{max_chars}.",
-+            (
-+                f"Объём статьи {length} зн. без пробелов, требуется "
-+                f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH}."
-+            ),
+             (
+                 f"Объём статьи {length} зн. без пробелов, требуется "
+                 f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH}."
+             ),
              details=stats,
          )
      return result
++def _keyword_regex(term: str) -> re.Pattern:
++    pattern = rf"(?i)(?<!\\w){re.escape(term)}(?!\\w)"
++    return re.compile(pattern)
++
 

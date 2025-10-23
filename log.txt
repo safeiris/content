@@ -1,0 +1,387 @@
+[2025-10-23 11:47:04,845] INFO: WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on http://127.0.0.1:8000
+[2025-10-23 11:47:04,845] INFO: Press CTRL+C to quit
+[2025-10-23 11:50:49,208] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:49] "GET / HTTP/1.1" 302 -
+[2025-10-23 11:50:49,220] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:49] "GET /login?next=/ HTTP/1.1" 200 -
+[2025-10-23 11:50:49,508] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:49] "GET /favicon.ico HTTP/1.1" 302 -
+[2025-10-23 11:50:49,556] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:49] "GET /login?next=/favicon.ico HTTP/1.1" 200 -
+[2025-10-23 11:50:55,397] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:55] "POST /login?next=/ HTTP/1.1" 302 -
+[2025-10-23 11:50:55,407] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:55] "GET / HTTP/1.1" 200 -
+[2025-10-23 11:50:55,424] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:55] "GET /styles.css HTTP/1.1" 304 -
+[2025-10-23 11:50:55,428] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:55] "GET /script.js HTTP/1.1" 200 -
+[2025-10-23 11:50:55,604] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:55] "GET /api/pipes HTTP/1.1" 200 -
+[2025-10-23 11:50:55,683] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:55] "GET /api/artifacts HTTP/1.1" 200 -
+[2025-10-23 11:50:55,737] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:55] "GET /favicon.ico HTTP/1.1" 200 -
+[2025-10-23 11:50:56,402] INFO: HTTP Request: GET https://api.openai.com/v1/models "HTTP/1.1 200 OK"
+[2025-10-23 11:50:56,514] INFO: temperature is ignored for GPT-5; using default
+[2025-10-23 11:50:57,170] INFO: HTTP Request: GET https://api.openai.com/v1/models/gpt-5 "HTTP/1.1 200 OK"
+[2025-10-23 11:50:57,171] INFO: dispatch route=responses model=gpt-5
+[2025-10-23 11:50:57,171] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:50:57,171] INFO: responses input_len=144
+[2025-10-23 11:50:57,171] INFO: responses max_output_tokens=12
+[2025-10-23 11:50:57,987] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 400 Bad Request"
+[2025-10-23 11:50:57,987] ERROR: Responses API error: status=400 error.type=invalid_request_error error.message="Invalid 'max_output_tokens': integer below minimum value. Expected a value >= 16, but got 12 instead."
+[2025-10-23 11:50:57,990] WARNING: Responses API call failed: Ошибка сервиса OpenAI: HTTP 400 — Invalid 'max_output_tokens': integer below minimum value. Expected a value >= 16, but got 12 instead.
+[2025-10-23 11:50:57,990] WARNING: switching to fallback model gpt-4o (primary=gpt-5, reason=api_error_gpt5_responses)
+[2025-10-23 11:50:57,990] INFO: chat payload: tool_choice omitted (no tools)
+[2025-10-23 11:50:57,990] INFO: openai payload blueprint: {'model': 'gpt-4o', 'messages': '<2 messages>', 'max_tokens': 12, 'temperature': 0.0}
+[2025-10-23 11:50:57,991] INFO: dispatch route=chat model=gpt-4o
+[2025-10-23 11:50:59,319] INFO: HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[2025-10-23 11:50:59,322] INFO: fallback completion schema category=text (schema=message.content:str, route=chat)
+[2025-10-23 11:50:59,327] INFO: 127.0.0.1 - - [23/Oct/2025 11:50:59] "GET /api/health?theme=finance HTTP/1.1" 200 -
+[2025-10-23 11:52:38,251] INFO: LOG:LLM_REQUEST step=skeleton model=gpt-5 prompt_len=4531 attempt=1 max_tokens=1500
+[2025-10-23 11:52:38,264] INFO: temperature is ignored for GPT-5; using default
+[2025-10-23 11:52:38,974] INFO: HTTP Request: GET https://api.openai.com/v1/models/gpt-5 "HTTP/1.1 200 OK"
+[2025-10-23 11:52:38,975] INFO: dispatch route=responses model=gpt-5
+[2025-10-23 11:52:38,975] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:52:38,975] INFO: responses input_len=4512
+[2025-10-23 11:52:38,975] INFO: responses max_output_tokens=1500
+[2025-10-23 11:53:00,972] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+[2025-10-23 11:53:00,973] INFO: responses status=incomplete id=resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9
+[2025-10-23 11:53:00,973] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:53:00,973] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1472.0 max_output_tokens=1500 previous_response_id=
+[2025-10-23 11:53:00,973] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=initial
+[2025-10-23 11:53:00,973] INFO: responses poll attempt=1 delay=0.300 id=resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9
+[2025-10-23 11:53:01,954] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9 "HTTP/1.1 200 OK"
+[2025-10-23 11:53:01,954] INFO: responses status=incomplete id=resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9 (poll)
+[2025-10-23 11:53:01,954] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:53:01,954] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1472.0 max_output_tokens=1500 previous_response_id=
+[2025-10-23 11:53:01,954] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#1
+[2025-10-23 11:53:01,955] INFO: responses poll attempt=2 delay=0.600 id=resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9
+[2025-10-23 11:53:03,385] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9 "HTTP/1.1 200 OK"
+[2025-10-23 11:53:03,386] INFO: responses status=incomplete id=resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9 (poll)
+[2025-10-23 11:53:03,386] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:53:03,386] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1472.0 max_output_tokens=1500 previous_response_id=
+[2025-10-23 11:53:03,386] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#2
+[2025-10-23 11:53:03,386] INFO: responses poll attempt=3 delay=1.000 id=resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9
+[2025-10-23 11:53:05,837] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9 "HTTP/1.1 200 OK"
+[2025-10-23 11:53:05,837] INFO: responses status=incomplete id=resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9 (poll)
+[2025-10-23 11:53:05,837] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:53:05,837] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1472.0 max_output_tokens=1500 previous_response_id=
+[2025-10-23 11:53:05,837] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#3
+[2025-10-23 11:53:05,837] INFO: responses poll attempt=4 delay=1.500 id=resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9
+[2025-10-23 11:53:07,746] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9 "HTTP/1.1 200 OK"
+[2025-10-23 11:53:07,747] INFO: responses status=incomplete id=resp_03d2ea0f37b9464b0068f9fae7a610819a90ac3ecf2f8cdfe9 (poll)
+[2025-10-23 11:53:07,747] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:53:07,748] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1472.0 max_output_tokens=1500 previous_response_id=
+[2025-10-23 11:53:07,748] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#4
+[2025-10-23 11:53:07,748] WARNING: responses restart triggered signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:53:07,748] INFO: escalate max_output_tokens: 1500 -> 2200
+[2025-10-23 11:53:07,748] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:53:07,748] INFO: responses input_len=4512
+[2025-10-23 11:53:07,748] INFO: responses max_output_tokens=2200
+[2025-10-23 11:53:58,416] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+[2025-10-23 11:53:58,416] INFO: responses status=incomplete id=resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611
+[2025-10-23 11:53:58,417] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:53:58,417] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:53:58,417] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=initial
+[2025-10-23 11:53:58,417] INFO: responses poll attempt=1 delay=0.300 id=resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611
+[2025-10-23 11:53:59,076] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611 "HTTP/1.1 200 OK"
+[2025-10-23 11:53:59,077] INFO: responses status=incomplete id=resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611 (poll)
+[2025-10-23 11:53:59,077] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:53:59,077] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:53:59,077] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#1
+[2025-10-23 11:53:59,077] INFO: responses poll attempt=2 delay=0.600 id=resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611
+[2025-10-23 11:54:00,329] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611 "HTTP/1.1 200 OK"
+[2025-10-23 11:54:00,330] INFO: responses status=incomplete id=resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611 (poll)
+[2025-10-23 11:54:00,330] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:54:00,330] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:54:00,330] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#2
+[2025-10-23 11:54:00,330] INFO: responses poll attempt=3 delay=1.000 id=resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611
+[2025-10-23 11:54:01,637] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611 "HTTP/1.1 200 OK"
+[2025-10-23 11:54:01,637] INFO: responses status=incomplete id=resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611 (poll)
+[2025-10-23 11:54:01,637] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:54:01,637] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:54:01,637] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#3
+[2025-10-23 11:54:01,637] INFO: responses poll attempt=4 delay=1.500 id=resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611
+[2025-10-23 11:54:04,250] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611 "HTTP/1.1 200 OK"
+[2025-10-23 11:54:04,251] INFO: responses status=incomplete id=resp_00b5902f8a1967a70068f9fb03f0548199ab3f4246880b8611 (poll)
+[2025-10-23 11:54:04,251] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:54:04,251] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:54:04,251] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#4
+[2025-10-23 11:54:04,251] WARNING: responses restart triggered signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:54:04,251] INFO: escalate max_output_tokens: 2200 -> 2600
+[2025-10-23 11:54:04,251] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:54:04,251] INFO: responses input_len=4512
+[2025-10-23 11:54:04,251] INFO: responses max_output_tokens=2600
+[2025-10-23 11:54:39,636] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+[2025-10-23 11:54:39,637] INFO: responses status=incomplete id=resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925
+[2025-10-23 11:54:39,637] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:54:39,637] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:54:39,637] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=initial
+[2025-10-23 11:54:39,637] INFO: responses poll attempt=1 delay=0.300 id=resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925
+[2025-10-23 11:54:40,443] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925 "HTTP/1.1 200 OK"
+[2025-10-23 11:54:40,443] INFO: responses status=incomplete id=resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925 (poll)
+[2025-10-23 11:54:40,443] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:54:40,444] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:54:40,444] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#1
+[2025-10-23 11:54:40,444] INFO: responses poll attempt=2 delay=0.600 id=resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925
+[2025-10-23 11:54:41,418] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925 "HTTP/1.1 200 OK"
+[2025-10-23 11:54:41,419] INFO: responses status=incomplete id=resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925 (poll)
+[2025-10-23 11:54:41,419] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:54:41,419] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:54:41,419] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#2
+[2025-10-23 11:54:41,419] INFO: responses poll attempt=3 delay=1.000 id=resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925
+[2025-10-23 11:54:42,852] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925 "HTTP/1.1 200 OK"
+[2025-10-23 11:54:42,852] INFO: responses status=incomplete id=resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925 (poll)
+[2025-10-23 11:54:42,852] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:54:42,853] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:54:42,853] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#3
+[2025-10-23 11:54:42,853] INFO: responses poll attempt=4 delay=1.500 id=resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925
+[2025-10-23 11:54:44,900] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925 "HTTP/1.1 200 OK"
+[2025-10-23 11:54:44,901] INFO: responses status=incomplete id=resp_03b9c64233c25b140068f9fb3ccadc81909336058d3507b925 (poll)
+[2025-10-23 11:54:44,901] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:54:44,901] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:54:44,901] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#4
+[2025-10-23 11:54:44,901] WARNING: responses restart triggered signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:54:44,901] INFO: responses restart skipped reason=max_output_tokens_exhausted segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:54:44,902] WARNING: Пустой ответ от Responses API gpt-5 (schema=responses.none)
+[2025-10-23 11:54:44,902] WARNING: parse_chain: content_str=0; parts=0; content_dict=0; choices_text=0; output_text=0; retry=0; fallback=responses; schema=responses.none
+[2025-10-23 11:54:44,902] WARNING: empty completion from Responses API gpt-5 (schema=responses.none)
+[2025-10-23 11:54:44,902] WARNING: switching to fallback model gpt-4o (primary=gpt-5, reason=empty_completion_gpt5_responses)
+[2025-10-23 11:54:44,903] INFO: chat payload: tool_choice omitted (no tools)
+[2025-10-23 11:54:44,903] INFO: openai payload blueprint: {'model': 'gpt-4o', 'messages': '<3 messages>', 'max_tokens': 1500, 'temperature': 0.3}
+[2025-10-23 11:54:44,903] INFO: dispatch route=chat model=gpt-4o
+[2025-10-23 11:54:56,070] INFO: HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[2025-10-23 11:54:56,072] INFO: fallback completion schema category=text (schema=message.content:str, route=chat)
+[2025-10-23 11:54:56,072] INFO: LOG:LLM_RESPONSE step=skeleton tokens_used=unknown status=ok
+[2025-10-23 11:54:56,072] INFO: SKELETON_JSON_OK attempt=1
+[2025-10-23 11:54:56,072] WARNING: SKELETON_RETRY_json_error attempt=1 error=Количество блоков в основной части не совпадает с ожиданиями по структуре
+[2025-10-23 11:54:56,073] INFO: LOG:LLM_REQUEST step=skeleton model=gpt-5 prompt_len=4531 attempt=1 max_tokens=1350
+[2025-10-23 11:54:56,086] INFO: temperature is ignored for GPT-5; using default
+[2025-10-23 11:54:56,678] INFO: HTTP Request: GET https://api.openai.com/v1/models/gpt-5 "HTTP/1.1 200 OK"
+[2025-10-23 11:54:56,679] INFO: dispatch route=responses model=gpt-5
+[2025-10-23 11:54:56,679] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:54:56,679] INFO: responses input_len=4512
+[2025-10-23 11:54:56,679] INFO: responses max_output_tokens=1350
+[2025-10-23 11:55:14,396] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+[2025-10-23 11:55:14,396] INFO: responses status=incomplete id=resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298
+[2025-10-23 11:55:14,397] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:55:14,397] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1344.0 max_output_tokens=1350 previous_response_id=
+[2025-10-23 11:55:14,397] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=initial
+[2025-10-23 11:55:14,397] INFO: responses poll attempt=1 delay=0.300 id=resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298
+[2025-10-23 11:55:16,437] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298 "HTTP/1.1 200 OK"
+[2025-10-23 11:55:16,437] INFO: responses status=incomplete id=resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298 (poll)
+[2025-10-23 11:55:16,437] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:55:16,438] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1344.0 max_output_tokens=1350 previous_response_id=
+[2025-10-23 11:55:16,438] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#1
+[2025-10-23 11:55:16,438] INFO: responses poll attempt=2 delay=0.600 id=resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298
+[2025-10-23 11:55:17,565] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298 "HTTP/1.1 200 OK"
+[2025-10-23 11:55:17,565] INFO: responses status=incomplete id=resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298 (poll)
+[2025-10-23 11:55:17,565] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:55:17,566] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1344.0 max_output_tokens=1350 previous_response_id=
+[2025-10-23 11:55:17,566] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#2
+[2025-10-23 11:55:17,566] INFO: responses poll attempt=3 delay=1.000 id=resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298
+[2025-10-23 11:55:19,304] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298 "HTTP/1.1 200 OK"
+[2025-10-23 11:55:19,305] INFO: responses status=incomplete id=resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298 (poll)
+[2025-10-23 11:55:19,305] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:55:19,305] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1344.0 max_output_tokens=1350 previous_response_id=
+[2025-10-23 11:55:19,305] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#3
+[2025-10-23 11:55:19,305] INFO: responses poll attempt=4 delay=1.500 id=resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298
+[2025-10-23 11:55:21,341] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298 "HTTP/1.1 200 OK"
+[2025-10-23 11:55:21,342] INFO: responses status=incomplete id=resp_0b17f081167ae84f0068f9fb70dcc08199ad83dbf5d1c9a298 (poll)
+[2025-10-23 11:55:21,342] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:55:21,342] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1344.0 max_output_tokens=1350 previous_response_id=
+[2025-10-23 11:55:21,342] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#4
+[2025-10-23 11:55:21,342] WARNING: responses restart triggered signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:55:21,342] INFO: escalate max_output_tokens: 1350 -> 2200
+[2025-10-23 11:55:21,342] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:55:21,342] INFO: responses input_len=4512
+[2025-10-23 11:55:21,342] INFO: responses max_output_tokens=2200
+[2025-10-23 11:55:55,966] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+[2025-10-23 11:55:55,967] INFO: responses status=incomplete id=resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233
+[2025-10-23 11:55:55,967] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:55:55,967] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:55:55,967] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=initial
+[2025-10-23 11:55:55,967] INFO: responses poll attempt=1 delay=0.300 id=resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233
+[2025-10-23 11:55:57,093] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233 "HTTP/1.1 200 OK"
+[2025-10-23 11:55:57,093] INFO: responses status=incomplete id=resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233 (poll)
+[2025-10-23 11:55:57,093] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:55:57,093] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:55:57,093] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#1
+[2025-10-23 11:55:57,094] INFO: responses poll attempt=2 delay=0.600 id=resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233
+[2025-10-23 11:55:58,714] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233 "HTTP/1.1 200 OK"
+[2025-10-23 11:55:58,714] INFO: responses status=incomplete id=resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233 (poll)
+[2025-10-23 11:55:58,715] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:55:58,715] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:55:58,715] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#2
+[2025-10-23 11:55:58,715] INFO: responses poll attempt=3 delay=1.000 id=resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233
+[2025-10-23 11:56:00,469] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233 "HTTP/1.1 200 OK"
+[2025-10-23 11:56:00,470] INFO: responses status=incomplete id=resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233 (poll)
+[2025-10-23 11:56:00,470] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:56:00,470] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:56:00,470] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#3
+[2025-10-23 11:56:00,470] INFO: responses poll attempt=4 delay=1.500 id=resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233
+[2025-10-23 11:56:02,464] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233 "HTTP/1.1 200 OK"
+[2025-10-23 11:56:02,464] INFO: responses status=incomplete id=resp_082c40353a2395ab0068f9fb89820081909e34d99741a40233 (poll)
+[2025-10-23 11:56:02,464] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:56:02,464] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:56:02,464] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#4
+[2025-10-23 11:56:02,464] WARNING: responses restart triggered signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:56:02,465] INFO: escalate max_output_tokens: 2200 -> 2600
+[2025-10-23 11:56:02,465] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:56:02,465] INFO: responses input_len=4512
+[2025-10-23 11:56:02,465] INFO: responses max_output_tokens=2600
+[2025-10-23 11:56:39,316] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+[2025-10-23 11:56:39,330] INFO: responses status=incomplete id=resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad
+[2025-10-23 11:56:39,330] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:56:39,330] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:56:39,330] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=initial
+[2025-10-23 11:56:39,330] INFO: responses poll attempt=1 delay=0.300 id=resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad
+[2025-10-23 11:56:40,120] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad "HTTP/1.1 200 OK"
+[2025-10-23 11:56:40,121] INFO: responses status=incomplete id=resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad (poll)
+[2025-10-23 11:56:40,121] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:56:40,121] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:56:40,121] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#1
+[2025-10-23 11:56:40,121] INFO: responses poll attempt=2 delay=0.600 id=resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad
+[2025-10-23 11:56:41,229] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad "HTTP/1.1 200 OK"
+[2025-10-23 11:56:41,229] INFO: responses status=incomplete id=resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad (poll)
+[2025-10-23 11:56:41,229] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:56:41,230] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:56:41,230] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#2
+[2025-10-23 11:56:41,230] INFO: responses poll attempt=3 delay=1.000 id=resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad
+[2025-10-23 11:56:42,867] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad "HTTP/1.1 200 OK"
+[2025-10-23 11:56:42,867] INFO: responses status=incomplete id=resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad (poll)
+[2025-10-23 11:56:42,867] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:56:42,867] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:56:42,867] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#3
+[2025-10-23 11:56:42,867] INFO: responses poll attempt=4 delay=1.500 id=resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad
+[2025-10-23 11:56:45,017] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad "HTTP/1.1 200 OK"
+[2025-10-23 11:56:45,018] INFO: responses status=incomplete id=resp_0ae2968689564fe30068f9fbb2a7b0819583baf1a4389dc6ad (poll)
+[2025-10-23 11:56:45,018] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:56:45,018] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:56:45,019] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#4
+[2025-10-23 11:56:45,019] WARNING: responses restart triggered signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:56:45,019] INFO: responses restart skipped reason=max_output_tokens_exhausted segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:56:45,020] WARNING: Пустой ответ от Responses API gpt-5 (schema=responses.none)
+[2025-10-23 11:56:45,020] WARNING: parse_chain: content_str=0; parts=0; content_dict=0; choices_text=0; output_text=0; retry=0; fallback=responses; schema=responses.none
+[2025-10-23 11:56:45,020] WARNING: empty completion from Responses API gpt-5 (schema=responses.none)
+[2025-10-23 11:56:45,020] WARNING: switching to fallback model gpt-4o (primary=gpt-5, reason=empty_completion_gpt5_responses)
+[2025-10-23 11:56:45,020] INFO: chat payload: tool_choice omitted (no tools)
+[2025-10-23 11:56:45,020] INFO: openai payload blueprint: {'model': 'gpt-4o', 'messages': '<3 messages>', 'max_tokens': 1350, 'temperature': 0.3}
+[2025-10-23 11:56:45,020] INFO: dispatch route=chat model=gpt-4o
+[2025-10-23 11:56:59,763] INFO: HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[2025-10-23 11:56:59,764] INFO: fallback completion schema category=text (schema=message.content:str, route=chat)
+[2025-10-23 11:56:59,765] INFO: LOG:LLM_RESPONSE step=skeleton tokens_used=unknown status=ok
+[2025-10-23 11:56:59,765] INFO: SKELETON_JSON_OK attempt=2
+[2025-10-23 11:56:59,765] WARNING: SKELETON_RETRY_json_error attempt=2 error=Количество блоков в основной части не совпадает с ожиданиями по структуре
+[2025-10-23 11:56:59,765] INFO: LOG:LLM_REQUEST step=skeleton model=gpt-5 prompt_len=4531 attempt=1 max_tokens=1215
+[2025-10-23 11:56:59,778] INFO: temperature is ignored for GPT-5; using default
+[2025-10-23 11:57:00,584] INFO: HTTP Request: GET https://api.openai.com/v1/models/gpt-5 "HTTP/1.1 200 OK"
+[2025-10-23 11:57:00,585] INFO: dispatch route=responses model=gpt-5
+[2025-10-23 11:57:00,585] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:57:00,585] INFO: responses input_len=4512
+[2025-10-23 11:57:00,585] INFO: responses max_output_tokens=1215
+[2025-10-23 11:57:29,262] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+[2025-10-23 11:57:29,262] INFO: responses status=incomplete id=resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483
+[2025-10-23 11:57:29,262] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:57:29,262] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1152.0 max_output_tokens=1215 previous_response_id=
+[2025-10-23 11:57:29,262] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens source=initial
+[2025-10-23 11:57:29,262] INFO: responses poll attempt=1 delay=0.300 id=resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483
+[2025-10-23 11:57:30,071] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483 "HTTP/1.1 200 OK"
+[2025-10-23 11:57:30,071] INFO: responses status=incomplete id=resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483 (poll)
+[2025-10-23 11:57:30,071] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:57:30,072] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1152.0 max_output_tokens=1215 previous_response_id=
+[2025-10-23 11:57:30,072] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens source=poll#1
+[2025-10-23 11:57:30,072] INFO: responses poll attempt=2 delay=0.600 id=resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483
+[2025-10-23 11:57:31,200] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483 "HTTP/1.1 200 OK"
+[2025-10-23 11:57:31,201] INFO: responses status=incomplete id=resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483 (poll)
+[2025-10-23 11:57:31,201] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:57:31,201] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1152.0 max_output_tokens=1215 previous_response_id=
+[2025-10-23 11:57:31,201] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens source=poll#2
+[2025-10-23 11:57:31,201] INFO: responses poll attempt=3 delay=1.000 id=resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483
+[2025-10-23 11:57:32,839] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483 "HTTP/1.1 200 OK"
+[2025-10-23 11:57:32,840] INFO: responses status=incomplete id=resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483 (poll)
+[2025-10-23 11:57:32,840] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:57:32,840] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1152.0 max_output_tokens=1215 previous_response_id=
+[2025-10-23 11:57:32,840] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens source=poll#3
+[2025-10-23 11:57:32,840] INFO: responses poll attempt=4 delay=1.500 id=resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483
+[2025-10-23 11:57:34,989] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483 "HTTP/1.1 200 OK"
+[2025-10-23 11:57:34,989] INFO: responses status=incomplete id=resp_04839e297cf852a10068f9fbecc2b48193ae3eab442151b483 (poll)
+[2025-10-23 11:57:34,989] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:57:34,989] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=1152.0 max_output_tokens=1215 previous_response_id=
+[2025-10-23 11:57:34,989] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens source=poll#4
+[2025-10-23 11:57:34,990] WARNING: responses restart triggered signals=incomplete_reason=max_output_tokens
+[2025-10-23 11:57:34,990] INFO: escalate max_output_tokens: 1215 -> 2200
+[2025-10-23 11:57:34,990] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:57:34,990] INFO: responses input_len=4512
+[2025-10-23 11:57:34,990] INFO: responses max_output_tokens=2200
+[2025-10-23 11:58:30,799] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+[2025-10-23 11:58:30,799] INFO: responses status=incomplete id=resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd
+[2025-10-23 11:58:30,800] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:58:30,800] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:58:30,800] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=initial
+[2025-10-23 11:58:30,800] INFO: responses poll attempt=1 delay=0.300 id=resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd
+[2025-10-23 11:58:31,719] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd "HTTP/1.1 200 OK"
+[2025-10-23 11:58:31,719] INFO: responses status=incomplete id=resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd (poll)
+[2025-10-23 11:58:31,720] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:58:31,720] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:58:31,720] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#1
+[2025-10-23 11:58:31,720] INFO: responses poll attempt=2 delay=0.600 id=resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd
+[2025-10-23 11:58:32,743] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd "HTTP/1.1 200 OK"
+[2025-10-23 11:58:32,744] INFO: responses status=incomplete id=resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd (poll)
+[2025-10-23 11:58:32,744] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:58:32,744] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:58:32,744] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#2
+[2025-10-23 11:58:32,744] INFO: responses poll attempt=3 delay=1.000 id=resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd
+[2025-10-23 11:58:34,385] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd "HTTP/1.1 200 OK"
+[2025-10-23 11:58:34,386] INFO: responses status=incomplete id=resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd (poll)
+[2025-10-23 11:58:34,386] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:58:34,386] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:58:34,386] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#3
+[2025-10-23 11:58:34,386] INFO: responses poll attempt=4 delay=1.500 id=resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd
+[2025-10-23 11:58:37,149] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd "HTTP/1.1 200 OK"
+[2025-10-23 11:58:37,150] INFO: responses status=incomplete id=resp_0b4342a5ab8133260068f9fc0f5b5c819b98708a51323829dd (poll)
+[2025-10-23 11:58:37,150] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:58:37,150] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2176.0 max_output_tokens=2200 previous_response_id=
+[2025-10-23 11:58:37,151] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#4
+[2025-10-23 11:58:37,151] WARNING: responses restart triggered signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:58:37,151] INFO: escalate max_output_tokens: 2200 -> 2600
+[2025-10-23 11:58:37,151] INFO: responses payload_keys=['input', 'max_output_tokens', 'model']
+[2025-10-23 11:58:37,151] INFO: responses input_len=4512
+[2025-10-23 11:58:37,151] INFO: responses max_output_tokens=2600
+[2025-10-23 11:59:20,464] INFO: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+[2025-10-23 11:59:20,464] INFO: responses status=incomplete id=resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53
+[2025-10-23 11:59:20,464] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:59:20,465] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:59:20,465] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=initial
+[2025-10-23 11:59:20,465] INFO: responses poll attempt=1 delay=0.300 id=resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53
+[2025-10-23 11:59:21,231] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53 "HTTP/1.1 200 OK"
+[2025-10-23 11:59:21,231] INFO: responses status=incomplete id=resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53 (poll)
+[2025-10-23 11:59:21,231] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:59:21,232] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:59:21,232] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#1
+[2025-10-23 11:59:21,232] INFO: responses poll attempt=2 delay=0.600 id=resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53
+[2025-10-23 11:59:22,365] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53 "HTTP/1.1 200 OK"
+[2025-10-23 11:59:22,365] INFO: responses status=incomplete id=resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53 (poll)
+[2025-10-23 11:59:22,365] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:59:22,365] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:59:22,366] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#2
+[2025-10-23 11:59:22,366] INFO: responses poll attempt=3 delay=1.000 id=resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53
+[2025-10-23 11:59:23,938] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53 "HTTP/1.1 200 OK"
+[2025-10-23 11:59:23,939] INFO: responses status=incomplete id=resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53 (poll)
+[2025-10-23 11:59:23,939] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:59:23,939] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:59:23,939] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#3
+[2025-10-23 11:59:23,939] INFO: responses poll attempt=4 delay=1.500 id=resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53
+[2025-10-23 11:59:26,008] INFO: HTTP Request: GET https://api.openai.com/v1/responses/resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53 "HTTP/1.1 200 OK"
+[2025-10-23 11:59:26,009] INFO: responses status=incomplete id=resp_081506ae01aba7e50068f9fc4d597081949e045cab23e0ed53 (poll)
+[2025-10-23 11:59:26,009] INFO: responses parse resp_keys=['background', 'billing', 'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user'] root=None segments=0 len=0 schema=responses.none
+[2025-10-23 11:59:26,009] INFO: responses meta status=incomplete incomplete_reason=max_output_tokens usage_output_tokens=2560.0 max_output_tokens=2600 previous_response_id=
+[2025-10-23 11:59:26,009] INFO: responses parse segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct source=poll#4
+[2025-10-23 11:59:26,009] WARNING: responses restart triggered signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:59:26,009] INFO: responses restart skipped reason=max_output_tokens_exhausted segments=0 signals=incomplete_reason=max_output_tokens,usage_output_tokens>=98pct
+[2025-10-23 11:59:26,010] WARNING: Пустой ответ от Responses API gpt-5 (schema=responses.none)
+[2025-10-23 11:59:26,011] WARNING: parse_chain: content_str=0; parts=0; content_dict=0; choices_text=0; output_text=0; retry=0; fallback=responses; schema=responses.none
+[2025-10-23 11:59:26,011] WARNING: empty completion from Responses API gpt-5 (schema=responses.none)
+[2025-10-23 11:59:26,011] WARNING: switching to fallback model gpt-4o (primary=gpt-5, reason=empty_completion_gpt5_responses)
+[2025-10-23 11:59:26,011] INFO: chat payload: tool_choice omitted (no tools)
+[2025-10-23 11:59:26,011] INFO: openai payload blueprint: {'model': 'gpt-4o', 'messages': '<3 messages>', 'max_tokens': 1215, 'temperature': 0.3}
+[2025-10-23 11:59:26,012] INFO: dispatch route=chat model=gpt-4o
+[2025-10-23 11:59:34,361] INFO: HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[2025-10-23 11:59:34,363] INFO: fallback completion schema category=text (schema=message.content:str, route=chat)
+[2025-10-23 11:59:34,363] INFO: LOG:LLM_RESPONSE step=skeleton tokens_used=unknown status=ok
+[2025-10-23 11:59:34,363] INFO: SKELETON_JSON_OK attempt=3
+[2025-10-23 11:59:34,363] WARNING: SKELETON_RETRY_json_error attempt=3 error=Количество блоков в основной части не совпадает с ожиданиями по структуре
+[2025-10-23 11:59:34,364] WARNING: API error: Количество блоков в основной части не совпадает с ожиданиями по структуре
+[2025-10-23 11:59:34,364] INFO: 127.0.0.1 - - [23/Oct/2025 11:59:34] "POST /api/generate HTTP/1.1" 500 -

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
-from keyword_injector import LOCK_END, LOCK_START_TEMPLATE, build_term_pattern
+from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
 
 _FAQ_START = "<!--FAQ_START-->"
 _FAQ_END = "<!--FAQ_END-->"
@@ -164,7 +164,7 @@ def validate_article(
     missing: List[str] = []
     article = strip_jsonld(text)
     for term in normalized_keywords:
-        pattern = build_term_pattern(term)
+        pattern = _keyword_regex(term)
         if not pattern.search(article):
             missing.append(term)
             continue
@@ -267,3 +267,7 @@ def validate_article(
             details=stats,
         )
     return result
+def _keyword_regex(term: str) -> re.Pattern:
+    pattern = rf"(?i)(?<!\\w){re.escape(term)}(?!\\w)"
+    return re.compile(pattern)
+

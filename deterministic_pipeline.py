@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from llm_client import GenerationResult, generate as llm_generate
+from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
+from faq_builder import _normalize_entry
 from keyword_injector import (
     KeywordInjectionResult,
     LOCK_END,
@@ -21,6 +22,7 @@ from keyword_injector import (
     inject_keywords,
 )
 from length_trimmer import TrimResult, TrimValidationError, trim_text
+from prompt_templates import load_template
 from validators import (
     ValidationError,
     ValidationResult,
@@ -126,6 +128,7 @@ class DeterministicPipeline:
         self.locked_terms: List[str] = []
         self.jsonld_reserve: int = 0
         self.skeleton_payload: Optional[Dict[str, object]] = None
+        self._skeleton_faq_entries: List[Dict[str, str]] = []
         self.keywords_coverage_percent: float = 0.0
 
         self._model_used: Optional[str] = None
@@ -198,18 +201,20 @@ class DeterministicPipeline:
         step: PipelineStep,
         messages: Sequence[Dict[str, object]],
         max_tokens: Optional[int] = None,
+        override_model: Optional[str] = None,
     ) -> GenerationResult:
         prompt_len = self._prompt_length(messages)
         limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
         if not limit or limit <= 0:
             limit = 700
         attempt = 0
+        model_to_use = (override_model or self.model).strip()
         while attempt < 3:
             attempt += 1
             LOGGER.info(
                 "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d attempt=%d max_tokens=%d",
                 step.value,
-                self.model,
+                model_to_use,
                 prompt_len,
                 attempt,
                 limit,
@@ -217,7 +222,7 @@ class DeterministicPipeline:
             try:
                 result = llm_generate(
                     list(messages),
-                    model=self.model,
+                    model=model_to_use,
                     temperature=self.temperature,
                     max_tokens=limit,
                     timeout_s=self.timeout_s,
@@ -284,12 +289,10 @@ class DeterministicPipeline:
         }
 
     def _resolve_skeleton_tokens(self) -> int:
-        baseline = max(self.max_tokens, self.max_chars + 400)
-        if baseline <= 0:
-            baseline = self.max_chars + 400
-        return min(1500, max(600, baseline))
+        baseline = 1200 if self.max_tokens <= 0 else min(self.max_tokens, 1200)
+        return max(600, baseline)
 
-    def _skeleton_contract(self) -> Dict[str, object]:
+    def _skeleton_contract(self) -> Tuple[Dict[str, object], str]:
         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
         intro = outline[0] if outline else "Введение"
         outro = outline[-1] if len(outline) > 1 else "Вывод"
@@ -301,30 +304,48 @@ class DeterministicPipeline:
         if not core_sections:
             core_sections = ["Основная часть"]
         contract = {
-            "intro": f"2-3 плотных абзаца для раздела '{intro}'",
+            "intro": f"один абзац с вводной рамкой для раздела '{intro}'",
             "main": [
-                f"2-3 абзаца раскрывают тему '{heading}' на практических примерах"
+                (
+                    "3-5 абзацев раскрывают тему '"
+                    + heading
+                    + "' с примерами, рисками и расчётами"
+                )
                 for heading in core_sections
             ],
-            "outro": f"1-2 абзаца с выводами и призывом к действию для блока '{outro}'",
+            "faq": [
+                {"q": "вопрос", "a": "ответ"} for _ in range(5)
+            ],
+            "conclusion": f"один абзац выводов и призыва к действию для блока '{outro}'",
         }
-        return contract
+        template_example = load_template("json_contract.txt").strip()
+        return contract, template_example
 
     def _build_skeleton_messages(self) -> List[Dict[str, object]]:
         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
-        contract_payload = self._skeleton_contract()
+        contract_payload, contract_template = self._skeleton_contract()
         contract = json.dumps(contract_payload, ensure_ascii=False, indent=2)
-        main_expected = max(1, len(contract_payload.get("main") or []))
+        keywords_clause = "Используй ключевые слова: " + ", ".join(self.normalized_keywords)
+        if not self.normalized_keywords:
+            keywords_clause = "Используй все предоставленные ключевые слова в точных формах."
+        sections_clause = ", ".join(outline) if outline else "Введение, Основная часть, FAQ, Вывод"
         user_payload = textwrap.dedent(
             f"""
-            Сформируй структуру статьи в строгом JSON-формате.
-            Требования:
-            1. Соблюдай порядок разделов: {', '.join(outline) if outline else 'Введение, Основная часть, Вывод'}.
-            2. Верни JSON вида {{"intro": str, "main": [str, ...], "outro": str}} без дополнительных ключей.
-            3. main должен содержать {main_expected} элемента — по одному на каждый раздел основной части.
-            4. Каждый элемент intro/main/outro содержит 2-3 осмысленных абзаца по 3-4 предложения, без Markdown и приветствий.
-            5. Не добавляй FAQ, разметку, комментарии и служебные подписи.
-            Образец структуры:
+            Ты создаёшь детерминированный SEO-текст. Соблюдай требования UI:
+            • Верни строго JSON-объект с ключами intro, main, faq, conclusion.
+            • intro и conclusion — по одному абзацу без приветствий.
+            • main — список из 3–6 элементов, каждый элемент содержит 3–5 абзацев по 3–4 предложения.
+            • faq — массив из 5 объектов {{"q": str, "a": str}}. Ответы FAQ развернутые (минимум 2 предложения) и прикладные.
+            • Общий объём статьи (intro + main + conclusion + ответы FAQ) — 3500–6000 символов без пробелов.
+            • {keywords_clause}
+            • Соблюдай последовательность разделов: {sections_clause}.
+            • Не добавляй ничего, кроме требуемого JSON. Не используй Markdown, комментарии и пояснения.
+
+            Оберни ответ маркерами <response_json> и </response_json> без дополнительного текста.
+            Пример целевого формата:
+            {contract_template}
+
+            Каркас с подсказками для содержания:
             {contract}
             """
         ).strip()
@@ -338,13 +359,32 @@ class DeterministicPipeline:
 
         intro = str(payload.get("intro") or "").strip()
         main = payload.get("main")
-        outro = str(payload.get("outro") or "").strip()
-        if not intro or not outro or not isinstance(main, list) or not main:
-            raise ValueError("Скелет не содержит обязательных полей")
+        conclusion = str(payload.get("conclusion") or "").strip()
+        faq = payload.get("faq")
+        if not intro or not conclusion or not isinstance(main, list) or len(main) == 0:
+            raise ValueError("Скелет не содержит обязательных полей intro/main/conclusion")
 
+        if not 3 <= len(main) <= 6:
+            raise ValueError("Скелет основной части должен содержать 3–6 блоков")
+
+        normalized_main: List[str] = []
         for idx, item in enumerate(main):
             if not isinstance(item, str) or not item.strip():
                 raise ValueError(f"Элемент основной части №{idx + 1} пуст")
+            normalized_main.append(item.strip())
+
+        if not isinstance(faq, list) or len(faq) != 5:
+            raise ValueError("Скелет FAQ должен содержать ровно 5 элементов")
+
+        normalized_faq: List[Dict[str, str]] = []
+        for idx, entry in enumerate(faq, start=1):
+            if not isinstance(entry, dict):
+                raise ValueError(f"FAQ элемент №{idx} имеет неверный формат")
+            question = str(entry.get("q") or "").strip()
+            answer = str(entry.get("a") or "").strip()
+            if not question or not answer:
+                raise ValueError(f"FAQ элемент №{idx} пуст")
+            normalized_faq.append({"question": question, "answer": answer})
 
         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
         outline = [
@@ -356,14 +396,16 @@ class DeterministicPipeline:
             outline = ["Введение", "Основная часть", "Вывод"]
 
         intro_heading = outline[0]
-        outro_heading = outline[-1]
+        conclusion_heading = outline[-1]
         main_headings = outline[1:-1]
         if not main_headings:
             main_headings = ["Основная часть"]
-        if len(main_headings) != len(main):
-            raise ValueError(
-                "Количество блоков в основной части не совпадает с ожиданиями по структуре"
-            )
+        if len(main_headings) < len(normalized_main):
+            extra = len(normalized_main) - len(main_headings)
+            for index in range(extra):
+                main_headings.append(f"Блок {len(main_headings) + 1}")
+        elif len(main_headings) > len(normalized_main):
+            main_headings = main_headings[: len(normalized_main)]
 
         lines: List[str] = [f"# {self.topic}", ""]
 
@@ -377,16 +419,17 @@ class DeterministicPipeline:
                 lines.append("")
 
         _append_section(intro_heading, intro)
-        for heading, body in zip(main_headings, main):
+        for heading, body in zip(main_headings, normalized_main):
             _append_section(heading, body)
-        _append_section(outro_heading, outro)
+        _append_section(conclusion_heading, conclusion)
 
         lines.append("## FAQ")
         lines.append(FAQ_START)
         lines.append(FAQ_END)
         markdown = "\n".join(lines).strip()
-        outline_summary = [intro_heading, *main_headings, outro_heading]
-        return markdown, {"outline": outline_summary}
+        outline_summary = [intro_heading, *main_headings, conclusion_heading]
+        self._skeleton_faq_entries = normalized_faq
+        return markdown, {"outline": outline_summary, "faq": normalized_faq}
 
     def _render_faq_markdown(self, entries: Sequence[Dict[str, str]]) -> str:
         lines: List[str] = []
@@ -425,14 +468,23 @@ class DeterministicPipeline:
 
     def _sanitize_entries(self, entries: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
         sanitized: List[Dict[str, str]] = []
+        seen_questions: set[str] = set()
         for entry in entries:
-            question = str(entry.get("question", "")).strip()
-            answer = str(entry.get("answer", "")).strip()
-            if not question or not answer:
-                continue
+            try:
+                normalized = _normalize_entry(dict(entry), seen_questions)
+            except ValueError as exc:
+                raise PipelineStepError(
+                    PipelineStep.FAQ,
+                    f"Некорректный FAQ: {exc}.",
+                ) from exc
+            question = normalized.question.strip()
+            answer = normalized.answer.strip()
             lowered = (question + " " + answer).lower()
             if "дополнительно рассматривается" in lowered:
-                raise PipelineStepError(PipelineStep.FAQ, "FAQ содержит шаблонную фразу 'Дополнительно рассматривается'.")
+                raise PipelineStepError(
+                    PipelineStep.FAQ,
+                    "FAQ содержит шаблонную фразу 'Дополнительно рассматривается'.",
+                )
             sanitized.append({"question": question, "answer": answer})
         return sanitized
 
@@ -526,6 +578,9 @@ class DeterministicPipeline:
         payload: Optional[Dict[str, object]] = None
         markdown: Optional[str] = None
         metadata_snapshot: Dict[str, object] = {}
+        json_error_count = 0
+        use_fallback = False
+        result: Optional[GenerationResult] = None
         while attempt < 3 and markdown is None:
             attempt += 1
             try:
@@ -533,6 +588,7 @@ class DeterministicPipeline:
                     step=PipelineStep.SKELETON,
                     messages=messages,
                     max_tokens=skeleton_tokens,
+                    override_model=FALLBACK_MODEL if use_fallback else None,
                 )
             except PipelineStepError:
                 raise
@@ -548,6 +604,11 @@ class DeterministicPipeline:
                 skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
                 continue
             raw_text = result.text.strip()
+            if "<response_json>" in raw_text and "</response_json>" in raw_text:
+                try:
+                    raw_text = raw_text.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
+                except Exception:  # pragma: no cover - defensive
+                    raw_text = raw_text
             if not raw_text:
                 last_error = PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=empty", attempt)
@@ -561,11 +622,19 @@ class DeterministicPipeline:
                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
                 skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
                 last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
+                json_error_count += 1
+                if not use_fallback and json_error_count >= 2:
+                    LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
+                    use_fallback = True
+                    attempt = 0
+                    continue
                 continue
             try:
                 markdown, summary = self._render_skeleton_markdown(payload)
                 snapshot = dict(payload)
                 snapshot["outline"] = summary.get("outline", [])
+                if "faq" in summary:
+                    snapshot["faq"] = summary.get("faq", [])
                 self.skeleton_payload = snapshot
                 LOGGER.info("SKELETON_RENDERED_WITH_MARKERS outline=%s", ",".join(summary.get("outline", [])))
             except Exception as exc:  # noqa: BLE001
@@ -587,6 +656,11 @@ class DeterministicPipeline:
             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось вставить маркеры FAQ на этапе скелета.")
 
         self._check_template_text(markdown, PipelineStep.SKELETON)
+        if result is not None:
+            route = result.api_route or ("chat" if use_fallback else "responses")
+        else:
+            route = "responses"
+        LOGGER.info("SKELETON_OK route=%s", route)
         self._update_log(
             PipelineStep.SKELETON,
             "ok",
@@ -630,52 +704,41 @@ class DeterministicPipeline:
 
     def _run_faq(self, text: str) -> str:
         self._log(PipelineStep.FAQ, "running")
-        messages = self._build_faq_messages(text)
-        faq_tokens = 700
-        attempt = 0
-        last_error: Optional[Exception] = None
-        while attempt < 3:
-            attempt += 1
-            try:
-                result = self._call_llm(step=PipelineStep.FAQ, messages=messages, max_tokens=faq_tokens)
-            except PipelineStepError:
-                raise
-            metadata = result.metadata or {}
-            status = str(metadata.get("status") or "").lower()
-            if status == "incomplete" or metadata.get("incomplete_reason"):
-                LOGGER.warning(
-                    "FAQ_RETRY_incomplete attempt=%d status=%s reason=%s",
-                    attempt,
-                    status or "incomplete",
-                    metadata.get("incomplete_reason") or "",
+        entries_source: List[Dict[str, str]] = []
+        if self._skeleton_faq_entries:
+            entries_source = list(self._skeleton_faq_entries)
+        elif self.provided_faq:
+            entries_source = [
+                {"question": str(item.get("question", "")).strip(), "answer": str(item.get("answer", "")).strip()}
+                for item in self.provided_faq
+                if isinstance(item, dict)
+            ]
+
+        if entries_source:
+            sanitized = self._sanitize_entries(entries_source)
+            if len(sanitized) != 5:
+                raise PipelineStepError(
+                    PipelineStep.FAQ,
+                    "FAQ должно содержать ровно 5 пар вопросов и ответов.",
                 )
-                faq_tokens = max(300, int(faq_tokens * 0.9))
-                last_error = PipelineStepError(PipelineStep.FAQ, "Модель не завершила формирование FAQ.")
-                continue
-            try:
-                entries = self._parse_faq_entries(result.text)
-            except PipelineStepError as exc:
-                last_error = exc
-                LOGGER.warning("FAQ_RETRY_parse_error attempt=%d error=%s", attempt, exc)
-                faq_tokens = max(300, int(faq_tokens * 0.9))
-                continue
-            faq_block = self._render_faq_markdown(entries)
+            faq_block = self._render_faq_markdown(sanitized)
             merged_text = self._merge_faq(text, faq_block)
-            self.jsonld = self._build_jsonld(entries)
+            self.jsonld = self._build_jsonld(sanitized)
             self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
-            LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in entries))
+            LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in sanitized))
             self._update_log(
                 PipelineStep.FAQ,
                 "ok",
-                entries=[entry["question"] for entry in entries],
+                entries=[entry["question"] for entry in sanitized],
                 **self._metrics(merged_text),
             )
             self.checkpoints[PipelineStep.FAQ] = merged_text
             return merged_text
 
-        if last_error:
-            raise last_error
-        raise PipelineStepError(PipelineStep.FAQ, "Не удалось сформировать блок FAQ после нескольких попыток.")
+        raise PipelineStepError(
+            PipelineStep.FAQ,
+            "Не удалось сформировать блок FAQ: отсутствуют подготовленные данные.",
+        )
 
     def _run_trim(self, text: str) -> TrimResult:
         self._log(PipelineStep.TRIM, "running")

@@ -45,8 +45,10 @@ def _normalize_question(question: str, seen: set[str]) -> str:
 
 
 def _normalize_entry(raw: Dict[str, str], seen: set[str]) -> FaqEntry:
-    question = _normalize_question(str(raw.get("question", "")), seen)
-    answer = _normalize_answer(str(raw.get("answer", "")))
+    question_raw = raw.get("question") if "question" in raw else raw.get("q")
+    answer_raw = raw.get("answer") if "answer" in raw else raw.get("a")
+    question = _normalize_question(str(question_raw or ""), seen)
+    answer = _normalize_answer(str(answer_raw or ""))
     anchor = str(raw.get("anchor") or _sanitize_anchor(question))
     return FaqEntry(question=question, answer=answer, anchor=anchor)
 

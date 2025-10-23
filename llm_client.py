@@ -32,7 +32,7 @@ MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 FALLBACK_MODEL = "gpt-4o"
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
-RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens")
+RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "response_format")
 RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
 RESPONSES_MAX_ESCALATIONS = 2
 MAX_RESPONSES_POLL_ATTEMPTS = (
@@ -140,6 +140,8 @@ def build_responses_payload(
         "model": str(model).strip(),
         "input": joined_input.strip(),
         "max_output_tokens": int(max_tokens),
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
     }
     return payload
 
@@ -178,6 +180,18 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
                 sanitized[key] = int(value)
             except (TypeError, ValueError):
                 continue
+            continue
+        if key == "temperature":
+            try:
+                sanitized[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+            continue
+        if key == "response_format":
+            if isinstance(value, dict):
+                sanitized[key] = {"type": str(value.get("type", "")).strip() or "json_object"}
+            else:
+                sanitized[key] = {"type": "json_object"}
             continue
     input_value = sanitized.get("input", "")
     input_length = len(input_value) if isinstance(input_value, str) else 0
@@ -484,6 +498,12 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
     resp_keys = sorted(str(key) for key in data.keys())
     parse_flags["resp_keys"] = resp_keys
 
+    output_text_raw = data.get("output_text")
+    if isinstance(output_text_raw, str):
+        output_text_value = output_text_raw.strip()
+    else:
+        output_text_value = ""
+
     def _iter_segments(container: object) -> List[str]:
         collected: List[str] = []
         if isinstance(container, list):
@@ -520,19 +540,29 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
             segments.extend(extracted)
             root_used = root_key
 
-    schema_label = "responses.output_text" if segments else "responses.none"
+    content_text = "\n\n".join(segments) if segments else ""
+    schema_label = "responses.output_text" if (segments or output_text_value) else "responses.none"
     parse_flags["schema"] = schema_label
     parse_flags["segments"] = len(segments)
+    parse_flags["output_text_len"] = len(output_text_value)
+    parse_flags["content_text_len"] = len(content_text)
 
-    text = "\n\n".join(segments) if segments else ""
     LOGGER.info(
-        "responses parse resp_keys=%s root=%s segments=%d len=%d schema=%s",
+        "RESP_PARSE=output_text:%d|content_text:%d",
+        parse_flags["output_text_len"],
+        parse_flags["content_text_len"],
+    )
+    LOGGER.info(
+        "responses parse resp_keys=%s root=%s segments=%d schema=%s",
         resp_keys,
         root_used,
         parse_flags.get("segments", 0),
-        len(text),
         schema_label,
     )
+
+    text = output_text_value or content_text
+    if text:
+        LOGGER.info("RESP_PARSE_OK schema=%s len=%d", schema_label, len(text))
     return text, parse_flags, schema_label
 
 
@@ -925,67 +955,29 @@ def generate(
         system_text = "\n\n".join(system_segments)
         user_text = "\n\n".join(user_segments)
 
-        payload = build_responses_payload(target_model, system_text, user_text, max_tokens)
-        sanitized_payload, _ = sanitize_payload_for_responses(payload)
+        base_payload = build_responses_payload(target_model, system_text, user_text, max_tokens)
+        sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
 
-        def _coerce_positive_int(value: object, fallback: int) -> int:
-            try:
-                coerced = int(value)
-            except (TypeError, ValueError):
-                coerced = fallback
-            if coerced <= 0:
-                coerced = fallback
-            return min(coerced, G5_MAX_OUTPUT_TOKENS_MAX)
+        try:
+            max_tokens_value = int(sanitized_payload.get("max_output_tokens", 1200))
+        except (TypeError, ValueError):
+            max_tokens_value = 1200
+        if max_tokens_value <= 0:
+            max_tokens_value = 1200
+        max_tokens_value = min(max_tokens_value, 1200)
+        sanitized_payload["max_output_tokens"] = max_tokens_value
+        sanitized_payload["temperature"] = 0.3
+        sanitized_payload["response_format"] = {"type": "json_object"}
 
-        base_max_output_tokens = _coerce_positive_int(
-            sanitized_payload.get("max_output_tokens"),
-            _coerce_positive_int(max_tokens, G5_MAX_OUTPUT_TOKENS_BASE),
-        )
-        sanitized_payload["max_output_tokens"] = base_max_output_tokens
-
-        escalation_candidates = [
-            value
-            for value in (
-                G5_MAX_OUTPUT_TOKENS_STEP1,
-                G5_MAX_OUTPUT_TOKENS_STEP2,
-                G5_MAX_OUTPUT_TOKENS_MAX,
-            )
-            if value > base_max_output_tokens
-        ]
-        max_escalations_allowed = min(RESPONSES_MAX_ESCALATIONS, len(escalation_candidates))
-        escalation_index = 0
-        escalations_used = 0
-
-        LOGGER.info("dispatch route=responses model=%s", target_model)
-
-        def _log_payload_state(payload_snapshot: Dict[str, object]) -> None:
-            keys = sorted(payload_snapshot.keys())
+        def _log_payload(snapshot: Dict[str, object]) -> None:
+            keys = sorted(snapshot.keys())
             LOGGER.info("responses payload_keys=%s", keys)
-            input_candidate = payload_snapshot.get("input", "")
+            input_candidate = snapshot.get("input", "")
             length = len(input_candidate) if isinstance(input_candidate, str) else 0
             LOGGER.info("responses input_len=%d", length)
-            LOGGER.info(
-                "responses max_output_tokens=%s",
-                payload_snapshot.get("max_output_tokens"),
-            )
+            LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
 
-        def _search_finish_reason(container: object) -> Optional[str]:
-            if isinstance(container, dict):
-                finish_value = container.get("finish_reason")
-                if isinstance(finish_value, str) and finish_value.strip():
-                    return finish_value.strip()
-                for value in container.values():
-                    found = _search_finish_reason(value)
-                    if found:
-                        return found
-            elif isinstance(container, list):
-                for item in container:
-                    found = _search_finish_reason(item)
-                    if found:
-                        return found
-            return None
-
-        def _extract_responses_metadata(payload: Dict[str, object]) -> Dict[str, object]:
+        def _extract_metadata(payload: Dict[str, object]) -> Dict[str, object]:
             status_value = payload.get("status")
             status = str(status_value).strip().lower() if isinstance(status_value, str) else ""
             incomplete_details = payload.get("incomplete_details")
@@ -994,425 +986,87 @@ def generate(
                 reason = incomplete_details.get("reason")
                 if isinstance(reason, str):
                     incomplete_reason = reason.strip().lower()
-            usage_output_tokens: Optional[float] = None
             usage_block = payload.get("usage")
+            usage_output_tokens: Optional[float] = None
             if isinstance(usage_block, dict):
-                output_tokens = usage_block.get("output_tokens")
-                if isinstance(output_tokens, (int, float)):
-                    usage_output_tokens = float(output_tokens)
-                elif isinstance(output_tokens, dict):
-                    for value in output_tokens.values():
+                raw_usage = usage_block.get("output_tokens")
+                if isinstance(raw_usage, (int, float)):
+                    usage_output_tokens = float(raw_usage)
+                elif isinstance(raw_usage, dict):
+                    for value in raw_usage.values():
                         if isinstance(value, (int, float)):
                             usage_output_tokens = float(value)
                             break
-            finish_reason_value = _search_finish_reason(payload)
-            finish_reason = (
-                finish_reason_value.strip().lower()
-                if isinstance(finish_reason_value, str)
-                else ""
-            )
-            previous_response_id = ""
-            candidate = payload.get("previous_response_id")
-            if isinstance(candidate, str) and candidate.strip():
-                previous_response_id = candidate.strip()
-            else:
-                metadata_block = payload.get("metadata")
-                if isinstance(metadata_block, dict):
-                    meta_candidate = metadata_block.get("previous_response_id")
-                    if isinstance(meta_candidate, str) and meta_candidate.strip():
-                        previous_response_id = meta_candidate.strip()
             return {
                 "status": status,
                 "incomplete_reason": incomplete_reason,
                 "usage_output_tokens": usage_output_tokens,
-                "finish_reason": finish_reason,
-                "previous_response_id": previous_response_id,
             }
 
-        def _detect_truncation_signals(
-            metadata: Dict[str, object],
-            *,
-            max_output_tokens_value: Optional[int],
-        ) -> List[str]:
-            signals: List[str] = []
-            if metadata.get("incomplete_reason") == "max_output_tokens":
-                signals.append("incomplete_reason=max_output_tokens")
-            usage_output_tokens = metadata.get("usage_output_tokens")
-            if (
-                isinstance(max_output_tokens_value, int)
-                and isinstance(usage_output_tokens, (int, float))
-                and max_output_tokens_value > 0
-                and usage_output_tokens >= max_output_tokens_value * 0.98
-            ):
-                signals.append("usage_output_tokens>=98pct")
-            if metadata.get("finish_reason") == "length":
-                signals.append("finish_reason=length")
-            return signals
-
-        def _process_responses_payload(
-            payload: Dict[str, object],
-            *,
-            max_output_tokens_value: Optional[int],
-            source: str,
-        ) -> Dict[str, object]:
-            text, parse_flags, schema_label = _extract_responses_text(payload)
-            segments = int(parse_flags.get("segments", 0) or 0)
-            metadata = _extract_responses_metadata(payload)
-            signals = _detect_truncation_signals(
-                metadata, max_output_tokens_value=max_output_tokens_value
-            )
-            LOGGER.info(
-                "responses meta status=%s incomplete_reason=%s usage_output_tokens=%s max_output_tokens=%s previous_response_id=%s",
-                metadata.get("status") or "",
-                metadata.get("incomplete_reason") or "",
-                metadata.get("usage_output_tokens"),
-                max_output_tokens_value,
-                metadata.get("previous_response_id") or "",
-            )
-            LOGGER.info(
-                "responses parse segments=%d signals=%s source=%s",
-                segments,
-                ",".join(signals) if signals else "none",
-                source,
-            )
-            return {
-                "data": payload,
-                "text": text,
-                "parse_flags": parse_flags,
-                "schema": schema_label,
-                "segments": segments,
-                "metadata": metadata,
-                "signals": signals,
-                "source": source,
-            }
-
-        current_payload = dict(sanitized_payload)
-        base_payload = dict(sanitized_payload)
-        attempt_index = 0
-        shimmed_param: Optional[str] = None
+        attempts = 0
+        current_max = max_tokens_value
         last_error: Optional[BaseException] = None
-        hint_retry_used = False
-        text_format_retry_used = False
 
-        while attempt_index < MAX_RETRIES:
-            attempt_index += 1
-            if attempt_index > 1:
+        while attempts < 3:
+            attempts += 1
+            current_payload = dict(sanitized_payload)
+            current_payload["max_output_tokens"] = max(32, int(current_max))
+            if attempts > 1:
                 retry_used = True
-            _log_payload_state(current_payload)
+            _log_payload(current_payload)
             try:
                 _store_responses_request_snapshot(current_payload)
                 response = http_client.post(
                     RESPONSES_API_URL,
                     headers=headers,
                     json=current_payload,
+                    timeout=timeout,
                 )
                 response.raise_for_status()
                 data = response.json()
                 if not isinstance(data, dict):
                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
-
-                try:
-                    max_output_tokens_value: Optional[int] = int(
-                        current_payload.get("max_output_tokens", 0)
-                    )
-                except (TypeError, ValueError):
-                    max_output_tokens_value = None
-
-                response_id = data.get("id") if isinstance(data.get("id"), str) else None
-                LOGGER.info(
-                    "responses status=%s id=%s",
-                    data.get("status"),
-                    response_id,
-                )
-
-                records: List[Dict[str, object]] = []
-                best_record: Optional[Dict[str, object]] = None
-                best_record_no_trunc: Optional[Dict[str, object]] = None
-                last_record: Optional[Dict[str, object]] = None
-
-                def _consider_record(record: Dict[str, object]) -> None:
-                    nonlocal best_record, best_record_no_trunc, last_record
-                    last_record = record
-                    records.append(record)
-                    if record["segments"] > 0:
-                        if best_record is None or record["segments"] >= best_record["segments"]:
-                            best_record = record
-                        if not record["signals"] and best_record_no_trunc is None:
-                            best_record_no_trunc = record
-
-                initial_record = _process_responses_payload(
-                    data,
-                    max_output_tokens_value=max_output_tokens_value,
-                    source="initial",
-                )
-                _consider_record(initial_record)
-
-                poll_attempt = 0
-                previous_fetch_done = False
-                current_record = initial_record
-
-                while True:
-                    status = current_record["metadata"].get("status")
-                    ready_without_trunc = (
-                        current_record["segments"] > 0 and not current_record["signals"]
-                    )
-                    if status == "completed" or ready_without_trunc:
-                        break
-                    if poll_attempt >= MAX_RESPONSES_POLL_ATTEMPTS or not response_id:
-                        break
-                    delay_index = min(
-                        poll_attempt,
-                        len(RESPONSES_POLL_SCHEDULE) - 1,
-                    ) if RESPONSES_POLL_SCHEDULE else 0
-                    delay = (
-                        RESPONSES_POLL_SCHEDULE[delay_index]
-                        if RESPONSES_POLL_SCHEDULE
-                        else 0.5
-                    )
-                    poll_attempt += 1
+                _store_responses_response_snapshot(data)
+                text, parse_flags, schema_label = _extract_responses_text(data)
+                metadata = _extract_metadata(data)
+                status = metadata.get("status") or ""
+                reason = metadata.get("incomplete_reason") or ""
+                segments = int(parse_flags.get("segments", 0) or 0)
+                LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
+                if status == "incomplete" or segments == 0:
                     LOGGER.info(
-                        "responses poll attempt=%d delay=%.3f id=%s",
-                        poll_attempt,
-                        delay,
-                        response_id,
+                        "RESP_STATUS=incomplete|max_output_tokens=%s",
+                        current_payload.get("max_output_tokens"),
                     )
-                    time.sleep(delay)
-                    try:
-                        poll_response = http_client.get(
-                            f"{RESPONSES_API_URL}/{response_id}",
-                            headers=headers,
-                        )
-                        poll_response.raise_for_status()
-                        polled_data = poll_response.json()
-                        if not isinstance(polled_data, dict):
-                            LOGGER.warning(
-                                "responses poll unexpected payload id=%s", response_id
-                            )
-                            break
-                        response_id = (
-                            polled_data.get("id")
-                            if isinstance(polled_data.get("id"), str)
-                            else response_id
-                        )
-                        LOGGER.info(
-                            "responses status=%s id=%s (poll)",
-                            polled_data.get("status"),
-                            response_id,
-                        )
-                        current_record = _process_responses_payload(
-                            polled_data,
-                            max_output_tokens_value=max_output_tokens_value,
-                            source=f"poll#{poll_attempt}",
-                        )
-                        _consider_record(current_record)
-                    except Exception as poll_error:  # noqa: BLE001
-                        LOGGER.warning(
-                            "responses poll failed id=%s error=%s",
-                            response_id,
-                            poll_error,
-                        )
-                        break
-
-                current_metadata = current_record["metadata"] if current_record else {}
-                previous_response_id = (
-                    current_metadata.get("previous_response_id") if current_metadata else ""
-                )
-                if (
-                    G5_ENABLE_PREVIOUS_ID_FETCH
-                    and previous_response_id
-                    and current_metadata.get("status") != "completed"
-                    and not previous_fetch_done
-                ):
-                    LOGGER.info(
-                        "responses fetch previous_response_id=%s", previous_response_id
-                    )
-                    previous_fetch_done = True
-                    try:
-                        prev_response = http_client.get(
-                            f"{RESPONSES_API_URL}/{previous_response_id}",
-                            headers=headers,
-                        )
-                        prev_response.raise_for_status()
-                        prev_data = prev_response.json()
-                        if isinstance(prev_data, dict):
-                            current_record = _process_responses_payload(
-                                prev_data,
-                                max_output_tokens_value=max_output_tokens_value,
-                                source="previous_response",
-                            )
-                            _consider_record(current_record)
-                        else:
-                            LOGGER.warning(
-                                "responses previous_response unexpected payload id=%s",
-                                previous_response_id,
-                            )
-                    except Exception as prev_error:  # noqa: BLE001
-                        LOGGER.warning(
-                            "responses previous_response fetch failed id=%s error=%s",
-                            previous_response_id,
-                            prev_error,
-                        )
-
-                record_to_use = best_record_no_trunc or best_record or current_record
-                if record_to_use is None:
-                    record_to_use = initial_record
-
-                if record_to_use["text"]:
-                    selected_segments = record_to_use["segments"]
-                else:
-                    selected_segments = 0
-
-                last_signals = current_record["signals"] if current_record else []
-
-                if best_record_no_trunc is not None:
-                    LOGGER.info(
-                        "responses restart skipped reason=segments_without_truncation segments=%d",
-                        best_record_no_trunc["segments"],
-                    )
-                elif last_signals:
-                    signals_label = ",".join(last_signals)
-                    LOGGER.warning(
-                        "responses restart triggered signals=%s",
-                        signals_label,
-                    )
-                    if selected_segments == 0:
-                        can_escalate = (
-                            escalation_index < max_escalations_allowed
-                            and escalation_index < len(escalation_candidates)
-                            and escalations_used < RESPONSES_MAX_ESCALATIONS
-                        )
-                        if can_escalate:
-                            current_max_value = _coerce_positive_int(
-                                current_payload.get("max_output_tokens"),
-                                base_max_output_tokens,
-                            )
-                            next_value = escalation_candidates[escalation_index]
-                            if next_value > current_max_value:
-                                LOGGER.info(
-                                    "escalate max_output_tokens: %s -> %s",
-                                    current_max_value,
-                                    next_value,
-                                )
-                                updated_payload = dict(current_payload)
-                                updated_payload["max_output_tokens"] = next_value
-                                current_payload, _ = sanitize_payload_for_responses(
-                                    updated_payload
-                                )
-                                base_payload = dict(current_payload)
-                                base_max_output_tokens = next_value
-                                escalation_index += 1
-                                escalations_used += 1
-                                retry_used = True
-                                continue
-                            LOGGER.info(
-                                "responses restart skipped reason=escalation_target_not_higher current=%s target=%s",
-                                current_max_value,
-                                next_value,
-                            )
-                        LOGGER.info(
-                            "responses restart skipped reason=max_output_tokens_exhausted segments=%d signals=%s",
-                            selected_segments,
-                            signals_label,
-                        )
-                    else:
-                        LOGGER.info(
-                            "responses restart skipped reason=segments_present segments=%d signals=%s",
-                            selected_segments,
-                            signals_label,
-                        )
-                else:
-                    LOGGER.info(
-                        "responses restart skipped reason=no_truncation_signals status=%s segments=%d",
-                        (current_record["metadata"].get("status") if current_record else ""),
-                        selected_segments,
-                    )
-
-                if isinstance(record_to_use.get("data"), dict):
-                    _store_responses_response_snapshot(record_to_use["data"])
-
-                text = record_to_use["text"]
-                parse_flags = dict(record_to_use["parse_flags"])
-                parse_flags.setdefault("metadata", record_to_use.get("metadata", {}))
-                schema_label = record_to_use["schema"]
-
+                    last_error = RuntimeError("responses_incomplete")
+                    current_max = max(32, int(current_payload["max_output_tokens"] * 0.85))
+                    continue
                 if not text:
-                    LOGGER.warning(
-                        "Пустой ответ от Responses API %s (schema=%s)",
-                        target_model,
-                        schema_label,
-                    )
-                    raise EmptyCompletionError(
-                        "Responses API вернул пустой ответ",
-                        raw_response=record_to_use.get("data", {}),
+                    last_error = EmptyCompletionError(
+                        "Модель вернула пустой ответ",
+                        raw_response=data,
                         parse_flags=parse_flags,
                     )
-
-                _persist_raw_response(record_to_use.get("data", {}))
-                return text, parse_flags, record_to_use.get("data", {}), schema_label
-            except EmptyCompletionError:
-                raise
-            except httpx.HTTPStatusError as exc:
-                status_code = exc.response.status_code if exc.response is not None else None
-                error_message = ""
-                if exc.response is not None:
-                    try:
-                        payload_json = exc.response.json()
-                    except ValueError:
-                        payload_json = None
-                    if isinstance(payload_json, dict):
-                        error_block = payload_json.get("error")
-                        if isinstance(error_block, dict):
-                            error_message = str(error_block.get("message", ""))
-                    if not error_message:
-                        error_message = exc.response.text or ""
-                _handle_responses_http_error(exc, current_payload)
-                lowered_message = error_message.lower()
-                if status_code == 400:
-                    if shimmed_param is None:
-                        param_name = _extract_unknown_parameter_name(exc.response)
-                        if param_name:
-                            next_payload = dict(current_payload)
-                            if param_name in next_payload:
-                                next_payload.pop(param_name, None)
-                            current_payload, _ = sanitize_payload_for_responses(next_payload)
-                            shimmed_param = param_name
-                            retry_used = True
-                            LOGGER.warning(
-                                "retry=shim_unknown_param stripped='%s'",
-                                param_name,
-                            )
-                            continue
-                    if not hint_retry_used and "response_format" in lowered_message:
-                        current_payload = dict(base_payload)
-                        hint_retry_used = True
-                        LOGGER.warning("retry=shim_hint_response_format")
-                        continue
-                    if (
-                        not text_format_retry_used
-                        and (
-                            "invalid type for text.format" in lowered_message
-                            or "must specify text.format" in lowered_message
-                            or "expected a text format" in lowered_message
-                            or "specify text.format" in lowered_message
-                        )
-                    ):
-                        current_payload = dict(base_payload)
-                        text_format_retry_used = True
-                        LOGGER.warning("retry=shim_text_format")
-                        continue
+                    LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
+                    current_max = max(32, int(current_payload["max_output_tokens"] * 0.85))
+                    continue
+                _persist_raw_response(data)
+                return text, parse_flags, data, schema_label
+            except EmptyCompletionError as exc:
                 last_error = exc
+                current_max = max(32, int(current_payload.get("max_output_tokens", 32) * 0.85))
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                _handle_responses_http_error(exc, current_payload)
+                break
             except Exception as exc:  # noqa: BLE001
-                if isinstance(exc, KeyboardInterrupt):  # pragma: no cover - respect interrupts
+                if isinstance(exc, KeyboardInterrupt):
                     raise
                 last_error = exc
-            if attempt_index >= MAX_RETRIES or not _should_retry(last_error):
+            if attempts >= 3:
                 break
-            sleep_for = schedule[min(attempt_index - 1, len(schedule) - 1)]
-            reason = _describe_error(last_error)
-            print(
-                f"[llm_client] retry #{attempt_index} reason: {reason}; sleeping {sleep_for}s",
-                file=sys.stderr,
-            )
+            sleep_for = schedule[min(attempts - 1, len(schedule) - 1)] if schedule else 0.5
+            LOGGER.warning("responses retry attempt=%d sleep=%.2f", attempts, sleep_for)
             time.sleep(sleep_for)
 
         if last_error:
@@ -1423,6 +1077,7 @@ def generate(
             raise last_error
 
         raise RuntimeError("Модель не вернула ответ.")
+
 
     lower_model = model_name.lower()
     is_gpt5_model = lower_model.startswith("gpt-5")
