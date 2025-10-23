@@ -7,7 +7,7 @@ import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from llm_client import GenerationResult, generate
+from llm_client import DEFAULT_RESPONSES_TEXT_FORMAT, GenerationResult, generate
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +56,7 @@ class DummyClient:
         self.probe_count = 0
         self.poll_count = 0
 
-    def post(self, url, headers=None, json=None):
+    def post(self, url, headers=None, json=None, **kwargs):
         request = {
             "url": url,
             "headers": headers,
@@ -159,11 +159,13 @@ def test_generate_uses_responses_payload_for_gpt5():
     payload = request_payload["json"]
     assert payload["max_output_tokens"] == 42
     assert "modalities" not in payload
-    assert "temperature" not in payload
+    assert payload["temperature"] == 0.3
     assert "messages" not in payload
     assert payload["model"] == "gpt-5-preview"
     assert payload["input"] == "ping"
-    assert set(payload.keys()) == {"input", "max_output_tokens", "model"}
+    assert "text" in payload
+    assert payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
+    assert set(payload.keys()) == {"input", "max_output_tokens", "model", "temperature", "text"}
     assert request_payload["url"].endswith("/responses")
 
 
@@ -180,7 +182,7 @@ def test_generate_logs_about_temperature_for_gpt5():
     mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
     mock_logger.info.assert_any_call(
         "responses payload_keys=%s",
-        ["input", "max_output_tokens", "model"],
+        ["input", "max_output_tokens", "model", "temperature", "text"],
     )
     mock_logger.info.assert_any_call("responses input_len=%d", 4)
     mock_logger.info.assert_any_call("responses max_output_tokens=%s", 42)

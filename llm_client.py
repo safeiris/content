@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -32,7 +33,7 @@ MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 FALLBACK_MODEL = "gpt-4o"
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
-RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "response_format")
+RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "text")
 RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
 RESPONSES_MAX_ESCALATIONS = 2
 MAX_RESPONSES_POLL_ATTEMPTS = (
@@ -41,6 +42,42 @@ MAX_RESPONSES_POLL_ATTEMPTS = (
 if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
+
+DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "seo_article_skeleton",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "intro": {"type": "string"},
+                "main": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 3,
+                    "maxItems": 6,
+                },
+                "faq": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "q": {"type": "string"},
+                            "a": {"type": "string"},
+                        },
+                        "required": ["q", "a"],
+                    },
+                    "minItems": 5,
+                    "maxItems": 5,
+                },
+                "conclusion": {"type": "string"},
+            },
+            "required": ["intro", "main", "faq", "conclusion"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+}
 
 MODEL_PROVIDER_MAP = {
     "gpt-5": "openai",
@@ -119,6 +156,8 @@ def build_responses_payload(
     system_text: Optional[str],
     user_text: Optional[str],
     max_tokens: int,
+    *,
+    text_format: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """Construct a minimal Responses API payload for GPT-5 models."""
 
@@ -136,14 +175,34 @@ def build_responses_payload(
     joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
     joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
 
+    format_block = deepcopy(text_format or DEFAULT_RESPONSES_TEXT_FORMAT)
+
     payload: Dict[str, object] = {
         "model": str(model).strip(),
         "input": joined_input.strip(),
         "max_output_tokens": int(max_tokens),
         "temperature": 0.3,
-        "response_format": {"type": "json_object"},
+        "text": {"format": format_block},
     }
     return payload
+
+
+def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, object]]:
+    if not isinstance(text_value, dict):
+        return None
+    format_block = text_value.get("format")
+    if not isinstance(format_block, dict):
+        return None
+    sanitized_format: Dict[str, object] = {}
+    fmt_type = format_block.get("type")
+    if isinstance(fmt_type, str) and fmt_type.strip():
+        sanitized_format["type"] = fmt_type.strip()
+    json_schema_value = format_block.get("json_schema")
+    if isinstance(json_schema_value, dict):
+        sanitized_format["json_schema"] = json_schema_value
+    if not sanitized_format:
+        return None
+    return {"format": sanitized_format}
 
 
 def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str, object], int]:
@@ -187,11 +246,11 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
             except (TypeError, ValueError):
                 continue
             continue
-        if key == "response_format":
+        if key == "text":
             if isinstance(value, dict):
-                sanitized[key] = {"type": str(value.get("type", "")).strip() or "json_object"}
-            else:
-                sanitized[key] = {"type": "json_object"}
+                sanitized_text = _sanitize_text_block(value)
+                if sanitized_text:
+                    sanitized[key] = sanitized_text
             continue
     input_value = sanitized.get("input", "")
     input_length = len(input_value) if isinstance(input_value, str) else 0
@@ -547,8 +606,20 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
     parse_flags["output_text_len"] = len(output_text_value)
     parse_flags["content_text_len"] = len(content_text)
 
+    if output_text_value:
+        parse_source = "output_text"
+        parse_length = parse_flags["output_text_len"]
+    elif content_text:
+        parse_source = "content_text"
+        parse_length = parse_flags["content_text_len"]
+    else:
+        parse_source = "none"
+        parse_length = 0
+
     LOGGER.info(
-        "RESP_PARSE=output_text:%d|content_text:%d",
+        "RESP_PARSE=%s len=%d output_len=%d content_len=%d",
+        parse_source,
+        parse_length,
         parse_flags["output_text_len"],
         parse_flags["content_text_len"],
     )
@@ -701,6 +772,22 @@ def _should_retry(exc: BaseException) -> bool:
     return False
 
 
+def _is_responses_fallback_allowed(exc: BaseException) -> bool:
+    inspected: List[BaseException] = []
+    current: Optional[BaseException] = exc
+    while current is not None and current not in inspected:
+        inspected.append(current)
+        if isinstance(current, (httpx.TimeoutException, httpx.TransportError)):
+            return True
+        if isinstance(current, httpx.HTTPStatusError):
+            response = current.response
+            status = response.status_code if response is not None else None
+            if status and (status >= 500 or status in {408, 409, 425, 429}):
+                return True
+        current = getattr(current, "__cause__", None)
+    return False
+
+
 def _describe_error(exc: BaseException) -> str:
     status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
     if status:
@@ -765,6 +852,24 @@ def _extract_unknown_parameter_name(response: httpx.Response) -> Optional[str]:
     if remainder.startswith("'") and "'" in remainder[1:]:
         return remainder.split("'", 2)[1].strip()
     return remainder.split()[0].strip("'\"") or None
+
+
+def _has_text_format_migration_hint(response: httpx.Response) -> bool:
+    message: str = ""
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error_block = payload.get("error")
+        if isinstance(error_block, dict):
+            message = str(error_block.get("message", ""))
+    if not message:
+        message = response.text or ""
+    message = message.strip()
+    if not message:
+        return False
+    return "moved to 'text.format'" in message.lower()
 
 
 def _make_request(
@@ -851,6 +956,7 @@ def generate(
     max_tokens: int = 1400,
     timeout_s: int = 60,
     backoff_schedule: Optional[List[float]] = None,
+    responses_text_format: Optional[Dict[str, object]] = None,
 ) -> GenerationResult:
     """Call the configured LLM and return a structured generation result."""
 
@@ -955,8 +1061,25 @@ def generate(
         system_text = "\n\n".join(system_segments)
         user_text = "\n\n".join(user_segments)
 
-        base_payload = build_responses_payload(target_model, system_text, user_text, max_tokens)
+        base_payload = build_responses_payload(
+            target_model,
+            system_text,
+            user_text,
+            max_tokens,
+            text_format=responses_text_format,
+        )
         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
+
+        format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
+
+        def _clone_text_format() -> Dict[str, object]:
+            return deepcopy(format_template)
+
+        def _apply_text_format(target: Dict[str, object]) -> None:
+            target.pop("response_format", None)
+            target["text"] = {"format": _clone_text_format()}
+
+        _apply_text_format(sanitized_payload)
 
         try:
             max_tokens_value = int(sanitized_payload.get("max_output_tokens", 1200))
@@ -967,7 +1090,6 @@ def generate(
         max_tokens_value = min(max_tokens_value, 1200)
         sanitized_payload["max_output_tokens"] = max_tokens_value
         sanitized_payload["temperature"] = 0.3
-        sanitized_payload["response_format"] = {"type": "json_object"}
 
         def _log_payload(snapshot: Dict[str, object]) -> None:
             keys = sorted(snapshot.keys())
@@ -976,6 +1098,21 @@ def generate(
             length = len(input_candidate) if isinstance(input_candidate, str) else 0
             LOGGER.info("responses input_len=%d", length)
             LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
+            text_block = snapshot.get("text")
+            format_type = "-"
+            schema_name = "-"
+            if isinstance(text_block, dict):
+                format_block = text_block.get("format")
+                if isinstance(format_block, dict):
+                    fmt = format_block.get("type")
+                    if isinstance(fmt, str) and fmt.strip():
+                        format_type = fmt.strip()
+                    schema_block = format_block.get("json_schema")
+                    if isinstance(schema_block, dict):
+                        schema_candidate = schema_block.get("name")
+                        if isinstance(schema_candidate, str) and schema_candidate.strip():
+                            schema_name = schema_candidate.strip()
+            LOGGER.info("responses text_format type=%s schema=%s", format_type, schema_name)
 
         def _extract_metadata(payload: Dict[str, object]) -> Dict[str, object]:
             status_value = payload.get("status")
@@ -1006,10 +1143,12 @@ def generate(
         attempts = 0
         current_max = max_tokens_value
         last_error: Optional[BaseException] = None
+        format_retry_done = False
 
         while attempts < 3:
             attempts += 1
             current_payload = dict(sanitized_payload)
+            current_payload["text"] = {"format": _clone_text_format()}
             current_payload["max_output_tokens"] = max(32, int(current_max))
             if attempts > 1:
                 retry_used = True
@@ -1056,6 +1195,19 @@ def generate(
                 last_error = exc
                 current_max = max(32, int(current_payload.get("max_output_tokens", 32) * 0.85))
             except httpx.HTTPStatusError as exc:
+                response_obj = exc.response
+                status = response_obj.status_code if response_obj is not None else None
+                if (
+                    status == 400
+                    and not format_retry_done
+                    and response_obj is not None
+                    and _has_text_format_migration_hint(response_obj)
+                ):
+                    format_retry_done = True
+                    retry_used = True
+                    LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
+                    _apply_text_format(sanitized_payload)
+                    continue
                 last_error = exc
                 _handle_responses_http_error(exc, current_payload)
                 break
@@ -1217,6 +1369,8 @@ def generate(
                                     error_details["error_type"] = error_block.get("type")
                                     error_details["error_message"] = error_block.get("message")
                     raise _build_force_model_error("responses_error", error_details) from responses_error
+                if not _is_responses_fallback_allowed(responses_error):
+                    raise
                 fallback_reason = "api_error_gpt5_responses"
             fallback_used = FALLBACK_MODEL
             LOGGER.warning(

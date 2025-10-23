@@ -630,6 +630,7 @@ def _run_health_ping() -> Dict[str, object]:
             temperature=0.0,
             max_tokens=32,
             timeout_s=10,
+            responses_text_format={"type": "text"},
         )
     except Exception as exc:  # noqa: BLE001
         reason = str(exc).strip() or "ошибка вызова"
