@@ -319,3 +319,7 @@ def test_gather_health_status_handles_missing_theme(monkeypatch):
     status = gather_health_status(theme="")
     assert not status["ok"]
     assert not status["checks"]["theme_index"]["ok"]
+    llm_ping = status["checks"]["llm_ping"]
+    assert llm_ping["route"] == "responses"
+    assert llm_ping["fallback_used"] is False
+    assert not llm_ping["ok"]

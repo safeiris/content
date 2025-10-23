@@ -100,6 +100,8 @@ def create_app() -> Flask:
     frontend_root = (Path(__file__).resolve().parent.parent / "frontend_demo").resolve()
     template_root = frontend_root / "templates"
     app = Flask(__name__, template_folder=str(template_root))
+    if hasattr(app, "json"):
+        app.json.ensure_ascii = False
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
     secret_key = os.environ.get("FLASK_SECRET_KEY")

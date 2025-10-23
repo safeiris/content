@@ -536,76 +536,142 @@ def generate_article_from_payload(
 
 def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
     checks: Dict[str, Dict[str, object]] = {}
-    ok = True
 
-    api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
-    if not api_key:
-        checks["openai_key"] = {"ok": False, "message": "OPENAI_API_KEY не найден"}
-        ok = False
-    else:
-        masked = f"{api_key[:4]}***{api_key[-4:]}" if len(api_key) > 8 else "*" * len(api_key)
-        checks["openai_key"] = {"ok": True, "message": f"Ключ найден ({masked})"}
-
-        try:
-            probe_messages = [
-                {"role": "system", "content": "Ты проверка готовности. Ответь строго словом PING."},
-                {"role": "user", "content": "Ответь словом PING"},
-            ]
-            ping_result = llm_generate(
-                probe_messages,
-                model=DEFAULT_MODEL,
-                temperature=0.0,
-                max_tokens=32,
-                timeout_s=10,
-            )
-            reply = (ping_result.text or "").strip().lower()
-            route = (ping_result.api_route or "").strip().lower()
-            used_fallback = bool(ping_result.fallback_used)
-            ping_ok = reply.startswith("ping") and route == "responses" and not used_fallback
-            if ping_ok:
-                checks["openai_key"]["message"] = f"Ключ активен ({masked})"
-                checks["llm_ping"] = {"ok": True, "message": "Ответ PING получен"}
-            else:
-                ok = False
-                message = "OpenAI API недоступен"
-                if reply and not reply.startswith("ping"):
-                    message = f"OpenAI API недоступен (ответ: {ping_result.text[:32]})"
-                elif route != "responses" or used_fallback:
-                    message = "OpenAI API недоступен (fallback)"
-                checks["llm_ping"] = {"ok": False, "message": message}
-        except Exception:  # noqa: BLE001
-            ok = False
-            checks["llm_ping"] = {"ok": False, "message": "OpenAI API недоступен"}
-
-    artifacts_dir = Path("artifacts")
+    artifacts_dir = Path("artifacts").resolve()
     try:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         probe = artifacts_dir / ".write_check"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
-        checks["artifacts_writable"] = {"ok": True, "message": "Запись в artifacts/ доступна"}
+        checks["artifacts_writable"] = {
+            "ok": True,
+            "message": f"Артефакты доступны: {artifacts_dir}",
+        }
     except Exception as exc:  # noqa: BLE001
-        ok = False
-        checks["artifacts_writable"] = {"ok": False, "message": f"Нет доступа к artifacts/: {exc}"}
+        checks["artifacts_writable"] = {
+            "ok": False,
+            "message": f"Артефакты недоступны: {exc}",
+        }
+
+    api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
+    masked_key = _mask_openai_key(api_key)
+    if api_key:
+        checks["openai_key"] = {
+            "ok": True,
+            "message": f"Ключ найден ({masked_key})",
+        }
+        checks["llm_ping"] = _run_health_ping()
+    else:
+        checks["openai_key"] = {
+            "ok": False,
+            "message": "OPENAI_API_KEY не найден",
+        }
+        checks["llm_ping"] = {
+            "ok": False,
+            "message": "Responses недоступен: ключ не задан",
+            "route": "responses",
+            "fallback_used": False,
+        }
 
     theme_slug = (theme or "").strip()
     if not theme_slug:
-        checks["theme_index"] = {"ok": False, "message": "Тема не указана"}
-        ok = False
+        checks["theme_index"] = {
+            "ok": False,
+            "message": "Тема не указана",
+        }
     else:
         index_path = Path("profiles") / theme_slug / "index.json"
         if not index_path.exists():
-            checks["theme_index"] = {"ok": False, "message": f"Индекс для темы '{theme_slug}' не найден"}
-            ok = False
+            checks["theme_index"] = {
+                "ok": False,
+                "message": f"Индекс для темы '{theme_slug}' не найден",
+            }
         else:
             try:
                 json.loads(index_path.read_text(encoding="utf-8"))
-                checks["theme_index"] = {"ok": True, "message": f"Индекс найден ({index_path})"}
+                checks["theme_index"] = {
+                    "ok": True,
+                    "message": f"Профиль темы загружен ({index_path.as_posix()})",
+                }
             except json.JSONDecodeError as exc:
-                ok = False
-                checks["theme_index"] = {"ok": False, "message": f"Индекс повреждён: {exc}"}
+                checks["theme_index"] = {
+                    "ok": False,
+                    "message": f"Индекс повреждён: {exc}",
+                }
 
+    ok = all(check.get("ok") is True for check in checks.values())
     return {"ok": ok, "checks": checks}
+
+
+def _mask_openai_key(raw_key: str) -> str:
+    key = (raw_key or "").strip()
+    if not key:
+        return "****"
+    if key.startswith("sk-") and len(key) > 6:
+        return f"sk-****{key[-4:]}"
+    if len(key) <= 4:
+        return "*" * len(key)
+    return f"{key[:2]}***{key[-2:]}"
+
+
+def _run_health_ping() -> Dict[str, object]:
+    probe_messages = [
+        {
+            "role": "system",
+            "content": "Ты сервис проверки доступности. Ответь словом PONG.",
+        },
+        {"role": "user", "content": "Пожалуйста, ответь строго словом PONG."},
+    ]
+
+    try:
+        ping_result = llm_generate(
+            probe_messages,
+            model=DEFAULT_MODEL,
+            temperature=0.0,
+            max_tokens=32,
+            timeout_s=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        reason = str(exc).strip() or "ошибка вызова"
+        return {
+            "ok": False,
+            "message": f"Responses недоступен: {reason}",
+            "route": "responses",
+            "fallback_used": False,
+        }
+
+    reply = (ping_result.text or "").strip()
+    reply_lower = reply.lower()
+    route = (ping_result.api_route or "").strip() or "responses"
+    fallback_used = bool(ping_result.fallback_used)
+
+    if reply_lower.startswith("pong") and route == "responses" and not fallback_used:
+        model_used = (ping_result.model_used or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        return {
+            "ok": True,
+            "message": f"Responses OK ({model_used}, 32 токена)",
+            "route": "responses",
+            "fallback_used": False,
+        }
+
+    if fallback_used:
+        reason = f"использован fallback {ping_result.fallback_used}"
+    elif route != "responses":
+        reason = f"маршрут {route}"
+    elif reply:
+        truncated = reply.replace("\n", " ")
+        if len(truncated) > 60:
+            truncated = f"{truncated[:57]}..."
+        reason = f"ответ: {truncated}"
+    else:
+        reason = "пустой ответ"
+
+    return {
+        "ok": False,
+        "message": f"Responses недоступен: {reason}",
+        "route": route or "responses",
+        "fallback_used": fallback_used,
+    }
 
 
 def _parse_args() -> argparse.Namespace:

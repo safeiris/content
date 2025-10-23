@@ -2015,28 +2015,34 @@ async function handleHealthCheck(event) {
     const theme = pipeSelect.value;
     const query = theme ? `?theme=${encodeURIComponent(theme)}` : "";
     const response = await fetch(`${API_BASE}/api/health${query}`);
-    const text = await response.text();
-
-    if (!response.ok) {
-      let message = text || `HTTP ${response.status}`;
-      try {
-        const data = JSON.parse(text);
-        message = data.error || message;
-      } catch (parseError) {
-        // keep original message
-      }
-      throw new Error(message);
-    }
-
-    let data;
+    let text = "";
     try {
-      data = text ? JSON.parse(text) : null;
-    } catch (parseError) {
+      text = await response.text();
+    } catch (readError) {
       renderHealthError("Ошибка при запросе Health", "error");
       return;
     }
 
-    renderHealthStatus(data);
+    let data = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch (parseError) {
+        renderHealthError("Ошибка при разборе Health", "error");
+        return;
+      }
+    }
+
+    if (data && typeof data === "object" && data.checks) {
+      renderHealthStatus(data);
+      return;
+    }
+
+    const errorMessage =
+      (data && typeof data === "object" && (data.error || data.message)) ||
+      text ||
+      `HTTP ${response.status}`;
+    throw new Error(errorMessage);
   } catch (error) {
     console.error(error);
     if (error instanceof TypeError) {
@@ -2060,7 +2066,9 @@ function renderHealthStatus(status) {
     return;
   }
 
-  Object.entries(checks).forEach(([key, value], index) => {
+  const entries = Object.entries(checks);
+
+  entries.forEach(([key, value], index) => {
     const normalized = normalizeHealthCheck(value);
     const tone = normalized.ok ? "success" : "error";
     const icon = normalized.ok ? "🟢" : "🔴";
@@ -2079,19 +2087,27 @@ function renderHealthStatus(status) {
     card.dataset.healthKey = key;
     healthStatus.append(card);
   });
-  const failingEntry = Object.entries(checks).find(([, value]) => !normalizeHealthCheck(value).ok);
-  const fallbackDictionary = failingEntry ? HEALTH_STATUS_MESSAGES[failingEntry[0]] || {} : {};
-  const reason = failingEntry
-    ? normalizeHealthCheck(failingEntry[1]).message || fallbackDictionary.fail || "Модель недоступна"
-    : "";
-  setGenerateAvailability(Boolean(status?.ok), reason);
+  const bad = entries.some(([, value]) => value && value.ok === false);
+  const overallOk = status?.ok === true && !bad;
+  const failingEntry = entries.find(([, value]) => value && value.ok === false);
+  let failingMessage = "";
+  if (failingEntry) {
+    const [, rawValue] = failingEntry;
+    if (rawValue && typeof rawValue === "object" && typeof rawValue.message === "string") {
+      failingMessage = rawValue.message;
+    } else {
+      const dictionary = HEALTH_STATUS_MESSAGES[failingEntry[0]] || {};
+      failingMessage = dictionary.fail || "Модель недоступна";
+    }
+  }
+  setGenerateAvailability(overallOk, failingMessage);
 }
 
 function normalizeHealthCheck(value) {
   if (value && typeof value === "object") {
     return {
-      ok: Boolean(value.ok),
-      message: value.message || value.status || "",
+      ok: value.ok === true,
+      message: (typeof value.message === "string" && value.message) || value.status || "",
     };
   }
   return {
@@ -2152,6 +2168,8 @@ function setGenerateAvailability(ok, reason = "") {
     generateBtn.disabled = true;
     if (reason) {
       generateBtn.title = reason;
+    } else {
+      generateBtn.removeAttribute("title");
     }
   }
 }
