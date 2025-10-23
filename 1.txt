@@ -1,28 +1,8 @@
 diff --git a/llm_client.py b/llm_client.py
-index 3c1bf5bd3e842880ab661e1534bcaefb9a427025..1fe4d2a59d4cebba0e10d55a063e21f99b38cf4c 100644
+index 1fe4d2a59d4cebba0e10d55a063e21f99b38cf4c..9eb7118a8c642296d52e6890e6c39b3a37df71cd 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -1,69 +1,106 @@
- # -*- coding: utf-8 -*-
- """Simple wrapper around chat completion providers with retries and sane defaults."""
- from __future__ import annotations
- 
- import json
- import logging
- import os
- import re
- import sys
- import time
-+from copy import deepcopy
- from dataclasses import dataclass
- from pathlib import Path
- from typing import Dict, List, Optional, Tuple
- 
- import httpx
- 
- from config import (
-     FORCE_MODEL,
-     OPENAI_API_KEY,
+@@ -21,50 +21,57 @@ from config import (
      G5_ENABLE_PREVIOUS_ID_FETCH,
      G5_MAX_OUTPUT_TOKENS_BASE,
      G5_MAX_OUTPUT_TOKENS_MAX,
@@ -38,8 +18,7 @@ index 3c1bf5bd3e842880ab661e1534bcaefb9a427025..1fe4d2a59d4cebba0e10d55a063e21f9
  BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
  FALLBACK_MODEL = "gpt-4o"
  RESPONSES_API_URL = "https://api.openai.com/v1/responses"
--RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "response_format")
-+RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "text")
+ RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "text")
  RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
  RESPONSES_MAX_ESCALATIONS = 2
  MAX_RESPONSES_POLL_ATTEMPTS = (
@@ -49,95 +28,41 @@ index 3c1bf5bd3e842880ab661e1534bcaefb9a427025..1fe4d2a59d4cebba0e10d55a063e21f9
      MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
  GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
  
-+DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
-+    "type": "json_schema",
-+    "json_schema": {
-+        "name": "seo_article_skeleton",
-+        "schema": {
-+            "type": "object",
-+            "properties": {
-+                "intro": {"type": "string"},
-+                "main": {
-+                    "type": "array",
-+                    "items": {"type": "string"},
-+                    "minItems": 3,
-+                    "maxItems": 6,
-+                },
-+                "faq": {
-+                    "type": "array",
-+                    "items": {
-+                        "type": "object",
-+                        "properties": {
-+                            "q": {"type": "string"},
-+                            "a": {"type": "string"},
-+                        },
-+                        "required": ["q", "a"],
-+                    },
-+                    "minItems": 5,
-+                    "maxItems": 5,
-+                },
-+                "conclusion": {"type": "string"},
-+            },
-+            "required": ["intro", "main", "faq", "conclusion"],
-+            "additionalProperties": False,
-+        },
-+        "strict": True,
-+    },
-+}
 +
- MODEL_PROVIDER_MAP = {
-     "gpt-5": "openai",
-     "gpt-4o": "openai",
-     "gpt-4o-mini": "openai",
- }
- 
- PROVIDER_API_URLS = {
-     "openai": "https://api.openai.com/v1/chat/completions",
- }
- 
- 
- LOGGER = logging.getLogger(__name__)
- RAW_RESPONSE_PATH = Path("artifacts/debug/last_raw_response.json")
- RESPONSES_RESPONSE_PATH = Path("artifacts/debug/last_gpt5_responses_response.json")
- RESPONSES_REQUEST_PATH = Path("artifacts/debug/last_gpt5_responses_request.json")
- 
- 
- @dataclass(frozen=True)
- class GenerationResult:
-     """Container describing the outcome of a text generation call."""
- 
-     text: str
-     model_used: str
-     retry_used: bool
-     fallback_used: Optional[str]
-@@ -97,123 +134,145 @@ def _format_diagnostics(details: Dict[str, object]) -> str:
-             continue
-         if isinstance(value, (list, dict)):
-             try:
-                 value_repr = json.dumps(value, ensure_ascii=False)
-             except TypeError:
-                 value_repr = str(value)
-         else:
-             value_repr = str(value)
-         components.append(f"{key}={value_repr}")
-     return ", ".join(components)
- 
- 
- def _build_force_model_error(reason: str, details: Dict[str, object]) -> RuntimeError:
-     diagnostics = _format_diagnostics(details)
-     message = f"FORCE_MODEL active: {reason}"
-     if diagnostics:
-         message += f"; diagnostics: {diagnostics}"
-     return RuntimeError(message)
- 
- 
- def build_responses_payload(
-     model: str,
-     system_text: Optional[str],
-     user_text: Optional[str],
-     max_tokens: int,
-+    *,
-+    text_format: Optional[Dict[str, object]] = None,
++def _supports_temperature(model: str) -> bool:
++    """Return True if the target model accepts the temperature parameter."""
++
++    model_name = (model or "").strip().lower()
++    return not model_name.startswith("gpt-5")
++
+ DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
+     "type": "json_schema",
+     "json_schema": {
+         "name": "seo_article_skeleton",
+         "schema": {
+             "type": "object",
+             "properties": {
+                 "intro": {"type": "string"},
+                 "main": {
+                     "type": "array",
+                     "items": {"type": "string"},
+                     "minItems": 3,
+                     "maxItems": 6,
+                 },
+                 "faq": {
+                     "type": "array",
+                     "items": {
+                         "type": "object",
+                         "properties": {
+                             "q": {"type": "string"},
+                             "a": {"type": "string"},
+                         },
+                         "required": ["q", "a"],
+                     },
+                     "minItems": 5,
+@@ -159,53 +166,54 @@ def build_responses_payload(
+     *,
+     text_format: Optional[Dict[str, object]] = None,
  ) -> Dict[str, object]:
      """Construct a minimal Responses API payload for GPT-5 models."""
  
@@ -155,413 +80,60 @@ index 3c1bf5bd3e842880ab661e1534bcaefb9a427025..1fe4d2a59d4cebba0e10d55a063e21f9
      joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
      joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
  
-+    format_block = deepcopy(text_format or DEFAULT_RESPONSES_TEXT_FORMAT)
-+
+     format_block = deepcopy(text_format or DEFAULT_RESPONSES_TEXT_FORMAT)
+ 
      payload: Dict[str, object] = {
          "model": str(model).strip(),
          "input": joined_input.strip(),
          "max_output_tokens": int(max_tokens),
-         "temperature": 0.3,
--        "response_format": {"type": "json_object"},
-+        "text": {"format": format_block},
+-        "temperature": 0.3,
+         "text": {"format": format_block},
      }
++    if _supports_temperature(model):
++        payload["temperature"] = 0.3
      return payload
  
  
-+def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, object]]:
-+    if not isinstance(text_value, dict):
-+        return None
-+    format_block = text_value.get("format")
-+    if not isinstance(format_block, dict):
-+        return None
-+    sanitized_format: Dict[str, object] = {}
-+    fmt_type = format_block.get("type")
-+    if isinstance(fmt_type, str) and fmt_type.strip():
-+        sanitized_format["type"] = fmt_type.strip()
-+    json_schema_value = format_block.get("json_schema")
-+    if isinstance(json_schema_value, dict):
-+        sanitized_format["json_schema"] = json_schema_value
-+    if not sanitized_format:
-+        return None
-+    return {"format": sanitized_format}
-+
-+
+ def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, object]]:
+     if not isinstance(text_value, dict):
+         return None
+     format_block = text_value.get("format")
+     if not isinstance(format_block, dict):
+         return None
+     sanitized_format: Dict[str, object] = {}
+     fmt_type = format_block.get("type")
+     if isinstance(fmt_type, str) and fmt_type.strip():
+         sanitized_format["type"] = fmt_type.strip()
+     json_schema_value = format_block.get("json_schema")
+     if isinstance(json_schema_value, dict):
+         sanitized_format["json_schema"] = json_schema_value
+     if not sanitized_format:
+         return None
+     return {"format": sanitized_format}
+ 
+ 
  def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str, object], int]:
      """Restrict Responses payload to the documented whitelist and types."""
  
      sanitized: Dict[str, object] = {}
-     for key in RESPONSES_ALLOWED_KEYS:
-         if key not in payload:
-             continue
-         value = payload.get(key)
-         if value is None:
-             continue
-         if isinstance(value, str):
-             trimmed = value.strip()
-             if not trimmed:
-                 continue
-             if key == "model":
-                 sanitized[key] = trimmed
-                 continue
-             if key == "input":
-                 sanitized[key] = trimmed
-                 continue
-         if key == "input" and not isinstance(value, str):
-             if isinstance(value, (list, dict)):
-                 converted = json.dumps(value, ensure_ascii=False)
-             else:
-                 converted = str(value)
-             converted = converted.strip()
-             if converted:
-                 sanitized[key] = converted
-             continue
-         if key == "max_output_tokens":
-             try:
-                 sanitized[key] = int(value)
-             except (TypeError, ValueError):
-                 continue
-             continue
-         if key == "temperature":
-             try:
-                 sanitized[key] = float(value)
-             except (TypeError, ValueError):
-                 continue
-             continue
--        if key == "response_format":
-+        if key == "text":
-             if isinstance(value, dict):
--                sanitized[key] = {"type": str(value.get("type", "")).strip() or "json_object"}
--            else:
--                sanitized[key] = {"type": "json_object"}
-+                sanitized_text = _sanitize_text_block(value)
-+                if sanitized_text:
-+                    sanitized[key] = sanitized_text
-             continue
-     input_value = sanitized.get("input", "")
-     input_length = len(input_value) if isinstance(input_value, str) else 0
-     return sanitized, input_length
- 
- 
- def _store_responses_request_snapshot(payload: Dict[str, object]) -> None:
-     """Persist a sanitized snapshot of the latest Responses API request."""
- 
-     try:
-         RESPONSES_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-         snapshot = dict(payload)
-         input_value = snapshot.pop("input", "")
-         if isinstance(input_value, str):
-             preview = input_value[:200]
-         else:
-             preview = str(input_value)[:200]
-         snapshot["input_preview"] = preview
-         RESPONSES_REQUEST_PATH.write_text(
-             json.dumps(snapshot, ensure_ascii=False, indent=2),
-             encoding="utf-8",
+@@ -1067,51 +1075,67 @@ def generate(
+             user_text,
+             max_tokens,
+             text_format=responses_text_format,
          )
-     except Exception as exc:  # pragma: no cover - diagnostics only
-         LOGGER.debug("failed to persist Responses request snapshot: %s", exc)
- 
-@@ -525,52 +584,64 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
-                             collected.append(stripped)
-             for key in ("output", "outputs"):
-                 nested = container.get(key)
-                 if nested is not None:
-                     collected.extend(_iter_segments(nested))
-         return collected
- 
-     segments: List[str] = []
-     root_used: Optional[str] = None
-     for root_key in ("output", "outputs"):
-         root_value = data.get(root_key)
-         if root_value is None:
-             continue
-         extracted = _iter_segments(root_value)
-         if extracted:
-             segments.extend(extracted)
-             root_used = root_key
- 
-     content_text = "\n\n".join(segments) if segments else ""
-     schema_label = "responses.output_text" if (segments or output_text_value) else "responses.none"
-     parse_flags["schema"] = schema_label
-     parse_flags["segments"] = len(segments)
-     parse_flags["output_text_len"] = len(output_text_value)
-     parse_flags["content_text_len"] = len(content_text)
- 
-+    if output_text_value:
-+        parse_source = "output_text"
-+        parse_length = parse_flags["output_text_len"]
-+    elif content_text:
-+        parse_source = "content_text"
-+        parse_length = parse_flags["content_text_len"]
-+    else:
-+        parse_source = "none"
-+        parse_length = 0
-+
-     LOGGER.info(
--        "RESP_PARSE=output_text:%d|content_text:%d",
-+        "RESP_PARSE=%s len=%d output_len=%d content_len=%d",
-+        parse_source,
-+        parse_length,
-         parse_flags["output_text_len"],
-         parse_flags["content_text_len"],
-     )
-     LOGGER.info(
-         "responses parse resp_keys=%s root=%s segments=%d schema=%s",
-         resp_keys,
-         root_used,
-         parse_flags.get("segments", 0),
-         schema_label,
-     )
- 
-     text = output_text_value or content_text
-     if text:
-         LOGGER.info("RESP_PARSE_OK schema=%s len=%d", schema_label, len(text))
-     return text, parse_flags, schema_label
- 
- 
- def _resolve_model_name(model: Optional[str]) -> str:
-     env_model = os.getenv("LLM_MODEL")
-     candidate = (model or env_model or DEFAULT_MODEL).strip()
-     return candidate or DEFAULT_MODEL
- 
- 
- def _resolve_provider(model_name: str) -> str:
-     return MODEL_PROVIDER_MAP.get(model_name, "openai")
-@@ -679,50 +750,66 @@ def _log_parse_chain(parse_flags: Dict[str, object], *, retry: int, fallback: st
-     LOGGER.warning(
-         "parse_chain: content_str=%d; parts=%d; content_dict=%d; choices_text=%d; output_text=%d; retry=%d; fallback=%s; schema=%s",
-         parse_flags.get("content_str", 0),
-         parse_flags.get("parts", 0),
-         parse_flags.get("content_dict", 0),
-         parse_flags.get("choices_text", 0),
-         parse_flags.get("output_text", 0),
-         retry,
-         fallback,
-         parse_flags.get("schema", "unknown"),
-     )
- 
- 
- def _should_retry(exc: BaseException) -> bool:
-     if isinstance(exc, httpx.HTTPStatusError):
-         status = exc.response.status_code
-         if status in {408, 409, 425, 429, 500, 502, 503, 504}:
-             return True
-     if isinstance(exc, httpx.TimeoutException):
-         return True
-     if isinstance(exc, httpx.TransportError):
-         return True
-     return False
- 
- 
-+def _is_responses_fallback_allowed(exc: BaseException) -> bool:
-+    inspected: List[BaseException] = []
-+    current: Optional[BaseException] = exc
-+    while current is not None and current not in inspected:
-+        inspected.append(current)
-+        if isinstance(current, (httpx.TimeoutException, httpx.TransportError)):
-+            return True
-+        if isinstance(current, httpx.HTTPStatusError):
-+            response = current.response
-+            status = response.status_code if response is not None else None
-+            if status and (status >= 500 or status in {408, 409, 425, 429}):
-+                return True
-+        current = getattr(current, "__cause__", None)
-+    return False
-+
-+
- def _describe_error(exc: BaseException) -> str:
-     status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
-     if status:
-         return str(status)
-     if isinstance(exc, httpx.HTTPStatusError):  # pragma: no cover - depends on response type
-         return str(exc.response.status_code)
-     return exc.__class__.__name__
- 
- 
- def _raise_for_last_error(last_error: BaseException) -> None:
-     if isinstance(last_error, httpx.HTTPStatusError):
-         status_code = last_error.response.status_code
-         detail = ""
-         try:
-             payload = last_error.response.json()
-             if isinstance(payload, dict):
-                 detail = (
-                     payload.get("error", {}).get("message")
-                     if isinstance(payload.get("error"), dict)
-                     else payload.get("message", "")
-                 ) or ""
-         except ValueError:
-             detail = last_error.response.text.strip()
-         message = f"Ошибка сервиса OpenAI: HTTP {status_code}"
-         if detail:
-@@ -745,50 +832,68 @@ def _extract_unknown_parameter_name(response: httpx.Response) -> Optional[str]:
-         payload = response.json()
-     except ValueError:
-         payload = None
-     if isinstance(payload, dict):
-         error_block = payload.get("error")
-         if isinstance(error_block, dict):
-             message = str(error_block.get("message", ""))
-     if not message:
-         message = response.text or ""
-     message = message.strip()
-     if not message:
-         return None
-     lowered = message.lower()
-     if "unknown parameter" not in lowered and "unsupported parameter" not in lowered:
-         return None
-     marker = ":"
-     if marker in message:
-         remainder = message.split(marker, 1)[1].strip()
-     else:
-         remainder = message
-     if remainder.startswith("'") and "'" in remainder[1:]:
-         return remainder.split("'", 2)[1].strip()
-     return remainder.split()[0].strip("'\"") or None
- 
- 
-+def _has_text_format_migration_hint(response: httpx.Response) -> bool:
-+    message: str = ""
-+    try:
-+        payload = response.json()
-+    except ValueError:
-+        payload = None
-+    if isinstance(payload, dict):
-+        error_block = payload.get("error")
-+        if isinstance(error_block, dict):
-+            message = str(error_block.get("message", ""))
-+    if not message:
-+        message = response.text or ""
-+    message = message.strip()
-+    if not message:
-+        return False
-+    return "moved to 'text.format'" in message.lower()
-+
-+
- def _make_request(
-     http_client: httpx.Client,
-     *,
-     api_url: str,
-     headers: Dict[str, str],
-     payload: Dict[str, object],
-     schedule: List[float],
- ) -> Tuple[Dict[str, object], bool]:
-     last_error: Optional[BaseException] = None
-     shimmed_param = False
-     stripped_param: Optional[str] = None
-     current_payload: Dict[str, object] = dict(payload)
-     attempt_index = 0
-     while attempt_index < MAX_RETRIES:
-         attempt_index += 1
-         try:
-             response = http_client.post(api_url, headers=headers, json=current_payload)
-             response.raise_for_status()
-             data = response.json()
-             if isinstance(data, dict):
-                 return data, shimmed_param
-             raise RuntimeError("Модель вернула неожиданный формат ответа.")
-         except EmptyCompletionError:
-             raise
-         except httpx.HTTPStatusError as exc:
-@@ -829,50 +934,51 @@ def _make_request(
-             "param shim exhausted for '%s' with HTTP %s", stripped_param, last_error.response.status_code
-         )
-     if last_error:
-         _raise_for_last_error(last_error)
-     raise RuntimeError("Модель не вернула ответ.")
- 
- 
- def _extract_response_text(data: Dict[str, object]) -> Tuple[str, Dict[str, object], str]:
-     choices = data.get("choices") if isinstance(data, dict) else None
-     if not isinstance(choices, list) or not choices:
-         raise RuntimeError("Модель не вернула варианты ответа.")
-     choice = choices[0]
-     if not isinstance(choice, dict):
-         raise RuntimeError("Модель вернула неожиданный формат ответа.")
-     return _extract_choice_content(choice)
- 
- 
- def generate(
-     messages: List[Dict[str, str]],
-     *,
-     model: Optional[str] = None,
-     temperature: float = 0.3,
-     max_tokens: int = 1400,
-     timeout_s: int = 60,
-     backoff_schedule: Optional[List[float]] = None,
-+    responses_text_format: Optional[Dict[str, object]] = None,
- ) -> GenerationResult:
-     """Call the configured LLM and return a structured generation result."""
- 
-     if not messages:
-         raise ValueError("messages must not be empty")
- 
-     model_name = _resolve_model_name(model)
-     provider = _resolve_provider(model_name)
-     api_key = _resolve_api_key(provider)
-     api_url = PROVIDER_API_URLS.get(provider)
-     if not api_url:
-         raise RuntimeError(f"Неизвестный провайдер для модели '{model_name}'")
- 
-     timeout = httpx.Timeout(timeout_s)
-     http_client = httpx.Client(timeout=timeout)
- 
-     schedule = _resolve_backoff_schedule(backoff_schedule)
-     headers = {
-         "Authorization": f"Bearer {api_key}",
-         "Content-Type": "application/json",
-     }
- 
-     def _augment_gpt5_messages(original: List[Dict[str, object]]) -> List[Dict[str, object]]:
-         augmented: List[Dict[str, object]] = []
-         appended_suffix = False
-@@ -933,151 +1039,197 @@ def generate(
-             )
-         _persist_raw_response(data)
-         return text, parse_flags, data, schema_label
- 
-     def _call_responses_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
-         nonlocal retry_used
- 
-         payload_messages = _messages_for_model(target_model)
-         system_segments: List[str] = []
-         user_segments: List[str] = []
-         for item in payload_messages:
-             role = str(item.get("role", "")).strip().lower()
-             content = str(item.get("content", "")).strip()
-             if not content:
-                 continue
-             if role == "system":
-                 system_segments.append(content)
-             elif role == "user":
-                 user_segments.append(content)
-             else:
-                 user_segments.append(f"{role.upper()}:\n{content}")
- 
-         system_text = "\n\n".join(system_segments)
-         user_text = "\n\n".join(user_segments)
- 
--        base_payload = build_responses_payload(target_model, system_text, user_text, max_tokens)
-+        base_payload = build_responses_payload(
-+            target_model,
-+            system_text,
-+            user_text,
-+            max_tokens,
-+            text_format=responses_text_format,
-+        )
          sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
  
-+        format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
-+
-+        def _clone_text_format() -> Dict[str, object]:
-+            return deepcopy(format_template)
-+
-+        def _apply_text_format(target: Dict[str, object]) -> None:
-+            target.pop("response_format", None)
-+            target["text"] = {"format": _clone_text_format()}
-+
-+        _apply_text_format(sanitized_payload)
-+
+         format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
+ 
+         def _clone_text_format() -> Dict[str, object]:
+             return deepcopy(format_template)
+ 
+         def _apply_text_format(target: Dict[str, object]) -> None:
+             target.pop("response_format", None)
+             target["text"] = {"format": _clone_text_format()}
+ 
+         _apply_text_format(sanitized_payload)
+ 
          try:
              max_tokens_value = int(sanitized_payload.get("max_output_tokens", 1200))
          except (TypeError, ValueError):
@@ -570,8 +142,24 @@ index 3c1bf5bd3e842880ab661e1534bcaefb9a427025..1fe4d2a59d4cebba0e10d55a063e21f9
              max_tokens_value = 1200
          max_tokens_value = min(max_tokens_value, 1200)
          sanitized_payload["max_output_tokens"] = max_tokens_value
-         sanitized_payload["temperature"] = 0.3
--        sanitized_payload["response_format"] = {"type": "json_object"}
+-        sanitized_payload["temperature"] = 0.3
++
++        supports_temperature = _supports_temperature(target_model)
++        if supports_temperature:
++            raw_temperature = sanitized_payload.get("temperature", temperature)
++            if raw_temperature is None:
++                raw_temperature = 0.3
++            try:
++                sanitized_payload["temperature"] = float(raw_temperature)
++            except (TypeError, ValueError):
++                sanitized_payload["temperature"] = 0.3
++        else:
++            if "temperature" in sanitized_payload:
++                sanitized_payload.pop("temperature", None)
++            LOGGER.info(
++                "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
++                target_model,
++            )
  
          def _log_payload(snapshot: Dict[str, object]) -> None:
              keys = sorted(snapshot.keys())
@@ -580,116 +168,24 @@ index 3c1bf5bd3e842880ab661e1534bcaefb9a427025..1fe4d2a59d4cebba0e10d55a063e21f9
              length = len(input_candidate) if isinstance(input_candidate, str) else 0
              LOGGER.info("responses input_len=%d", length)
              LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
-+            text_block = snapshot.get("text")
-+            format_type = "-"
-+            schema_name = "-"
-+            if isinstance(text_block, dict):
-+                format_block = text_block.get("format")
-+                if isinstance(format_block, dict):
-+                    fmt = format_block.get("type")
-+                    if isinstance(fmt, str) and fmt.strip():
-+                        format_type = fmt.strip()
-+                    schema_block = format_block.get("json_schema")
-+                    if isinstance(schema_block, dict):
-+                        schema_candidate = schema_block.get("name")
-+                        if isinstance(schema_candidate, str) and schema_candidate.strip():
-+                            schema_name = schema_candidate.strip()
-+            LOGGER.info("responses text_format type=%s schema=%s", format_type, schema_name)
+             text_block = snapshot.get("text")
+             format_type = "-"
+             schema_name = "-"
+             if isinstance(text_block, dict):
+                 format_block = text_block.get("format")
+                 if isinstance(format_block, dict):
+                     fmt = format_block.get("type")
+                     if isinstance(fmt, str) and fmt.strip():
+                         format_type = fmt.strip()
+                     schema_block = format_block.get("json_schema")
+                     if isinstance(schema_block, dict):
+                         schema_candidate = schema_block.get("name")
+                         if isinstance(schema_candidate, str) and schema_candidate.strip():
+                             schema_name = schema_candidate.strip()
+             LOGGER.info("responses text_format type=%s schema=%s", format_type, schema_name)
  
          def _extract_metadata(payload: Dict[str, object]) -> Dict[str, object]:
-             status_value = payload.get("status")
-             status = str(status_value).strip().lower() if isinstance(status_value, str) else ""
-             incomplete_details = payload.get("incomplete_details")
-             incomplete_reason = ""
-             if isinstance(incomplete_details, dict):
-                 reason = incomplete_details.get("reason")
-                 if isinstance(reason, str):
-                     incomplete_reason = reason.strip().lower()
-             usage_block = payload.get("usage")
-             usage_output_tokens: Optional[float] = None
-             if isinstance(usage_block, dict):
-                 raw_usage = usage_block.get("output_tokens")
-                 if isinstance(raw_usage, (int, float)):
-                     usage_output_tokens = float(raw_usage)
-                 elif isinstance(raw_usage, dict):
-                     for value in raw_usage.values():
-                         if isinstance(value, (int, float)):
-                             usage_output_tokens = float(value)
-                             break
-             return {
-                 "status": status,
-                 "incomplete_reason": incomplete_reason,
-                 "usage_output_tokens": usage_output_tokens,
-             }
- 
-         attempts = 0
-         current_max = max_tokens_value
-         last_error: Optional[BaseException] = None
-+        format_retry_done = False
- 
-         while attempts < 3:
-             attempts += 1
-             current_payload = dict(sanitized_payload)
-+            current_payload["text"] = {"format": _clone_text_format()}
-             current_payload["max_output_tokens"] = max(32, int(current_max))
-             if attempts > 1:
-                 retry_used = True
-             _log_payload(current_payload)
-             try:
-                 _store_responses_request_snapshot(current_payload)
-                 response = http_client.post(
-                     RESPONSES_API_URL,
-                     headers=headers,
-                     json=current_payload,
-                     timeout=timeout,
-                 )
-                 response.raise_for_status()
-                 data = response.json()
-                 if not isinstance(data, dict):
-                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
-                 _store_responses_response_snapshot(data)
-                 text, parse_flags, schema_label = _extract_responses_text(data)
-                 metadata = _extract_metadata(data)
-                 status = metadata.get("status") or ""
-                 reason = metadata.get("incomplete_reason") or ""
-                 segments = int(parse_flags.get("segments", 0) or 0)
-                 LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
-                 if status == "incomplete" or segments == 0:
-                     LOGGER.info(
-                         "RESP_STATUS=incomplete|max_output_tokens=%s",
-                         current_payload.get("max_output_tokens"),
-                     )
-                     last_error = RuntimeError("responses_incomplete")
-                     current_max = max(32, int(current_payload["max_output_tokens"] * 0.85))
-                     continue
-                 if not text:
-                     last_error = EmptyCompletionError(
-                         "Модель вернула пустой ответ",
-                         raw_response=data,
-                         parse_flags=parse_flags,
-                     )
-                     LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
-                     current_max = max(32, int(current_payload["max_output_tokens"] * 0.85))
-                     continue
-                 _persist_raw_response(data)
-                 return text, parse_flags, data, schema_label
-             except EmptyCompletionError as exc:
-                 last_error = exc
-                 current_max = max(32, int(current_payload.get("max_output_tokens", 32) * 0.85))
-             except httpx.HTTPStatusError as exc:
-+                response_obj = exc.response
-+                status = response_obj.status_code if response_obj is not None else None
-+                if (
-+                    status == 400
-+                    and not format_retry_done
-+                    and response_obj is not None
-+                    and _has_text_format_migration_hint(response_obj)
-+                ):
-+                    format_retry_done = True
-+                    retry_used = True
-+                    LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
-+                    _apply_text_format(sanitized_payload)
-+                    continue
+@@ -1211,52 +1235,50 @@ def generate(
                  last_error = exc
                  _handle_responses_http_error(exc, current_payload)
                  break
@@ -715,207 +211,38 @@ index 3c1bf5bd3e842880ab661e1534bcaefb9a427025..1fe4d2a59d4cebba0e10d55a063e21f9
  
      lower_model = model_name.lower()
      is_gpt5_model = lower_model.startswith("gpt-5")
-@@ -1195,50 +1347,52 @@ def generate(
-             except Exception as responses_error:  # noqa: BLE001
-                 LOGGER.warning("Responses API call failed: %s", responses_error)
-                 if FORCE_MODEL:
-                     error_details: Dict[str, object] = {
-                         "reason": "api_error_gpt5_responses",
-                         "exception": str(responses_error),
-                     }
-                     if isinstance(responses_error, httpx.HTTPStatusError):
-                         status_code = (
-                             responses_error.response.status_code
-                             if responses_error.response is not None
-                             else None
-                         )
-                         error_details["status_code"] = status_code
-                         if responses_error.response is not None:
-                             try:
-                                 payload_json = responses_error.response.json()
-                             except ValueError:
-                                 payload_json = None
-                             if isinstance(payload_json, dict):
-                                 error_block = payload_json.get("error")
-                                 if isinstance(error_block, dict):
-                                     error_details["error_type"] = error_block.get("type")
-                                     error_details["error_message"] = error_block.get("message")
-                     raise _build_force_model_error("responses_error", error_details) from responses_error
-+                if not _is_responses_fallback_allowed(responses_error):
-+                    raise
-                 fallback_reason = "api_error_gpt5_responses"
-             fallback_used = FALLBACK_MODEL
-             LOGGER.warning(
-                 "switching to fallback model %s (primary=%s, reason=%s)",
-                 fallback_used,
-                 model_name,
-                 fallback_reason,
-             )
-             text, parse_flags_fallback, _, schema_fallback = _call_chat_model(fallback_used)
-             schema_category = _categorize_schema(parse_flags_fallback)
-             LOGGER.info(
-                 "fallback completion schema category=%s (schema=%s, route=chat)",
-                 schema_category,
-                 schema_fallback,
-             )
-             metadata_block = None
-             if isinstance(parse_flags_fallback, dict):
-                 meta_candidate = parse_flags_fallback.get("metadata")
-                 if isinstance(meta_candidate, dict):
-                     metadata_block = dict(meta_candidate)
-             return GenerationResult(
-                 text=text,
-                 model_used=fallback_used,
-                 retry_used=retry_used,
-                 fallback_used=fallback_used,
-diff --git a/orchestrate.py b/orchestrate.py
-index 50a77990c895d49594100b73e00706f403b65115..d93bf012d23f7d0a68c13767b14ce9bab7c11571 100644
---- a/orchestrate.py
-+++ b/orchestrate.py
-@@ -608,50 +608,51 @@ def _mask_openai_key(raw_key: str) -> str:
-     if not key:
-         return "****"
-     if key.startswith("sk-") and len(key) > 6:
-         return f"sk-****{key[-4:]}"
-     if len(key) <= 4:
-         return "*" * len(key)
-     return f"{key[:2]}***{key[-2:]}"
+-    if is_gpt5_model:
+-        LOGGER.info("temperature is ignored for GPT-5; using default")
  
- 
- def _run_health_ping() -> Dict[str, object]:
-     probe_messages = [
-         {
-             "role": "system",
-             "content": "Ты сервис проверки доступности. Ответь словом PONG.",
-         },
-         {"role": "user", "content": "Пожалуйста, ответь строго словом PONG."},
-     ]
+     retry_used = False
+     fallback_used: Optional[str] = None
+     fallback_reason: Optional[str] = None
  
      try:
-         ping_result = llm_generate(
-             probe_messages,
-             model=DEFAULT_MODEL,
-             temperature=0.0,
-             max_tokens=32,
-             timeout_s=10,
-+            responses_text_format={"type": "text"},
-         )
-     except Exception as exc:  # noqa: BLE001
-         reason = str(exc).strip() or "ошибка вызова"
-         return {
-             "ok": False,
-             "message": f"Responses недоступен: {reason}",
-             "route": "responses",
-             "fallback_used": False,
-         }
- 
-     reply = (ping_result.text or "").strip()
-     reply_lower = reply.lower()
-     route = (ping_result.api_route or "").strip() or "responses"
-     fallback_used = bool(ping_result.fallback_used)
- 
-     if reply_lower.startswith("pong") and route == "responses" and not fallback_used:
-         model_used = (ping_result.model_used or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-         return {
-             "ok": True,
-             "message": f"Responses OK ({model_used}, 32 токена)",
-             "route": "responses",
-             "fallback_used": False,
-         }
- 
-     if fallback_used:
+         if is_gpt5_model:
+             available = _check_model_availability(
+                 http_client,
+                 provider=provider,
+                 headers=headers,
+                 model_name=model_name,
+             )
+             if not available:
+                 error_message = "Model GPT-5 not available for this key/plan"
+                 LOGGER.warning("primary model %s unavailable — considering fallback", model_name)
+                 if FORCE_MODEL:
+                     raise RuntimeError(error_message)
+                 fallback_used = FALLBACK_MODEL
+                 fallback_reason = "model_unavailable"
+                 LOGGER.warning(
+                     "switching to fallback model %s (primary=%s, reason=%s: %s)",
+                     fallback_used,
+                     model_name,
+                     fallback_reason,
 diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index 9fabf7c9ed4c9a1443010e2aa53aa54b4d0be828..d4e620eb4ddbc5f33bb481c5475338d8356b3bae 100644
+index d4e620eb4ddbc5f33bb481c5475338d8356b3bae..c4fbc40d9f3d918697f06732c4ffd50cdf440ff3 100644
 --- a/tests/test_llm_client.py
 +++ b/tests/test_llm_client.py
-@@ -1,84 +1,84 @@
- # -*- coding: utf-8 -*-
- from pathlib import Path
- from unittest.mock import patch
- import httpx
- import pytest
- import sys
- 
- sys.path.append(str(Path(__file__).resolve().parents[1]))
- 
--from llm_client import GenerationResult, generate
-+from llm_client import DEFAULT_RESPONSES_TEXT_FORMAT, GenerationResult, generate
- 
- 
- @pytest.fixture(autouse=True)
- def _force_api_key(monkeypatch):
-     monkeypatch.setenv("OPENAI_API_KEY", "test")
-     yield
-     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
- 
- 
- class DummyResponse:
-     def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
-         if payload is None:
-             payload = {
-                 "choices": [
-                     {
-                         "message": {
-                             "content": "ok",
-                         }
-                     }
-                 ]
-             }
-         self._json = payload
-         self.status_code = status_code
-         self.text = text
-         self._raise_for_status_exc = raise_for_status_exc
- 
-     def raise_for_status(self):
-         if self._raise_for_status_exc:
-             raise self._raise_for_status_exc
-         return None
- 
-     def json(self):
-         return self._json
- 
- 
- class DummyClient:
-     def __init__(self, payloads=None, availability=None, poll_payloads=None):
-         self.last_request = None
-         self.requests = []
-         self.last_probe = None
-         self.last_poll = None
-         self.payloads = payloads or []
-         self.availability = availability or []
-         self.poll_payloads = poll_payloads or []
-         self.call_count = 0
-         self.probe_count = 0
-         self.poll_count = 0
- 
--    def post(self, url, headers=None, json=None):
-+    def post(self, url, headers=None, json=None, **kwargs):
-         request = {
-             "url": url,
-             "headers": headers,
-             "json": json,
-         }
-         self.last_request = request
-         self.requests.append(request)
-         payload = None
-         if self.payloads:
-             index = min(self.call_count, len(self.payloads) - 1)
-             payload = self.payloads[index]
-         self.call_count += 1
-         if isinstance(payload, dict) and payload.get("__error__") == "http":
-             status = int(payload.get("status", 400))
-             response_payload = payload.get("payload", {})
-             text = payload.get("text", "")
-             request_obj = httpx.Request("POST", url)
-             response_obj = httpx.Response(status, request=request_obj, json=response_payload)
-             error = httpx.HTTPStatusError("HTTP error", request=request_obj, response=response_obj)
-             return DummyResponse(response_payload, status_code=status, text=text, raise_for_status_exc=error)
-         return DummyResponse(payload)
- 
-     def get(self, url, headers=None):
-         if url.startswith("https://api.openai.com/v1/responses"):
-             self.last_poll = {
-@@ -137,72 +137,74 @@ def test_generate_uses_max_tokens_for_non_gpt5():
+@@ -137,78 +137,89 @@ def test_generate_uses_max_tokens_for_non_gpt5():
      assert "max_completion_tokens" not in request_payload["json"]
      assert request_payload["json"]["temperature"] == 0
      assert "tool_choice" not in request_payload["json"]
@@ -941,20 +268,30 @@ index 9fabf7c9ed4c9a1443010e2aa53aa54b4d0be828..d4e620eb4ddbc5f33bb481c5475338d8
      payload = request_payload["json"]
      assert payload["max_output_tokens"] == 42
      assert "modalities" not in payload
--    assert "temperature" not in payload
-+    assert payload["temperature"] == 0.3
+-    assert payload["temperature"] == 0.3
      assert "messages" not in payload
      assert payload["model"] == "gpt-5-preview"
      assert payload["input"] == "ping"
--    assert set(payload.keys()) == {"input", "max_output_tokens", "model"}
-+    assert "text" in payload
-+    assert payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
-+    assert set(payload.keys()) == {"input", "max_output_tokens", "model", "temperature", "text"}
+     assert "text" in payload
+     assert payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
+-    assert set(payload.keys()) == {"input", "max_output_tokens", "model", "temperature", "text"}
++    assert "temperature" not in payload
++    assert set(payload.keys()) == {"input", "max_output_tokens", "model", "text"}
      assert request_payload["url"].endswith("/responses")
  
  
  def test_generate_logs_about_temperature_for_gpt5():
-     dummy_client = DummyClient()
+-    dummy_client = DummyClient()
++    responses_payload = {
++        "output": [
++            {
++                "content": [
++                    {"type": "text", "text": "ok"},
++                ]
++            }
++        ]
++    }
++    dummy_client = DummyClient(payloads=[responses_payload])
      with patch("llm_client.httpx.Client", return_value=dummy_client), patch("llm_client.LOGGER") as mock_logger:
          generate(
              messages=[{"role": "user", "content": "ping"}],
@@ -963,15 +300,19 @@ index 9fabf7c9ed4c9a1443010e2aa53aa54b4d0be828..d4e620eb4ddbc5f33bb481c5475338d8
              max_tokens=42,
          )
  
-     mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
+-    mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
      mock_logger.info.assert_any_call(
          "responses payload_keys=%s",
--        ["input", "max_output_tokens", "model"],
-+        ["input", "max_output_tokens", "model", "temperature", "text"],
+-        ["input", "max_output_tokens", "model", "temperature", "text"],
++        ["input", "max_output_tokens", "model", "text"],
      )
      mock_logger.info.assert_any_call("responses input_len=%d", 4)
      mock_logger.info.assert_any_call("responses max_output_tokens=%s", 42)
-     mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
+-    mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
++    mock_logger.info.assert_any_call(
++        "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
++        "gpt-5-super",
++    )
  
  
  def test_generate_polls_for_incomplete_responses_status():
@@ -993,4 +334,65 @@ index 9fabf7c9ed4c9a1443010e2aa53aa54b4d0be828..d4e620eb4ddbc5f33bb481c5475338d8
                  "content": [
                      {"type": "output_text", "text": "done"},
                  ]
+             }
+         ],
+     }
+     dummy_client = DummyClient(payloads=[initial_payload], poll_payloads=[final_payload])
+@@ -226,54 +237,56 @@ def test_generate_polls_for_incomplete_responses_status():
+     assert isinstance(result, GenerationResult)
+     assert result.text == "done"
+     assert result.api_route == "responses"
+     assert result.schema == "responses.output_text"
+     assert dummy_client.poll_count == 1
+     assert dummy_client.last_poll["url"].endswith("/responses/resp-123")
+     mock_sleep.assert_called()
+ 
+ 
+ def test_generate_sends_minimal_payload_for_gpt5():
+     responses_payload = {
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "ok"},
+                 ]
+             }
+         ]
+     }
+     _, request_payload = _run_and_capture_request("gpt-5-turbo", payloads=[responses_payload])
+     payload = request_payload["json"]
+     assert payload["model"] == "gpt-5-turbo"
+     assert "modalities" not in payload
+     assert payload["max_output_tokens"] == 42
+     assert payload["input"] == "ping"
++    assert "temperature" not in payload
+     assert set(payload.keys()) == {
+         "model",
+         "input",
+         "max_output_tokens",
++        "text",
+     }
+ 
+ 
+ def test_generate_retries_when_unknown_parameter_reported():
+     error_entry = {
+         "__error__": "http",
+         "status": 400,
+         "payload": {"error": {"message": "Unknown parameter: 'modalities'"}},
+     }
+     success_payload = {
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "ok"},
+                 ]
+             }
+         ]
+     }
+     dummy_client = DummyClient(payloads=[error_entry, success_payload])
+     with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
+         "llm_client.LOGGER"
+     ) as mock_logger:
+         result = generate(
+             messages=[{"role": "user", "content": "ping"}],
+             model="gpt-5",  # ensure responses route
 

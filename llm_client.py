@@ -43,6 +43,13 @@ if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
 
+
+def _supports_temperature(model: str) -> bool:
+    """Return True if the target model accepts the temperature parameter."""
+
+    model_name = (model or "").strip().lower()
+    return not model_name.startswith("gpt-5")
+
 DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
     "type": "json_schema",
     "json_schema": {
@@ -181,9 +188,10 @@ def build_responses_payload(
         "model": str(model).strip(),
         "input": joined_input.strip(),
         "max_output_tokens": int(max_tokens),
-        "temperature": 0.3,
         "text": {"format": format_block},
     }
+    if _supports_temperature(model):
+        payload["temperature"] = 0.3
     return payload
 
 
@@ -1089,7 +1097,23 @@ def generate(
             max_tokens_value = 1200
         max_tokens_value = min(max_tokens_value, 1200)
         sanitized_payload["max_output_tokens"] = max_tokens_value
-        sanitized_payload["temperature"] = 0.3
+
+        supports_temperature = _supports_temperature(target_model)
+        if supports_temperature:
+            raw_temperature = sanitized_payload.get("temperature", temperature)
+            if raw_temperature is None:
+                raw_temperature = 0.3
+            try:
+                sanitized_payload["temperature"] = float(raw_temperature)
+            except (TypeError, ValueError):
+                sanitized_payload["temperature"] = 0.3
+        else:
+            if "temperature" in sanitized_payload:
+                sanitized_payload.pop("temperature", None)
+            LOGGER.info(
+                "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
+                target_model,
+            )
 
         def _log_payload(snapshot: Dict[str, object]) -> None:
             keys = sorted(snapshot.keys())
@@ -1233,8 +1257,6 @@ def generate(
 
     lower_model = model_name.lower()
     is_gpt5_model = lower_model.startswith("gpt-5")
-    if is_gpt5_model:
-        LOGGER.info("temperature is ignored for GPT-5; using default")
 
     retry_used = False
     fallback_used: Optional[str] = None

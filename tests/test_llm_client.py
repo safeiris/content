@@ -159,18 +159,27 @@ def test_generate_uses_responses_payload_for_gpt5():
     payload = request_payload["json"]
     assert payload["max_output_tokens"] == 42
     assert "modalities" not in payload
-    assert payload["temperature"] == 0.3
     assert "messages" not in payload
     assert payload["model"] == "gpt-5-preview"
     assert payload["input"] == "ping"
     assert "text" in payload
     assert payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
-    assert set(payload.keys()) == {"input", "max_output_tokens", "model", "temperature", "text"}
+    assert "temperature" not in payload
+    assert set(payload.keys()) == {"input", "max_output_tokens", "model", "text"}
     assert request_payload["url"].endswith("/responses")
 
 
 def test_generate_logs_about_temperature_for_gpt5():
-    dummy_client = DummyClient()
+    responses_payload = {
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "ok"},
+                ]
+            }
+        ]
+    }
+    dummy_client = DummyClient(payloads=[responses_payload])
     with patch("llm_client.httpx.Client", return_value=dummy_client), patch("llm_client.LOGGER") as mock_logger:
         generate(
             messages=[{"role": "user", "content": "ping"}],
@@ -179,14 +188,16 @@ def test_generate_logs_about_temperature_for_gpt5():
             max_tokens=42,
         )
 
-    mock_logger.info.assert_any_call("dispatch route=responses model=%s", "gpt-5-super")
     mock_logger.info.assert_any_call(
         "responses payload_keys=%s",
-        ["input", "max_output_tokens", "model", "temperature", "text"],
+        ["input", "max_output_tokens", "model", "text"],
     )
     mock_logger.info.assert_any_call("responses input_len=%d", 4)
     mock_logger.info.assert_any_call("responses max_output_tokens=%s", 42)
-    mock_logger.info.assert_any_call("temperature is ignored for GPT-5; using default")
+    mock_logger.info.assert_any_call(
+        "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
+        "gpt-5-super",
+    )
 
 
 def test_generate_polls_for_incomplete_responses_status():
@@ -248,10 +259,12 @@ def test_generate_sends_minimal_payload_for_gpt5():
     assert "modalities" not in payload
     assert payload["max_output_tokens"] == 42
     assert payload["input"] == "ping"
+    assert "temperature" not in payload
     assert set(payload.keys()) == {
         "model",
         "input",
         "max_output_tokens",
+        "text",
     }
 
 
