@@ -563,14 +563,14 @@ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
         if checks.get("openai_key", {}).get("ok"):
             try:
                 probe_messages = [
-                    {"role": "system", "content": "Ты проверка готовности. Ответь одним словом."},
-                    {"role": "user", "content": "Скажи PING"},
+                    {"role": "system", "content": "Ты проверка готовности. Ответь строго словом PING."},
+                    {"role": "user", "content": "Ответь словом PING"},
                 ]
                 ping_result = llm_generate(
                     probe_messages,
                     model=DEFAULT_MODEL,
                     temperature=0.0,
-                    max_tokens=4,
+                    max_tokens=12,
                     timeout_s=10,
                 )
                 reply = (ping_result.text or "").strip().lower()

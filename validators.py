@@ -94,16 +94,25 @@ def _skeleton_status(
         return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
     if not isinstance(skeleton_payload, dict):
         return False, "Данные скелета не получены или имеют неверный формат."
-    sections = skeleton_payload.get("sections")
-    if not isinstance(sections, list) or not sections:
-        return False, "Скелет не содержит секций."
-    for section in sections:
-        if not isinstance(section, dict):
-            return False, "Секция скелета повреждена."
-        heading = str(section.get("heading") or "").strip()
-        paragraphs = section.get("paragraphs")
-        if not heading or not isinstance(paragraphs, list) or not paragraphs:
-            return False, "Секция скелета заполнена не полностью."
+
+    intro = str(skeleton_payload.get("intro") or "").strip()
+    outro = str(skeleton_payload.get("outro") or "").strip()
+    main = skeleton_payload.get("main")
+    if not intro or not outro or not isinstance(main, list) or not main:
+        return False, "Скелет не содержит обязательных полей intro/main/outro."
+    for idx, item in enumerate(main):
+        if not isinstance(item, str) or not item.strip():
+            return False, f"Блок основной части №{idx + 1} пуст."
+
+    outline = skeleton_payload.get("outline")
+    if outline and isinstance(outline, list):
+        normalized_outline = [str(entry).strip() for entry in outline if str(entry).strip()]
+    else:
+        normalized_outline = []
+
+    expected_main = max(1, len(normalized_outline) - 2) if normalized_outline else len(main)
+    if len(main) != expected_main:
+        return False, "Количество блоков основной части не совпадает с ожидаемым."
     if "## FAQ" not in text or _FAQ_START not in text or _FAQ_END not in text:
         return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
     return True, None

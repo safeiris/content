@@ -126,18 +126,31 @@ def _stub_llm(monkeypatch):
         "Расчёт коэффициентов сопровождаем примерами и перечнем действий."
     )
     outline = ["Введение", "Аналитика", "Решения"]
-    skeleton_sections = []
-    for heading in outline:
-        paragraphs = []
-        for idx in range(6):
-            paragraphs.append(
-                f"{base_paragraph} {heading} блок {idx + 1} раскрывает практическое значение ключевых метрик и указывает конкретные шаги, подкреплённые цифрами и контрольными датами."
-            )
-            paragraphs.append("Расписываем временные рамки, ответственных лиц и цифровые инструменты, которые удерживают контроль над бюджетом и помогают выдерживать долговую нагрузку в безопасных пределах.")
-        skeleton_sections.append({"heading": heading, "paragraphs": paragraphs})
+    intro_block = []
+    for idx in range(4):
+        intro_block.append(
+            f"{base_paragraph} Введение блок {idx + 1} показывает, как сформировать картину текущей ситуации и определить безопасные пределы долга."
+        )
+    intro_text = "\n\n".join(intro_block)
+
+    main_blocks = []
+    for idx in range(5):
+        main_blocks.append(
+            f"{base_paragraph} Аналитика блок {idx + 1} фокусируется на цифрах, добавляет формулы и объясняет, как применять их на практике."
+        )
+    main_text = "\n\n".join(main_blocks)
+
+    outro_parts = []
+    for idx in range(3):
+        outro_parts.append(
+            f"{base_paragraph} Решения блок {idx + 1} переводит выводы в план действий, перечисляет контрольные даты и роли участников."
+        )
+    outro_text = "\n\n".join(outro_parts)
+
     skeleton_payload = {
-        "title": "Долговая нагрузка семьи: практическое руководство",
-        "sections": skeleton_sections,
+        "intro": intro_text,
+        "main": [main_text],
+        "outro": outro_text,
     }
     skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
     faq_payload = {

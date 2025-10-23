@@ -13,7 +13,12 @@ from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from llm_client import GenerationResult, generate as llm_generate
-from keyword_injector import KeywordInjectionResult, build_term_pattern, inject_keywords
+from keyword_injector import (
+    KeywordInjectionResult,
+    LOCK_START_TEMPLATE,
+    build_term_pattern,
+    inject_keywords,
+)
 from length_trimmer import TrimResult, trim_text
 from validators import (
     ValidationError,
@@ -251,34 +256,39 @@ class DeterministicPipeline:
 
     def _skeleton_contract(self) -> Dict[str, object]:
         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
+        intro = outline[0] if outline else "Введение"
+        outro = outline[-1] if len(outline) > 1 else "Вывод"
+        core_sections = [
+            item
+            for item in outline[1:-1]
+            if item.lower() not in {"faq", "f.a.q.", "вопросы и ответы"}
+        ]
+        if not core_sections:
+            core_sections = ["Основная часть"]
         contract = {
-            "title": "Строго один заголовок первого уровня",
-            "sections": [
-                {
-                    "heading": item,
-                    "goal": "Краткое назначение секции",
-                    "paragraphs": [
-                        "1-3 насыщенных абзаца без буллитов",
-                    ],
-                    "bullets": [],
-                }
-                for item in outline
+            "intro": f"2-3 плотных абзаца для раздела '{intro}'",
+            "main": [
+                f"2-3 абзаца раскрывают тему '{heading}' на практических примерах"
+                for heading in core_sections
             ],
+            "outro": f"1-2 абзаца с выводами и призывом к действию для блока '{outro}'",
         }
         return contract
 
     def _build_skeleton_messages(self) -> List[Dict[str, object]]:
         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
-        contract = json.dumps(self._skeleton_contract(), ensure_ascii=False, indent=2)
+        contract_payload = self._skeleton_contract()
+        contract = json.dumps(contract_payload, ensure_ascii=False, indent=2)
+        main_expected = max(1, len(contract_payload.get("main") or []))
         user_payload = textwrap.dedent(
             f"""
             Сформируй структуру статьи в строгом JSON-формате.
             Требования:
-            1. Соблюдай следующий порядок разделов: {', '.join(outline)}.
-            2. Верни JSON вида {{"title": str, "sections": [{{"heading": str, "paragraphs": [str, ...]}}]}}.
-            3. Каждый paragraphs содержит 2-3 осмысленных абзаца по 3-4 предложения без приветствий.
-            4. Не добавляй FAQ и маркеры; только данные для отрисовки.
-            5. Не используй Markdown и комментарии.
+            1. Соблюдай порядок разделов: {', '.join(outline) if outline else 'Введение, Основная часть, Вывод'}.
+            2. Верни JSON вида {{"intro": str, "main": [str, ...], "outro": str}} без дополнительных ключей.
+            3. main должен содержать {main_expected} элемента — по одному на каждый раздел основной части.
+            4. Каждый элемент intro/main/outro содержит 2-3 осмысленных абзаца по 3-4 предложения, без Markdown и приветствий.
+            5. Не добавляй FAQ, разметку, комментарии и служебные подписи.
             Образец структуры:
             {contract}
             """
@@ -290,32 +300,58 @@ class DeterministicPipeline:
     def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
         if not isinstance(payload, dict):
             raise ValueError("Структура скелета не является объектом")
-        title = str(payload.get("title") or "").strip()
-        sections = payload.get("sections")
-        if not title or not isinstance(sections, list) or not sections:
+
+        intro = str(payload.get("intro") or "").strip()
+        main = payload.get("main")
+        outro = str(payload.get("outro") or "").strip()
+        if not intro or not outro or not isinstance(main, list) or not main:
             raise ValueError("Скелет не содержит обязательных полей")
-        outline = []
-        lines: List[str] = [f"# {title}", ""]
-        for section in sections:
-            if not isinstance(section, dict):
-                raise ValueError("Секция имеет некорректный формат")
-            heading = str(section.get("heading") or "").strip()
-            paragraphs = section.get("paragraphs")
-            if not heading or not isinstance(paragraphs, list) or not paragraphs:
-                raise ValueError("Секция неполная")
-            outline.append(heading)
+
+        for idx, item in enumerate(main):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f"Элемент основной части №{idx + 1} пуст")
+
+        outline = [segment.strip() for segment in self.base_outline if segment.strip()]
+        outline = [
+            entry
+            for entry in outline
+            if entry.lower() not in {"faq", "f.a.q.", "вопросы и ответы"}
+        ]
+        if len(outline) < 3:
+            outline = ["Введение", "Основная часть", "Вывод"]
+
+        intro_heading = outline[0]
+        outro_heading = outline[-1]
+        main_headings = outline[1:-1]
+        if not main_headings:
+            main_headings = ["Основная часть"]
+        if len(main_headings) != len(main):
+            raise ValueError(
+                "Количество блоков в основной части не совпадает с ожиданиями по структуре"
+            )
+
+        lines: List[str] = [f"# {self.topic}", ""]
+
+        def _append_section(heading: str, content: str) -> None:
+            paragraphs = [part.strip() for part in re.split(r"\n{2,}", content) if part.strip()]
+            if not paragraphs:
+                raise ValueError(f"Раздел '{heading}' пуст")
             lines.append(f"## {heading}")
             for paragraph in paragraphs:
-                text = str(paragraph).strip()
-                if not text:
-                    continue
-                lines.append(text)
+                lines.append(paragraph)
                 lines.append("")
+
+        _append_section(intro_heading, intro)
+        for heading, body in zip(main_headings, main):
+            _append_section(heading, body)
+        _append_section(outro_heading, outro)
+
         lines.append("## FAQ")
         lines.append(FAQ_START)
         lines.append(FAQ_END)
         markdown = "\n".join(lines).strip()
-        return markdown, {"title": title, "outline": outline}
+        outline_summary = [intro_heading, *main_headings, outro_heading]
+        return markdown, {"outline": outline_summary}
 
     def _render_faq_markdown(self, entries: Sequence[Dict[str, str]]) -> str:
         lines: List[str] = []
@@ -484,7 +520,9 @@ class DeterministicPipeline:
                 continue
             try:
                 markdown, summary = self._render_skeleton_markdown(payload)
-                self.skeleton_payload = payload
+                snapshot = dict(payload)
+                snapshot["outline"] = summary.get("outline", [])
+                self.skeleton_payload = snapshot
                 LOGGER.info("SKELETON_RENDERED_WITH_MARKERS outline=%s", ",".join(summary.get("outline", [])))
             except Exception as exc:  # noqa: BLE001
                 last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
@@ -570,6 +608,27 @@ class DeterministicPipeline:
             raise PipelineStepError(
                 PipelineStep.TRIM,
                 f"Объём после трима вне диапазона {self.min_chars}–{self.max_chars} (без пробелов).",
+            )
+
+        missing_locks = [
+            term
+            for term in self.normalized_keywords
+            if LOCK_START_TEMPLATE.format(term=term) not in result.text
+        ]
+        if missing_locks:
+            raise PipelineStepError(
+                PipelineStep.TRIM,
+                "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing_locks)),
+            )
+
+        faq_block = ""
+        if FAQ_START in result.text and FAQ_END in result.text:
+            faq_block = result.text.split(FAQ_START, 1)[1].split(FAQ_END, 1)[0]
+        faq_pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", faq_block)
+        if len(faq_pairs) != 5:
+            raise PipelineStepError(
+                PipelineStep.TRIM,
+                "FAQ должен содержать ровно 5 вопросов после тримминга.",
             )
         self._update_log(
             PipelineStep.TRIM,
