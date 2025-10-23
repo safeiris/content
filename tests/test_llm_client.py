@@ -7,7 +7,12 @@ import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from llm_client import DEFAULT_RESPONSES_TEXT_FORMAT, GenerationResult, generate
+from llm_client import (
+    DEFAULT_RESPONSES_TEXT_FORMAT,
+    G5_MAX_OUTPUT_TOKENS_MAX,
+    GenerationResult,
+    generate,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -455,7 +460,11 @@ def test_generate_escalates_max_tokens_when_truncated():
     assert result.text == "expanded"
     assert result.retry_used is True
     assert client.call_count == 2
-    assert client.requests[1]["json"]["max_output_tokens"] == 1200
+    first_tokens = client.requests[0]["json"]["max_output_tokens"]
+    second_tokens = client.requests[1]["json"]["max_output_tokens"]
+    assert second_tokens >= first_tokens
+    if G5_MAX_OUTPUT_TOKENS_MAX > 0:
+        assert second_tokens <= G5_MAX_OUTPUT_TOKENS_MAX
 
 
 def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):

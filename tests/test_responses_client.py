@@ -12,6 +12,7 @@ from llm_client import (
     RESPONSES_FORMAT_DEFAULT_NAME,
     build_responses_payload,
     generate,
+    sanitize_payload_for_responses,
 )
 
 
@@ -103,7 +104,39 @@ def test_build_responses_payload_for_gpt5_includes_required_fields():
     assert payload["input"].count("user message") == 1
     assert payload["max_output_tokens"] == 64
     assert "temperature" not in payload
-    assert payload["text"]["format"]["type"] == "json_schema"
+    format_block = payload["text"]["format"]
+    assert format_block["type"] == "json_schema"
+    assert "json_schema" not in format_block
+    assert isinstance(format_block.get("schema"), dict)
+
+
+def test_sanitize_payload_converts_legacy_json_schema():
+    legacy_schema = {
+        "type": "object",
+        "properties": {
+            "intro": {"type": "string"},
+        },
+        "required": ["intro"],
+    }
+    payload = {
+        "model": "gpt-5",
+        "input": "hello",
+        "max_output_tokens": 256,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "legacy",
+                "json_schema": {"schema": legacy_schema, "strict": True},
+            }
+        },
+    }
+
+    sanitized, _ = sanitize_payload_for_responses(payload)
+    format_block = sanitized["text"]["format"]
+
+    assert "json_schema" not in format_block
+    assert format_block["schema"] == legacy_schema
+    assert format_block["strict"] is True
 
 
 def test_generate_retries_with_min_token_bump(monkeypatch):
@@ -183,7 +216,8 @@ def test_generate_retries_on_missing_format_name(monkeypatch):
     second_format = dummy_client.requests[1]["json"]["text"]["format"]
     assert first_format["name"] == RESPONSES_FORMAT_DEFAULT_NAME
     assert second_format["name"] == RESPONSES_FORMAT_DEFAULT_NAME
-    assert "name" not in first_format.get("json_schema", {})
+    assert "json_schema" not in first_format
+    assert isinstance(first_format.get("schema"), dict)
     mock_logger.warning.assert_any_call(
         "RESP_RETRY_REASON=format_name_missing route=responses attempt=%d",
         1,

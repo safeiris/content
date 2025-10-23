@@ -81,37 +81,35 @@ RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
 DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
     "type": "json_schema",
     "name": RESPONSES_FORMAT_DEFAULT_NAME,
-    "json_schema": {
-        "schema": {
-            "type": "object",
-            "properties": {
-                "intro": {"type": "string"},
-                "main": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 3,
-                    "maxItems": 6,
-                },
-                "faq": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "q": {"type": "string"},
-                            "a": {"type": "string"},
-                        },
-                        "required": ["q", "a"],
-                    },
-                    "minItems": 5,
-                    "maxItems": 5,
-                },
-                "conclusion": {"type": "string"},
+    "schema": {
+        "type": "object",
+        "properties": {
+            "intro": {"type": "string"},
+            "main": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 3,
+                "maxItems": 6,
             },
-            "required": ["intro", "main", "faq", "conclusion"],
-            "additionalProperties": False,
+            "faq": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "q": {"type": "string"},
+                        "a": {"type": "string"},
+                    },
+                    "required": ["q", "a"],
+                },
+                "minItems": 5,
+                "maxItems": 5,
+            },
+            "conclusion": {"type": "string"},
         },
-        "strict": True,
+        "required": ["intro", "main", "faq", "conclusion"],
+        "additionalProperties": False,
     },
+    "strict": True,
 }
 
 MODEL_PROVIDER_MAP = {
@@ -210,7 +208,11 @@ def build_responses_payload(
     joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
     joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
 
-    format_block = deepcopy(text_format or DEFAULT_RESPONSES_TEXT_FORMAT)
+    format_block, _, _ = _prepare_text_format_for_request(
+        text_format or DEFAULT_RESPONSES_TEXT_FORMAT,
+        context="build_payload",
+        log_on_migration=False,
+    )
 
     payload: Dict[str, object] = {
         "model": str(model).strip(),
@@ -248,22 +250,138 @@ def _shrink_responses_input(text_value: str) -> str:
     return text_value[:target]
 
 
+def _coerce_bool(value: object) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _sanitize_text_format_in_place(format_block: Dict[str, object]) -> Tuple[bool, bool]:
+    migrated = False
+    if not isinstance(format_block, dict):
+        return False, False
+
+    allowed_keys = {"type", "name", "schema", "strict"}
+
+    schema_value = format_block.get("schema")
+    if not isinstance(schema_value, dict):
+        if "schema" in format_block:
+            format_block.pop("schema", None)
+            migrated = True
+        schema_value = None
+
+    legacy_block = format_block.pop("json_schema", None)
+    if isinstance(legacy_block, dict):
+        schema_candidate = legacy_block.get("schema")
+        if isinstance(schema_candidate, dict):
+            format_block["schema"] = deepcopy(schema_candidate)
+            schema_value = format_block["schema"]
+        strict_candidate = legacy_block.get("strict")
+        strict_value = _coerce_bool(strict_candidate)
+        if strict_value is not None and "strict" not in format_block:
+            format_block["strict"] = strict_value
+        migrated = True
+
+    type_value = format_block.get("type")
+    if isinstance(type_value, str):
+        trimmed = type_value.strip()
+        if trimmed:
+            if trimmed != type_value:
+                format_block["type"] = trimmed
+                migrated = True
+        else:
+            format_block.pop("type", None)
+            migrated = True
+    elif type_value is not None:
+        trimmed = str(type_value).strip()
+        if trimmed:
+            format_block["type"] = trimmed
+            migrated = True
+        else:
+            format_block.pop("type", None)
+            migrated = True
+
+    name_value = format_block.get("name")
+    if isinstance(name_value, str):
+        trimmed = name_value.strip()
+        if trimmed:
+            if trimmed != name_value:
+                format_block["name"] = trimmed
+                migrated = True
+        else:
+            format_block.pop("name", None)
+            migrated = True
+    elif name_value is not None:
+        trimmed = str(name_value).strip()
+        if trimmed:
+            format_block["name"] = trimmed
+            migrated = True
+        else:
+            format_block.pop("name", None)
+            migrated = True
+
+    strict_value = format_block.get("strict")
+    strict_bool = _coerce_bool(strict_value)
+    if strict_bool is None:
+        if "strict" in format_block:
+            format_block.pop("strict", None)
+            migrated = True
+    else:
+        if strict_value is not strict_bool:
+            format_block["strict"] = strict_bool
+            migrated = True
+
+    for key in list(format_block.keys()):
+        if key not in allowed_keys:
+            format_block.pop(key, None)
+            migrated = True
+
+    has_schema = isinstance(format_block.get("schema"), dict)
+    return migrated, has_schema
+
+
+def _prepare_text_format_for_request(
+    template: Optional[Dict[str, object]],
+    *,
+    context: str,
+    log_on_migration: bool = True,
+) -> Tuple[Dict[str, object], bool, bool]:
+    if not isinstance(template, dict):
+        return {}, False, False
+    working_copy: Dict[str, object] = deepcopy(template)
+    migrated, has_schema = _sanitize_text_format_in_place(working_copy)
+    if migrated and log_on_migration:
+        fmt_type = str(working_copy.get("type", "")).strip() or "-"
+        fmt_name = str(working_copy.get("name", "")).strip() or "-"
+        LOGGER.info(
+            "LOG:RESP_FORMAT_MIGRATED context=%s type=%s name=%s has_schema=%s",
+            context,
+            fmt_type,
+            fmt_name,
+            has_schema,
+        )
+    return working_copy, migrated, has_schema
+
+
 def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, object]]:
     if not isinstance(text_value, dict):
         return None
     format_block = text_value.get("format")
     if not isinstance(format_block, dict):
         return None
-    sanitized_format: Dict[str, object] = {}
-    fmt_type = format_block.get("type")
-    if isinstance(fmt_type, str) and fmt_type.strip():
-        sanitized_format["type"] = fmt_type.strip()
-    name_value = format_block.get("name")
-    if isinstance(name_value, str) and name_value.strip():
-        sanitized_format["name"] = name_value.strip()
-    json_schema_value = format_block.get("json_schema")
-    if isinstance(json_schema_value, dict):
-        sanitized_format["json_schema"] = json_schema_value
+    sanitized_format, _, _ = _prepare_text_format_for_request(
+        format_block,
+        context="sanitize_payload",
+        log_on_migration=True,
+    )
     if not sanitized_format:
         return None
     return {"format": sanitized_format}
@@ -354,9 +472,29 @@ def _store_responses_response_snapshot(payload: Dict[str, object]) -> None:
         LOGGER.debug("failed to persist Responses response snapshot: %s", exc)
 
 
+def _infer_responses_step(payload_snapshot: Dict[str, object]) -> str:
+    if not isinstance(payload_snapshot, dict):
+        return "unknown"
+    text_block = payload_snapshot.get("text")
+    if isinstance(text_block, dict):
+        format_block = text_block.get("format")
+        if isinstance(format_block, dict):
+            name_value = format_block.get("name")
+            if isinstance(name_value, str):
+                trimmed = name_value.strip()
+                if trimmed:
+                    step = trimmed
+                    if "_" in trimmed:
+                        step = trimmed.rsplit("_", 1)[-1]
+                    return step.lower()
+    return "unknown"
+
+
 def _handle_responses_http_error(
     error: httpx.HTTPStatusError,
     payload_snapshot: Dict[str, object],
+    *,
+    step: Optional[str] = None,
 ) -> None:
     """Log a concise message and persist diagnostics for Responses failures."""
 
@@ -379,11 +517,13 @@ def _handle_responses_http_error(
         if not message:
             message = response.text.strip()
     truncated = (message or "")[:200]
+    step_name = (step or _infer_responses_step(payload_snapshot) or "unknown").strip() or "unknown"
     LOGGER.error(
-        'Responses API error: status=%s error.type=%s error.message="%s"',
+        'Responses API error: status=%s error.type=%s error.message="%s" step=%s',
         status,
         error_type or "unknown",
         truncated,
+        step_name,
     )
     if not error_payload and response is not None:
         # Ensure we persist at least the textual payload
@@ -1153,13 +1293,24 @@ def generate(
         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
 
         raw_format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
-        if isinstance(raw_format_template, dict):
-            format_template = deepcopy(raw_format_template)
-        else:
-            format_template = deepcopy(DEFAULT_RESPONSES_TEXT_FORMAT)
+        format_template, _, _ = _prepare_text_format_for_request(
+            raw_format_template,
+            context="template",
+            log_on_migration=False,
+        )
+        text_block_candidate = sanitized_payload.get("text")
+        if isinstance(text_block_candidate, dict):
+            format_candidate = text_block_candidate.get("format")
+            if isinstance(format_candidate, dict) and format_candidate:
+                format_template = deepcopy(format_candidate)
+        if not isinstance(format_template, dict):
+            format_template = {}
+        _sanitize_text_format_in_place(format_template)
         fmt_template_type = str(format_template.get("type", "")).strip().lower()
         if fmt_template_type == "json_schema":
-            format_template["name"] = RESPONSES_FORMAT_DEFAULT_NAME
+            current_name = str(format_template.get("name", "")).strip()
+            if current_name != RESPONSES_FORMAT_DEFAULT_NAME:
+                format_template["name"] = RESPONSES_FORMAT_DEFAULT_NAME
 
         def _clone_text_format() -> Dict[str, object]:
             return deepcopy(format_template)
@@ -1176,23 +1327,18 @@ def generate(
             has_schema = False
             fixed = False
             if isinstance(format_block, dict):
+                _sanitize_text_format_in_place(format_block)
                 fmt_type = str(format_block.get("type", "")).strip() or "-"
-                has_schema = isinstance(format_block.get("json_schema"), dict)
+                has_schema = isinstance(format_block.get("schema"), dict)
+                current_name = str(format_block.get("name", "")).strip()
                 if fmt_type.lower() == "json_schema":
-                    current_name = str(format_block.get("name", "")).strip()
                     desired = RESPONSES_FORMAT_DEFAULT_NAME
                     if current_name != desired:
                         format_block["name"] = desired
                         current_name = desired
                         fixed = True
-                    schema_block = format_block.get("json_schema")
-                    if isinstance(schema_block, dict) and "name" in schema_block:
-                        schema_block.pop("name", None)
-                    fmt_name = current_name or desired
-                else:
-                    current_name = str(format_block.get("name", "")).strip()
-                    if current_name:
-                        fmt_name = current_name
+                if current_name:
+                    fmt_name = current_name
             return fmt_type, fmt_name, has_schema, fixed
 
         def _ensure_format_name(
@@ -1211,13 +1357,22 @@ def generate(
 
         _apply_text_format(sanitized_payload)
 
+        raw_max_tokens = sanitized_payload.get("max_output_tokens")
         try:
-            max_tokens_value = int(sanitized_payload.get("max_output_tokens", 1200))
+            max_tokens_value = int(raw_max_tokens)
         except (TypeError, ValueError):
-            max_tokens_value = 1200
+            max_tokens_value = 0
         if max_tokens_value <= 0:
-            max_tokens_value = 1200
-        max_tokens_value = min(max_tokens_value, 1200)
+            fallback_default = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
+            max_tokens_value = fallback_default
+        upper_cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+        if upper_cap is not None and max_tokens_value > upper_cap:
+            LOGGER.info(
+                "responses max_output_tokens clamped requested=%s limit=%s",
+                raw_max_tokens,
+                upper_cap,
+            )
+            max_tokens_value = upper_cap
         sanitized_payload["max_output_tokens"] = max_tokens_value
 
         supports_temperature = _supports_temperature(target_model)
@@ -1246,19 +1401,24 @@ def generate(
             LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
             text_block = snapshot.get("text")
             format_type = "-"
-            schema_name = "-"
+            format_name = "-"
+            has_schema = False
             if isinstance(text_block, dict):
                 format_block = text_block.get("format")
                 if isinstance(format_block, dict):
                     fmt = format_block.get("type")
                     if isinstance(fmt, str) and fmt.strip():
                         format_type = fmt.strip()
-                    schema_block = format_block.get("json_schema")
-                    if isinstance(schema_block, dict):
-                        schema_candidate = schema_block.get("name")
-                        if isinstance(schema_candidate, str) and schema_candidate.strip():
-                            schema_name = schema_candidate.strip()
-            LOGGER.info("responses text_format type=%s schema=%s", format_type, schema_name)
+                    name_candidate = format_block.get("name")
+                    if isinstance(name_candidate, str) and name_candidate.strip():
+                        format_name = name_candidate.strip()
+                    has_schema = isinstance(format_block.get("schema"), dict)
+            LOGGER.info(
+                "responses text_format type=%s name=%s has_schema=%s",
+                format_type,
+                format_name,
+                has_schema,
+            )
 
         def _extract_metadata(payload: Dict[str, object]) -> Dict[str, object]:
             status_value = payload.get("status")
@@ -1499,7 +1659,8 @@ def generate(
                         )
                         continue
                 last_error = exc
-                _handle_responses_http_error(exc, current_payload)
+                step_label = _infer_responses_step(current_payload)
+                _handle_responses_http_error(exc, current_payload, step=step_label)
                 break
             except Exception as exc:  # noqa: BLE001
                 if isinstance(exc, KeyboardInterrupt):

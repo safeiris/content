@@ -1,122 +1,8 @@
-diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 8fd26c89d3301eb399b6e1fd8aceda84f9bcdfd2..41da91d5c3e4e5953cceb371202317852def89a1 100644
---- a/deterministic_pipeline.py
-+++ b/deterministic_pipeline.py
-@@ -1,50 +1,51 @@
- """LLM-driven content pipeline with explicit step-level guarantees."""
- 
- from __future__ import annotations
- 
- import json
- import json
- import logging
- import re
- import textwrap
- import time
- from dataclasses import dataclass, field
- from enum import Enum
- from typing import Dict, Iterable, List, Optional, Sequence, Tuple
- 
- from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
- from faq_builder import _normalize_entry
- from keyword_injector import (
-     KeywordInjectionResult,
-     LOCK_END,
-     LOCK_START_TEMPLATE,
-     build_term_pattern,
-     inject_keywords,
- )
- from length_trimmer import TrimResult, TrimValidationError, trim_text
- from prompt_templates import load_template
-+from skeleton_utils import normalize_skeleton_payload
- from validators import (
-     ValidationError,
-     ValidationResult,
-     length_no_spaces,
-     strip_jsonld,
-     validate_article,
- )
- 
- 
- LOGGER = logging.getLogger("content_factory.pipeline")
- 
- FAQ_START = "<!--FAQ_START-->"
- FAQ_END = "<!--FAQ_END-->"
- 
- _TEMPLATE_SNIPPETS = [
-     "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
-     "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист",
-     "В выводах собираем план действий, назначаем контрольные даты",
- ]
- 
- 
- class PipelineStep(str, Enum):
-     SKELETON = "skeleton"
-     KEYWORDS = "keywords"
-     FAQ = "faq"
-@@ -597,50 +598,51 @@ class DeterministicPipeline:
-                 raise
-             metadata_snapshot = result.metadata or {}
-             status = str(metadata_snapshot.get("status") or "ok").lower()
-             if status == "incomplete" or metadata_snapshot.get("incomplete_reason"):
-                 LOGGER.warning(
-                     "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
-                     attempt,
-                     status,
-                     metadata_snapshot.get("incomplete_reason") or "",
-                 )
-                 skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                 continue
-             raw_text = result.text.strip()
-             if "<response_json>" in raw_text and "</response_json>" in raw_text:
-                 try:
-                     raw_text = raw_text.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
-                 except Exception:  # pragma: no cover - defensive
-                     raw_text = raw_text
-             if not raw_text:
-                 last_error = PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
-                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=empty", attempt)
-                 skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
-                 continue
-             try:
-                 payload = json.loads(raw_text)
-+                payload = normalize_skeleton_payload(payload)
-                 LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
-             except json.JSONDecodeError as exc:
-                 LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, exc)
-                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
-                 skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                 last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
-                 json_error_count += 1
-                 if not use_fallback and json_error_count >= 2:
-                     LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
-                     use_fallback = True
-                     attempt = 0
-                     continue
-                 continue
-             try:
-                 markdown, summary = self._render_skeleton_markdown(payload)
-                 snapshot = dict(payload)
-                 snapshot["outline"] = summary.get("outline", [])
-                 if "faq" in summary:
-                     snapshot["faq"] = summary.get("faq", [])
-                 self.skeleton_payload = snapshot
-                 LOGGER.info("SKELETON_RENDERED_WITH_MARKERS outline=%s", ",".join(summary.get("outline", [])))
-             except Exception as exc:  # noqa: BLE001
-                 last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
-                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=%s", attempt, exc)
-                 payload = None
 diff --git a/llm_client.py b/llm_client.py
-index b8c66c3d397b1546606ab31fadebaaf6e6c7bdd3..256e4bc1aa5b2ffe1a831b55cf9b2580570dce63 100644
+index 256e4bc1aa5b2ffe1a831b55cf9b2580570dce63..1f3e175a5cca2b5258a9245eb4071bc247ea3222 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -53,54 +53,57 @@ def _supports_temperature(model: str) -> bool:
- 
- def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
-     """Detect the specific 400 error about max_output_tokens being too small."""
- 
-     if response is None:
-         return False
+@@ -59,81 +59,79 @@ def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
  
      message = ""
      try:
@@ -136,40 +22,146 @@ index b8c66c3d397b1546606ab31fadebaaf6e6c7bdd3..256e4bc1aa5b2ffe1a831b55cf9b2580
          return False
      return "expected" in normalized and ">=" in normalized and "16" in normalized
  
-+RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
-+
-+
+ RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
+ 
+ 
  DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
      "type": "json_schema",
-+    "name": RESPONSES_FORMAT_DEFAULT_NAME,
-     "json_schema": {
--        "name": "seo_article_skeleton",
-         "schema": {
-             "type": "object",
-             "properties": {
-                 "intro": {"type": "string"},
-                 "main": {
-                     "type": "array",
-                     "items": {"type": "string"},
-                     "minItems": 3,
-                     "maxItems": 6,
-                 },
-                 "faq": {
-                     "type": "array",
-                     "items": {
-                         "type": "object",
-                         "properties": {
-                             "q": {"type": "string"},
-                             "a": {"type": "string"},
-                         },
-                         "required": ["q", "a"],
+     "name": RESPONSES_FORMAT_DEFAULT_NAME,
+-    "json_schema": {
+-        "schema": {
+-            "type": "object",
+-            "properties": {
+-                "intro": {"type": "string"},
+-                "main": {
+-                    "type": "array",
+-                    "items": {"type": "string"},
+-                    "minItems": 3,
+-                    "maxItems": 6,
+-                },
+-                "faq": {
+-                    "type": "array",
+-                    "items": {
+-                        "type": "object",
+-                        "properties": {
+-                            "q": {"type": "string"},
+-                            "a": {"type": "string"},
+-                        },
+-                        "required": ["q", "a"],
++    "schema": {
++        "type": "object",
++        "properties": {
++            "intro": {"type": "string"},
++            "main": {
++                "type": "array",
++                "items": {"type": "string"},
++                "minItems": 3,
++                "maxItems": 6,
++            },
++            "faq": {
++                "type": "array",
++                "items": {
++                    "type": "object",
++                    "properties": {
++                        "q": {"type": "string"},
++                        "a": {"type": "string"},
                      },
-                     "minItems": 5,
-                     "maxItems": 5,
+-                    "minItems": 5,
+-                    "maxItems": 5,
++                    "required": ["q", "a"],
                  },
-                 "conclusion": {"type": "string"},
+-                "conclusion": {"type": "string"},
++                "minItems": 5,
++                "maxItems": 5,
              },
-@@ -233,50 +236,53 @@ def _shrink_responses_input(text_value: str) -> str:
+-            "required": ["intro", "main", "faq", "conclusion"],
+-            "additionalProperties": False,
++            "conclusion": {"type": "string"},
+         },
+-        "strict": True,
++        "required": ["intro", "main", "faq", "conclusion"],
++        "additionalProperties": False,
+     },
++    "strict": True,
+ }
+ 
+ MODEL_PROVIDER_MAP = {
+     "gpt-5": "openai",
+     "gpt-4o": "openai",
+     "gpt-4o-mini": "openai",
+ }
+ 
+ PROVIDER_API_URLS = {
+     "openai": "https://api.openai.com/v1/chat/completions",
+ }
+ 
+ 
+ LOGGER = logging.getLogger(__name__)
+ RAW_RESPONSE_PATH = Path("artifacts/debug/last_raw_response.json")
+ RESPONSES_RESPONSE_PATH = Path("artifacts/debug/last_gpt5_responses_response.json")
+ RESPONSES_REQUEST_PATH = Path("artifacts/debug/last_gpt5_responses_request.json")
+ 
+ 
+ @dataclass(frozen=True)
+ class GenerationResult:
+     """Container describing the outcome of a text generation call."""
+ 
+     text: str
+     model_used: str
+@@ -188,104 +186,224 @@ def _build_force_model_error(reason: str, details: Dict[str, object]) -> Runtime
+ 
+ def build_responses_payload(
+     model: str,
+     system_text: Optional[str],
+     user_text: Optional[str],
+     max_tokens: int,
+     *,
+     text_format: Optional[Dict[str, object]] = None,
+ ) -> Dict[str, object]:
+     """Construct a minimal Responses API payload for GPT-5 models."""
+ 
+     sections: List[str] = []
+ 
+     system_block = (system_text or "").strip()
+     if system_block:
+         sections.append(system_block)
+ 
+     user_block = (user_text or "").strip()
+     if user_block:
+         sections.append(user_block)
+ 
+     joined_input = "\n\n".join(section for section in sections if section)
+     joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
+     joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
+ 
+-    format_block = deepcopy(text_format or DEFAULT_RESPONSES_TEXT_FORMAT)
++    format_block, _, _ = _prepare_text_format_for_request(
++        text_format or DEFAULT_RESPONSES_TEXT_FORMAT,
++        context="build_payload",
++        log_on_migration=False,
++    )
+ 
+     payload: Dict[str, object] = {
+         "model": str(model).strip(),
+         "input": joined_input.strip(),
+         "max_output_tokens": int(max_tokens),
+         "text": {"format": format_block},
+     }
+     if _supports_temperature(model):
+         payload["temperature"] = 0.3
+     return payload
+ 
+ 
+ def _shrink_responses_input(text_value: str) -> str:
+     """Return a slightly condensed version of the Responses input payload."""
+ 
+     if not text_value:
+         return text_value
+ 
+     normalized_lines: List[str] = []
+     seen: set[str] = set()
+     for raw_line in text_value.splitlines():
+         stripped = raw_line.strip()
          if not stripped:
              continue
          fingerprint = re.sub(r"\s+", " ", stripped.lower())
@@ -185,22 +177,148 @@ index b8c66c3d397b1546606ab31fadebaaf6e6c7bdd3..256e4bc1aa5b2ffe1a831b55cf9b2580
      return text_value[:target]
  
  
++def _coerce_bool(value: object) -> Optional[bool]:
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, (int, float)):
++        return bool(value)
++    if isinstance(value, str):
++        lowered = value.strip().lower()
++        if lowered in {"1", "true", "yes", "on"}:
++            return True
++        if lowered in {"0", "false", "no", "off"}:
++            return False
++    return None
++
++
++def _sanitize_text_format_in_place(format_block: Dict[str, object]) -> Tuple[bool, bool]:
++    migrated = False
++    if not isinstance(format_block, dict):
++        return False, False
++
++    allowed_keys = {"type", "name", "schema", "strict"}
++
++    schema_value = format_block.get("schema")
++    if not isinstance(schema_value, dict):
++        if "schema" in format_block:
++            format_block.pop("schema", None)
++            migrated = True
++        schema_value = None
++
++    legacy_block = format_block.pop("json_schema", None)
++    if isinstance(legacy_block, dict):
++        schema_candidate = legacy_block.get("schema")
++        if isinstance(schema_candidate, dict):
++            format_block["schema"] = deepcopy(schema_candidate)
++            schema_value = format_block["schema"]
++        strict_candidate = legacy_block.get("strict")
++        strict_value = _coerce_bool(strict_candidate)
++        if strict_value is not None and "strict" not in format_block:
++            format_block["strict"] = strict_value
++        migrated = True
++
++    type_value = format_block.get("type")
++    if isinstance(type_value, str):
++        trimmed = type_value.strip()
++        if trimmed:
++            if trimmed != type_value:
++                format_block["type"] = trimmed
++                migrated = True
++        else:
++            format_block.pop("type", None)
++            migrated = True
++    elif type_value is not None:
++        trimmed = str(type_value).strip()
++        if trimmed:
++            format_block["type"] = trimmed
++            migrated = True
++        else:
++            format_block.pop("type", None)
++            migrated = True
++
++    name_value = format_block.get("name")
++    if isinstance(name_value, str):
++        trimmed = name_value.strip()
++        if trimmed:
++            if trimmed != name_value:
++                format_block["name"] = trimmed
++                migrated = True
++        else:
++            format_block.pop("name", None)
++            migrated = True
++    elif name_value is not None:
++        trimmed = str(name_value).strip()
++        if trimmed:
++            format_block["name"] = trimmed
++            migrated = True
++        else:
++            format_block.pop("name", None)
++            migrated = True
++
++    strict_value = format_block.get("strict")
++    strict_bool = _coerce_bool(strict_value)
++    if strict_bool is None:
++        if "strict" in format_block:
++            format_block.pop("strict", None)
++            migrated = True
++    else:
++        if strict_value is not strict_bool:
++            format_block["strict"] = strict_bool
++            migrated = True
++
++    for key in list(format_block.keys()):
++        if key not in allowed_keys:
++            format_block.pop(key, None)
++            migrated = True
++
++    has_schema = isinstance(format_block.get("schema"), dict)
++    return migrated, has_schema
++
++
++def _prepare_text_format_for_request(
++    template: Optional[Dict[str, object]],
++    *,
++    context: str,
++    log_on_migration: bool = True,
++) -> Tuple[Dict[str, object], bool, bool]:
++    if not isinstance(template, dict):
++        return {}, False, False
++    working_copy: Dict[str, object] = deepcopy(template)
++    migrated, has_schema = _sanitize_text_format_in_place(working_copy)
++    if migrated and log_on_migration:
++        fmt_type = str(working_copy.get("type", "")).strip() or "-"
++        fmt_name = str(working_copy.get("name", "")).strip() or "-"
++        LOGGER.info(
++            "LOG:RESP_FORMAT_MIGRATED context=%s type=%s name=%s has_schema=%s",
++            context,
++            fmt_type,
++            fmt_name,
++            has_schema,
++        )
++    return working_copy, migrated, has_schema
++
++
  def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, object]]:
      if not isinstance(text_value, dict):
          return None
      format_block = text_value.get("format")
      if not isinstance(format_block, dict):
          return None
-     sanitized_format: Dict[str, object] = {}
-     fmt_type = format_block.get("type")
-     if isinstance(fmt_type, str) and fmt_type.strip():
-         sanitized_format["type"] = fmt_type.strip()
-+    name_value = format_block.get("name")
-+    if isinstance(name_value, str) and name_value.strip():
-+        sanitized_format["name"] = name_value.strip()
-     json_schema_value = format_block.get("json_schema")
-     if isinstance(json_schema_value, dict):
-         sanitized_format["json_schema"] = json_schema_value
+-    sanitized_format: Dict[str, object] = {}
+-    fmt_type = format_block.get("type")
+-    if isinstance(fmt_type, str) and fmt_type.strip():
+-        sanitized_format["type"] = fmt_type.strip()
+-    name_value = format_block.get("name")
+-    if isinstance(name_value, str) and name_value.strip():
+-        sanitized_format["name"] = name_value.strip()
+-    json_schema_value = format_block.get("json_schema")
+-    if isinstance(json_schema_value, dict):
+-        sanitized_format["json_schema"] = json_schema_value
++    sanitized_format, _, _ = _prepare_text_format_for_request(
++        format_block,
++        context="sanitize_payload",
++        log_on_migration=True,
++    )
      if not sanitized_format:
          return None
      return {"format": sanitized_format}
@@ -223,182 +341,114 @@ index b8c66c3d397b1546606ab31fadebaaf6e6c7bdd3..256e4bc1aa5b2ffe1a831b55cf9b2580
              if key == "model":
                  sanitized[key] = trimmed
                  continue
-@@ -818,140 +824,158 @@ def _log_parse_chain(parse_flags: Dict[str, object], *, retry: int, fallback: st
-     )
+             if key == "input":
+                 sanitized[key] = trimmed
+                 continue
+@@ -332,80 +450,102 @@ def _store_responses_request_snapshot(payload: Dict[str, object]) -> None:
+             preview = input_value[:200]
+         else:
+             preview = str(input_value)[:200]
+         snapshot["input_preview"] = preview
+         RESPONSES_REQUEST_PATH.write_text(
+             json.dumps(snapshot, ensure_ascii=False, indent=2),
+             encoding="utf-8",
+         )
+     except Exception as exc:  # pragma: no cover - diagnostics only
+         LOGGER.debug("failed to persist Responses request snapshot: %s", exc)
  
  
- def _should_retry(exc: BaseException) -> bool:
-     if isinstance(exc, httpx.HTTPStatusError):
-         status = exc.response.status_code
-         if status in {408, 409, 425, 429, 500, 502, 503, 504}:
-             return True
-     if isinstance(exc, httpx.TimeoutException):
-         return True
-     if isinstance(exc, httpx.TransportError):
-         return True
-     return False
+ def _store_responses_response_snapshot(payload: Dict[str, object]) -> None:
+     """Persist the latest Responses API payload for diagnostics."""
  
- 
- def _is_responses_fallback_allowed(exc: BaseException) -> bool:
-     inspected: List[BaseException] = []
-     current: Optional[BaseException] = exc
-     while current is not None and current not in inspected:
-         inspected.append(current)
-         if isinstance(current, (httpx.TimeoutException, httpx.TransportError)):
-             return True
-         if isinstance(current, httpx.HTTPStatusError):
-             response = current.response
-             status = response.status_code if response is not None else None
--            if status and (status >= 500 or status in {408, 409, 425, 429, 400}):
-+            if getattr(current, "responses_no_fallback", False):
-+                return False
-+            if status and status >= 500:
-+                return True
-+            if status in {408, 409, 425, 429}:
-                 return True
-+            if status == 400 and response is not None:
-+                message = _extract_error_message(response).lower()
-+                if "text.format" in message or "max_output_tokens" in message:
-+                    return False
-         current = getattr(current, "__cause__", None)
-     return False
- 
- 
- def _describe_error(exc: BaseException) -> str:
-     status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
-     if status:
-         return str(status)
-     if isinstance(exc, httpx.HTTPStatusError):  # pragma: no cover - depends on response type
-         return str(exc.response.status_code)
-     return exc.__class__.__name__
- 
- 
- def _raise_for_last_error(last_error: BaseException) -> None:
-     if isinstance(last_error, httpx.HTTPStatusError):
-         status_code = last_error.response.status_code
-         detail = ""
-         try:
-             payload = last_error.response.json()
-             if isinstance(payload, dict):
-                 detail = (
-                     payload.get("error", {}).get("message")
-                     if isinstance(payload.get("error"), dict)
-                     else payload.get("message", "")
-                 ) or ""
-         except ValueError:
-             detail = last_error.response.text.strip()
-         message = f"Ошибка сервиса OpenAI: HTTP {status_code}"
-         if detail:
-             message = f"{message} — {detail}"
-         raise RuntimeError(message) from last_error
-     if isinstance(last_error, httpx.TimeoutException):
-         raise RuntimeError(
-             "Сетевой таймаут при обращении к модели. Проверьте соединение и повторите попытку."
-         ) from last_error
-     if isinstance(last_error, httpx.TransportError):
-         raise RuntimeError(
-             "Сетевой сбой при обращении к модели. Проверьте соединение и повторите попытку."
-         ) from last_error
-     raise RuntimeError(f"Не удалось получить ответ модели: {last_error}") from last_error
- 
- 
- def _extract_unknown_parameter_name(response: httpx.Response) -> Optional[str]:
--    message: str = ""
--    try:
--        payload = response.json()
--    except ValueError:
--        payload = None
--    if isinstance(payload, dict):
--        error_block = payload.get("error")
--        if isinstance(error_block, dict):
--            message = str(error_block.get("message", ""))
--    if not message:
--        message = response.text or ""
--    message = message.strip()
-+    message = _extract_error_message(response)
-     if not message:
-         return None
-     lowered = message.lower()
-     if "unknown parameter" not in lowered and "unsupported parameter" not in lowered:
-         return None
-     marker = ":"
-     if marker in message:
-         remainder = message.split(marker, 1)[1].strip()
-     else:
-         remainder = message
-     if remainder.startswith("'") and "'" in remainder[1:]:
-         return remainder.split("'", 2)[1].strip()
-     return remainder.split()[0].strip("'\"") or None
- 
- 
--def _has_text_format_migration_hint(response: httpx.Response) -> bool:
-+def _extract_error_message(response: httpx.Response) -> str:
-     message: str = ""
      try:
-         payload = response.json()
-     except ValueError:
-         payload = None
-     if isinstance(payload, dict):
-         error_block = payload.get("error")
-         if isinstance(error_block, dict):
-             message = str(error_block.get("message", ""))
-     if not message:
-         message = response.text or ""
--    message = message.strip()
-+    return (message or "").strip()
-+
-+
-+def _has_text_format_migration_hint(response: httpx.Response) -> bool:
-+    message: str = ""
-+    message = _extract_error_message(response)
-     if not message:
-         return False
-     return "moved to 'text.format'" in message.lower()
+         RESPONSES_RESPONSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+         RESPONSES_RESPONSE_PATH.write_text(
+             json.dumps(payload, ensure_ascii=False, indent=2),
+             encoding="utf-8",
+         )
+     except Exception as exc:  # pragma: no cover - diagnostics only
+         LOGGER.debug("failed to persist Responses response snapshot: %s", exc)
  
  
-+def _needs_format_name_retry(response: httpx.Response) -> bool:
-+    message = _extract_error_message(response)
-+    if not message:
-+        return False
-+    lowered = message.lower()
-+    if "text.format.name" in lowered:
-+        return True
-+    if "text.format" in lowered and "missing" in lowered and "name" in lowered:
-+        return True
-+    if "unsupported parameter" in lowered and "text.format" in lowered:
-+        return True
-+    if "moved to text.format" in lowered and "name" in lowered:
-+        return True
-+    return False
++def _infer_responses_step(payload_snapshot: Dict[str, object]) -> str:
++    if not isinstance(payload_snapshot, dict):
++        return "unknown"
++    text_block = payload_snapshot.get("text")
++    if isinstance(text_block, dict):
++        format_block = text_block.get("format")
++        if isinstance(format_block, dict):
++            name_value = format_block.get("name")
++            if isinstance(name_value, str):
++                trimmed = name_value.strip()
++                if trimmed:
++                    step = trimmed
++                    if "_" in trimmed:
++                        step = trimmed.rsplit("_", 1)[-1]
++                    return step.lower()
++    return "unknown"
 +
 +
- def _make_request(
-     http_client: httpx.Client,
-     *,
-     api_url: str,
-     headers: Dict[str, str],
-     payload: Dict[str, object],
-     schedule: List[float],
- ) -> Tuple[Dict[str, object], bool]:
-     last_error: Optional[BaseException] = None
-     shimmed_param = False
-     stripped_param: Optional[str] = None
-     current_payload: Dict[str, object] = dict(payload)
-     attempt_index = 0
-     while attempt_index < MAX_RETRIES:
-         attempt_index += 1
+ def _handle_responses_http_error(
+     error: httpx.HTTPStatusError,
+     payload_snapshot: Dict[str, object],
++    *,
++    step: Optional[str] = None,
+ ) -> None:
+     """Log a concise message and persist diagnostics for Responses failures."""
+ 
+     response = error.response
+     status = response.status_code if response is not None else "unknown"
+     error_payload: Dict[str, object] = {}
+     error_type = ""
+     message = ""
+     if response is not None:
          try:
-             response = http_client.post(api_url, headers=headers, json=current_payload)
-             response.raise_for_status()
-             data = response.json()
-             if isinstance(data, dict):
-                 return data, shimmed_param
-             raise RuntimeError("Модель вернула неожиданный формат ответа.")
-         except EmptyCompletionError:
-             raise
-         except httpx.HTTPStatusError as exc:
-@@ -1106,59 +1130,107 @@ def generate(
-         user_segments: List[str] = []
+             parsed = response.json()
+         except ValueError:
+             parsed = None
+         if isinstance(parsed, dict):
+             error_payload = parsed
+             error_block = parsed.get("error")
+             if isinstance(error_block, dict):
+                 error_type = str(error_block.get("type", ""))
+                 message = str(error_block.get("message", ""))
+         if not message:
+             message = response.text.strip()
+     truncated = (message or "")[:200]
++    step_name = (step or _infer_responses_step(payload_snapshot) or "unknown").strip() or "unknown"
+     LOGGER.error(
+-        'Responses API error: status=%s error.type=%s error.message="%s"',
++        'Responses API error: status=%s error.type=%s error.message="%s" step=%s',
+         status,
+         error_type or "unknown",
+         truncated,
++        step_name,
+     )
+     if not error_payload and response is not None:
+         # Ensure we persist at least the textual payload
+         error_payload = {
+             "status": status,
+             "error": {
+                 "type": error_type or "unknown",
+                 "message": message,
+             },
+         }
+     _store_responses_request_snapshot(payload_snapshot)
+     if error_payload:
+         _store_responses_response_snapshot(error_payload)
+ 
+ 
+ def _collect_text_parts(parts: List[object]) -> str:
+     collected: List[str] = []
+     for part in parts:
+         candidate: Optional[str] = None
+         if isinstance(part, dict):
+             text_value = part.get("text")
+             if isinstance(text_value, str):
+                 candidate = text_value
+             else:
+                 content_value = part.get("content")
+@@ -1131,156 +1271,176 @@ def generate(
          for item in payload_messages:
              role = str(item.get("role", "")).strip().lower()
              content = str(item.get("content", "")).strip()
@@ -423,15 +473,30 @@ index b8c66c3d397b1546606ab31fadebaaf6e6c7bdd3..256e4bc1aa5b2ffe1a831b55cf9b2580
          )
          sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
  
--        format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
-+        raw_format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
-+        if isinstance(raw_format_template, dict):
-+            format_template = deepcopy(raw_format_template)
-+        else:
-+            format_template = deepcopy(DEFAULT_RESPONSES_TEXT_FORMAT)
-+        fmt_template_type = str(format_template.get("type", "")).strip().lower()
-+        if fmt_template_type == "json_schema":
-+            format_template["name"] = RESPONSES_FORMAT_DEFAULT_NAME
+         raw_format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
+-        if isinstance(raw_format_template, dict):
+-            format_template = deepcopy(raw_format_template)
+-        else:
+-            format_template = deepcopy(DEFAULT_RESPONSES_TEXT_FORMAT)
++        format_template, _, _ = _prepare_text_format_for_request(
++            raw_format_template,
++            context="template",
++            log_on_migration=False,
++        )
++        text_block_candidate = sanitized_payload.get("text")
++        if isinstance(text_block_candidate, dict):
++            format_candidate = text_block_candidate.get("format")
++            if isinstance(format_candidate, dict) and format_candidate:
++                format_template = deepcopy(format_candidate)
++        if not isinstance(format_template, dict):
++            format_template = {}
++        _sanitize_text_format_in_place(format_template)
+         fmt_template_type = str(format_template.get("type", "")).strip().lower()
+         if fmt_template_type == "json_schema":
+-            format_template["name"] = RESPONSES_FORMAT_DEFAULT_NAME
++            current_name = str(format_template.get("name", "")).strip()
++            if current_name != RESPONSES_FORMAT_DEFAULT_NAME:
++                format_template["name"] = RESPONSES_FORMAT_DEFAULT_NAME
  
          def _clone_text_format() -> Dict[str, object]:
              return deepcopy(format_template)
@@ -440,56 +505,74 @@ index b8c66c3d397b1546606ab31fadebaaf6e6c7bdd3..256e4bc1aa5b2ffe1a831b55cf9b2580
              target.pop("response_format", None)
              target["text"] = {"format": _clone_text_format()}
  
-+        def _normalize_format_block(
-+            format_block: Optional[Dict[str, object]]
-+        ) -> Tuple[str, str, bool, bool]:
-+            fmt_type = "-"
-+            fmt_name = "-"
-+            has_schema = False
-+            fixed = False
-+            if isinstance(format_block, dict):
-+                fmt_type = str(format_block.get("type", "")).strip() or "-"
-+                has_schema = isinstance(format_block.get("json_schema"), dict)
-+                if fmt_type.lower() == "json_schema":
-+                    current_name = str(format_block.get("name", "")).strip()
-+                    desired = RESPONSES_FORMAT_DEFAULT_NAME
-+                    if current_name != desired:
-+                        format_block["name"] = desired
-+                        current_name = desired
-+                        fixed = True
-+                    schema_block = format_block.get("json_schema")
-+                    if isinstance(schema_block, dict) and "name" in schema_block:
-+                        schema_block.pop("name", None)
-+                    fmt_name = current_name or desired
-+                else:
-+                    current_name = str(format_block.get("name", "")).strip()
-+                    if current_name:
-+                        fmt_name = current_name
-+            return fmt_type, fmt_name, has_schema, fixed
-+
-+        def _ensure_format_name(
-+            target: Dict[str, object]
-+        ) -> Tuple[Optional[Dict[str, object]], str, str, bool, bool]:
-+            text_block = target.get("text")
-+            if not isinstance(text_block, dict):
-+                text_block = {}
-+                target["text"] = text_block
-+            format_block = text_block.get("format")
-+            if not isinstance(format_block, dict):
-+                format_block = _clone_text_format()
-+                text_block["format"] = format_block
-+            fmt_type, fmt_name, has_schema, fixed = _normalize_format_block(format_block)
-+            return format_block, fmt_type, fmt_name, has_schema, fixed
-+
+         def _normalize_format_block(
+             format_block: Optional[Dict[str, object]]
+         ) -> Tuple[str, str, bool, bool]:
+             fmt_type = "-"
+             fmt_name = "-"
+             has_schema = False
+             fixed = False
+             if isinstance(format_block, dict):
++                _sanitize_text_format_in_place(format_block)
+                 fmt_type = str(format_block.get("type", "")).strip() or "-"
+-                has_schema = isinstance(format_block.get("json_schema"), dict)
++                has_schema = isinstance(format_block.get("schema"), dict)
++                current_name = str(format_block.get("name", "")).strip()
+                 if fmt_type.lower() == "json_schema":
+-                    current_name = str(format_block.get("name", "")).strip()
+                     desired = RESPONSES_FORMAT_DEFAULT_NAME
+                     if current_name != desired:
+                         format_block["name"] = desired
+                         current_name = desired
+                         fixed = True
+-                    schema_block = format_block.get("json_schema")
+-                    if isinstance(schema_block, dict) and "name" in schema_block:
+-                        schema_block.pop("name", None)
+-                    fmt_name = current_name or desired
+-                else:
+-                    current_name = str(format_block.get("name", "")).strip()
+-                    if current_name:
+-                        fmt_name = current_name
++                if current_name:
++                    fmt_name = current_name
+             return fmt_type, fmt_name, has_schema, fixed
+ 
+         def _ensure_format_name(
+             target: Dict[str, object]
+         ) -> Tuple[Optional[Dict[str, object]], str, str, bool, bool]:
+             text_block = target.get("text")
+             if not isinstance(text_block, dict):
+                 text_block = {}
+                 target["text"] = text_block
+             format_block = text_block.get("format")
+             if not isinstance(format_block, dict):
+                 format_block = _clone_text_format()
+                 text_block["format"] = format_block
+             fmt_type, fmt_name, has_schema, fixed = _normalize_format_block(format_block)
+             return format_block, fmt_type, fmt_name, has_schema, fixed
+ 
          _apply_text_format(sanitized_payload)
  
++        raw_max_tokens = sanitized_payload.get("max_output_tokens")
          try:
-             max_tokens_value = int(sanitized_payload.get("max_output_tokens", 1200))
+-            max_tokens_value = int(sanitized_payload.get("max_output_tokens", 1200))
++            max_tokens_value = int(raw_max_tokens)
          except (TypeError, ValueError):
-             max_tokens_value = 1200
+-            max_tokens_value = 1200
++            max_tokens_value = 0
          if max_tokens_value <= 0:
-             max_tokens_value = 1200
-         max_tokens_value = min(max_tokens_value, 1200)
+-            max_tokens_value = 1200
+-        max_tokens_value = min(max_tokens_value, 1200)
++            fallback_default = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
++            max_tokens_value = fallback_default
++        upper_cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
++        if upper_cap is not None and max_tokens_value > upper_cap:
++            LOGGER.info(
++                "responses max_output_tokens clamped requested=%s limit=%s",
++                raw_max_tokens,
++                upper_cap,
++            )
++            max_tokens_value = upper_cap
          sanitized_payload["max_output_tokens"] = max_tokens_value
  
          supports_temperature = _supports_temperature(target_model)
@@ -506,7 +589,50 @@ index b8c66c3d397b1546606ab31fadebaaf6e6c7bdd3..256e4bc1aa5b2ffe1a831b55cf9b2580
                  sanitized_payload.pop("temperature", None)
              LOGGER.info(
                  "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
-@@ -1197,50 +1269,51 @@ def generate(
+                 target_model,
+             )
+ 
+         def _log_payload(snapshot: Dict[str, object]) -> None:
+             keys = sorted(snapshot.keys())
+             LOGGER.info("responses payload_keys=%s", keys)
+             input_candidate = snapshot.get("input", "")
+             length = len(input_candidate) if isinstance(input_candidate, str) else 0
+             LOGGER.info("responses input_len=%d", length)
+             LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
+             text_block = snapshot.get("text")
+             format_type = "-"
+-            schema_name = "-"
++            format_name = "-"
++            has_schema = False
+             if isinstance(text_block, dict):
+                 format_block = text_block.get("format")
+                 if isinstance(format_block, dict):
+                     fmt = format_block.get("type")
+                     if isinstance(fmt, str) and fmt.strip():
+                         format_type = fmt.strip()
+-                    schema_block = format_block.get("json_schema")
+-                    if isinstance(schema_block, dict):
+-                        schema_candidate = schema_block.get("name")
+-                        if isinstance(schema_candidate, str) and schema_candidate.strip():
+-                            schema_name = schema_candidate.strip()
+-            LOGGER.info("responses text_format type=%s schema=%s", format_type, schema_name)
++                    name_candidate = format_block.get("name")
++                    if isinstance(name_candidate, str) and name_candidate.strip():
++                        format_name = name_candidate.strip()
++                    has_schema = isinstance(format_block.get("schema"), dict)
++            LOGGER.info(
++                "responses text_format type=%s name=%s has_schema=%s",
++                format_type,
++                format_name,
++                has_schema,
++            )
+ 
+         def _extract_metadata(payload: Dict[str, object]) -> Dict[str, object]:
+             status_value = payload.get("status")
+             status = str(status_value).strip().lower() if isinstance(status_value, str) else ""
+             incomplete_details = payload.get("incomplete_details")
+             incomplete_reason = ""
+             if isinstance(incomplete_details, dict):
                  reason = incomplete_details.get("reason")
                  if isinstance(reason, str):
                      incomplete_reason = reason.strip().lower()
@@ -525,161 +651,8 @@ index b8c66c3d397b1546606ab31fadebaaf6e6c7bdd3..256e4bc1aa5b2ffe1a831b55cf9b2580
                  "status": status,
                  "incomplete_reason": incomplete_reason,
                  "usage_output_tokens": usage_output_tokens,
-             }
- 
-         attempts = 0
-         max_attempts = 3
-         current_max = max_tokens_value
-         last_error: Optional[BaseException] = None
-         format_retry_done = False
-+        format_name_retry_done = False
-         min_tokens_bump_done = False
-         min_token_floor = 1
-         base_input_text = str(sanitized_payload.get("input", ""))
-         shrunken_input = _shrink_responses_input(base_input_text)
-         shrink_next_attempt = False
-         shrink_applied = False
-         incomplete_retry_count = 0
- 
-         def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
-             poll_attempt = 0
-             while poll_attempt < MAX_RESPONSES_POLL_ATTEMPTS:
-                 poll_attempt += 1
-                 poll_url = f"{RESPONSES_API_URL}/{response_id}"
-                 LOGGER.info("responses poll attempt=%d id=%s", poll_attempt, response_id)
-                 if poll_attempt == 1:
-                     initial_sleep = schedule[0] if schedule else 0.5
-                     LOGGER.info("responses poll initial sleep=%.2f", initial_sleep)
-                     time.sleep(initial_sleep)
-                 try:
-                     poll_response = http_client.get(
-                         poll_url,
-                         headers=headers,
-                         timeout=timeout,
-                     )
-                     poll_response.raise_for_status()
-@@ -1275,50 +1348,67 @@ def generate(
-                     break
-                 sleep_for = schedule[min(poll_attempt - 1, len(schedule) - 1)] if schedule else 0.5
-                 LOGGER.info("responses poll sleep=%.2f", sleep_for)
-                 time.sleep(sleep_for)
-             return None
- 
-         while attempts < max_attempts:
-             attempts += 1
-             current_payload = dict(sanitized_payload)
-             current_payload["text"] = {"format": _clone_text_format()}
-             if shrink_applied and shrunken_input:
-                 current_payload["input"] = shrunken_input
-             elif shrink_next_attempt:
-                 shrink_next_attempt = False
-                 if shrunken_input and shrunken_input != base_input_text:
-                     current_payload["input"] = shrunken_input
-                     shrink_applied = True
-                     LOGGER.info(
-                         "RESP_PROMPT_SHRINK original_len=%d shrunk_len=%d",
-                         len(base_input_text),
-                         len(shrunken_input),
-                     )
-             current_payload["max_output_tokens"] = max(min_token_floor, int(current_max))
-             if attempts > 1:
-                 retry_used = True
-+            format_block, fmt_type, fmt_name, has_schema, fixed_name = _ensure_format_name(current_payload)
-+            suffix = " (fixed=name)" if fixed_name else ""
-+            LOGGER.info(
-+                "LOG:RESP_PAYLOAD_FORMAT type=%s name=%s has_schema=%s%s",
-+                fmt_type,
-+                fmt_name or "-",
-+                has_schema,
-+                suffix,
-+            )
-+            if isinstance(format_block, dict):
-+                try:
-+                    format_snapshot = json.dumps(format_block, ensure_ascii=False, sort_keys=True)
-+                except (TypeError, ValueError):
-+                    format_snapshot = str(format_block)
-+                LOGGER.debug("DEBUG:payload.text.format = %s", format_snapshot)
-+            else:
-+                LOGGER.debug("DEBUG:payload.text.format = null")
-             _log_payload(current_payload)
-             try:
-                 _store_responses_request_snapshot(current_payload)
-                 response = http_client.post(
-                     RESPONSES_API_URL,
-                     headers=headers,
-                     json=current_payload,
-                     timeout=timeout,
-                 )
-                 response.raise_for_status()
-                 data = response.json()
-                 if not isinstance(data, dict):
-                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
-                 _store_responses_response_snapshot(data)
-                 text, parse_flags, schema_label = _extract_responses_text(data)
-                 metadata = _extract_metadata(data)
-                 status = metadata.get("status") or ""
-                 reason = metadata.get("incomplete_reason") or ""
-                 segments = int(parse_flags.get("segments", 0) or 0)
-                 LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
-                 if status in {"in_progress", "queued"}:
-                     response_id = data.get("id")
-                     if isinstance(response_id, str) and response_id.strip():
-                         polled_payload = _poll_responses_payload(response_id.strip())
-                         if polled_payload is None:
-@@ -1335,61 +1425,78 @@ def generate(
-                     LOGGER.info(
-                         "RESP_STATUS=incomplete|max_output_tokens=%s",
-                         current_payload.get("max_output_tokens"),
-                     )
-                     last_error = RuntimeError("responses_incomplete")
-                     incomplete_retry_count += 1
-                     if incomplete_retry_count >= 2:
-                         break
-                     shrink_next_attempt = True
-                     continue
-                 if not text:
-                     last_error = EmptyCompletionError(
-                         "Модель вернула пустой ответ",
-                         raw_response=data,
-                         parse_flags=parse_flags,
-                     )
-                     LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
-                     continue
-                 _persist_raw_response(data)
-                 return text, parse_flags, data, schema_label
-             except EmptyCompletionError as exc:
-                 last_error = exc
-             except httpx.HTTPStatusError as exc:
-                 response_obj = exc.response
-                 status = response_obj.status_code if response_obj is not None else None
-+                if response_obj is not None and _needs_format_name_retry(response_obj):
-+                    setattr(exc, "responses_no_fallback", True)
-                 if (
-                     status == 400
-                     and not format_retry_done
-                     and response_obj is not None
-                     and _has_text_format_migration_hint(response_obj)
-                 ):
-                     format_retry_done = True
-                     retry_used = True
-                     LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
-                     _apply_text_format(sanitized_payload)
-                     continue
-+                if (
-+                    status == 400
-+                    and response_obj is not None
-+                    and _needs_format_name_retry(response_obj)
-+                ):
-+                    if not format_name_retry_done:
-+                        format_name_retry_done = True
-+                        retry_used = True
-+                        LOGGER.warning(
-+                            "RESP_RETRY_REASON=format_name_missing route=responses attempt=%d",
-+                            attempts,
-+                        )
-+                        _apply_text_format(sanitized_payload)
-+                        _ensure_format_name(sanitized_payload)
-+                        continue
+@@ -1477,51 +1637,52 @@ def generate(
+                         continue
                  if (
                      status == 400
                      and not min_tokens_bump_done
@@ -704,154 +677,132 @@ index b8c66c3d397b1546606ab31fadebaaf6e6c7bdd3..256e4bc1aa5b2ffe1a831b55cf9b2580
                          )
                          continue
                  last_error = exc
-                 _handle_responses_http_error(exc, current_payload)
-diff --git a/skeleton_utils.py b/skeleton_utils.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..448ea5ceefb571f766adc2198d157fa10bbc7a5e
---- /dev/null
-+++ b/skeleton_utils.py
-@@ -0,0 +1,64 @@
-+# -*- coding: utf-8 -*-
-+"""Helpers for normalizing skeleton payloads returned by LLM."""
-+
-+from __future__ import annotations
-+
-+import logging
-+from typing import Any, Dict
-+
-+
-+LOGGER = logging.getLogger(__name__)
-+
-+_CANONICAL_CONCLUSION_KEYS = ("conclusion", "outro", "ending", "final", "summary")
-+
-+
-+def _as_list(value: Any) -> list:
-+    if isinstance(value, list):
-+        return list(value)
-+    if value is None:
-+        return []
-+    return [value]
-+
-+
-+def _describe_keys(payload: Dict[str, Any]) -> str:
-+    descriptors = []
-+    if "intro" in payload:
-+        descriptors.append("intro")
-+    if "main" in payload:
-+        descriptors.append("main[]")
-+    if "faq" in payload:
-+        descriptors.append("faq[]")
-+    if "conclusion" in payload:
-+        descriptors.append("conclusion")
-+    return ",".join(descriptors)
-+
-+
-+def normalize_skeleton_payload(payload: Any) -> Any:
-+    """Return a normalized skeleton payload with canonical keys."""
-+
-+    if not isinstance(payload, dict):
-+        return payload
-+
-+    normalized: Dict[str, Any] = dict(payload)
-+
-+    conclusion_value = None
-+    for key in _CANONICAL_CONCLUSION_KEYS:
-+        if key in normalized:
-+            value = normalized.get(key)
-+            if value is not None and str(value).strip():
-+                conclusion_value = value
-+                break
-+    if conclusion_value is not None:
-+        normalized["conclusion"] = conclusion_value
-+    for legacy_key in ("outro", "ending", "final", "summary"):
-+        normalized.pop(legacy_key, None)
-+
-+    normalized["main"] = _as_list(normalized.get("main"))
-+    normalized["faq"] = _as_list(normalized.get("faq"))
-+
-+    keys_descriptor = _describe_keys(normalized)
-+    LOGGER.info("LOG:SKELETON_NORMALIZED keys=%s", keys_descriptor)
-+    return normalized
-+
-+
-+__all__ = ["normalize_skeleton_payload"]
+-                _handle_responses_http_error(exc, current_payload)
++                step_label = _infer_responses_step(current_payload)
++                _handle_responses_http_error(exc, current_payload, step=step_label)
+                 break
+             except Exception as exc:  # noqa: BLE001
+                 if isinstance(exc, KeyboardInterrupt):
+                     raise
+                 last_error = exc
+             if attempts >= max_attempts:
+                 break
+             sleep_for = schedule[min(attempts - 1, len(schedule) - 1)] if schedule else 0.5
+             LOGGER.warning("responses retry attempt=%d sleep=%.2f", attempts, sleep_for)
+             time.sleep(sleep_for)
+ 
+         if last_error:
+             if isinstance(last_error, httpx.HTTPStatusError):
+                 _raise_for_last_error(last_error)
+             if isinstance(last_error, (httpx.TimeoutException, httpx.TransportError)):
+                 _raise_for_last_error(last_error)
+             raise last_error
+ 
+         raise RuntimeError("Модель не вернула ответ.")
+ 
+ 
+     lower_model = model_name.lower()
+     is_gpt5_model = lower_model.startswith("gpt-5")
+ 
+     retry_used = False
 diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index 0a3028cf165a6e586d392ee40bd819280e7ee905..276ed7f9ea15f53f1b06192db1eedb751821e147 100644
+index 276ed7f9ea15f53f1b06192db1eedb751821e147..66fa20261eb3e06fdf76a26a65a0c2dbd8ba0dd1 100644
 --- a/tests/test_llm_client.py
 +++ b/tests/test_llm_client.py
-@@ -302,59 +302,59 @@ def test_generate_retries_when_unknown_parameter_reported():
-         "modalities",
-     )
+@@ -1,35 +1,40 @@
+ # -*- coding: utf-8 -*-
+ from pathlib import Path
+ from unittest.mock import patch
+ import httpx
+ import pytest
+ import sys
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+-from llm_client import DEFAULT_RESPONSES_TEXT_FORMAT, GenerationResult, generate
++from llm_client import (
++    DEFAULT_RESPONSES_TEXT_FORMAT,
++    G5_MAX_OUTPUT_TOKENS_MAX,
++    GenerationResult,
++    generate,
++)
  
  
- def test_generate_logs_responses_error_and_artifacts():
-     error_entry = {
-         "__error__": "http",
-         "status": 400,
-         "payload": {"error": {"type": "invalid_request_error", "message": "invalid field"}},
-     }
-     fallback_payload = {
-         "choices": [
-             {
-                 "message": {
-                     "content": "fallback ok",
-                 }
-             }
-         ]
-     }
-     dummy_client = DummyClient(payloads=[error_entry, fallback_payload])
-     with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
-         "llm_client._store_responses_request_snapshot"
-     ) as mock_store_request, patch(
-         "llm_client._store_responses_response_snapshot"
-     ) as mock_store_response, patch("llm_client.LOGGER") as mock_logger:
--        result = generate(
--            messages=[{"role": "user", "content": "ping"}],
--            model="gpt-5",  # ensure Responses route
--            temperature=0.2,
--            max_tokens=42,
--        )
-+        with pytest.raises(RuntimeError) as excinfo:
-+            generate(
-+                messages=[{"role": "user", "content": "ping"}],
-+                model="gpt-5",  # ensure Responses route
-+                temperature=0.2,
-+                max_tokens=42,
-+            )
- 
--    assert result.model_used == "gpt-4o"
--    assert result.fallback_reason == "api_error_gpt5_responses"
-+    assert "HTTP 400" in str(excinfo.value)
-     mock_store_request.assert_called()
-     mock_store_response.assert_called()
-     logged_errors = [call for call in mock_logger.error.call_args_list if "Responses API error" in call[0][0]]
-     assert logged_errors, "Expected Responses API error log entry"
+ @pytest.fixture(autouse=True)
+ def _force_api_key(monkeypatch):
+     monkeypatch.setenv("OPENAI_API_KEY", "test")
+     yield
+     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
  
  
- def test_generate_collects_text_from_content_parts():
-     payloads = [
-         {
-             "choices": [
-                 {
-                     "message": {
-                         "content": [
-                             {"type": "text", "text": "Part1"},
-                             {"type": "text", "text": "Part2"},
-                         ]
+ class DummyResponse:
+     def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
+         if payload is None:
+             payload = {
+                 "choices": [
+                     {
+                         "message": {
+                             "content": "ok",
+                         }
                      }
-                 }
-             ]
-         }
-     ]
-     result, _ = _run_and_capture_request("gpt-4o", payloads=payloads)
-     assert result.text == "Part1\n\nPart2"
+                 ]
+             }
+         self._json = payload
+         self.status_code = status_code
+         self.text = text
+         self._raise_for_status_exc = raise_for_status_exc
+@@ -433,41 +438,45 @@ def test_generate_escalates_max_tokens_when_truncated():
+             }
+         ],
+     }
+     final_payload = {
+         "status": "completed",
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "expanded"},
+                 ]
+             }
+         ],
+     }
+     client = DummyClient(payloads=[initial_payload, final_payload])
+     with patch("llm_client.httpx.Client", return_value=client):
+         result = generate(
+             messages=[{"role": "user", "content": "ping"}],
+             model="gpt-5",
+             temperature=0.1,
+         )
+ 
+     assert isinstance(result, GenerationResult)
+     assert result.text == "expanded"
+     assert result.retry_used is True
+     assert client.call_count == 2
+-    assert client.requests[1]["json"]["max_output_tokens"] == 1200
++    first_tokens = client.requests[0]["json"]["max_output_tokens"]
++    second_tokens = client.requests[1]["json"]["max_output_tokens"]
++    assert second_tokens >= first_tokens
++    if G5_MAX_OUTPUT_TOKENS_MAX > 0:
++        assert second_tokens <= G5_MAX_OUTPUT_TOKENS_MAX
  
  
+ def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):
+     monkeypatch.setattr("llm_client.FORCE_MODEL", True)
+     client = DummyClient(payloads=[], availability=[403])
+     with patch("llm_client.httpx.Client", return_value=client):
+         with pytest.raises(RuntimeError) as excinfo:
+             generate(
+                 messages=[{"role": "user", "content": "ping"}],
+                 model="gpt-5",
+                 temperature=0.1,
+                 max_tokens=42,
+             )
+ 
+     assert "Model GPT-5 not available for this key/plan" in str(excinfo.value)
 diff --git a/tests/test_responses_client.py b/tests/test_responses_client.py
-index 70d617176c1679a24596ada81d7bf6474a4db176..908ae7f8d46663088cce1d103d34821651943338 100644
+index 908ae7f8d46663088cce1d103d34821651943338..94b33cb983d6d0f7094eecac0368229cb2baff61 100644
 --- a/tests/test_responses_client.py
 +++ b/tests/test_responses_client.py
-@@ -1,36 +1,40 @@
+@@ -1,39 +1,40 @@
  from pathlib import Path
  from unittest.mock import patch
  
@@ -862,12 +813,12 @@ index 70d617176c1679a24596ada81d7bf6474a4db176..908ae7f8d46663088cce1d103d348216
  
  sys.path.append(str(Path(__file__).resolve().parents[1]))
  
--from llm_client import build_responses_payload, generate
-+from llm_client import (
-+    RESPONSES_FORMAT_DEFAULT_NAME,
-+    build_responses_payload,
-+    generate,
-+)
+ from llm_client import (
+     RESPONSES_FORMAT_DEFAULT_NAME,
+     build_responses_payload,
+     generate,
++    sanitize_payload_for_responses,
+ )
  
  
  class DummyResponse:
@@ -892,8 +843,80 @@ index 70d617176c1679a24596ada81d7bf6474a4db176..908ae7f8d46663088cce1d103d348216
              request=request,
              json=payload,
          )
+@@ -81,51 +82,83 @@ class DummyClient:
+     def close(self):
+         return None
  
-@@ -117,25 +121,70 @@ def test_generate_retries_with_min_token_bump(monkeypatch):
+ 
+ @pytest.fixture(autouse=True)
+ def _force_api_key(monkeypatch):
+     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+     yield
+     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+ 
+ 
+ def test_build_responses_payload_for_gpt5_includes_required_fields():
+     payload = build_responses_payload(
+         "gpt-5",
+         "system message",
+         "user message",
+         64,
+         text_format={"type": "json_schema", "json_schema": {"name": "stub", "schema": {}}},
+     )
+ 
+     assert payload["model"] == "gpt-5"
+     assert payload["input"].count("system message") == 1
+     assert payload["input"].count("user message") == 1
+     assert payload["max_output_tokens"] == 64
+     assert "temperature" not in payload
+-    assert payload["text"]["format"]["type"] == "json_schema"
++    format_block = payload["text"]["format"]
++    assert format_block["type"] == "json_schema"
++    assert "json_schema" not in format_block
++    assert isinstance(format_block.get("schema"), dict)
++
++
++def test_sanitize_payload_converts_legacy_json_schema():
++    legacy_schema = {
++        "type": "object",
++        "properties": {
++            "intro": {"type": "string"},
++        },
++        "required": ["intro"],
++    }
++    payload = {
++        "model": "gpt-5",
++        "input": "hello",
++        "max_output_tokens": 256,
++        "text": {
++            "format": {
++                "type": "json_schema",
++                "name": "legacy",
++                "json_schema": {"schema": legacy_schema, "strict": True},
++            }
++        },
++    }
++
++    sanitized, _ = sanitize_payload_for_responses(payload)
++    format_block = sanitized["text"]["format"]
++
++    assert "json_schema" not in format_block
++    assert format_block["schema"] == legacy_schema
++    assert format_block["strict"] is True
+ 
+ 
+ def test_generate_retries_with_min_token_bump(monkeypatch):
+     error_payload = {
+         "__error__": "http",
+         "status": 400,
+         "payload": {
+             "error": {
+                 "message": "Invalid 'max_output_tokens': Expected a value >= 16",
+                 "type": "invalid_request_error",
+             }
+         },
+     }
+     success_payload = {
          "output": [
              {
                  "content": [
@@ -905,241 +928,37 @@ index 70d617176c1679a24596ada81d7bf6474a4db176..908ae7f8d46663088cce1d103d348216
      dummy_client = DummyClient(payloads=[error_payload, success_payload])
  
      with patch("llm_client.httpx.Client", return_value=dummy_client), patch("llm_client.LOGGER") as mock_logger:
+@@ -161,30 +194,31 @@ def test_generate_retries_on_missing_format_name(monkeypatch):
+             {
+                 "content": [
+                     {"type": "text", "text": "ok"},
+                 ]
+             }
+         ]
+     }
+     dummy_client = DummyClient(payloads=[error_payload, success_payload])
+ 
+     with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
+         "llm_client.LOGGER"
+     ) as mock_logger:
          result = generate(
              messages=[{"role": "user", "content": "ping"}],
-             model="gpt-5",
+             model="gpt-5", 
              temperature=0.0,
-             max_tokens=8,
+             max_tokens=64,
          )
  
      assert result.text == "ok"
      assert dummy_client.call_count == 2
-     first_request = dummy_client.requests[0]["json"]
-     second_request = dummy_client.requests[1]["json"]
-     assert first_request["max_output_tokens"] == 8
-     assert second_request["max_output_tokens"] >= 24
-     mock_logger.warning.assert_any_call("LOG:RESP_RETRY_REASON=max_tokens_min_bump")
-+
-+
-+def test_generate_retries_on_missing_format_name(monkeypatch):
-+    error_payload = {
-+        "__error__": "http",
-+        "status": 400,
-+        "payload": {
-+            "error": {
-+                "message": "Missing required field text.format.name",
-+                "type": "invalid_request_error",
-+            }
-+        },
-+    }
-+    success_payload = {
-+        "output": [
-+            {
-+                "content": [
-+                    {"type": "text", "text": "ok"},
-+                ]
-+            }
-+        ]
-+    }
-+    dummy_client = DummyClient(payloads=[error_payload, success_payload])
-+
-+    with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
-+        "llm_client.LOGGER"
-+    ) as mock_logger:
-+        result = generate(
-+            messages=[{"role": "user", "content": "ping"}],
-+            model="gpt-5", 
-+            temperature=0.0,
-+            max_tokens=64,
-+        )
-+
-+    assert result.text == "ok"
-+    assert dummy_client.call_count == 2
-+    first_format = dummy_client.requests[0]["json"]["text"]["format"]
-+    second_format = dummy_client.requests[1]["json"]["text"]["format"]
-+    assert first_format["name"] == RESPONSES_FORMAT_DEFAULT_NAME
-+    assert second_format["name"] == RESPONSES_FORMAT_DEFAULT_NAME
-+    assert "name" not in first_format.get("json_schema", {})
-+    mock_logger.warning.assert_any_call(
-+        "RESP_RETRY_REASON=format_name_missing route=responses attempt=%d",
-+        1,
-+    )
-diff --git a/tests/test_skeleton_utils.py b/tests/test_skeleton_utils.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..a1af4452e9c6b0430c5de73779968be4de770ca2
---- /dev/null
-+++ b/tests/test_skeleton_utils.py
-@@ -0,0 +1,17 @@
-+from skeleton_utils import normalize_skeleton_payload
-+
-+
-+def test_normalize_skeleton_payload_standardizes_keys():
-+    raw_payload = {
-+        "intro": "Intro",
-+        "main": "Section",
-+        "faq": {"q": "Q?", "a": "A!"},
-+        "outro": "Bye",
-+    }
-+
-+    normalized = normalize_skeleton_payload(raw_payload)
-+
-+    assert "outro" not in normalized
-+    assert normalized["conclusion"] == "Bye"
-+    assert normalized["main"] == ["Section"]
-+    assert normalized["faq"] == [{"q": "Q?", "a": "A!"}]
-diff --git a/validators.py b/validators.py
-index 44ed8ee8378c37407ed0bc52d7c524c9797d1dd5..eace6816fc168a8bc2b38fe548e97577e6c99839 100644
---- a/validators.py
-+++ b/validators.py
-@@ -1,32 +1,34 @@
- from __future__ import annotations
- 
- import json
- import re
- from dataclasses import dataclass, field
- from typing import Dict, Iterable, List, Optional, Tuple
- 
-+from skeleton_utils import normalize_skeleton_payload
-+
- from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
- from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
- 
- _FAQ_START = "<!--FAQ_START-->"
- _FAQ_END = "<!--FAQ_END-->"
- _JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">(.*?)</script>", re.DOTALL)
- _FAQ_ENTRY_PATTERN = re.compile(
-     r"\*\*Вопрос\s+(?P<index>\d+)\.\*\*\s*(?P<question>.+?)\s*\n\*\*Ответ\.\*\*\s*(?P<answer>.*?)(?=\n\*\*Вопрос\s+\d+\.\*\*|\Z)",
-     re.DOTALL,
- )
- 
- 
- class ValidationError(RuntimeError):
-     """Raised when one of the blocking validation groups fails."""
- 
-     def __init__(self, group: str, message: str, *, details: Optional[Dict[str, object]] = None) -> None:
-         super().__init__(message)
-         self.group = group
-         self.details = details or {}
- 
- 
- @dataclass
- class ValidationResult:
-     skeleton_ok: bool
-     keywords_ok: bool
-@@ -104,83 +106,111 @@ def _parse_jsonld_entries(text: str) -> Tuple[List[Dict[str, str]], Optional[str
-         if not isinstance(entry, dict) or entry.get("@type") != "Question":
-             return [], f"JSON-LD вопрос №{idx} имеет неверный формат."
-         answer = entry.get("acceptedAnswer")
-         if not isinstance(answer, dict) or answer.get("@type") != "Answer":
-             return [], f"JSON-LD ответ для вопроса №{idx} имеет неверный формат."
-         question = str(entry.get("name", "")).strip()
-         answer_text = str(answer.get("text", "")).strip()
-         if not question or not answer_text:
-             return [], f"JSON-LD вопрос №{idx} содержит пустые данные."
-         parsed.append({"index": idx, "question": question, "answer": answer_text})
-     return parsed, None
- 
- 
- def _skeleton_status(
-     skeleton_payload: Optional[Dict[str, object]],
-     text: str,
- ) -> Tuple[bool, Optional[str]]:
-     if skeleton_payload is None:
-         if "## FAQ" in text and _FAQ_START in text and _FAQ_END in text:
-             return True, None
-         return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
-     if not isinstance(skeleton_payload, dict):
-         return False, "Данные скелета не получены или имеют неверный формат."
- 
-     intro = str(skeleton_payload.get("intro") or "").strip()
--    outro = str(skeleton_payload.get("outro") or "").strip()
-     main = skeleton_payload.get("main")
--    if not intro or not outro or not isinstance(main, list) or not main:
--        return False, "Скелет не содержит обязательных полей intro/main/outro."
-+    faq = skeleton_payload.get("faq")
-+    conclusion = str(skeleton_payload.get("conclusion") or "").strip()
-+
-+    missing: List[str] = []
-+    if not intro:
-+        missing.append("intro")
-+    if not isinstance(main, list) or not main:
-+        missing.append("main[]")
-+    if not isinstance(faq, list) or not faq:
-+        missing.append("faq[]")
-+    if not conclusion:
-+        missing.append("conclusion")
-+    if missing:
-+        return (
-+            False,
-+            "Отсутствуют обязательные поля после нормализации: " + ", ".join(missing),
-+        )
-+
-     for idx, item in enumerate(main):
-         if not isinstance(item, str) or not item.strip():
-             return False, f"Блок основной части №{idx + 1} пуст."
- 
-+    for idx, entry in enumerate(faq, start=1):
-+        if not isinstance(entry, dict):
-+            return False, f"FAQ элемент №{idx} имеет неверный формат."
-+        question = str(entry.get("q") or entry.get("question") or "").strip()
-+        answer = str(entry.get("a") or entry.get("answer") or "").strip()
-+        if not question or not answer:
-+            return False, f"FAQ элемент №{idx} пуст."
-+
-     outline = skeleton_payload.get("outline")
-     if outline and isinstance(outline, list):
-         normalized_outline = [str(entry).strip() for entry in outline if str(entry).strip()]
-     else:
-         normalized_outline = []
- 
-     expected_main = max(1, len(normalized_outline) - 2) if normalized_outline else len(main)
-     if len(main) != expected_main:
-         return False, "Количество блоков основной части не совпадает с ожидаемым."
-     if "## FAQ" not in text or _FAQ_START not in text or _FAQ_END not in text:
-         return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
-     return True, None
- 
- 
- def validate_article(
-     text: str,
-     *,
-     keywords: Iterable[str],
-     min_chars: int,
-     max_chars: int,
-     skeleton_payload: Optional[Dict[str, object]] = None,
-     keyword_coverage_percent: Optional[float] = None,
- ) -> ValidationResult:
-     length = _length_no_spaces(text)
--    skeleton_ok, skeleton_message = _skeleton_status(skeleton_payload, text)
-+    normalized_skeleton = (
-+        normalize_skeleton_payload(skeleton_payload)
-+        if skeleton_payload is not None
-+        else None
-+    )
-+    skeleton_ok, skeleton_message = _skeleton_status(normalized_skeleton, text)
- 
-     normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
-     missing: List[str] = []
-     article = strip_jsonld(text)
-     for term in normalized_keywords:
-         pattern = _keyword_regex(term)
-         if not pattern.search(article):
-             missing.append(term)
-             continue
-         lock_token = LOCK_START_TEMPLATE.format(term=term)
-         lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-         if not lock_pattern.search(text):
-             missing.append(term)
-     keywords_ok = len(missing) == 0
- 
-     markdown_faq, markdown_error = _parse_markdown_faq(text)
-     faq_count = len(markdown_faq)
-     jsonld_entries, jsonld_error = _parse_jsonld_entries(text)
-     jsonld_ok = jsonld_error is None
- 
-     faq_ok = False
-     faq_error: Optional[str] = None
-     mismatched_questions: List[str] = []
-     if markdown_error:
-         faq_error = markdown_error
+     first_format = dummy_client.requests[0]["json"]["text"]["format"]
+     second_format = dummy_client.requests[1]["json"]["text"]["format"]
+     assert first_format["name"] == RESPONSES_FORMAT_DEFAULT_NAME
+     assert second_format["name"] == RESPONSES_FORMAT_DEFAULT_NAME
+-    assert "name" not in first_format.get("json_schema", {})
++    assert "json_schema" not in first_format
++    assert isinstance(first_format.get("schema"), dict)
+     mock_logger.warning.assert_any_call(
+         "RESP_RETRY_REASON=format_name_missing route=responses attempt=%d",
+         1,
+     )
 
