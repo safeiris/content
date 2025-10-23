@@ -9,9 +9,14 @@ import textwrap
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from config import G5_MAX_OUTPUT_TOKENS_BASE, G5_MAX_OUTPUT_TOKENS_MAX
+from config import (
+    G5_MAX_OUTPUT_TOKENS_MAX,
+    SKELETON_BATCH_SIZE_MAIN,
+    SKELETON_FAQ_BATCH,
+    TAIL_FILL_MAX_TOKENS,
+)
 from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
 from faq_builder import _normalize_entry
 from keyword_injector import (
@@ -22,7 +27,6 @@ from keyword_injector import (
     inject_keywords,
 )
 from length_trimmer import TrimResult, TrimValidationError, trim_text
-from prompt_templates import load_template
 from skeleton_utils import normalize_skeleton_payload
 from validators import (
     ValidationError,
@@ -84,6 +88,123 @@ class PipelineStepError(RuntimeError):
         self.step = step
         self.status_code = status_code
 
+
+class SkeletonBatchKind(str, Enum):
+    INTRO = "intro"
+    MAIN = "main"
+    FAQ = "faq"
+    CONCLUSION = "conclusion"
+
+
+@dataclass
+class SkeletonBatchPlan:
+    kind: SkeletonBatchKind
+    indices: List[int] = field(default_factory=list)
+    label: str = ""
+    tail_fill: bool = False
+
+
+@dataclass
+class SkeletonOutline:
+    intro_heading: str
+    main_headings: List[str]
+    conclusion_heading: str
+    has_faq: bool
+
+    def all_headings(self) -> List[str]:
+        headings = [self.intro_heading]
+        headings.extend(self.main_headings)
+        headings.append(self.conclusion_heading)
+        return headings
+
+    def update_main_headings(self, new_headings: Sequence[str]) -> None:
+        cleaned = [str(item).strip() for item in new_headings if str(item or "").strip()]
+        if not cleaned:
+            return
+        current_len = len(self.main_headings)
+        if current_len == 0:
+            self.main_headings = cleaned
+            return
+        adjusted = list(cleaned[:current_len])
+        if len(adjusted) < current_len:
+            adjusted.extend(self.main_headings[len(adjusted) :])
+        self.main_headings = adjusted
+
+
+@dataclass
+class SkeletonVolumeEstimate:
+    predicted_tokens: int
+    start_max_tokens: int
+    cap_tokens: Optional[int]
+    intro_tokens: int
+    conclusion_tokens: int
+    per_main_tokens: int
+    per_faq_tokens: int
+    requires_chunking: bool
+
+
+@dataclass
+class SkeletonAssembly:
+    outline: SkeletonOutline
+    intro: Optional[str] = None
+    conclusion: Optional[str] = None
+    main_sections: List[Optional[str]] = field(default_factory=list)
+    faq_entries: List[Dict[str, str]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.main_sections:
+            self.main_sections = [None] * len(self.outline.main_headings)
+
+    def apply_intro(
+        self,
+        intro_text: Optional[str],
+        main_headers: Optional[Sequence[str]] = None,
+        conclusion_heading: Optional[str] = None,
+    ) -> None:
+        if intro_text and intro_text.strip():
+            self.intro = intro_text.strip()
+        if main_headers:
+            self.outline.update_main_headings(main_headers)
+            if len(self.main_sections) != len(self.outline.main_headings):
+                self.main_sections = [None] * len(self.outline.main_headings)
+        if conclusion_heading and conclusion_heading.strip():
+            self.outline.conclusion_heading = conclusion_heading.strip()
+
+    def apply_main(self, index: int, body: str, *, heading: Optional[str] = None) -> None:
+        if heading and heading.strip() and 0 <= index < len(self.outline.main_headings):
+            self.outline.main_headings[index] = heading.strip()
+        if 0 <= index < len(self.main_sections) and body and body.strip():
+            self.main_sections[index] = body.strip()
+
+    def apply_faq(self, question: str, answer: str) -> None:
+        if question.strip() and answer.strip():
+            self.faq_entries.append({"q": question.strip(), "a": answer.strip()})
+
+    def apply_conclusion(self, conclusion_text: Optional[str]) -> None:
+        if conclusion_text and conclusion_text.strip():
+            self.conclusion = conclusion_text.strip()
+
+    def missing_main_indices(self) -> List[int]:
+        return [idx for idx, body in enumerate(self.main_sections) if not body]
+
+    def missing_faq_count(self, target_total: int) -> int:
+        return max(0, target_total - len(self.faq_entries))
+
+    def outline_snapshot(self) -> List[str]:
+        headings = [self.outline.intro_heading]
+        headings.extend(self.outline.main_headings)
+        headings.append(self.outline.conclusion_heading)
+        return headings
+
+    def build_payload(self) -> Dict[str, object]:
+        main_blocks = [body or "" for body in self.main_sections]
+        payload: Dict[str, object] = {
+            "intro": self.intro or "",
+            "main": main_blocks,
+            "faq": list(self.faq_entries),
+            "conclusion": self.conclusion or "",
+        }
+        return payload
 
 class DeterministicPipeline:
     """Pipeline that orchestrates LLM calls and post-processing steps."""
@@ -203,6 +324,8 @@ class DeterministicPipeline:
         messages: Sequence[Dict[str, object]],
         max_tokens: Optional[int] = None,
         override_model: Optional[str] = None,
+        previous_response_id: Optional[str] = None,
+        responses_format: Optional[Dict[str, object]] = None,
     ) -> GenerationResult:
         prompt_len = self._prompt_length(messages)
         limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
@@ -228,6 +351,8 @@ class DeterministicPipeline:
                     max_tokens=limit,
                     timeout_s=self.timeout_s,
                     backoff_schedule=self.backoff_schedule,
+                    previous_response_id=previous_response_id,
+                    responses_text_format=responses_format,
                 )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
@@ -289,77 +414,527 @@ class DeterministicPipeline:
             "keywords_total": len(self.normalized_keywords),
         }
 
-    def _resolve_skeleton_tokens(self) -> int:
-        if self.max_tokens and self.max_tokens > 0:
-            baseline = int(self.max_tokens)
-        else:
-            fallback = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
-            baseline = fallback
+    def _prepare_outline(self) -> SkeletonOutline:
+        outline = [str(segment or "").strip() for segment in self.base_outline if str(segment or "").strip()]
+        if not outline:
+            outline = ["Введение", "Основная часть", "FAQ", "Вывод"]
+        intro_heading = outline[0]
+        conclusion_heading = outline[-1] if len(outline) > 1 else "Вывод"
+        faq_markers = {"faq", "f.a.q.", "вопросы и ответы"}
+        has_faq = any(entry.strip().lower() in faq_markers for entry in outline)
+        main_candidates: List[str] = []
+        for entry in outline[1:-1]:
+            normalized = entry.strip()
+            if normalized.lower() in faq_markers:
+                continue
+            if normalized:
+                main_candidates.append(normalized)
+        if not main_candidates:
+            main_candidates = ["Основная часть"]
+        return SkeletonOutline(
+            intro_heading=intro_heading,
+            main_headings=main_candidates,
+            conclusion_heading=conclusion_heading,
+            has_faq=has_faq,
+        )
+
+    def _predict_skeleton_volume(self, outline: SkeletonOutline) -> SkeletonVolumeEstimate:
         cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-        if cap is not None:
-            baseline = min(baseline, cap)
-        return max(800, baseline)
+        min_chars = max(3200, int(self.min_chars) if self.min_chars > 0 else 3200)
+        max_chars = max(min_chars + 400, int(self.max_chars) if self.max_chars > 0 else min_chars + 1200)
+        avg_chars = max(min_chars, int((min_chars + max_chars) / 2))
+        approx_tokens = max(1100, int(avg_chars / 3.2))
+        main_count = max(1, len(outline.main_headings))
+        faq_count = 5 if outline.has_faq else 0
+        intro_tokens = max(160, int(approx_tokens * 0.12))
+        conclusion_tokens = max(140, int(approx_tokens * 0.1))
+        faq_pool = max(0, int(approx_tokens * 0.2)) if faq_count else 0
+        per_faq_tokens = max(70, int(faq_pool / faq_count)) if faq_count else 0
+        allocated_faq = per_faq_tokens * faq_count
+        remaining_for_main = max(
+            approx_tokens - intro_tokens - conclusion_tokens - allocated_faq,
+            220 * main_count,
+        )
+        per_main_tokens = max(220, int(remaining_for_main / main_count)) if main_count else 0
+        predicted = intro_tokens + conclusion_tokens + per_main_tokens * main_count + per_faq_tokens * faq_count
+        start_max = int(predicted * 1.2)
+        if cap is not None and cap > 0:
+            start_max = min(start_max, cap)
+        start_max = max(600, start_max)
+        requires_chunking = bool(cap is not None and predicted > cap)
+        LOGGER.info(
+            "SKELETON_ESTIMATE predicted=%d start_max=%d cap=%s",
+            predicted,
+            start_max,
+            cap if cap is not None else "-",
+        )
+        return SkeletonVolumeEstimate(
+            predicted_tokens=predicted,
+            start_max_tokens=start_max,
+            cap_tokens=cap,
+            intro_tokens=intro_tokens,
+            conclusion_tokens=conclusion_tokens,
+            per_main_tokens=per_main_tokens,
+            per_faq_tokens=per_faq_tokens,
+            requires_chunking=requires_chunking,
+        )
 
-    def _skeleton_contract(self) -> Tuple[Dict[str, object], str]:
-        outline = [segment.strip() for segment in self.base_outline if segment.strip()]
-        intro = outline[0] if outline else "Введение"
-        outro = outline[-1] if len(outline) > 1 else "Вывод"
-        core_sections = [
-            item
-            for item in outline[1:-1]
-            if item.lower() not in {"faq", "f.a.q.", "вопросы и ответы"}
-        ]
-        if not core_sections:
-            core_sections = ["Основная часть"]
-        contract = {
-            "intro": f"один абзац с вводной рамкой для раздела '{intro}'",
-            "main": [
-                (
-                    "3-5 абзацев раскрывают тему '"
-                    + heading
-                    + "' с примерами, рисками и расчётами"
+    def _build_skeleton_batches(self, outline: SkeletonOutline) -> List[SkeletonBatchPlan]:
+        batches: List[SkeletonBatchPlan] = [SkeletonBatchPlan(kind=SkeletonBatchKind.INTRO, label="intro")]
+        main_count = len(outline.main_headings)
+        if main_count > 0:
+            batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
+            start = 0
+            while start < main_count:
+                end = min(start + batch_size, main_count)
+                indices = list(range(start, end))
+                if len(indices) == 1:
+                    label = f"main[{indices[0] + 1}]"
+                else:
+                    label = f"main[{indices[0] + 1}-{indices[-1] + 1}]"
+                batches.append(
+                    SkeletonBatchPlan(
+                        kind=SkeletonBatchKind.MAIN,
+                        indices=indices,
+                        label=label,
+                    )
                 )
-                for heading in core_sections
-            ],
-            "faq": [
-                {"q": "вопрос", "a": "ответ"} for _ in range(5)
-            ],
-            "conclusion": f"один абзац выводов и призыва к действию для блока '{outro}'",
+                start = end
+        if outline.has_faq:
+            total_faq = 5
+            produced = 0
+            first_batch = min(SKELETON_FAQ_BATCH, total_faq)
+            if first_batch > 0:
+                indices = list(range(produced, produced + first_batch))
+                label = (
+                    f"faq[{indices[0] + 1}-{indices[-1] + 1}]"
+                    if len(indices) > 1
+                    else f"faq[{indices[0] + 1}]"
+                )
+                batches.append(
+                    SkeletonBatchPlan(
+                        kind=SkeletonBatchKind.FAQ,
+                        indices=indices,
+                        label=label,
+                    )
+                )
+                produced += first_batch
+            while produced < total_faq:
+                remaining = total_faq - produced
+                chunk_size = min(SKELETON_FAQ_BATCH, remaining)
+                indices = list(range(produced, produced + chunk_size))
+                label = (
+                    f"faq[{indices[0] + 1}-{indices[-1] + 1}]"
+                    if len(indices) > 1
+                    else f"faq[{indices[0] + 1}]"
+                )
+                batches.append(
+                    SkeletonBatchPlan(
+                        kind=SkeletonBatchKind.FAQ,
+                        indices=indices,
+                        label=label,
+                    )
+                )
+                produced += chunk_size
+        batches.append(SkeletonBatchPlan(kind=SkeletonBatchKind.CONCLUSION, label="conclusion"))
+        return batches
+
+    def _batch_schema(
+        self,
+        batch: SkeletonBatchPlan,
+        *,
+        outline: SkeletonOutline,
+        item_count: int,
+    ) -> Dict[str, object]:
+        if batch.kind == SkeletonBatchKind.INTRO:
+            schema = {
+                "type": "object",
+                "properties": {
+                    "intro": {"type": "string"},
+                    "main_headers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": len(outline.main_headings),
+                        "maxItems": len(outline.main_headings),
+                    },
+                    "conclusion_heading": {"type": "string"},
+                },
+                "required": ["intro", "main_headers", "conclusion_heading"],
+                "additionalProperties": False,
+            }
+        elif batch.kind == SkeletonBatchKind.MAIN:
+            min_items = 1 if item_count > 0 else 0
+            schema = {
+                "type": "object",
+                "properties": {
+                    "sections": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "body": {"type": "string"},
+                            },
+                            "required": ["title", "body"],
+                            "additionalProperties": False,
+                        },
+                        "minItems": min_items,
+                        "maxItems": max(item_count, 1),
+                    }
+                },
+                "required": ["sections"],
+                "additionalProperties": False,
+            }
+        elif batch.kind == SkeletonBatchKind.FAQ:
+            min_items = 1 if item_count > 0 else 0
+            schema = {
+                "type": "object",
+                "properties": {
+                    "faq": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "q": {"type": "string"},
+                                "a": {"type": "string"},
+                            },
+                            "required": ["q", "a"],
+                            "additionalProperties": False,
+                        },
+                        "minItems": min_items,
+                        "maxItems": max(item_count, 1),
+                    }
+                },
+                "required": ["faq"],
+                "additionalProperties": False,
+            }
+        else:
+            schema = {
+                "type": "object",
+                "properties": {"conclusion": {"type": "string"}},
+                "required": ["conclusion"],
+                "additionalProperties": False,
+            }
+        return {
+            "type": "json_schema",
+            "name": f"seo_article_{batch.kind.value}",
+            "schema": schema,
+            "strict": True,
         }
-        template_example = load_template("json_contract.txt").strip()
-        return contract, template_example
 
-    def _build_skeleton_messages(self) -> List[Dict[str, object]]:
-        outline = [segment.strip() for segment in self.base_outline if segment.strip()]
-        contract_payload, contract_template = self._skeleton_contract()
-        contract = json.dumps(contract_payload, ensure_ascii=False, indent=2)
-        keywords_clause = "Используй ключевые слова: " + ", ".join(self.normalized_keywords)
-        if not self.normalized_keywords:
-            keywords_clause = "Используй все предоставленные ключевые слова в точных формах."
-        sections_clause = ", ".join(outline) if outline else "Введение, Основная часть, FAQ, Вывод"
-        user_payload = textwrap.dedent(
-            f"""
-            Ты создаёшь детерминированный SEO-текст. Соблюдай требования UI:
-            • Верни строго JSON-объект с ключами intro, main, faq, conclusion.
-            • intro и conclusion — по одному абзацу без приветствий.
-            • main — список из 3–6 элементов, каждый элемент содержит 3–5 абзацев по 3–4 предложения.
-            • faq — массив из 5 объектов {{"q": str, "a": str}}. Ответы FAQ развернутые (минимум 2 предложения) и прикладные.
-            • Общий объём статьи (intro + main + conclusion + ответы FAQ) — 3500–6000 символов без пробелов.
-            • {keywords_clause}
-            • Соблюдай последовательность разделов: {sections_clause}.
-            • Не добавляй ничего, кроме требуемого JSON. Не используй Markdown, комментарии и пояснения.
+    def _extract_response_json(self, raw_text: str) -> Optional[object]:
+        candidate = (raw_text or "").strip()
+        if not candidate:
+            return None
+        if "<response_json>" in candidate and "</response_json>" in candidate:
+            try:
+                candidate = candidate.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
+            except Exception:  # pragma: no cover - defensive
+                candidate = candidate
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    return None
+        return None
 
-            Оберни ответ маркерами <response_json> и </response_json> без дополнительного текста.
-            Пример целевого формата:
-            {contract_template}
+    def _normalize_intro_batch(
+        self, payload: object, outline: SkeletonOutline
+    ) -> Tuple[Dict[str, object], List[str]]:
+        normalized: Dict[str, object] = {}
+        missing: List[str] = []
+        if not isinstance(payload, dict):
+            return normalized, ["intro", "main_headers"]
+        intro_text = str(payload.get("intro") or "").strip()
+        headers_raw = payload.get("main_headers")
+        if isinstance(headers_raw, list):
+            headers = [str(item or "").strip() for item in headers_raw if str(item or "").strip()]
+        else:
+            headers = []
+        conclusion_heading = str(payload.get("conclusion_heading") or "").strip()
+        if not intro_text:
+            missing.append("intro")
+        if len(headers) < len(outline.main_headings):
+            missing.append("main_headers")
+        normalized["intro"] = intro_text
+        normalized["main_headers"] = headers[: len(outline.main_headings)]
+        normalized["conclusion_heading"] = conclusion_heading or outline.conclusion_heading
+        return normalized, missing
 
-            Каркас с подсказками для содержания:
-            {contract}
-            """
-        ).strip()
-        messages = list(self.messages)
+    def _normalize_main_batch(
+        self,
+        payload: object,
+        target_indices: Sequence[int],
+        outline: SkeletonOutline,
+    ) -> Tuple[List[Tuple[int, str, str]], List[int]]:
+        normalized: List[Tuple[int, str, str]] = []
+        missing: List[int] = []
+        if not isinstance(payload, dict):
+            return normalized, list(target_indices)
+        sections = payload.get("sections")
+        if not isinstance(sections, list):
+            return normalized, list(target_indices)
+        max_count = len(target_indices)
+        for position, section in enumerate(sections[:max_count]):
+            if not isinstance(section, dict):
+                missing.append(target_indices[position])
+                continue
+            target_index = target_indices[position]
+            title = str(section.get("title") or outline.main_headings[target_index]).strip()
+            body = str(section.get("body") or "").strip()
+            if not body:
+                missing.append(target_index)
+                continue
+            normalized.append((target_index, title or outline.main_headings[target_index], body))
+        if len(normalized) < len(target_indices):
+            for index in target_indices[len(normalized) :]:
+                if index not in missing:
+                    missing.append(index)
+        return normalized, missing
+
+    def _normalize_faq_batch(
+        self,
+        payload: object,
+        target_indices: Sequence[int],
+    ) -> Tuple[List[Tuple[int, str, str]], List[int]]:
+        normalized: List[Tuple[int, str, str]] = []
+        missing: List[int] = []
+        if not isinstance(payload, dict):
+            return normalized, list(target_indices)
+        faq_items = payload.get("faq")
+        if not isinstance(faq_items, list):
+            return normalized, list(target_indices)
+        max_count = len(target_indices)
+        for position, entry in enumerate(faq_items[:max_count]):
+            if not isinstance(entry, dict):
+                missing.append(target_indices[position])
+                continue
+            question = str(entry.get("q") or "").strip()
+            answer = str(entry.get("a") or "").strip()
+            target_index = target_indices[position]
+            if not question or not answer:
+                missing.append(target_index)
+                continue
+            normalized.append((target_index, question, answer))
+        if len(normalized) < len(target_indices):
+            for index in target_indices[len(normalized) :]:
+                if index not in missing:
+                    missing.append(index)
+        return normalized, missing
+
+    def _normalize_conclusion_batch(self, payload: object) -> Tuple[str, bool]:
+        if not isinstance(payload, dict):
+            return "", True
+        conclusion = str(payload.get("conclusion") or "").strip()
+        return conclusion, not bool(conclusion)
+
+    def _batch_token_budget(
+        self,
+        batch: SkeletonBatchPlan,
+        estimate: SkeletonVolumeEstimate,
+        item_count: int,
+    ) -> int:
+        cap = estimate.cap_tokens or estimate.start_max_tokens
+        if batch.kind == SkeletonBatchKind.INTRO:
+            base = estimate.intro_tokens + max(estimate.per_main_tokens, 300)
+        elif batch.kind == SkeletonBatchKind.MAIN:
+            base = max(estimate.per_main_tokens * max(1, item_count), 400)
+        elif batch.kind == SkeletonBatchKind.FAQ:
+            base = max(estimate.per_faq_tokens * max(1, item_count), 320)
+        else:
+            base = estimate.conclusion_tokens + max(estimate.per_faq_tokens, 120)
+        allowance = cap if cap and cap > 0 else estimate.start_max_tokens
+        if allowance and allowance > 0:
+            base = min(base, allowance)
+        return max(400, int(base * 1.1))
+
+    def _build_batch_messages(
+        self,
+        batch: SkeletonBatchPlan,
+        *,
+        outline: SkeletonOutline,
+        assembly: SkeletonAssembly,
+        target_indices: Sequence[int],
+        tail_fill: bool = False,
+    ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+        messages = [dict(message) for message in self.messages]
+        outline_text = ", ".join(outline.all_headings())
+        general_lines = [
+            "Ты создаёшь детерминированный SEO-скелет статьи.",
+            f"Тема: {self.topic}.",
+            f"Общий объём: {self.min_chars}–{self.max_chars} символов без пробелов.",
+            f"План разделов: {outline_text}.",
+        ]
+        if self.normalized_keywords:
+            general_lines.append(
+                "Сохраняй точные упоминания ключевых слов: " + ", ".join(self.normalized_keywords) + "."
+            )
+
+        lines: List[str] = list(general_lines)
+        if batch.kind == SkeletonBatchKind.INTRO:
+            lines.extend(
+                [
+                    "Сформируй вводный абзац без приветствий и уточни заголовки основных разделов.",
+                    "Верни JSON вида {\"intro\": str, \"main_headers\": [..], \"conclusion_heading\": str}.",
+                    "main_headers должен содержать столько элементов, сколько основных разделов в плане, порядок сохраняется.",
+                    "intro — один абзац с 3–4 предложениями, без списков.",
+                ]
+            )
+        elif batch.kind == SkeletonBatchKind.MAIN:
+            headings = [outline.main_headings[index] for index in target_indices]
+            already_ready = [
+                outline.main_headings[idx]
+                for idx, body in enumerate(assembly.main_sections)
+                if body and idx not in target_indices
+            ]
+            lines.append(
+                "Нужно детализировать разделы: "
+                + "; ".join(
+                    f"{index + 1}. {heading}" for index, heading in zip(target_indices, headings)
+                )
+                + "."
+            )
+            if already_ready:
+                lines.append(
+                    "Эти разделы уже готовы и переписывать их не нужно: "
+                    + "; ".join(already_ready)
+                    + "."
+                )
+            lines.extend(
+                [
+                    "Каждый раздел — 3–5 абзацев по 3–4 предложения, с примерами, рисками и расчётами.",
+                    "Верни JSON {\"sections\": [{\"title\": str, \"body\": str}, ...]} в порядке указанного списка.",
+                ]
+            )
+            if tail_fill:
+                lines.append("Верни только недостающие разделы без повтора уже написанных частей.")
+        elif batch.kind == SkeletonBatchKind.FAQ:
+            start_number = target_indices[0] + 1 if target_indices else 1
+            lines.append(
+                "Подготовь новые элементы FAQ с практичными ответами (минимум два предложения каждый)."
+            )
+            lines.append(
+                "Верни JSON {\"faq\": [{\"q\": str, \"a\": str}, ...]} в количестве, равном запросу."
+            )
+            lines.append(
+                "Продолжай нумерацию вопросов, начиная с пункта №%d." % start_number
+            )
+            if tail_fill:
+                lines.append("Добавь только недостающие вопросы и ответы.")
+        else:
+            lines.extend(
+                [
+                    "Сделай связный вывод и обозначь план действий, ссылаясь на ключевые идеи статьи.",
+                    "Верни JSON {\"conclusion\": str} с одним абзацем.",
+                ]
+            )
+
+        lines.append("Ответ заверни в теги <response_json>...</response_json> без комментариев.")
+        user_payload = textwrap.dedent("\n".join(lines)).strip()
         messages.append({"role": "user", "content": user_payload})
-        return messages
+        format_block = self._batch_schema(batch, outline=outline, item_count=len(target_indices))
+        return messages, format_block
+
+    def _tail_fill_batch(
+        self,
+        batch: SkeletonBatchPlan,
+        *,
+        outline: SkeletonOutline,
+        assembly: SkeletonAssembly,
+        estimate: SkeletonVolumeEstimate,
+        missing_items: Sequence[int],
+        metadata: Dict[str, object],
+    ) -> None:
+        pending = [int(item) for item in missing_items if isinstance(item, int)]
+        if not pending:
+            return
+        previous_id = str(
+            metadata.get("response_id")
+            or metadata.get("previous_response_id")
+            or metadata.get("id")
+            or ""
+        ).strip()
+        if not previous_id:
+            return
+        tail_plan = SkeletonBatchPlan(
+            kind=batch.kind,
+            indices=list(pending),
+            label=batch.label + "#tail",
+            tail_fill=True,
+        )
+        messages, format_block = self._build_batch_messages(
+            tail_plan,
+            outline=outline,
+            assembly=assembly,
+            target_indices=list(pending),
+            tail_fill=True,
+        )
+        budget = self._batch_token_budget(batch, estimate, len(pending))
+        max_tokens = min(budget, TAIL_FILL_MAX_TOKENS)
+        LOGGER.info(
+            "TAIL_FILL missing_items=%s max_tokens=%d",
+            ",".join(str(item + 1) for item in pending),
+            max_tokens,
+        )
+        result = self._call_llm(
+            step=PipelineStep.SKELETON,
+            messages=messages,
+            max_tokens=max_tokens,
+            previous_response_id=previous_id,
+            responses_format=format_block,
+        )
+        tail_metadata = result.metadata or {}
+        payload = self._extract_response_json(result.text)
+        if batch.kind == SkeletonBatchKind.MAIN:
+            normalized, missing = self._normalize_main_batch(payload, list(pending), outline)
+            for index, heading, body in normalized:
+                assembly.apply_main(index, body, heading=heading)
+            if missing:
+                raise PipelineStepError(
+                    PipelineStep.SKELETON,
+                    "Не удалось достроить все разделы основной части.",
+                )
+        elif batch.kind == SkeletonBatchKind.FAQ:
+            normalized, missing = self._normalize_faq_batch(payload, list(pending))
+            for _, question, answer in normalized:
+                assembly.apply_faq(question, answer)
+            if missing:
+                raise PipelineStepError(
+                    PipelineStep.SKELETON,
+                    "Не удалось достроить все элементы FAQ.",
+                )
+        elif batch.kind == SkeletonBatchKind.INTRO:
+            normalized, missing_fields = self._normalize_intro_batch(payload, outline)
+            if normalized.get("intro"):
+                headers = normalized.get("main_headers") or []
+                if len(headers) < len(outline.main_headings):
+                    headers = headers + outline.main_headings[len(headers) :]
+                assembly.apply_intro(
+                    normalized.get("intro"),
+                    headers,
+                    normalized.get("conclusion_heading"),
+                )
+            if missing_fields:
+                raise PipelineStepError(
+                    PipelineStep.SKELETON,
+                    "Не удалось завершить вводный блок скелета.",
+                )
+        else:
+            conclusion_text, missing = self._normalize_conclusion_batch(payload)
+            if conclusion_text:
+                assembly.apply_conclusion(conclusion_text)
+            if missing:
+                raise PipelineStepError(
+                    PipelineStep.SKELETON,
+                    "Не удалось завершить вывод скелета.",
+                )
+        for key, value in tail_metadata.items():
+            if value:
+                metadata[key] = value
 
     def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
         if not isinstance(payload, dict):
@@ -579,150 +1154,130 @@ class DeterministicPipeline:
     # ------------------------------------------------------------------
     def _run_skeleton(self) -> str:
         self._log(PipelineStep.SKELETON, "running")
-        messages = self._build_skeleton_messages()
-        skeleton_tokens = self._resolve_skeleton_tokens()
-        attempt = 0
-        last_error: Optional[Exception] = None
-        payload: Optional[Dict[str, object]] = None
-        markdown: Optional[str] = None
+        outline = self._prepare_outline()
+        estimate = self._predict_skeleton_volume(outline)
+        batches = self._build_skeleton_batches(outline)
+        assembly = SkeletonAssembly(outline=outline)
         metadata_snapshot: Dict[str, object] = {}
-        json_error_count = 0
-        use_fallback = False
-        result: Optional[GenerationResult] = None
-        def _clamp_tokens(value: int) -> int:
-            cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-            upper = cap if cap is not None else int(value)
-            return max(800, min(upper, int(value)))
+        last_result: Optional[GenerationResult] = None
 
-        while attempt < 3 and markdown is None:
-            attempt += 1
+        for batch in batches:
+            target_indices = list(batch.indices)
+            messages, format_block = self._build_batch_messages(
+                batch,
+                outline=outline,
+                assembly=assembly,
+                target_indices=target_indices,
+                tail_fill=batch.tail_fill,
+            )
+            max_tokens = self._batch_token_budget(batch, estimate, len(target_indices))
             try:
                 result = self._call_llm(
                     step=PipelineStep.SKELETON,
                     messages=messages,
-                    max_tokens=skeleton_tokens,
-                    override_model=FALLBACK_MODEL if use_fallback else None,
+                    max_tokens=max_tokens,
+                    responses_format=format_block,
                 )
             except PipelineStepError:
                 raise
-            metadata_snapshot = result.metadata or {}
-            status = str(metadata_snapshot.get("status") or "ok").lower()
-            reason = str(metadata_snapshot.get("incomplete_reason") or "").lower()
-            raw_text = result.text.strip()
-            if "<response_json>" in raw_text and "</response_json>" in raw_text:
-                try:
-                    raw_text = raw_text.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
-                except Exception:  # pragma: no cover - defensive
-                    raw_text = raw_text
-            parsed_payload: Optional[Dict[str, object]] = None
-            decode_error: Optional[json.JSONDecodeError] = None
-            if raw_text:
-                try:
-                    parsed_payload = json.loads(raw_text)
-                except json.JSONDecodeError as exc:
-                    decode_error = exc
-                    parsed_payload = None
-            if status == "incomplete" or reason:
-                accepted_incomplete = False
-                if parsed_payload is not None:
-                    try:
-                        normalized_payload = normalize_skeleton_payload(parsed_payload)
-                        markdown_candidate, summary = self._render_skeleton_markdown(normalized_payload)
-                        snapshot = dict(normalized_payload)
-                        snapshot["outline"] = summary.get("outline", [])
-                        if "faq" in summary:
-                            snapshot["faq"] = summary.get("faq", [])
-                        self.skeleton_payload = snapshot
-                        metadata_snapshot = dict(metadata_snapshot)
-                        metadata_snapshot["status"] = "completed"
-                        metadata_snapshot["incomplete_reason"] = ""
-                        LOGGER.info("SKELETON_INCOMPLETE_ACCEPT attempt=%d", attempt)
-                        markdown = markdown_candidate
-                        payload = normalized_payload
-                        accepted_incomplete = True
-                    except Exception as exc:  # noqa: BLE001
-                        last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
-                        LOGGER.warning("SKELETON_INCOMPLETE_INVALID attempt=%d error=%s", attempt, exc)
-                        parsed_payload = None
-                if accepted_incomplete:
-                    break
-                LOGGER.warning(
-                    "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
-                    attempt,
-                    status,
-                    reason,
-                )
-                if decode_error is not None:
-                    LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, decode_error)
-                    LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
-                    last_error = PipelineStepError(
-                        PipelineStep.SKELETON, "Ответ модели не является корректным JSON."
-                    )
-                    json_error_count += 1
-                    if not use_fallback and json_error_count >= 2:
-                        LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
-                        use_fallback = True
-                        attempt = 0
-                        continue
-                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                continue
-            if not raw_text:
-                last_error = PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
-                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=empty", attempt)
-                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
-                continue
-            if parsed_payload is None:
-                if decode_error is not None:
-                    LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, decode_error)
-                    LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
-                    skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                    last_error = PipelineStepError(
-                        PipelineStep.SKELETON, "Ответ модели не является корректным JSON."
-                    )
-                    json_error_count += 1
-                    if not use_fallback and json_error_count >= 2:
-                        LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
-                        use_fallback = True
-                        attempt = 0
-                        continue
-                    continue
-                last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
-                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
-                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                continue
-            payload = normalize_skeleton_payload(parsed_payload)
-            LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
-            try:
-                markdown, summary = self._render_skeleton_markdown(payload)
-                snapshot = dict(payload)
-                snapshot["outline"] = summary.get("outline", [])
-                if "faq" in summary:
-                    snapshot["faq"] = summary.get("faq", [])
-                self.skeleton_payload = snapshot
-                LOGGER.info("SKELETON_RENDERED_WITH_MARKERS outline=%s", ",".join(summary.get("outline", [])))
-            except Exception as exc:  # noqa: BLE001
-                last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
-                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=%s", attempt, exc)
-                payload = None
-                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                markdown = None
 
-        if markdown is None:
-            if last_error:
-                raise last_error
+            last_result = result
+            metadata_snapshot = result.metadata or {}
+            payload_obj = self._extract_response_json(result.text)
+
+            if batch.kind == SkeletonBatchKind.INTRO:
+                normalized, missing_fields = self._normalize_intro_batch(payload_obj, outline)
+                intro_text = normalized.get("intro", "")
+                headers = normalized.get("main_headers") or []
+                if len(headers) < len(outline.main_headings):
+                    headers = headers + outline.main_headings[len(headers) :]
+                assembly.apply_intro(intro_text, headers, normalized.get("conclusion_heading"))
+                if missing_fields:
+                    self._tail_fill_batch(
+                        batch,
+                        outline=outline,
+                        assembly=assembly,
+                        estimate=estimate,
+                        missing_items=[0],
+                        metadata=metadata_snapshot,
+                    )
+            elif batch.kind == SkeletonBatchKind.MAIN:
+                normalized_sections, missing_indices = self._normalize_main_batch(
+                    payload_obj, target_indices, outline
+                )
+                for index, heading, body in normalized_sections:
+                    assembly.apply_main(index, body, heading=heading)
+                if missing_indices:
+                    self._tail_fill_batch(
+                        batch,
+                        outline=outline,
+                        assembly=assembly,
+                        estimate=estimate,
+                        missing_items=missing_indices,
+                        metadata=metadata_snapshot,
+                    )
+            elif batch.kind == SkeletonBatchKind.FAQ:
+                normalized_entries, missing_faq = self._normalize_faq_batch(payload_obj, target_indices)
+                for _, question, answer in normalized_entries:
+                    assembly.apply_faq(question, answer)
+                if missing_faq:
+                    self._tail_fill_batch(
+                        batch,
+                        outline=outline,
+                        assembly=assembly,
+                        estimate=estimate,
+                        missing_items=missing_faq,
+                        metadata=metadata_snapshot,
+                    )
+            else:
+                conclusion_text, missing_flag = self._normalize_conclusion_batch(payload_obj)
+                assembly.apply_conclusion(conclusion_text)
+                if missing_flag:
+                    self._tail_fill_batch(
+                        batch,
+                        outline=outline,
+                        assembly=assembly,
+                        estimate=estimate,
+                        missing_items=[0],
+                        metadata=metadata_snapshot,
+                    )
+
+            LOGGER.info("SKELETON_BATCH_ACCEPT kind=%s label=%s", batch.kind.value, batch.label)
+
+        if not assembly.intro:
+            raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вводный блок скелета.")
+        if not assembly.conclusion:
+            raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вывод скелета.")
+        missing_main = assembly.missing_main_indices()
+        if missing_main:
             raise PipelineStepError(
                 PipelineStep.SKELETON,
-                "Не удалось получить корректный скелет статьи после нескольких попыток.",
+                "Не удалось заполнить все разделы основной части.",
+            )
+        if outline.has_faq and assembly.missing_faq_count(5):
+            raise PipelineStepError(
+                PipelineStep.SKELETON,
+                "Не удалось собрать полный FAQ на этапе скелета.",
             )
 
-        if FAQ_START not in markdown or FAQ_END not in markdown:
-            raise PipelineStepError(PipelineStep.SKELETON, "Не удалось вставить маркеры FAQ на этапе скелета.")
+        payload = assembly.build_payload()
+        if outline.has_faq and len(payload.get("faq", [])) > 5:
+            payload["faq"] = payload["faq"][:5]
+
+        normalized_payload = normalize_skeleton_payload(payload)
+        markdown, summary = self._render_skeleton_markdown(normalized_payload)
+        snapshot = dict(normalized_payload)
+        snapshot["outline"] = summary.get("outline", [])
+        if "faq" in summary:
+            snapshot["faq"] = summary.get("faq", [])
+        self.skeleton_payload = snapshot
+        self._skeleton_faq_entries = [
+            {"question": entry.get("q", ""), "answer": entry.get("a", "")}
+            for entry in normalized_payload.get("faq", [])
+        ]
 
         self._check_template_text(markdown, PipelineStep.SKELETON)
-        if result is not None:
-            route = result.api_route or ("chat" if use_fallback else "responses")
-        else:
-            route = "responses"
+        route = last_result.api_route if last_result is not None else "responses"
         LOGGER.info("SKELETON_OK route=%s", route)
         self._update_log(
             PipelineStep.SKELETON,

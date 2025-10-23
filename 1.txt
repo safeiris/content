@@ -1,13 +1,78 @@
+diff --git a/config.py b/config.py
+index 849294e993752b25b643c263a02583fb676f0d9c..435a91ebb5731be02a1d998dcefc916a0c9a5d6f 100644
+--- a/config.py
++++ b/config.py
+@@ -27,56 +27,60 @@ def _env_float_list(name: str, default: str) -> tuple[float, ...]:
+     if not delays:
+         delays = [float(value) for value in default.split(",") if value]
+     return tuple(delays)
+ 
+ 
+ def _env_bool(name: str, default: bool) -> bool:
+     raw = str(os.getenv(name, "")).strip().lower()
+     if not raw:
+         return default
+     return raw not in {"0", "false", "off", "no"}
+ 
+ OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
+ 
+ USE_MOCK_LLM = _env_bool("USE_MOCK_LLM", False)
+ OFFLINE_MODE = _env_bool("OFFLINE_MODE", False)
+ PIPELINE_FAST_PATH = _env_bool("PIPELINE_FAST_PATH", False)
+ MODEL_PROVIDER = str(os.getenv("MODEL_PROVIDER", "openai")).strip() or "openai"
+ 
+ _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
+ FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
+ 
+ # GPT-5 Responses tuning
+ G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1500)
+ G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2200)
+ G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 2600)
+-G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3000)
++G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3600)
+ _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
+ G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
+ G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
+ G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
+ 
++SKELETON_BATCH_SIZE_MAIN = max(1, _env_int("SKELETON_BATCH_SIZE_MAIN", 2))
++SKELETON_FAQ_BATCH = max(1, _env_int("SKELETON_FAQ_BATCH", 3))
++TAIL_FILL_MAX_TOKENS = max(200, _env_int("TAIL_FILL_MAX_TOKENS", 700))
++
+ # Дефолтные настройки ядра
+ DEFAULT_TONE = "экспертный, дружелюбный"
+ DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "Вывод"]
+ 
+ # Простая «норма» для SEO: ориентир по упоминаниям ключей на ~100 слов
+ DEFAULT_SEO_DENSITY = 2
+ 
+ # Рекомендуемые границы объёма (знаков)
+ DEFAULT_MIN_LENGTH = 3500
+ DEFAULT_MAX_LENGTH = 6000
+ 
+ # Максимальный объём пользовательского контекста (символов)
+ MAX_CUSTOM_CONTEXT_CHARS = 20_000
+ 
+ # Стилевые профили
+ STYLE_PROFILE_PATH = "profiles/finance/style_profile.md"
+ STYLE_PROFILE_VARIANT = str(os.getenv("STYLE_PROFILE_VARIANT", "full")).strip().lower() or "full"
+ if STYLE_PROFILE_VARIANT not in {"full", "light"}:
+     STYLE_PROFILE_VARIANT = "full"
+ APPEND_STYLE_PROFILE_DEFAULT = (
+     str(os.getenv("APPEND_STYLE_PROFILE_DEFAULT", "true")).strip().lower() not in {"0", "false", "off", "no"}
+ )
+ 
+ # Ключевые слова
+ KEYWORDS_ALLOW_AUTO = _env_bool("KEYWORDS_ALLOW_AUTO", False)
 diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 03370bcea582bce7cdd3cbc4b5096c21f2c61a8c..7881881822e4577fb79d1548bec0dffebd320cef 100644
+index 7881881822e4577fb79d1548bec0dffebd320cef..7c8589687dfd5716c795776c077fce88261bdfb7 100644
 --- a/deterministic_pipeline.py
 +++ b/deterministic_pipeline.py
-@@ -1,30 +1,29 @@
+@@ -1,50 +1,54 @@
  """LLM-driven content pipeline with explicit step-level guarantees."""
  
  from __future__ import annotations
  
--import json
  import json
  import logging
  import re
@@ -15,9 +80,16 @@ index 03370bcea582bce7cdd3cbc4b5096c21f2c61a8c..7881881822e4577fb79d1548bec0dffe
  import time
  from dataclasses import dataclass, field
  from enum import Enum
- from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
++from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
  
- from config import G5_MAX_OUTPUT_TOKENS_BASE, G5_MAX_OUTPUT_TOKENS_MAX
+-from config import G5_MAX_OUTPUT_TOKENS_BASE, G5_MAX_OUTPUT_TOKENS_MAX
++from config import (
++    G5_MAX_OUTPUT_TOKENS_MAX,
++    SKELETON_BATCH_SIZE_MAIN,
++    SKELETON_FAQ_BATCH,
++    TAIL_FILL_MAX_TOKENS,
++)
  from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
  from faq_builder import _normalize_entry
  from keyword_injector import (
@@ -28,192 +100,1229 @@ index 03370bcea582bce7cdd3cbc4b5096c21f2c61a8c..7881881822e4577fb79d1548bec0dffe
      inject_keywords,
  )
  from length_trimmer import TrimResult, TrimValidationError, trim_text
- from prompt_templates import load_template
+-from prompt_templates import load_template
  from skeleton_utils import normalize_skeleton_payload
  from validators import (
      ValidationError,
      ValidationResult,
-@@ -586,86 +585,135 @@ class DeterministicPipeline:
-         last_error: Optional[Exception] = None
-         payload: Optional[Dict[str, object]] = None
-         markdown: Optional[str] = None
-         metadata_snapshot: Dict[str, object] = {}
-         json_error_count = 0
-         use_fallback = False
-         result: Optional[GenerationResult] = None
-         def _clamp_tokens(value: int) -> int:
-             cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-             upper = cap if cap is not None else int(value)
-             return max(800, min(upper, int(value)))
+     length_no_spaces,
+     strip_jsonld,
+     validate_article,
+ )
  
-         while attempt < 3 and markdown is None:
+ 
+ LOGGER = logging.getLogger("content_factory.pipeline")
+ 
+ FAQ_START = "<!--FAQ_START-->"
+ FAQ_END = "<!--FAQ_END-->"
+ 
+ _TEMPLATE_SNIPPETS = [
+     "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
+     "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист",
+     "В выводах собираем план действий, назначаем контрольные даты",
+ ]
+ 
+ 
+ class PipelineStep(str, Enum):
+     SKELETON = "skeleton"
+     KEYWORDS = "keywords"
+@@ -63,50 +67,167 @@ class PipelineLogEntry:
+ 
+ @dataclass
+ class PipelineState:
+     text: str
+     jsonld: Optional[str]
+     validation: Optional[ValidationResult]
+     logs: List[PipelineLogEntry]
+     checkpoints: Dict[PipelineStep, str]
+     model_used: Optional[str] = None
+     fallback_used: Optional[str] = None
+     fallback_reason: Optional[str] = None
+     api_route: Optional[str] = None
+     token_usage: Optional[float] = None
+     skeleton_payload: Optional[Dict[str, object]] = None
+ 
+ 
+ class PipelineStepError(RuntimeError):
+     """Raised when a particular pipeline step fails irrecoverably."""
+ 
+     def __init__(self, step: PipelineStep, message: str, *, status_code: int = 500) -> None:
+         super().__init__(message)
+         self.step = step
+         self.status_code = status_code
+ 
+ 
++class SkeletonBatchKind(str, Enum):
++    INTRO = "intro"
++    MAIN = "main"
++    FAQ = "faq"
++    CONCLUSION = "conclusion"
++
++
++@dataclass
++class SkeletonBatchPlan:
++    kind: SkeletonBatchKind
++    indices: List[int] = field(default_factory=list)
++    label: str = ""
++    tail_fill: bool = False
++
++
++@dataclass
++class SkeletonOutline:
++    intro_heading: str
++    main_headings: List[str]
++    conclusion_heading: str
++    has_faq: bool
++
++    def all_headings(self) -> List[str]:
++        headings = [self.intro_heading]
++        headings.extend(self.main_headings)
++        headings.append(self.conclusion_heading)
++        return headings
++
++    def update_main_headings(self, new_headings: Sequence[str]) -> None:
++        cleaned = [str(item).strip() for item in new_headings if str(item or "").strip()]
++        if not cleaned:
++            return
++        current_len = len(self.main_headings)
++        if current_len == 0:
++            self.main_headings = cleaned
++            return
++        adjusted = list(cleaned[:current_len])
++        if len(adjusted) < current_len:
++            adjusted.extend(self.main_headings[len(adjusted) :])
++        self.main_headings = adjusted
++
++
++@dataclass
++class SkeletonVolumeEstimate:
++    predicted_tokens: int
++    start_max_tokens: int
++    cap_tokens: Optional[int]
++    intro_tokens: int
++    conclusion_tokens: int
++    per_main_tokens: int
++    per_faq_tokens: int
++    requires_chunking: bool
++
++
++@dataclass
++class SkeletonAssembly:
++    outline: SkeletonOutline
++    intro: Optional[str] = None
++    conclusion: Optional[str] = None
++    main_sections: List[Optional[str]] = field(default_factory=list)
++    faq_entries: List[Dict[str, str]] = field(default_factory=list)
++
++    def __post_init__(self) -> None:
++        if not self.main_sections:
++            self.main_sections = [None] * len(self.outline.main_headings)
++
++    def apply_intro(
++        self,
++        intro_text: Optional[str],
++        main_headers: Optional[Sequence[str]] = None,
++        conclusion_heading: Optional[str] = None,
++    ) -> None:
++        if intro_text and intro_text.strip():
++            self.intro = intro_text.strip()
++        if main_headers:
++            self.outline.update_main_headings(main_headers)
++            if len(self.main_sections) != len(self.outline.main_headings):
++                self.main_sections = [None] * len(self.outline.main_headings)
++        if conclusion_heading and conclusion_heading.strip():
++            self.outline.conclusion_heading = conclusion_heading.strip()
++
++    def apply_main(self, index: int, body: str, *, heading: Optional[str] = None) -> None:
++        if heading and heading.strip() and 0 <= index < len(self.outline.main_headings):
++            self.outline.main_headings[index] = heading.strip()
++        if 0 <= index < len(self.main_sections) and body and body.strip():
++            self.main_sections[index] = body.strip()
++
++    def apply_faq(self, question: str, answer: str) -> None:
++        if question.strip() and answer.strip():
++            self.faq_entries.append({"q": question.strip(), "a": answer.strip()})
++
++    def apply_conclusion(self, conclusion_text: Optional[str]) -> None:
++        if conclusion_text and conclusion_text.strip():
++            self.conclusion = conclusion_text.strip()
++
++    def missing_main_indices(self) -> List[int]:
++        return [idx for idx, body in enumerate(self.main_sections) if not body]
++
++    def missing_faq_count(self, target_total: int) -> int:
++        return max(0, target_total - len(self.faq_entries))
++
++    def outline_snapshot(self) -> List[str]:
++        headings = [self.outline.intro_heading]
++        headings.extend(self.outline.main_headings)
++        headings.append(self.outline.conclusion_heading)
++        return headings
++
++    def build_payload(self) -> Dict[str, object]:
++        main_blocks = [body or "" for body in self.main_sections]
++        payload: Dict[str, object] = {
++            "intro": self.intro or "",
++            "main": main_blocks,
++            "faq": list(self.faq_entries),
++            "conclusion": self.conclusion or "",
++        }
++        return payload
++
+ class DeterministicPipeline:
+     """Pipeline that orchestrates LLM calls and post-processing steps."""
+ 
+     def __init__(
+         self,
+         *,
+         topic: str,
+         base_outline: Sequence[str],
+         keywords: Iterable[str],
+         min_chars: int,
+         max_chars: int,
+         messages: Sequence[Dict[str, object]],
+         model: str,
+         temperature: float,
+         max_tokens: int,
+         timeout_s: int,
+         backoff_schedule: Optional[List[float]] = None,
+         provided_faq: Optional[List[Dict[str, str]]] = None,
+         jsonld_requested: bool = True,
+     ) -> None:
+         if not model or not str(model).strip():
+             raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
+ 
+         self.topic = topic.strip() or "Тема"
+         self.base_outline = list(base_outline) if base_outline else ["Введение", "Основная часть", "Вывод"]
+@@ -181,75 +302,79 @@ class DeterministicPipeline:
+     def _extract_usage(self, result: GenerationResult) -> Optional[float]:
+         metadata = result.metadata or {}
+         if not isinstance(metadata, dict):
+             return None
+         candidates = [
+             metadata.get("usage_output_tokens"),
+             metadata.get("token_usage"),
+             metadata.get("output_tokens"),
+         ]
+         usage_block = metadata.get("usage")
+         if isinstance(usage_block, dict):
+             candidates.append(usage_block.get("output_tokens"))
+             candidates.append(usage_block.get("total_tokens"))
+         for candidate in candidates:
+             if isinstance(candidate, (int, float)):
+                 return float(candidate)
+         return None
+ 
+     def _call_llm(
+         self,
+         *,
+         step: PipelineStep,
+         messages: Sequence[Dict[str, object]],
+         max_tokens: Optional[int] = None,
+         override_model: Optional[str] = None,
++        previous_response_id: Optional[str] = None,
++        responses_format: Optional[Dict[str, object]] = None,
+     ) -> GenerationResult:
+         prompt_len = self._prompt_length(messages)
+         limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
+         if not limit or limit <= 0:
+             limit = 700
+         attempt = 0
+         model_to_use = (override_model or self.model).strip()
+         while attempt < 3:
              attempt += 1
+             LOGGER.info(
+                 "LOG:LLM_REQUEST step=%s model=%s prompt_len=%d attempt=%d max_tokens=%d",
+                 step.value,
+                 model_to_use,
+                 prompt_len,
+                 attempt,
+                 limit,
+             )
+             try:
+                 result = llm_generate(
+                     list(messages),
+                     model=model_to_use,
+                     temperature=self.temperature,
+                     max_tokens=limit,
+                     timeout_s=self.timeout_s,
+                     backoff_schedule=self.backoff_schedule,
++                    previous_response_id=previous_response_id,
++                    responses_text_format=responses_format,
+                 )
+             except Exception as exc:  # noqa: BLE001
+                 LOGGER.error("LOG:LLM_ERROR step=%s message=%s", step.value, exc)
+                 raise PipelineStepError(step, f"Сбой при обращении к модели ({step.value}): {exc}") from exc
+ 
+             usage = self._extract_usage(result)
+             metadata = result.metadata or {}
+             status = str(metadata.get("status") or "ok")
+             incomplete_reason = metadata.get("incomplete_reason") or ""
+             LOGGER.info(
+                 "LOG:LLM_RESPONSE step=%s tokens_used=%s status=%s",
+                 step.value,
+                 "%.0f" % usage if isinstance(usage, (int, float)) else "unknown",
+                 status,
+             )
+             if status.lower() != "incomplete" and not incomplete_reason:
+                 self._register_llm_result(result, usage)
+                 return result
+ 
+             if attempt >= 3:
+                 message = "Модель не завершила генерацию (incomplete)."
+                 LOGGER.error(
+                     "LLM_INCOMPLETE_ABORT step=%s status=%s reason=%s",
+                     step.value,
+                     status or "incomplete",
+@@ -267,121 +392,571 @@ class DeterministicPipeline:
+             limit = max(200, int(limit * 0.9))
+ 
+         raise PipelineStepError(step, "Не удалось получить ответ от модели.")
+ 
+     def _check_template_text(self, text: str, step: PipelineStep) -> None:
+         lowered = text.lower()
+         if lowered.count("дополнительно рассматривается") >= 3:
+             raise PipelineStepError(step, "Обнаружен шаблонный текст 'Дополнительно рассматривается'.")
+         for snippet in _TEMPLATE_SNIPPETS:
+             if snippet in lowered:
+                 raise PipelineStepError(step, "Найден служебный шаблонный фрагмент, генерация отклонена.")
+ 
+     def _metrics(self, text: str) -> Dict[str, object]:
+         article = strip_jsonld(text)
+         chars_no_spaces = length_no_spaces(article)
+         keywords_found = 0
+         for term in self.normalized_keywords:
+             if build_term_pattern(term).search(article):
+                 keywords_found += 1
+         return {
+             "chars_no_spaces": chars_no_spaces,
+             "keywords_found": keywords_found,
+             "keywords_total": len(self.normalized_keywords),
+         }
+ 
+-    def _resolve_skeleton_tokens(self) -> int:
+-        if self.max_tokens and self.max_tokens > 0:
+-            baseline = int(self.max_tokens)
+-        else:
+-            fallback = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
+-            baseline = fallback
++    def _prepare_outline(self) -> SkeletonOutline:
++        outline = [str(segment or "").strip() for segment in self.base_outline if str(segment or "").strip()]
++        if not outline:
++            outline = ["Введение", "Основная часть", "FAQ", "Вывод"]
++        intro_heading = outline[0]
++        conclusion_heading = outline[-1] if len(outline) > 1 else "Вывод"
++        faq_markers = {"faq", "f.a.q.", "вопросы и ответы"}
++        has_faq = any(entry.strip().lower() in faq_markers for entry in outline)
++        main_candidates: List[str] = []
++        for entry in outline[1:-1]:
++            normalized = entry.strip()
++            if normalized.lower() in faq_markers:
++                continue
++            if normalized:
++                main_candidates.append(normalized)
++        if not main_candidates:
++            main_candidates = ["Основная часть"]
++        return SkeletonOutline(
++            intro_heading=intro_heading,
++            main_headings=main_candidates,
++            conclusion_heading=conclusion_heading,
++            has_faq=has_faq,
++        )
++
++    def _predict_skeleton_volume(self, outline: SkeletonOutline) -> SkeletonVolumeEstimate:
+         cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+-        if cap is not None:
+-            baseline = min(baseline, cap)
+-        return max(800, baseline)
++        min_chars = max(3200, int(self.min_chars) if self.min_chars > 0 else 3200)
++        max_chars = max(min_chars + 400, int(self.max_chars) if self.max_chars > 0 else min_chars + 1200)
++        avg_chars = max(min_chars, int((min_chars + max_chars) / 2))
++        approx_tokens = max(1100, int(avg_chars / 3.2))
++        main_count = max(1, len(outline.main_headings))
++        faq_count = 5 if outline.has_faq else 0
++        intro_tokens = max(160, int(approx_tokens * 0.12))
++        conclusion_tokens = max(140, int(approx_tokens * 0.1))
++        faq_pool = max(0, int(approx_tokens * 0.2)) if faq_count else 0
++        per_faq_tokens = max(70, int(faq_pool / faq_count)) if faq_count else 0
++        allocated_faq = per_faq_tokens * faq_count
++        remaining_for_main = max(
++            approx_tokens - intro_tokens - conclusion_tokens - allocated_faq,
++            220 * main_count,
++        )
++        per_main_tokens = max(220, int(remaining_for_main / main_count)) if main_count else 0
++        predicted = intro_tokens + conclusion_tokens + per_main_tokens * main_count + per_faq_tokens * faq_count
++        start_max = int(predicted * 1.2)
++        if cap is not None and cap > 0:
++            start_max = min(start_max, cap)
++        start_max = max(600, start_max)
++        requires_chunking = bool(cap is not None and predicted > cap)
++        LOGGER.info(
++            "SKELETON_ESTIMATE predicted=%d start_max=%d cap=%s",
++            predicted,
++            start_max,
++            cap if cap is not None else "-",
++        )
++        return SkeletonVolumeEstimate(
++            predicted_tokens=predicted,
++            start_max_tokens=start_max,
++            cap_tokens=cap,
++            intro_tokens=intro_tokens,
++            conclusion_tokens=conclusion_tokens,
++            per_main_tokens=per_main_tokens,
++            per_faq_tokens=per_faq_tokens,
++            requires_chunking=requires_chunking,
++        )
+ 
+-    def _skeleton_contract(self) -> Tuple[Dict[str, object], str]:
+-        outline = [segment.strip() for segment in self.base_outline if segment.strip()]
+-        intro = outline[0] if outline else "Введение"
+-        outro = outline[-1] if len(outline) > 1 else "Вывод"
+-        core_sections = [
+-            item
+-            for item in outline[1:-1]
+-            if item.lower() not in {"faq", "f.a.q.", "вопросы и ответы"}
+-        ]
+-        if not core_sections:
+-            core_sections = ["Основная часть"]
+-        contract = {
+-            "intro": f"один абзац с вводной рамкой для раздела '{intro}'",
+-            "main": [
+-                (
+-                    "3-5 абзацев раскрывают тему '"
+-                    + heading
+-                    + "' с примерами, рисками и расчётами"
++    def _build_skeleton_batches(self, outline: SkeletonOutline) -> List[SkeletonBatchPlan]:
++        batches: List[SkeletonBatchPlan] = [SkeletonBatchPlan(kind=SkeletonBatchKind.INTRO, label="intro")]
++        main_count = len(outline.main_headings)
++        if main_count > 0:
++            batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
++            start = 0
++            while start < main_count:
++                end = min(start + batch_size, main_count)
++                indices = list(range(start, end))
++                if len(indices) == 1:
++                    label = f"main[{indices[0] + 1}]"
++                else:
++                    label = f"main[{indices[0] + 1}-{indices[-1] + 1}]"
++                batches.append(
++                    SkeletonBatchPlan(
++                        kind=SkeletonBatchKind.MAIN,
++                        indices=indices,
++                        label=label,
++                    )
+                 )
+-                for heading in core_sections
+-            ],
+-            "faq": [
+-                {"q": "вопрос", "a": "ответ"} for _ in range(5)
+-            ],
+-            "conclusion": f"один абзац выводов и призыва к действию для блока '{outro}'",
++                start = end
++        if outline.has_faq:
++            total_faq = 5
++            produced = 0
++            first_batch = min(SKELETON_FAQ_BATCH, total_faq)
++            if first_batch > 0:
++                indices = list(range(produced, produced + first_batch))
++                label = (
++                    f"faq[{indices[0] + 1}-{indices[-1] + 1}]"
++                    if len(indices) > 1
++                    else f"faq[{indices[0] + 1}]"
++                )
++                batches.append(
++                    SkeletonBatchPlan(
++                        kind=SkeletonBatchKind.FAQ,
++                        indices=indices,
++                        label=label,
++                    )
++                )
++                produced += first_batch
++            while produced < total_faq:
++                remaining = total_faq - produced
++                chunk_size = min(SKELETON_FAQ_BATCH, remaining)
++                indices = list(range(produced, produced + chunk_size))
++                label = (
++                    f"faq[{indices[0] + 1}-{indices[-1] + 1}]"
++                    if len(indices) > 1
++                    else f"faq[{indices[0] + 1}]"
++                )
++                batches.append(
++                    SkeletonBatchPlan(
++                        kind=SkeletonBatchKind.FAQ,
++                        indices=indices,
++                        label=label,
++                    )
++                )
++                produced += chunk_size
++        batches.append(SkeletonBatchPlan(kind=SkeletonBatchKind.CONCLUSION, label="conclusion"))
++        return batches
++
++    def _batch_schema(
++        self,
++        batch: SkeletonBatchPlan,
++        *,
++        outline: SkeletonOutline,
++        item_count: int,
++    ) -> Dict[str, object]:
++        if batch.kind == SkeletonBatchKind.INTRO:
++            schema = {
++                "type": "object",
++                "properties": {
++                    "intro": {"type": "string"},
++                    "main_headers": {
++                        "type": "array",
++                        "items": {"type": "string"},
++                        "minItems": len(outline.main_headings),
++                        "maxItems": len(outline.main_headings),
++                    },
++                    "conclusion_heading": {"type": "string"},
++                },
++                "required": ["intro", "main_headers", "conclusion_heading"],
++                "additionalProperties": False,
++            }
++        elif batch.kind == SkeletonBatchKind.MAIN:
++            min_items = 1 if item_count > 0 else 0
++            schema = {
++                "type": "object",
++                "properties": {
++                    "sections": {
++                        "type": "array",
++                        "items": {
++                            "type": "object",
++                            "properties": {
++                                "title": {"type": "string"},
++                                "body": {"type": "string"},
++                            },
++                            "required": ["title", "body"],
++                            "additionalProperties": False,
++                        },
++                        "minItems": min_items,
++                        "maxItems": max(item_count, 1),
++                    }
++                },
++                "required": ["sections"],
++                "additionalProperties": False,
++            }
++        elif batch.kind == SkeletonBatchKind.FAQ:
++            min_items = 1 if item_count > 0 else 0
++            schema = {
++                "type": "object",
++                "properties": {
++                    "faq": {
++                        "type": "array",
++                        "items": {
++                            "type": "object",
++                            "properties": {
++                                "q": {"type": "string"},
++                                "a": {"type": "string"},
++                            },
++                            "required": ["q", "a"],
++                            "additionalProperties": False,
++                        },
++                        "minItems": min_items,
++                        "maxItems": max(item_count, 1),
++                    }
++                },
++                "required": ["faq"],
++                "additionalProperties": False,
++            }
++        else:
++            schema = {
++                "type": "object",
++                "properties": {"conclusion": {"type": "string"}},
++                "required": ["conclusion"],
++                "additionalProperties": False,
++            }
++        return {
++            "type": "json_schema",
++            "name": f"seo_article_{batch.kind.value}",
++            "schema": schema,
++            "strict": True,
+         }
+-        template_example = load_template("json_contract.txt").strip()
+-        return contract, template_example
+ 
+-    def _build_skeleton_messages(self) -> List[Dict[str, object]]:
+-        outline = [segment.strip() for segment in self.base_outline if segment.strip()]
+-        contract_payload, contract_template = self._skeleton_contract()
+-        contract = json.dumps(contract_payload, ensure_ascii=False, indent=2)
+-        keywords_clause = "Используй ключевые слова: " + ", ".join(self.normalized_keywords)
+-        if not self.normalized_keywords:
+-            keywords_clause = "Используй все предоставленные ключевые слова в точных формах."
+-        sections_clause = ", ".join(outline) if outline else "Введение, Основная часть, FAQ, Вывод"
+-        user_payload = textwrap.dedent(
+-            f"""
+-            Ты создаёшь детерминированный SEO-текст. Соблюдай требования UI:
+-            • Верни строго JSON-объект с ключами intro, main, faq, conclusion.
+-            • intro и conclusion — по одному абзацу без приветствий.
+-            • main — список из 3–6 элементов, каждый элемент содержит 3–5 абзацев по 3–4 предложения.
+-            • faq — массив из 5 объектов {{"q": str, "a": str}}. Ответы FAQ развернутые (минимум 2 предложения) и прикладные.
+-            • Общий объём статьи (intro + main + conclusion + ответы FAQ) — 3500–6000 символов без пробелов.
+-            • {keywords_clause}
+-            • Соблюдай последовательность разделов: {sections_clause}.
+-            • Не добавляй ничего, кроме требуемого JSON. Не используй Markdown, комментарии и пояснения.
+-
+-            Оберни ответ маркерами <response_json> и </response_json> без дополнительного текста.
+-            Пример целевого формата:
+-            {contract_template}
+-
+-            Каркас с подсказками для содержания:
+-            {contract}
+-            """
+-        ).strip()
+-        messages = list(self.messages)
++    def _extract_response_json(self, raw_text: str) -> Optional[object]:
++        candidate = (raw_text or "").strip()
++        if not candidate:
++            return None
++        if "<response_json>" in candidate and "</response_json>" in candidate:
++            try:
++                candidate = candidate.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
++            except Exception:  # pragma: no cover - defensive
++                candidate = candidate
++        try:
++            return json.loads(candidate)
++        except json.JSONDecodeError:
++            match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
++            if match:
++                try:
++                    return json.loads(match.group(0))
++                except json.JSONDecodeError:
++                    return None
++        return None
++
++    def _normalize_intro_batch(
++        self, payload: object, outline: SkeletonOutline
++    ) -> Tuple[Dict[str, object], List[str]]:
++        normalized: Dict[str, object] = {}
++        missing: List[str] = []
++        if not isinstance(payload, dict):
++            return normalized, ["intro", "main_headers"]
++        intro_text = str(payload.get("intro") or "").strip()
++        headers_raw = payload.get("main_headers")
++        if isinstance(headers_raw, list):
++            headers = [str(item or "").strip() for item in headers_raw if str(item or "").strip()]
++        else:
++            headers = []
++        conclusion_heading = str(payload.get("conclusion_heading") or "").strip()
++        if not intro_text:
++            missing.append("intro")
++        if len(headers) < len(outline.main_headings):
++            missing.append("main_headers")
++        normalized["intro"] = intro_text
++        normalized["main_headers"] = headers[: len(outline.main_headings)]
++        normalized["conclusion_heading"] = conclusion_heading or outline.conclusion_heading
++        return normalized, missing
++
++    def _normalize_main_batch(
++        self,
++        payload: object,
++        target_indices: Sequence[int],
++        outline: SkeletonOutline,
++    ) -> Tuple[List[Tuple[int, str, str]], List[int]]:
++        normalized: List[Tuple[int, str, str]] = []
++        missing: List[int] = []
++        if not isinstance(payload, dict):
++            return normalized, list(target_indices)
++        sections = payload.get("sections")
++        if not isinstance(sections, list):
++            return normalized, list(target_indices)
++        max_count = len(target_indices)
++        for position, section in enumerate(sections[:max_count]):
++            if not isinstance(section, dict):
++                missing.append(target_indices[position])
++                continue
++            target_index = target_indices[position]
++            title = str(section.get("title") or outline.main_headings[target_index]).strip()
++            body = str(section.get("body") or "").strip()
++            if not body:
++                missing.append(target_index)
++                continue
++            normalized.append((target_index, title or outline.main_headings[target_index], body))
++        if len(normalized) < len(target_indices):
++            for index in target_indices[len(normalized) :]:
++                if index not in missing:
++                    missing.append(index)
++        return normalized, missing
++
++    def _normalize_faq_batch(
++        self,
++        payload: object,
++        target_indices: Sequence[int],
++    ) -> Tuple[List[Tuple[int, str, str]], List[int]]:
++        normalized: List[Tuple[int, str, str]] = []
++        missing: List[int] = []
++        if not isinstance(payload, dict):
++            return normalized, list(target_indices)
++        faq_items = payload.get("faq")
++        if not isinstance(faq_items, list):
++            return normalized, list(target_indices)
++        max_count = len(target_indices)
++        for position, entry in enumerate(faq_items[:max_count]):
++            if not isinstance(entry, dict):
++                missing.append(target_indices[position])
++                continue
++            question = str(entry.get("q") or "").strip()
++            answer = str(entry.get("a") or "").strip()
++            target_index = target_indices[position]
++            if not question or not answer:
++                missing.append(target_index)
++                continue
++            normalized.append((target_index, question, answer))
++        if len(normalized) < len(target_indices):
++            for index in target_indices[len(normalized) :]:
++                if index not in missing:
++                    missing.append(index)
++        return normalized, missing
++
++    def _normalize_conclusion_batch(self, payload: object) -> Tuple[str, bool]:
++        if not isinstance(payload, dict):
++            return "", True
++        conclusion = str(payload.get("conclusion") or "").strip()
++        return conclusion, not bool(conclusion)
++
++    def _batch_token_budget(
++        self,
++        batch: SkeletonBatchPlan,
++        estimate: SkeletonVolumeEstimate,
++        item_count: int,
++    ) -> int:
++        cap = estimate.cap_tokens or estimate.start_max_tokens
++        if batch.kind == SkeletonBatchKind.INTRO:
++            base = estimate.intro_tokens + max(estimate.per_main_tokens, 300)
++        elif batch.kind == SkeletonBatchKind.MAIN:
++            base = max(estimate.per_main_tokens * max(1, item_count), 400)
++        elif batch.kind == SkeletonBatchKind.FAQ:
++            base = max(estimate.per_faq_tokens * max(1, item_count), 320)
++        else:
++            base = estimate.conclusion_tokens + max(estimate.per_faq_tokens, 120)
++        allowance = cap if cap and cap > 0 else estimate.start_max_tokens
++        if allowance and allowance > 0:
++            base = min(base, allowance)
++        return max(400, int(base * 1.1))
++
++    def _build_batch_messages(
++        self,
++        batch: SkeletonBatchPlan,
++        *,
++        outline: SkeletonOutline,
++        assembly: SkeletonAssembly,
++        target_indices: Sequence[int],
++        tail_fill: bool = False,
++    ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
++        messages = [dict(message) for message in self.messages]
++        outline_text = ", ".join(outline.all_headings())
++        general_lines = [
++            "Ты создаёшь детерминированный SEO-скелет статьи.",
++            f"Тема: {self.topic}.",
++            f"Общий объём: {self.min_chars}–{self.max_chars} символов без пробелов.",
++            f"План разделов: {outline_text}.",
++        ]
++        if self.normalized_keywords:
++            general_lines.append(
++                "Сохраняй точные упоминания ключевых слов: " + ", ".join(self.normalized_keywords) + "."
++            )
++
++        lines: List[str] = list(general_lines)
++        if batch.kind == SkeletonBatchKind.INTRO:
++            lines.extend(
++                [
++                    "Сформируй вводный абзац без приветствий и уточни заголовки основных разделов.",
++                    "Верни JSON вида {\"intro\": str, \"main_headers\": [..], \"conclusion_heading\": str}.",
++                    "main_headers должен содержать столько элементов, сколько основных разделов в плане, порядок сохраняется.",
++                    "intro — один абзац с 3–4 предложениями, без списков.",
++                ]
++            )
++        elif batch.kind == SkeletonBatchKind.MAIN:
++            headings = [outline.main_headings[index] for index in target_indices]
++            already_ready = [
++                outline.main_headings[idx]
++                for idx, body in enumerate(assembly.main_sections)
++                if body and idx not in target_indices
++            ]
++            lines.append(
++                "Нужно детализировать разделы: "
++                + "; ".join(
++                    f"{index + 1}. {heading}" for index, heading in zip(target_indices, headings)
++                )
++                + "."
++            )
++            if already_ready:
++                lines.append(
++                    "Эти разделы уже готовы и переписывать их не нужно: "
++                    + "; ".join(already_ready)
++                    + "."
++                )
++            lines.extend(
++                [
++                    "Каждый раздел — 3–5 абзацев по 3–4 предложения, с примерами, рисками и расчётами.",
++                    "Верни JSON {\"sections\": [{\"title\": str, \"body\": str}, ...]} в порядке указанного списка.",
++                ]
++            )
++            if tail_fill:
++                lines.append("Верни только недостающие разделы без повтора уже написанных частей.")
++        elif batch.kind == SkeletonBatchKind.FAQ:
++            start_number = target_indices[0] + 1 if target_indices else 1
++            lines.append(
++                "Подготовь новые элементы FAQ с практичными ответами (минимум два предложения каждый)."
++            )
++            lines.append(
++                "Верни JSON {\"faq\": [{\"q\": str, \"a\": str}, ...]} в количестве, равном запросу."
++            )
++            lines.append(
++                "Продолжай нумерацию вопросов, начиная с пункта №%d." % start_number
++            )
++            if tail_fill:
++                lines.append("Добавь только недостающие вопросы и ответы.")
++        else:
++            lines.extend(
++                [
++                    "Сделай связный вывод и обозначь план действий, ссылаясь на ключевые идеи статьи.",
++                    "Верни JSON {\"conclusion\": str} с одним абзацем.",
++                ]
++            )
++
++        lines.append("Ответ заверни в теги <response_json>...</response_json> без комментариев.")
++        user_payload = textwrap.dedent("\n".join(lines)).strip()
+         messages.append({"role": "user", "content": user_payload})
+-        return messages
++        format_block = self._batch_schema(batch, outline=outline, item_count=len(target_indices))
++        return messages, format_block
++
++    def _tail_fill_batch(
++        self,
++        batch: SkeletonBatchPlan,
++        *,
++        outline: SkeletonOutline,
++        assembly: SkeletonAssembly,
++        estimate: SkeletonVolumeEstimate,
++        missing_items: Sequence[int],
++        metadata: Dict[str, object],
++    ) -> None:
++        pending = [int(item) for item in missing_items if isinstance(item, int)]
++        if not pending:
++            return
++        previous_id = str(
++            metadata.get("response_id")
++            or metadata.get("previous_response_id")
++            or metadata.get("id")
++            or ""
++        ).strip()
++        if not previous_id:
++            return
++        tail_plan = SkeletonBatchPlan(
++            kind=batch.kind,
++            indices=list(pending),
++            label=batch.label + "#tail",
++            tail_fill=True,
++        )
++        messages, format_block = self._build_batch_messages(
++            tail_plan,
++            outline=outline,
++            assembly=assembly,
++            target_indices=list(pending),
++            tail_fill=True,
++        )
++        budget = self._batch_token_budget(batch, estimate, len(pending))
++        max_tokens = min(budget, TAIL_FILL_MAX_TOKENS)
++        LOGGER.info(
++            "TAIL_FILL missing_items=%s max_tokens=%d",
++            ",".join(str(item + 1) for item in pending),
++            max_tokens,
++        )
++        result = self._call_llm(
++            step=PipelineStep.SKELETON,
++            messages=messages,
++            max_tokens=max_tokens,
++            previous_response_id=previous_id,
++            responses_format=format_block,
++        )
++        tail_metadata = result.metadata or {}
++        payload = self._extract_response_json(result.text)
++        if batch.kind == SkeletonBatchKind.MAIN:
++            normalized, missing = self._normalize_main_batch(payload, list(pending), outline)
++            for index, heading, body in normalized:
++                assembly.apply_main(index, body, heading=heading)
++            if missing:
++                raise PipelineStepError(
++                    PipelineStep.SKELETON,
++                    "Не удалось достроить все разделы основной части.",
++                )
++        elif batch.kind == SkeletonBatchKind.FAQ:
++            normalized, missing = self._normalize_faq_batch(payload, list(pending))
++            for _, question, answer in normalized:
++                assembly.apply_faq(question, answer)
++            if missing:
++                raise PipelineStepError(
++                    PipelineStep.SKELETON,
++                    "Не удалось достроить все элементы FAQ.",
++                )
++        elif batch.kind == SkeletonBatchKind.INTRO:
++            normalized, missing_fields = self._normalize_intro_batch(payload, outline)
++            if normalized.get("intro"):
++                headers = normalized.get("main_headers") or []
++                if len(headers) < len(outline.main_headings):
++                    headers = headers + outline.main_headings[len(headers) :]
++                assembly.apply_intro(
++                    normalized.get("intro"),
++                    headers,
++                    normalized.get("conclusion_heading"),
++                )
++            if missing_fields:
++                raise PipelineStepError(
++                    PipelineStep.SKELETON,
++                    "Не удалось завершить вводный блок скелета.",
++                )
++        else:
++            conclusion_text, missing = self._normalize_conclusion_batch(payload)
++            if conclusion_text:
++                assembly.apply_conclusion(conclusion_text)
++            if missing:
++                raise PipelineStepError(
++                    PipelineStep.SKELETON,
++                    "Не удалось завершить вывод скелета.",
++                )
++        for key, value in tail_metadata.items():
++            if value:
++                metadata[key] = value
+ 
+     def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
+         if not isinstance(payload, dict):
+             raise ValueError("Структура скелета не является объектом")
+ 
+         intro = str(payload.get("intro") or "").strip()
+         main = payload.get("main")
+         conclusion = str(payload.get("conclusion") or "").strip()
+         faq = payload.get("faq")
+         if not intro or not conclusion or not isinstance(main, list) or len(main) == 0:
+             raise ValueError("Скелет не содержит обязательных полей intro/main/conclusion")
+ 
+         if not 3 <= len(main) <= 6:
+             raise ValueError("Скелет основной части должен содержать 3–6 блоков")
+ 
+         normalized_main: List[str] = []
+         for idx, item in enumerate(main):
+             if not isinstance(item, str) or not item.strip():
+                 raise ValueError(f"Элемент основной части №{idx + 1} пуст")
+             normalized_main.append(item.strip())
+ 
+         if not isinstance(faq, list) or len(faq) != 5:
+             raise ValueError("Скелет FAQ должен содержать ровно 5 элементов")
+ 
+         normalized_faq: List[Dict[str, str]] = []
+@@ -557,194 +1132,174 @@ class DeterministicPipeline:
+                     "Ты опытный финансовый редактор. Сформируй полезный FAQ без повторов,"
+                     " обеспечь, чтобы вопросы отличались по фокусу и помогали читателю действовать."
+                 ),
+             },
+             {"role": "user", "content": f"{payload}\n\n{article_block}"},
+         ]
+ 
+     def _sync_locked_terms(self, text: str) -> None:
+         pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
+         self.locked_terms = pattern.findall(text)
+         if self.normalized_keywords:
+             article = strip_jsonld(text)
+             found = 0
+             for term in self.normalized_keywords:
+                 lock_token = LOCK_START_TEMPLATE.format(term=term)
+                 lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
+                 if lock_pattern.search(text) and build_term_pattern(term).search(article):
+                     found += 1
+             self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
+ 
+     # ------------------------------------------------------------------
+     # Step implementations
+     # ------------------------------------------------------------------
+     def _run_skeleton(self) -> str:
+         self._log(PipelineStep.SKELETON, "running")
+-        messages = self._build_skeleton_messages()
+-        skeleton_tokens = self._resolve_skeleton_tokens()
+-        attempt = 0
+-        last_error: Optional[Exception] = None
+-        payload: Optional[Dict[str, object]] = None
+-        markdown: Optional[str] = None
++        outline = self._prepare_outline()
++        estimate = self._predict_skeleton_volume(outline)
++        batches = self._build_skeleton_batches(outline)
++        assembly = SkeletonAssembly(outline=outline)
+         metadata_snapshot: Dict[str, object] = {}
+-        json_error_count = 0
+-        use_fallback = False
+-        result: Optional[GenerationResult] = None
+-        def _clamp_tokens(value: int) -> int:
+-            cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+-            upper = cap if cap is not None else int(value)
+-            return max(800, min(upper, int(value)))
+-
+-        while attempt < 3 and markdown is None:
+-            attempt += 1
++        last_result: Optional[GenerationResult] = None
++
++        for batch in batches:
++            target_indices = list(batch.indices)
++            messages, format_block = self._build_batch_messages(
++                batch,
++                outline=outline,
++                assembly=assembly,
++                target_indices=target_indices,
++                tail_fill=batch.tail_fill,
++            )
++            max_tokens = self._batch_token_budget(batch, estimate, len(target_indices))
              try:
                  result = self._call_llm(
                      step=PipelineStep.SKELETON,
                      messages=messages,
-                     max_tokens=skeleton_tokens,
-                     override_model=FALLBACK_MODEL if use_fallback else None,
+-                    max_tokens=skeleton_tokens,
+-                    override_model=FALLBACK_MODEL if use_fallback else None,
++                    max_tokens=max_tokens,
++                    responses_format=format_block,
                  )
              except PipelineStepError:
                  raise
++
++            last_result = result
              metadata_snapshot = result.metadata or {}
-             status = str(metadata_snapshot.get("status") or "ok").lower()
--            if status == "incomplete" or metadata_snapshot.get("incomplete_reason"):
-+            reason = str(metadata_snapshot.get("incomplete_reason") or "").lower()
-+            raw_text = result.text.strip()
-+            if "<response_json>" in raw_text and "</response_json>" in raw_text:
-+                try:
-+                    raw_text = raw_text.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
-+                except Exception:  # pragma: no cover - defensive
-+                    raw_text = raw_text
-+            parsed_payload: Optional[Dict[str, object]] = None
-+            decode_error: Optional[json.JSONDecodeError] = None
-+            if raw_text:
-+                try:
-+                    parsed_payload = json.loads(raw_text)
-+                except json.JSONDecodeError as exc:
-+                    decode_error = exc
-+                    parsed_payload = None
-+            if status == "incomplete" or reason:
-+                accepted_incomplete = False
-+                if parsed_payload is not None:
-+                    try:
-+                        normalized_payload = normalize_skeleton_payload(parsed_payload)
-+                        markdown_candidate, summary = self._render_skeleton_markdown(normalized_payload)
-+                        snapshot = dict(normalized_payload)
-+                        snapshot["outline"] = summary.get("outline", [])
-+                        if "faq" in summary:
-+                            snapshot["faq"] = summary.get("faq", [])
-+                        self.skeleton_payload = snapshot
-+                        metadata_snapshot = dict(metadata_snapshot)
-+                        metadata_snapshot["status"] = "completed"
-+                        metadata_snapshot["incomplete_reason"] = ""
-+                        LOGGER.info("SKELETON_INCOMPLETE_ACCEPT attempt=%d", attempt)
-+                        markdown = markdown_candidate
-+                        payload = normalized_payload
-+                        accepted_incomplete = True
-+                    except Exception as exc:  # noqa: BLE001
-+                        last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
-+                        LOGGER.warning("SKELETON_INCOMPLETE_INVALID attempt=%d error=%s", attempt, exc)
-+                        parsed_payload = None
-+                if accepted_incomplete:
-+                    break
-                 LOGGER.warning(
-                     "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
-                     attempt,
-                     status,
--                    metadata_snapshot.get("incomplete_reason") or "",
-+                    reason,
-                 )
-+                if decode_error is not None:
-+                    LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, decode_error)
-+                    LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
-+                    last_error = PipelineStepError(
-+                        PipelineStep.SKELETON, "Ответ модели не является корректным JSON."
-+                    )
-+                    json_error_count += 1
-+                    if not use_fallback and json_error_count >= 2:
-+                        LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
-+                        use_fallback = True
-+                        attempt = 0
-+                        continue
-                 skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                 continue
+-            status = str(metadata_snapshot.get("status") or "ok").lower()
+-            reason = str(metadata_snapshot.get("incomplete_reason") or "").lower()
 -            raw_text = result.text.strip()
 -            if "<response_json>" in raw_text and "</response_json>" in raw_text:
 -                try:
 -                    raw_text = raw_text.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
 -                except Exception:  # pragma: no cover - defensive
 -                    raw_text = raw_text
-             if not raw_text:
-                 last_error = PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
-                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=empty", attempt)
-                 skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
-                 continue
--            try:
--                payload = json.loads(raw_text)
--                payload = normalize_skeleton_payload(payload)
--                LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
--            except json.JSONDecodeError as exc:
--                LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, exc)
-+            if parsed_payload is None:
-+                if decode_error is not None:
-+                    LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, decode_error)
-+                    LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
-+                    skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-+                    last_error = PipelineStepError(
-+                        PipelineStep.SKELETON, "Ответ модели не является корректным JSON."
+-            parsed_payload: Optional[Dict[str, object]] = None
+-            decode_error: Optional[json.JSONDecodeError] = None
+-            if raw_text:
+-                try:
+-                    parsed_payload = json.loads(raw_text)
+-                except json.JSONDecodeError as exc:
+-                    decode_error = exc
+-                    parsed_payload = None
+-            if status == "incomplete" or reason:
+-                accepted_incomplete = False
+-                if parsed_payload is not None:
+-                    try:
+-                        normalized_payload = normalize_skeleton_payload(parsed_payload)
+-                        markdown_candidate, summary = self._render_skeleton_markdown(normalized_payload)
+-                        snapshot = dict(normalized_payload)
+-                        snapshot["outline"] = summary.get("outline", [])
+-                        if "faq" in summary:
+-                            snapshot["faq"] = summary.get("faq", [])
+-                        self.skeleton_payload = snapshot
+-                        metadata_snapshot = dict(metadata_snapshot)
+-                        metadata_snapshot["status"] = "completed"
+-                        metadata_snapshot["incomplete_reason"] = ""
+-                        LOGGER.info("SKELETON_INCOMPLETE_ACCEPT attempt=%d", attempt)
+-                        markdown = markdown_candidate
+-                        payload = normalized_payload
+-                        accepted_incomplete = True
+-                    except Exception as exc:  # noqa: BLE001
+-                        last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
+-                        LOGGER.warning("SKELETON_INCOMPLETE_INVALID attempt=%d error=%s", attempt, exc)
+-                        parsed_payload = None
+-                if accepted_incomplete:
+-                    break
+-                LOGGER.warning(
+-                    "SKELETON_RETRY_incomplete attempt=%d status=%s reason=%s",
+-                    attempt,
+-                    status,
+-                    reason,
++            payload_obj = self._extract_response_json(result.text)
++
++            if batch.kind == SkeletonBatchKind.INTRO:
++                normalized, missing_fields = self._normalize_intro_batch(payload_obj, outline)
++                intro_text = normalized.get("intro", "")
++                headers = normalized.get("main_headers") or []
++                if len(headers) < len(outline.main_headings):
++                    headers = headers + outline.main_headings[len(headers) :]
++                assembly.apply_intro(intro_text, headers, normalized.get("conclusion_heading"))
++                if missing_fields:
++                    self._tail_fill_batch(
++                        batch,
++                        outline=outline,
++                        assembly=assembly,
++                        estimate=estimate,
++                        missing_items=[0],
++                        metadata=metadata_snapshot,
 +                    )
-+                    json_error_count += 1
-+                    if not use_fallback and json_error_count >= 2:
-+                        LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
-+                        use_fallback = True
-+                        attempt = 0
-+                        continue
-+                    continue
-+                last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
-                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
-                 skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
--                last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
--                json_error_count += 1
--                if not use_fallback and json_error_count >= 2:
--                    LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
--                    use_fallback = True
--                    attempt = 0
++            elif batch.kind == SkeletonBatchKind.MAIN:
++                normalized_sections, missing_indices = self._normalize_main_batch(
++                    payload_obj, target_indices, outline
+                 )
+-                if decode_error is not None:
+-                    LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, decode_error)
+-                    LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
+-                    last_error = PipelineStepError(
+-                        PipelineStep.SKELETON, "Ответ модели не является корректным JSON."
++                for index, heading, body in normalized_sections:
++                    assembly.apply_main(index, body, heading=heading)
++                if missing_indices:
++                    self._tail_fill_batch(
++                        batch,
++                        outline=outline,
++                        assembly=assembly,
++                        estimate=estimate,
++                        missing_items=missing_indices,
++                        metadata=metadata_snapshot,
+                     )
+-                    json_error_count += 1
+-                    if not use_fallback and json_error_count >= 2:
+-                        LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
+-                        use_fallback = True
+-                        attempt = 0
+-                        continue
+-                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
+-                continue
+-            if not raw_text:
+-                last_error = PipelineStepError(PipelineStep.SKELETON, "Модель вернула пустой ответ.")
+-                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=empty", attempt)
+-                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+-                continue
+-            if parsed_payload is None:
+-                if decode_error is not None:
+-                    LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, decode_error)
+-                    LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
+-                    skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
+-                    last_error = PipelineStepError(
+-                        PipelineStep.SKELETON, "Ответ модели не является корректным JSON."
++            elif batch.kind == SkeletonBatchKind.FAQ:
++                normalized_entries, missing_faq = self._normalize_faq_batch(payload_obj, target_indices)
++                for _, question, answer in normalized_entries:
++                    assembly.apply_faq(question, answer)
++                if missing_faq:
++                    self._tail_fill_batch(
++                        batch,
++                        outline=outline,
++                        assembly=assembly,
++                        estimate=estimate,
++                        missing_items=missing_faq,
++                        metadata=metadata_snapshot,
+                     )
+-                    json_error_count += 1
+-                    if not use_fallback and json_error_count >= 2:
+-                        LOGGER.warning("SKELETON_FALLBACK_CHAT triggered after repeated json_error")
+-                        use_fallback = True
+-                        attempt = 0
+-                        continue
 -                    continue
-                 continue
-+            payload = normalize_skeleton_payload(parsed_payload)
-+            LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
-             try:
-                 markdown, summary = self._render_skeleton_markdown(payload)
-                 snapshot = dict(payload)
-                 snapshot["outline"] = summary.get("outline", [])
-                 if "faq" in summary:
-                     snapshot["faq"] = summary.get("faq", [])
-                 self.skeleton_payload = snapshot
-                 LOGGER.info("SKELETON_RENDERED_WITH_MARKERS outline=%s", ",".join(summary.get("outline", [])))
-             except Exception as exc:  # noqa: BLE001
-                 last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
-                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=%s", attempt, exc)
-                 payload = None
-                 skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
-                 markdown = None
- 
-         if markdown is None:
-             if last_error:
-                 raise last_error
+-                last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
+-                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
+-                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
+-                continue
+-            payload = normalize_skeleton_payload(parsed_payload)
+-            LOGGER.info("SKELETON_JSON_OK attempt=%d", attempt)
+-            try:
+-                markdown, summary = self._render_skeleton_markdown(payload)
+-                snapshot = dict(payload)
+-                snapshot["outline"] = summary.get("outline", [])
+-                if "faq" in summary:
+-                    snapshot["faq"] = summary.get("faq", [])
+-                self.skeleton_payload = snapshot
+-                LOGGER.info("SKELETON_RENDERED_WITH_MARKERS outline=%s", ",".join(summary.get("outline", [])))
+-            except Exception as exc:  # noqa: BLE001
+-                last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
+-                LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=%s", attempt, exc)
+-                payload = None
+-                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
+-                markdown = None
+-
+-        if markdown is None:
+-            if last_error:
+-                raise last_error
++            else:
++                conclusion_text, missing_flag = self._normalize_conclusion_batch(payload_obj)
++                assembly.apply_conclusion(conclusion_text)
++                if missing_flag:
++                    self._tail_fill_batch(
++                        batch,
++                        outline=outline,
++                        assembly=assembly,
++                        estimate=estimate,
++                        missing_items=[0],
++                        metadata=metadata_snapshot,
++                    )
++
++            LOGGER.info("SKELETON_BATCH_ACCEPT kind=%s label=%s", batch.kind.value, batch.label)
++
++        if not assembly.intro:
++            raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вводный блок скелета.")
++        if not assembly.conclusion:
++            raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вывод скелета.")
++        missing_main = assembly.missing_main_indices()
++        if missing_main:
++            raise PipelineStepError(
++                PipelineStep.SKELETON,
++                "Не удалось заполнить все разделы основной части.",
++            )
++        if outline.has_faq and assembly.missing_faq_count(5):
              raise PipelineStepError(
                  PipelineStep.SKELETON,
-                 "Не удалось получить корректный скелет статьи после нескольких попыток.",
+-                "Не удалось получить корректный скелет статьи после нескольких попыток.",
++                "Не удалось собрать полный FAQ на этапе скелета.",
              )
  
-         if FAQ_START not in markdown or FAQ_END not in markdown:
-             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось вставить маркеры FAQ на этапе скелета.")
+-        if FAQ_START not in markdown or FAQ_END not in markdown:
+-            raise PipelineStepError(PipelineStep.SKELETON, "Не удалось вставить маркеры FAQ на этапе скелета.")
++        payload = assembly.build_payload()
++        if outline.has_faq and len(payload.get("faq", [])) > 5:
++            payload["faq"] = payload["faq"][:5]
++
++        normalized_payload = normalize_skeleton_payload(payload)
++        markdown, summary = self._render_skeleton_markdown(normalized_payload)
++        snapshot = dict(normalized_payload)
++        snapshot["outline"] = summary.get("outline", [])
++        if "faq" in summary:
++            snapshot["faq"] = summary.get("faq", [])
++        self.skeleton_payload = snapshot
++        self._skeleton_faq_entries = [
++            {"question": entry.get("q", ""), "answer": entry.get("a", "")}
++            for entry in normalized_payload.get("faq", [])
++        ]
+ 
+         self._check_template_text(markdown, PipelineStep.SKELETON)
+-        if result is not None:
+-            route = result.api_route or ("chat" if use_fallback else "responses")
+-        else:
+-            route = "responses"
++        route = last_result.api_route if last_result is not None else "responses"
+         LOGGER.info("SKELETON_OK route=%s", route)
+         self._update_log(
+             PipelineStep.SKELETON,
+             "ok",
+             length=len(markdown),
+             metadata_status=metadata_snapshot.get("status") or "ok",
+             **self._metrics(markdown),
+         )
+         self.checkpoints[PipelineStep.SKELETON] = markdown
+         return markdown
+ 
+     def _run_keywords(self, text: str) -> KeywordInjectionResult:
+         self._log(PipelineStep.KEYWORDS, "running")
+         result = inject_keywords(text, self.keywords)
+         self.locked_terms = list(result.locked_terms)
+         self.keywords_coverage_percent = result.coverage_percent
+         total = result.total_terms
+         found = result.found_terms
+         missing = sorted(result.missing_terms)
+         LOGGER.info(
+             "KEYWORDS_COVERAGE=%.0f%% missing=%s",
+             result.coverage_percent,
+             ",".join(missing) if missing else "-",
+         )
+         if total and found < total:
 diff --git a/llm_client.py b/llm_client.py
-index 89839f76f1d494cfa621956a3575724c22c148cc..c6734ad031d57fcbafdbe1d05615e323474ab1d7 100644
+index c6734ad031d57fcbafdbe1d05615e323474ab1d7..971cbec76516545344743b55eac4b7b5fe9df7cf 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -1,41 +1,44 @@
- # -*- coding: utf-8 -*-
- """Simple wrapper around chat completion providers with retries and sane defaults."""
- from __future__ import annotations
- 
- import json
- import logging
- import os
- import re
- import sys
- import time
- from copy import deepcopy
- from dataclasses import dataclass
- from pathlib import Path
+@@ -14,51 +14,58 @@ from pathlib import Path
  from typing import Any, Dict, List, Optional, Tuple
  
  import httpx
-+from jsonschema import Draft7Validator
-+from jsonschema.exceptions import SchemaError as JSONSchemaError
-+from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
+ from jsonschema import Draft7Validator
+ from jsonschema.exceptions import SchemaError as JSONSchemaError
+ from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
  
  from config import (
      FORCE_MODEL,
@@ -233,13 +1342,103 @@ index 89839f76f1d494cfa621956a3575724c22c148cc..c6734ad031d57fcbafdbe1d05615e323
  BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
  FALLBACK_MODEL = "gpt-4o"
  RESPONSES_API_URL = "https://api.openai.com/v1/responses"
- RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "text")
+-RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "text")
++RESPONSES_ALLOWED_KEYS = (
++    "model",
++    "input",
++    "max_output_tokens",
++    "temperature",
++    "text",
++    "previous_response_id",
++)
  RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
  RESPONSES_MAX_ESCALATIONS = 2
  MAX_RESPONSES_POLL_ATTEMPTS = (
      G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
  )
-@@ -299,50 +302,79 @@ def build_responses_payload(
+ if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
+     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
+ GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
+ 
+ 
+ def _supports_temperature(model: str) -> bool:
+     """Return True if the target model accepts the temperature parameter."""
+ 
+     model_name = (model or "").strip().lower()
+     return not model_name.startswith("gpt-5")
+ 
+ 
+ def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
+     """Detect the specific 400 error about max_output_tokens being too small."""
+ 
+     if response is None:
+         return False
+ 
+     message = ""
+     try:
+@@ -243,79 +250,82 @@ def _format_diagnostics(details: Dict[str, object]) -> str:
+             try:
+                 value_repr = json.dumps(value, ensure_ascii=False)
+             except TypeError:
+                 value_repr = str(value)
+         else:
+             value_repr = str(value)
+         components.append(f"{key}={value_repr}")
+     return ", ".join(components)
+ 
+ 
+ def _build_force_model_error(reason: str, details: Dict[str, object]) -> RuntimeError:
+     diagnostics = _format_diagnostics(details)
+     message = f"FORCE_MODEL active: {reason}"
+     if diagnostics:
+         message += f"; diagnostics: {diagnostics}"
+     return RuntimeError(message)
+ 
+ 
+ def build_responses_payload(
+     model: str,
+     system_text: Optional[str],
+     user_text: Optional[str],
+     max_tokens: int,
+     *,
+     text_format: Optional[Dict[str, object]] = None,
++    previous_response_id: Optional[str] = None,
+ ) -> Dict[str, object]:
+     """Construct a minimal Responses API payload for GPT-5 models."""
+ 
+     sections: List[str] = []
+ 
+     system_block = (system_text or "").strip()
+     if system_block:
+         sections.append(system_block)
+ 
+     user_block = (user_text or "").strip()
+     if user_block:
+         sections.append(user_block)
+ 
+     joined_input = "\n\n".join(section for section in sections if section)
+     joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
+     joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
+ 
+     format_block, _, _ = _prepare_text_format_for_request(
+         text_format or DEFAULT_RESPONSES_TEXT_FORMAT,
+         context="build_payload",
+         log_on_migration=False,
+     )
+ 
+     payload: Dict[str, object] = {
+         "model": str(model).strip(),
+         "input": joined_input.strip(),
+         "max_output_tokens": int(max_tokens),
+         "text": {"format": format_block},
+     }
++    if previous_response_id and previous_response_id.strip():
++        payload["previous_response_id"] = previous_response_id.strip()
+     if _supports_temperature(model):
+         payload["temperature"] = 0.3
+     return payload
+ 
+ 
  def _shrink_responses_input(text_value: str) -> str:
      """Return a slightly condensed version of the Responses input payload."""
  
@@ -260,624 +1459,162 @@ index 89839f76f1d494cfa621956a3575724c22c148cc..c6734ad031d57fcbafdbe1d05615e323
  
      condensed = "\n\n".join(normalized_lines)
      if len(condensed) < len(text_value):
-         return condensed
-     target = max(1000, int(len(text_value) * 0.9))
-     return text_value[:target]
+@@ -527,50 +537,53 @@ def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, ob
+     if not sanitized_format:
+         return None
+     return {"format": sanitized_format}
  
  
-+def _is_valid_json_schema_instance(schema: Dict[str, Any], text: str) -> bool:
-+    """Validate the provided JSON text against the supplied schema."""
-+
-+    if not schema or not text:
-+        return False
-+
-+    try:
-+        instance = json.loads(text)
-+    except json.JSONDecodeError:
-+        return False
-+
-+    if not isinstance(instance, (dict, list)):
-+        return False
-+
-+    try:
-+        Draft7Validator.check_schema(schema)
-+    except JSONSchemaError:
-+        LOGGER.warning("RESP_INCOMPLETE_SCHEMA_INVALID schema=invalid")
-+        return False
-+
-+    try:
-+        Draft7Validator(schema).validate(instance)
-+    except JSONSchemaValidationError as exc:
-+        LOGGER.warning("RESP_INCOMPLETE_SCHEMA_INVALID message=%s", exc.message)
-+        return False
-+
-+    return True
-+
-+
- def _coerce_bool(value: object) -> Optional[bool]:
-     if isinstance(value, bool):
-         return value
-     if isinstance(value, (int, float)):
-         return bool(value)
-     if isinstance(value, str):
-         lowered = value.strip().lower()
-         if lowered in {"1", "true", "yes", "on"}:
-             return True
-         if lowered in {"0", "false", "no", "off"}:
-             return False
-     return None
+ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str, object], int]:
+     """Restrict Responses payload to the documented whitelist and types."""
  
- 
- def _sanitize_text_format_in_place(
-     format_block: Dict[str, object],
-     *,
-     context: str = "-",
-     log_on_migration: bool = True,
- ) -> Tuple[bool, bool, int]:
-     migrated = False
-     if not isinstance(format_block, dict):
-         return False, False, 0
- 
-     allowed_keys = {"type", "name", "schema", "strict"}
-@@ -1584,50 +1616,52 @@ def generate(
-                 finish_reason = finish_block.strip().lower()
-             return {
-                 "status": status,
-                 "incomplete_reason": incomplete_reason,
-                 "usage_output_tokens": usage_output_tokens,
-                 "response_id": response_id,
-                 "previous_response_id": prev_response_id,
-                 "finish_reason": finish_reason,
-             }
- 
-         attempts = 0
-         max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)
-         current_max = max_tokens_value
-         last_error: Optional[BaseException] = None
-         format_retry_done = False
-         format_name_retry_done = False
-         min_tokens_bump_done = False
-         min_token_floor = 1
-         base_input_text = str(sanitized_payload.get("input", ""))
-         shrunken_input = _shrink_responses_input(base_input_text)
-         shrink_next_attempt = False
-         shrink_applied = False
-         incomplete_retry_count = 0
-         token_escalations = 0
-         resume_from_response_id: Optional[str] = None
-+        content_started = False
-+        cap_retry_performed = False
- 
-         def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
-             candidate = current
-             if step_index == 0:
-                 candidate = max(current + 600, int(current * 1.5))
-             elif step_index == 1:
-                 candidate = max(current + 600, int(current * 1.35))
+     sanitized: Dict[str, object] = {}
+     for key in RESPONSES_ALLOWED_KEYS:
+         if key not in payload:
+             continue
+         value = payload.get(key)
+         if value is None:
+             continue
+         if isinstance(value, str):
+             trimmed = value.strip()
+             if not trimmed:
+                 continue
+             if key == "model":
+                 sanitized[key] = trimmed
+                 continue
+             if key == "input":
+                 sanitized[key] = trimmed
+                 continue
++            if key == "previous_response_id":
++                sanitized[key] = trimmed
++                continue
+         if key == "input" and not isinstance(value, str):
+             if isinstance(value, (list, dict)):
+                 converted = json.dumps(value, ensure_ascii=False)
              else:
-                 if cap is not None:
-                     candidate = cap
-                 else:
-                     candidate = current + 600
-             if cap is not None:
-                 candidate = min(candidate, cap)
-             return int(candidate)
- 
-         def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
-             poll_attempt = 0
-             while poll_attempt < MAX_RESPONSES_POLL_ATTEMPTS:
-                 poll_attempt += 1
-                 poll_url = f"{RESPONSES_API_URL}/{response_id}"
-                 LOGGER.info("responses poll attempt=%d id=%s", poll_attempt, response_id)
-                 if poll_attempt == 1:
-                     initial_sleep = schedule[0] if schedule else 0.5
-                     LOGGER.info("responses poll initial sleep=%.2f", initial_sleep)
-@@ -1658,165 +1692,228 @@ def generate(
-                 poll_reason = metadata.get("incomplete_reason") or ""
-                 segments = int(poll_parse_flags.get("segments", 0) or 0)
-                 LOGGER.info("RESP_POLL_STATUS=%s|%s", poll_status or "ok", poll_reason or "-")
-                 if poll_status == "completed" and (text or segments > 0):
-                     return payload
-                 if poll_status == "incomplete" and poll_reason == "max_output_tokens":
-                     LOGGER.info(
-                         "RESP_STATUS=incomplete|max_output_tokens=%s",
-                         sanitized_payload.get("max_output_tokens"),
-                     )
-                     break
-                 if poll_attempt >= MAX_RESPONSES_POLL_ATTEMPTS:
-                     break
-                 sleep_for = schedule[min(poll_attempt - 1, len(schedule) - 1)] if schedule else 0.5
-                 LOGGER.info("responses poll sleep=%.2f", sleep_for)
-                 time.sleep(sleep_for)
-             return None
- 
-         while attempts < max_attempts:
-             attempts += 1
-             current_payload = dict(sanitized_payload)
-             current_payload["text"] = {"format": _clone_text_format()}
-             if resume_from_response_id:
-                 current_payload["previous_response_id"] = resume_from_response_id
-                 LOGGER.info("RESP_CONTINUE previous_response_id=%s", resume_from_response_id)
--            if shrink_applied and shrunken_input:
--                current_payload["input"] = shrunken_input
--            elif shrink_next_attempt:
--                shrink_next_attempt = False
--                if shrunken_input and shrunken_input != base_input_text:
-+            if not content_started:
-+                if shrink_applied and shrunken_input:
-                     current_payload["input"] = shrunken_input
--                    shrink_applied = True
--                    LOGGER.info(
--                        "RESP_PROMPT_SHRINK original_len=%d shrunk_len=%d",
--                        len(base_input_text),
--                        len(shrunken_input),
--                    )
-+                elif shrink_next_attempt:
-+                    shrink_next_attempt = False
-+                    if shrunken_input and shrunken_input != base_input_text:
-+                        current_payload["input"] = shrunken_input
-+                        shrink_applied = True
-+                        LOGGER.info(
-+                            "RESP_PROMPT_SHRINK original_len=%d shrunk_len=%d",
-+                            len(base_input_text),
-+                            len(shrunken_input),
-+                        )
-+            else:
-+                if shrink_applied:
-+                    LOGGER.info("RESP_PROMPT_SHRINK_DISABLED after_content_started")
-+                shrink_applied = False
-+                shrink_next_attempt = False
-             current_payload["max_output_tokens"] = max(min_token_floor, int(current_max))
-             if attempts > 1:
-                 retry_used = True
-             format_block, fmt_type, fmt_name, has_schema, fixed_name = _ensure_format_name(current_payload)
-             suffix = " (fixed=name)" if fixed_name else ""
-             LOGGER.info(
-                 "LOG:RESP_PAYLOAD_FORMAT type=%s name=%s has_schema=%s%s",
-                 fmt_type,
-                 fmt_name or "-",
-                 has_schema,
-                 suffix,
-             )
-             if isinstance(format_block, dict):
-                 try:
-                     format_snapshot = json.dumps(format_block, ensure_ascii=False, sort_keys=True)
-                 except (TypeError, ValueError):
-                     format_snapshot = str(format_block)
-                 LOGGER.debug("DEBUG:payload.text.format = %s", format_snapshot)
-             else:
-                 LOGGER.debug("DEBUG:payload.text.format = null")
-             _log_payload(current_payload)
+                 converted = str(value)
+             converted = converted.strip()
+             if converted:
+                 sanitized[key] = converted
+             continue
+         if key == "max_output_tokens":
              try:
-                 _store_responses_request_snapshot(current_payload)
-                 response = http_client.post(
-                     RESPONSES_API_URL,
-                     headers=headers,
-                     json=current_payload,
-                     timeout=timeout,
-                 )
-                 response.raise_for_status()
-                 data = response.json()
-                 if not isinstance(data, dict):
-                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
-                 _store_responses_response_snapshot(data)
-                 text, parse_flags, schema_label = _extract_responses_text(data)
-                 metadata = _extract_metadata(data)
-                 if isinstance(parse_flags, dict):
-                     parse_flags["metadata"] = metadata
-+                content_lengths = 0
-+                if isinstance(parse_flags, dict):
-+                    output_len = int(parse_flags.get("output_text_len", 0) or 0)
-+                    content_len = int(parse_flags.get("content_text_len", 0) or 0)
-+                    content_lengths = output_len + content_len
-+                if content_lengths > 0 and not content_started:
-+                    content_started = True
-+                    shrink_applied = False
-+                    shrink_next_attempt = False
-+                    LOGGER.info("RESP_CONTENT_STARTED len=%d", content_lengths)
-                 status = metadata.get("status") or ""
-                 reason = metadata.get("incomplete_reason") or ""
-                 segments = int(parse_flags.get("segments", 0) or 0)
-                 LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
-                 if status in {"in_progress", "queued"}:
-                     response_id = data.get("id")
-                     if isinstance(response_id, str) and response_id.strip():
-                         polled_payload = _poll_responses_payload(response_id.strip())
-                         if polled_payload is None:
-                             last_error = RuntimeError("responses_incomplete")
-                             continue
-                         data = polled_payload
-                         text, parse_flags, schema_label = _extract_responses_text(data)
-                         metadata = _extract_metadata(data)
-                         if isinstance(parse_flags, dict):
-                             parse_flags["metadata"] = metadata
-+                        content_lengths = 0
-+                        if isinstance(parse_flags, dict):
-+                            output_len = int(parse_flags.get("output_text_len", 0) or 0)
-+                            content_len = int(parse_flags.get("content_text_len", 0) or 0)
-+                            content_lengths = output_len + content_len
-+                        if content_lengths > 0 and not content_started:
-+                            content_started = True
-+                            shrink_applied = False
-+                            shrink_next_attempt = False
-+                            LOGGER.info("RESP_CONTENT_STARTED len=%d", content_lengths)
-                         status = metadata.get("status") or ""
-                         reason = metadata.get("incomplete_reason") or ""
-                         segments = int(parse_flags.get("segments", 0) or 0)
-                         LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
-                 if status == "incomplete":
-                     if reason == "max_output_tokens":
-                         LOGGER.info(
-                             "RESP_STATUS=incomplete|max_output_tokens=%s",
-                             current_payload.get("max_output_tokens"),
-                         )
-                         last_error = RuntimeError("responses_incomplete")
-                         response_id_value = metadata.get("response_id") or ""
-                         prev_field_present = "previous_response_id" in data or (
-                             isinstance(metadata.get("previous_response_id"), str)
-                             and metadata.get("previous_response_id")
-                         )
-                         if (
-                             response_id_value
-                             and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
-                         ):
-                             resume_from_response_id = str(response_id_value)
-+                        schema_dict: Optional[Dict[str, Any]] = None
-+                        if isinstance(format_block, dict):
-+                            candidate_schema = format_block.get("schema")
-+                            if isinstance(candidate_schema, dict):
-+                                schema_dict = candidate_schema
-+                        if schema_dict and text and _is_valid_json_schema_instance(schema_dict, text):
-+                            LOGGER.info(
-+                                "RESP_INCOMPLETE_ACCEPT schema_valid len=%d",
-+                                len(text),
-+                            )
-+                            metadata = dict(metadata)
-+                            metadata["status"] = "completed"
-+                            metadata["incomplete_reason"] = ""
-+                            parse_flags["metadata"] = metadata
-+                            updated_data = dict(data)
-+                            updated_data["metadata"] = metadata
-+                            _persist_raw_response(updated_data)
-+                            return text, parse_flags, updated_data, schema_label
-                         if upper_cap is not None and int(current_max) >= upper_cap:
-                             message = (
-                                 f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
--                                "Увеличь кап или упростите ТЗ/схему."
-+                                "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру."
-                             )
-                             raise RuntimeError(message)
-                         if token_escalations >= RESPONSES_MAX_ESCALATIONS:
-+                            if (
-+                                upper_cap is not None
-+                                and int(current_max) < upper_cap
-+                                and upper_cap > 0
-+                            ):
-+                                LOGGER.info(
-+                                    "RESP_ESCALATE_TOKENS reason=max_output_tokens cap_force=%s",
-+                                    upper_cap,
-+                                )
-+                                token_escalations += 1
-+                                current_max = upper_cap
-+                                sanitized_payload["max_output_tokens"] = max(
-+                                    min_token_floor, int(current_max)
-+                                )
-+                                cap_retry_performed = True
-+                                shrink_next_attempt = False
-+                                continue
-                             break
-                         next_max = _compute_next_max_tokens(
-                             int(current_max), token_escalations, upper_cap
-                         )
-                         if next_max <= int(current_max):
-                             if upper_cap is not None and int(current_max) >= upper_cap:
-                                 message = (
-                                     f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
--                                    "Увеличь кап или упростите ТЗ/схему."
-+                                    "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру."
-                                 )
-                                 raise RuntimeError(message)
-                             break
-                         cap_label = upper_cap if upper_cap is not None else "-"
-                         LOGGER.info(
-                             "RESP_ESCALATE_TOKENS reason=max_output_tokens from=%s to=%s cap=%s",
-                             current_payload.get("max_output_tokens"),
-                             next_max,
-                             cap_label,
-                         )
-                         token_escalations += 1
-                         current_max = next_max
-+                        if upper_cap is not None and int(current_max) == upper_cap:
-+                            cap_retry_performed = True
-                         sanitized_payload["max_output_tokens"] = max(
-                             min_token_floor, int(current_max)
-                         )
-                         shrink_next_attempt = False
-                         continue
-                     last_error = RuntimeError("responses_incomplete")
-                     incomplete_retry_count += 1
-                     if incomplete_retry_count >= 2:
-                         break
-                     shrink_next_attempt = True
-                     continue
-                 if not text:
-                     last_error = EmptyCompletionError(
-                         "Модель вернула пустой ответ",
-                         raw_response=data,
-                         parse_flags=parse_flags,
-                     )
-                     LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
-                     continue
-                 _persist_raw_response(data)
-                 return text, parse_flags, data, schema_label
-             except EmptyCompletionError as exc:
-                 last_error = exc
-             except httpx.HTTPStatusError as exc:
-                 response_obj = exc.response
-@@ -1865,50 +1962,62 @@ def generate(
-                     shim_param = _extract_unknown_parameter_name(response_obj)
-                     if shim_param:
-                         retry_used = True
-                         if shim_param in sanitized_payload:
-                             sanitized_payload.pop(shim_param, None)
-                         LOGGER.warning(
-                             "retry=shim_unknown_param stripped='%s'",
-                             shim_param,
-                         )
-                         continue
-                 last_error = exc
-                 step_label = _infer_responses_step(current_payload)
-                 _handle_responses_http_error(exc, current_payload, step=step_label)
-                 break
-             except Exception as exc:  # noqa: BLE001
-                 if isinstance(exc, KeyboardInterrupt):
-                     raise
-                 last_error = exc
-             if attempts >= max_attempts:
-                 break
-             sleep_for = schedule[min(attempts - 1, len(schedule) - 1)] if schedule else 0.5
-             LOGGER.warning("responses retry attempt=%d sleep=%.2f", attempts, sleep_for)
-             time.sleep(sleep_for)
- 
-         if last_error:
-+            if (
-+                isinstance(last_error, RuntimeError)
-+                and str(last_error) == "responses_incomplete"
-+                and cap_retry_performed
-+                and upper_cap is not None
-+                and int(current_max) >= upper_cap
-+            ):
-+                message = (
-+                    f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
-+                    "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру."
-+                )
-+                raise RuntimeError(message)
-             if isinstance(last_error, httpx.HTTPStatusError):
-                 _raise_for_last_error(last_error)
-             if isinstance(last_error, (httpx.TimeoutException, httpx.TransportError)):
-                 _raise_for_last_error(last_error)
-             raise last_error
- 
-         raise RuntimeError("Модель не вернула ответ.")
- 
- 
-     lower_model = model_name.lower()
-     is_gpt5_model = lower_model.startswith("gpt-5")
- 
-     retry_used = False
-     fallback_used: Optional[str] = None
-     fallback_reason: Optional[str] = None
- 
-     try:
-         if is_gpt5_model:
-             available = _check_model_availability(
-                 http_client,
-                 provider=provider,
-                 headers=headers,
-                 model_name=model_name,
-             )
-             if not available:
-diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index a073b3a5082c508679e00a7de574137e755b1201..6b08620a053de8d8f1771285abf20544c2f4486e 100644
---- a/tests/test_llm_client.py
-+++ b/tests/test_llm_client.py
-@@ -1,32 +1,34 @@
- # -*- coding: utf-8 -*-
- from pathlib import Path
- from unittest.mock import patch
- import httpx
- import pytest
- import sys
- 
-+import json
-+
- sys.path.append(str(Path(__file__).resolve().parents[1]))
- 
- from llm_client import (
-     DEFAULT_RESPONSES_TEXT_FORMAT,
-     G5_MAX_OUTPUT_TOKENS_MAX,
-     GenerationResult,
-     generate,
- )
- 
- 
- @pytest.fixture(autouse=True)
- def _force_api_key(monkeypatch):
-     monkeypatch.setenv("OPENAI_API_KEY", "test")
-     yield
-     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
- 
- 
- class DummyResponse:
-     def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
-         if payload is None:
-             payload = {
-                 "choices": [
-                     {
-                         "message": {
-                             "content": "ok",
-@@ -450,62 +452,162 @@ def test_generate_escalates_max_tokens_when_truncated():
-         ],
-     }
-     client = DummyClient(payloads=[initial_payload, final_payload])
-     with patch("llm_client.httpx.Client", return_value=client):
-         result = generate(
-             messages=[{"role": "user", "content": "ping"}],
-             model="gpt-5",
-             temperature=0.1,
+                 sanitized[key] = int(value)
+             except (TypeError, ValueError):
+                 continue
+             continue
+         if key == "temperature":
+             try:
+                 sanitized[key] = float(value)
+             except (TypeError, ValueError):
+                 continue
+             continue
+         if key == "text":
+             if isinstance(value, dict):
+                 sanitized_text = _sanitize_text_block(value)
+                 if sanitized_text:
+@@ -1299,50 +1312,51 @@ def _make_request(
          )
- 
-     assert isinstance(result, GenerationResult)
-     assert result.text == "expanded"
-     assert result.retry_used is True
-     assert client.call_count == 2
-     first_tokens = client.requests[0]["json"]["max_output_tokens"]
-     second_tokens = client.requests[1]["json"]["max_output_tokens"]
-     cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-     expected_second = max(first_tokens + 600, int(first_tokens * 1.5))
-     if cap is not None:
-         expected_second = min(expected_second, cap)
-     assert second_tokens == expected_second
-     assert client.requests[1]["json"].get("previous_response_id") == "resp-1"
-     assert client.requests[0]["json"].get("previous_response_id") is None
+     if last_error:
+         _raise_for_last_error(last_error)
+     raise RuntimeError("Модель не вернула ответ.")
  
  
-+def test_generate_accepts_incomplete_with_valid_json():
-+    skeleton_payload = {
-+        "intro": "Вступление",
-+        "main": ["Блок 1", "Блок 2", "Блок 3"],
-+        "faq": [
-+            {"q": f"Вопрос {idx}", "a": f"Ответ {idx}. Детали."}
-+            for idx in range(1, 6)
-+        ],
-+        "conclusion": "Вывод",
-+    }
-+    skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
-+    incomplete_payload = {
-+        "id": "resp-accept",
-+        "status": "incomplete",
-+        "incomplete_details": {"reason": "max_output_tokens"},
-+        "output": [
-+            {
-+                "content": [
-+                    {"type": "text", "text": skeleton_text},
-+                ]
-+            }
-+        ],
-+    }
-+    client = DummyClient(payloads=[incomplete_payload])
-+    with patch("llm_client.httpx.Client", return_value=client):
-+        result = generate(
-+            messages=[{"role": "user", "content": "ping"}],
-+            model="gpt-5",
-+            temperature=0.1,
-+        )
-+
-+    assert client.call_count == 1
-+    assert isinstance(result, GenerationResult)
-+    assert result.text == skeleton_text
-+    assert result.metadata is not None
-+    assert result.metadata.get("status") == "completed"
-+    assert result.metadata.get("incomplete_reason") in {None, ""}
-+
-+
-+def test_generate_does_not_shrink_prompt_after_content_started():
-+    skeleton_payload = {
-+        "intro": "Вступление",
-+        "main": ["Блок 1", "Блок 2", "Блок 3"],
-+        "faq": [
-+            {"q": f"Вопрос {idx}", "a": f"Ответ {idx}. Детали."}
-+            for idx in range(1, 6)
-+        ],
-+        "conclusion": "Вывод",
-+    }
-+    skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
-+    first_payload = {
-+        "id": "resp-partial",
-+        "status": "incomplete",
-+        "incomplete_details": {"reason": "safety"},
-+        "output": [
-+            {
-+                "content": [
-+                    {"type": "text", "text": "partial draft"},
-+                ]
-+            }
-+        ],
-+    }
-+    final_payload = {
-+        "status": "completed",
-+        "output": [
-+            {
-+                "content": [
-+                    {"type": "text", "text": skeleton_text},
-+                ]
-+            }
-+        ],
-+    }
-+    messages = [
-+        {
-+            "role": "system",
-+            "content": "A\nB\nA",
-+        },
-+        {
-+            "role": "user",
-+            "content": "C\nC\nD",
-+        },
-+    ]
-+    client = DummyClient(payloads=[first_payload, final_payload])
-+    with patch("llm_client.httpx.Client", return_value=client):
-+        result = generate(
-+            messages=messages,
-+            model="gpt-5",
-+            temperature=0.2,
-+        )
-+
-+    assert client.call_count == 2
-+    assert isinstance(result, GenerationResult)
-+    assert result.text == skeleton_text
-+    first_input = client.requests[0]["json"]["input"]
-+    second_input = client.requests[1]["json"]["input"]
-+    assert second_input == first_input
-+
-+
- def test_generate_raises_when_incomplete_at_cap(monkeypatch):
-     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 1800)
-     initial_payload = {
-         "id": "resp-init",
-         "status": "incomplete",
-         "incomplete_details": {"reason": "max_output_tokens"},
+ def _extract_response_text(data: Dict[str, object]) -> Tuple[str, Dict[str, object], str]:
+     choices = data.get("choices") if isinstance(data, dict) else None
+     if not isinstance(choices, list) or not choices:
+         raise RuntimeError("Модель не вернула варианты ответа.")
+     choice = choices[0]
+     if not isinstance(choice, dict):
+         raise RuntimeError("Модель вернула неожиданный формат ответа.")
+     return _extract_choice_content(choice)
+ 
+ 
+ def generate(
+     messages: List[Dict[str, str]],
+     *,
+     model: Optional[str] = None,
+     temperature: float = 0.3,
+     max_tokens: int = 1400,
+     timeout_s: int = 60,
+     backoff_schedule: Optional[List[float]] = None,
+     responses_text_format: Optional[Dict[str, object]] = None,
++    previous_response_id: Optional[str] = None,
+ ) -> GenerationResult:
+     """Call the configured LLM and return a structured generation result."""
+ 
+     if not messages:
+         raise ValueError("messages must not be empty")
+ 
+     model_name = _resolve_model_name(model)
+     provider = _resolve_provider(model_name)
+     api_key = _resolve_api_key(provider)
+     api_url = PROVIDER_API_URLS.get(provider)
+     if not api_url:
+         raise RuntimeError(f"Неизвестный провайдер для модели '{model_name}'")
+ 
+     timeout = httpx.Timeout(timeout_s)
+     http_client = httpx.Client(timeout=timeout)
+ 
+     schedule = _resolve_backoff_schedule(backoff_schedule)
+     headers = {
+         "Authorization": f"Bearer {api_key}",
+         "Content-Type": "application/json",
      }
-     second_payload = {
-         "id": "resp-second",
-         "status": "incomplete",
-         "incomplete_details": {"reason": "max_output_tokens"},
-     }
-     client = DummyClient(payloads=[initial_payload, second_payload])
-     with patch("llm_client.httpx.Client", return_value=client):
-         with pytest.raises(RuntimeError) as excinfo:
-             generate(
-                 messages=[{"role": "user", "content": "ping"}],
-                 model="gpt-5",
-                 temperature=0.1,
-             )
  
--    assert "Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX=1800" in str(excinfo.value)
-+    message = str(excinfo.value)
-+    assert "Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX=1800" in message
-+    assert "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру" in message
+     def _augment_gpt5_messages(original: List[Dict[str, object]]) -> List[Dict[str, object]]:
+         augmented: List[Dict[str, object]] = []
+         appended_suffix = False
+@@ -1409,50 +1423,51 @@ def generate(
  
+         payload_messages = _messages_for_model(target_model)
+         system_segments: List[str] = []
+         user_segments: List[str] = []
+         for item in payload_messages:
+             role = str(item.get("role", "")).strip().lower()
+             content = str(item.get("content", "")).strip()
+             if not content:
+                 continue
+             if role == "system":
+                 system_segments.append(content)
+             elif role == "user":
+                 user_segments.append(content)
+             else:
+                 user_segments.append(f"{role.upper()}:\n{content}")
  
- def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):
-     monkeypatch.setattr("llm_client.FORCE_MODEL", True)
-     client = DummyClient(payloads=[], availability=[403])
-     with patch("llm_client.httpx.Client", return_value=client):
-         with pytest.raises(RuntimeError) as excinfo:
-             generate(
-                 messages=[{"role": "user", "content": "ping"}],
-                 model="gpt-5",
-                 temperature=0.1,
-                 max_tokens=42,
-             )
+         system_text = "\n\n".join(system_segments)
+         user_text = "\n\n".join(user_segments)
  
-     assert "Model GPT-5 not available for this key/plan" in str(excinfo.value)
+         base_payload = build_responses_payload(
+             target_model,
+             system_text,
+             user_text,
+             max_tokens,
+             text_format=responses_text_format,
++            previous_response_id=previous_response_id,
+         )
+         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
+ 
+         raw_format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
+         format_template, _, _ = _prepare_text_format_for_request(
+             raw_format_template,
+             context="template",
+             log_on_migration=False,
+         )
+         text_block_candidate = sanitized_payload.get("text")
+         if isinstance(text_block_candidate, dict):
+             format_candidate = text_block_candidate.get("format")
+             if isinstance(format_candidate, dict) and format_candidate:
+                 format_template = deepcopy(format_candidate)
+         if not isinstance(format_template, dict):
+             format_template = {}
+         _sanitize_text_format_in_place(
+             format_template,
+             context="template_normalize",
+             log_on_migration=False,
+         )
+         fmt_template_type = str(format_template.get("type", "")).strip().lower()
+         if fmt_template_type == "json_schema":
+             current_name = str(format_template.get("name", "")).strip()
+             if current_name != RESPONSES_FORMAT_DEFAULT_NAME:
 

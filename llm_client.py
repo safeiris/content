@@ -36,7 +36,14 @@ MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
 FALLBACK_MODEL = "gpt-4o"
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
-RESPONSES_ALLOWED_KEYS = ("model", "input", "max_output_tokens", "temperature", "text")
+RESPONSES_ALLOWED_KEYS = (
+    "model",
+    "input",
+    "max_output_tokens",
+    "temperature",
+    "text",
+    "previous_response_id",
+)
 RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
 RESPONSES_MAX_ESCALATIONS = 2
 MAX_RESPONSES_POLL_ATTEMPTS = (
@@ -265,6 +272,7 @@ def build_responses_payload(
     max_tokens: int,
     *,
     text_format: Optional[Dict[str, object]] = None,
+    previous_response_id: Optional[str] = None,
 ) -> Dict[str, object]:
     """Construct a minimal Responses API payload for GPT-5 models."""
 
@@ -294,6 +302,8 @@ def build_responses_payload(
         "max_output_tokens": int(max_tokens),
         "text": {"format": format_block},
     }
+    if previous_response_id and previous_response_id.strip():
+        payload["previous_response_id"] = previous_response_id.strip()
     if _supports_temperature(model):
         payload["temperature"] = 0.3
     return payload
@@ -547,6 +557,9 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
                 sanitized[key] = trimmed
                 continue
             if key == "input":
+                sanitized[key] = trimmed
+                continue
+            if key == "previous_response_id":
                 sanitized[key] = trimmed
                 continue
         if key == "input" and not isinstance(value, str):
@@ -1321,6 +1334,7 @@ def generate(
     timeout_s: int = 60,
     backoff_schedule: Optional[List[float]] = None,
     responses_text_format: Optional[Dict[str, object]] = None,
+    previous_response_id: Optional[str] = None,
 ) -> GenerationResult:
     """Call the configured LLM and return a structured generation result."""
 
@@ -1431,6 +1445,7 @@ def generate(
             user_text,
             max_tokens,
             text_format=responses_text_format,
+            previous_response_id=previous_response_id,
         )
         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
 
