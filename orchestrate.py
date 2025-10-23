@@ -23,7 +23,13 @@ from config import (
     OPENAI_API_KEY,
 )
 from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
-from llm_client import DEFAULT_MODEL, RESPONSES_API_URL
+from llm_client import (
+    DEFAULT_MODEL,
+    RESPONSES_API_URL,
+    build_responses_payload,
+    is_min_tokens_error,
+    sanitize_payload_for_responses,
+)
 from keywords import parse_manual_keywords
 from length_limits import ResolvedLengthLimits, resolve_length_limits
 from validators import ValidationResult, length_no_spaces
@@ -31,6 +37,11 @@ from validators import ValidationResult, length_no_spaces
 BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
 TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
 LATEST_SCHEMA_VERSION = "2024-06"
+
+HEALTH_MODEL = DEFAULT_MODEL
+HEALTH_PROMPT = "Ответь ровно словом: PONG"
+HEALTH_INITIAL_MAX_TOKENS = 24
+HEALTH_MIN_BUMP_TOKENS = 24
 
 
 @dataclass
@@ -616,12 +627,22 @@ def _mask_openai_key(raw_key: str) -> str:
 
 
 def _run_health_ping() -> Dict[str, object]:
-    payload: Dict[str, object] = {
-        "model": DEFAULT_MODEL,
-        "input": "Ответь ровно словом: PONG",
-        "max_output_tokens": 8,
-        "text": {"format": {"type": "text"}},
-    }
+    model = HEALTH_MODEL
+    prompt = HEALTH_PROMPT
+    max_tokens = HEALTH_INITIAL_MAX_TOKENS
+    text_format = {"type": "text"}
+
+    base_payload = build_responses_payload(
+        model,
+        None,
+        prompt,
+        max_tokens,
+        text_format=text_format,
+    )
+    sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
+    sanitized_payload["text"] = {"format": deepcopy(text_format)}
+    sanitized_payload["max_output_tokens"] = max_tokens
+    sanitized_payload.pop("temperature", None)
 
     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
     if not api_key:
@@ -641,9 +662,37 @@ def _run_health_ping() -> Dict[str, object]:
     fallback_used = False
 
     start = time.perf_counter()
+    attempts = 0
+    max_attempts = 2
+    min_bump_done = False
+    current_max_tokens = max_tokens
+    auto_bump_applied = False
+    data: Optional[Dict[str, object]] = None
+    response: Optional[httpx.Response] = None
+
     try:
         with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
-            response = client.post(RESPONSES_API_URL, json=payload, headers=headers)
+            while attempts < max_attempts:
+                attempts += 1
+                payload_snapshot = dict(sanitized_payload)
+                payload_snapshot["text"] = {"format": deepcopy(text_format)}
+                payload_snapshot["max_output_tokens"] = current_max_tokens
+                response = client.post(
+                    RESPONSES_API_URL,
+                    json=payload_snapshot,
+                    headers=headers,
+                )
+                if (
+                    response.status_code == 400
+                    and not min_bump_done
+                    and is_min_tokens_error(response)
+                ):
+                    current_max_tokens = max(current_max_tokens, HEALTH_MIN_BUMP_TOKENS)
+                    sanitized_payload["max_output_tokens"] = current_max_tokens
+                    min_bump_done = True
+                    auto_bump_applied = True
+                    continue
+                break
     except httpx.TimeoutException:
         latency_ms = int((time.perf_counter() - start) * 1000)
         return {
@@ -665,6 +714,15 @@ def _run_health_ping() -> Dict[str, object]:
         }
 
     latency_ms = int((time.perf_counter() - start) * 1000)
+
+    if response is None:
+        return {
+            "ok": False,
+            "message": "Responses недоступен: нет ответа",
+            "route": route,
+            "fallback_used": fallback_used,
+            "latency_ms": latency_ms,
+        }
 
     if response.status_code != 200:
         detail = response.text.strip()
@@ -704,11 +762,16 @@ def _run_health_ping() -> Dict[str, object]:
     elif isinstance(data.get("output"), list) or isinstance(data.get("outputs"), list):
         got_output = True
 
+    extras: List[str] = []
+    if auto_bump_applied:
+        extras.append("auto-bump до 24")
+
     if status == "completed":
-        message = "Responses OK"
+        message = f"Responses OK (gpt-5, {current_max_tokens} токена"
         ok = True
     elif status == "incomplete" and incomplete_reason == "max_output_tokens":
-        message = "Responses OK (incomplete из-за маленького max_output_tokens)"
+        extras.insert(0, "incomplete по лимиту — норм для health")
+        message = f"Responses OK (gpt-5, {current_max_tokens} токена"
         ok = True
     else:
         if not status:
@@ -725,6 +788,11 @@ def _run_health_ping() -> Dict[str, object]:
             "latency_ms": latency_ms,
             "status": status or "",
         }
+
+    if extras:
+        message = f"{message}; {'; '.join(extras)})"
+    else:
+        message = f"{message})"
 
     result: Dict[str, object] = {
         "ok": ok,

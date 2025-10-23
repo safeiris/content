@@ -290,7 +290,7 @@ class DeterministicPipeline:
 
     def _resolve_skeleton_tokens(self) -> int:
         baseline = 1200 if self.max_tokens <= 0 else min(self.max_tokens, 1200)
-        return max(600, baseline)
+        return max(800, min(1200, baseline))
 
     def _skeleton_contract(self) -> Tuple[Dict[str, object], str]:
         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
@@ -581,6 +581,9 @@ class DeterministicPipeline:
         json_error_count = 0
         use_fallback = False
         result: Optional[GenerationResult] = None
+        def _clamp_tokens(value: int) -> int:
+            return max(800, min(1200, value))
+
         while attempt < 3 and markdown is None:
             attempt += 1
             try:
@@ -601,7 +604,7 @@ class DeterministicPipeline:
                     status,
                     metadata_snapshot.get("incomplete_reason") or "",
                 )
-                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
                 continue
             raw_text = result.text.strip()
             if "<response_json>" in raw_text and "</response_json>" in raw_text:
@@ -620,7 +623,7 @@ class DeterministicPipeline:
             except json.JSONDecodeError as exc:
                 LOGGER.warning("SKELETON_JSON_INVALID attempt=%d error=%s", attempt, exc)
                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d", attempt)
-                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
                 last_error = PipelineStepError(PipelineStep.SKELETON, "Ответ модели не является корректным JSON.")
                 json_error_count += 1
                 if not use_fallback and json_error_count >= 2:
@@ -641,7 +644,7 @@ class DeterministicPipeline:
                 last_error = PipelineStepError(PipelineStep.SKELETON, str(exc))
                 LOGGER.warning("SKELETON_RETRY_json_error attempt=%d error=%s", attempt, exc)
                 payload = None
-                skeleton_tokens = max(600, int(skeleton_tokens * 0.9))
+                skeleton_tokens = _clamp_tokens(int(skeleton_tokens * 0.9))
                 markdown = None
 
         if markdown is None:

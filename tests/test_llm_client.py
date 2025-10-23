@@ -79,7 +79,7 @@ class DummyClient:
             return DummyResponse(response_payload, status_code=status, text=text, raise_for_status_exc=error)
         return DummyResponse(payload)
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, **kwargs):
         if url.startswith("https://api.openai.com/v1/responses"):
             self.last_poll = {
                 "url": url,
@@ -455,7 +455,7 @@ def test_generate_escalates_max_tokens_when_truncated():
     assert result.text == "expanded"
     assert result.retry_used is True
     assert client.call_count == 2
-    assert client.requests[1]["json"]["max_output_tokens"] == 2200
+    assert client.requests[1]["json"]["max_output_tokens"] == 1200
 
 
 def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):

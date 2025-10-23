@@ -50,6 +50,31 @@ def _supports_temperature(model: str) -> bool:
     model_name = (model or "").strip().lower()
     return not model_name.startswith("gpt-5")
 
+
+def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
+    """Detect the specific 400 error about max_output_tokens being too small."""
+
+    if response is None:
+        return False
+
+    message = ""
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if isinstance(payload, dict):
+        error_block = payload.get("error")
+        if isinstance(error_block, dict):
+            message = str(error_block.get("message", ""))
+    if not message:
+        message = response.text or ""
+
+    normalized = re.sub(r"\s+", " ", message).lower()
+    if "max_output_tokens" not in normalized:
+        return False
+    return "expected" in normalized and ">=" in normalized and "16" in normalized
+
 DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
     "type": "json_schema",
     "json_schema": {
@@ -193,6 +218,31 @@ def build_responses_payload(
     if _supports_temperature(model):
         payload["temperature"] = 0.3
     return payload
+
+
+def _shrink_responses_input(text_value: str) -> str:
+    """Return a slightly condensed version of the Responses input payload."""
+
+    if not text_value:
+        return text_value
+
+    normalized_lines: List[str] = []
+    seen: set[str] = set()
+    for raw_line in text_value.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        fingerprint = re.sub(r"\s+", " ", stripped.lower())
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        normalized_lines.append(stripped)
+
+    condensed = "\n\n".join(normalized_lines)
+    if len(condensed) < len(text_value):
+        return condensed
+    target = max(1000, int(len(text_value) * 0.9))
+    return text_value[:target]
 
 
 def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -790,7 +840,7 @@ def _is_responses_fallback_allowed(exc: BaseException) -> bool:
         if isinstance(current, httpx.HTTPStatusError):
             response = current.response
             status = response.status_code if response is not None else None
-            if status and (status >= 500 or status in {408, 409, 425, 429}):
+            if status and (status >= 500 or status in {408, 409, 425, 429, 400}):
                 return True
         current = getattr(current, "__cause__", None)
     return False
@@ -1165,15 +1215,86 @@ def generate(
             }
 
         attempts = 0
+        max_attempts = 3
         current_max = max_tokens_value
         last_error: Optional[BaseException] = None
         format_retry_done = False
+        min_tokens_bump_done = False
+        min_token_floor = 1
+        base_input_text = str(sanitized_payload.get("input", ""))
+        shrunken_input = _shrink_responses_input(base_input_text)
+        shrink_next_attempt = False
+        shrink_applied = False
+        incomplete_retry_count = 0
 
-        while attempts < 3:
+        def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
+            poll_attempt = 0
+            while poll_attempt < MAX_RESPONSES_POLL_ATTEMPTS:
+                poll_attempt += 1
+                poll_url = f"{RESPONSES_API_URL}/{response_id}"
+                LOGGER.info("responses poll attempt=%d id=%s", poll_attempt, response_id)
+                if poll_attempt == 1:
+                    initial_sleep = schedule[0] if schedule else 0.5
+                    LOGGER.info("responses poll initial sleep=%.2f", initial_sleep)
+                    time.sleep(initial_sleep)
+                try:
+                    poll_response = http_client.get(
+                        poll_url,
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                    poll_response.raise_for_status()
+                except httpx.HTTPStatusError as poll_error:
+                    _handle_responses_http_error(poll_error, {"poll_id": response_id})
+                    break
+                except httpx.HTTPError as transport_error:  # pragma: no cover - defensive
+                    LOGGER.warning("responses poll transport error: %s", transport_error)
+                    break
+                try:
+                    payload = poll_response.json()
+                except ValueError:
+                    LOGGER.warning("responses poll returned invalid JSON")
+                    break
+                if not isinstance(payload, dict):
+                    break
+                text, poll_parse_flags, _ = _extract_responses_text(payload)
+                metadata = _extract_metadata(payload)
+                poll_status = metadata.get("status") or ""
+                poll_reason = metadata.get("incomplete_reason") or ""
+                segments = int(poll_parse_flags.get("segments", 0) or 0)
+                LOGGER.info("RESP_POLL_STATUS=%s|%s", poll_status or "ok", poll_reason or "-")
+                if poll_status == "completed" and (text or segments > 0):
+                    return payload
+                if poll_status == "incomplete" and poll_reason == "max_output_tokens":
+                    LOGGER.info(
+                        "RESP_STATUS=incomplete|max_output_tokens=%s",
+                        sanitized_payload.get("max_output_tokens"),
+                    )
+                    break
+                if poll_attempt >= MAX_RESPONSES_POLL_ATTEMPTS:
+                    break
+                sleep_for = schedule[min(poll_attempt - 1, len(schedule) - 1)] if schedule else 0.5
+                LOGGER.info("responses poll sleep=%.2f", sleep_for)
+                time.sleep(sleep_for)
+            return None
+
+        while attempts < max_attempts:
             attempts += 1
             current_payload = dict(sanitized_payload)
             current_payload["text"] = {"format": _clone_text_format()}
-            current_payload["max_output_tokens"] = max(32, int(current_max))
+            if shrink_applied and shrunken_input:
+                current_payload["input"] = shrunken_input
+            elif shrink_next_attempt:
+                shrink_next_attempt = False
+                if shrunken_input and shrunken_input != base_input_text:
+                    current_payload["input"] = shrunken_input
+                    shrink_applied = True
+                    LOGGER.info(
+                        "RESP_PROMPT_SHRINK original_len=%d shrunk_len=%d",
+                        len(base_input_text),
+                        len(shrunken_input),
+                    )
+            current_payload["max_output_tokens"] = max(min_token_floor, int(current_max))
             if attempts > 1:
                 retry_used = True
             _log_payload(current_payload)
@@ -1196,13 +1317,30 @@ def generate(
                 reason = metadata.get("incomplete_reason") or ""
                 segments = int(parse_flags.get("segments", 0) or 0)
                 LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
-                if status == "incomplete" or segments == 0:
+                if status in {"in_progress", "queued"}:
+                    response_id = data.get("id")
+                    if isinstance(response_id, str) and response_id.strip():
+                        polled_payload = _poll_responses_payload(response_id.strip())
+                        if polled_payload is None:
+                            last_error = RuntimeError("responses_incomplete")
+                            continue
+                        data = polled_payload
+                        text, parse_flags, schema_label = _extract_responses_text(data)
+                        metadata = _extract_metadata(data)
+                        status = metadata.get("status") or ""
+                        reason = metadata.get("incomplete_reason") or ""
+                        segments = int(parse_flags.get("segments", 0) or 0)
+                        LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
+                if status == "incomplete" and reason == "max_output_tokens":
                     LOGGER.info(
                         "RESP_STATUS=incomplete|max_output_tokens=%s",
                         current_payload.get("max_output_tokens"),
                     )
                     last_error = RuntimeError("responses_incomplete")
-                    current_max = max(32, int(current_payload["max_output_tokens"] * 0.85))
+                    incomplete_retry_count += 1
+                    if incomplete_retry_count >= 2:
+                        break
+                    shrink_next_attempt = True
                     continue
                 if not text:
                     last_error = EmptyCompletionError(
@@ -1211,13 +1349,11 @@ def generate(
                         parse_flags=parse_flags,
                     )
                     LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
-                    current_max = max(32, int(current_payload["max_output_tokens"] * 0.85))
                     continue
                 _persist_raw_response(data)
                 return text, parse_flags, data, schema_label
             except EmptyCompletionError as exc:
                 last_error = exc
-                current_max = max(32, int(current_payload.get("max_output_tokens", 32) * 0.85))
             except httpx.HTTPStatusError as exc:
                 response_obj = exc.response
                 status = response_obj.status_code if response_obj is not None else None
@@ -1232,6 +1368,29 @@ def generate(
                     LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
                     _apply_text_format(sanitized_payload)
                     continue
+                if (
+                    status == 400
+                    and not min_tokens_bump_done
+                    and is_min_tokens_error(response_obj)
+                ):
+                    min_tokens_bump_done = True
+                    retry_used = True
+                    min_token_floor = max(min_token_floor, 24)
+                    current_max = max(current_max, min_token_floor)
+                    sanitized_payload["max_output_tokens"] = max(current_max, min_token_floor)
+                    LOGGER.warning("LOG:RESP_RETRY_REASON=max_tokens_min_bump")
+                    continue
+                if status == 400 and response_obj is not None:
+                    shim_param = _extract_unknown_parameter_name(response_obj)
+                    if shim_param:
+                        retry_used = True
+                        if shim_param in sanitized_payload:
+                            sanitized_payload.pop(shim_param, None)
+                        LOGGER.warning(
+                            "retry=shim_unknown_param stripped='%s'",
+                            shim_param,
+                        )
+                        continue
                 last_error = exc
                 _handle_responses_http_error(exc, current_payload)
                 break
@@ -1239,7 +1398,7 @@ def generate(
                 if isinstance(exc, KeyboardInterrupt):
                     raise
                 last_error = exc
-            if attempts >= 3:
+            if attempts >= max_attempts:
                 break
             sleep_for = schedule[min(attempts - 1, len(schedule) - 1)] if schedule else 0.5
             LOGGER.warning("responses retry attempt=%d sleep=%.2f", attempts, sleep_for)
@@ -1413,6 +1572,8 @@ def generate(
                 meta_candidate = parse_flags_fallback.get("metadata")
                 if isinstance(meta_candidate, dict):
                     metadata_block = dict(meta_candidate)
+            if fallback_reason == "empty_completion_gpt5_responses":
+                retry_used = False
             return GenerationResult(
                 text=text,
                 model_used=fallback_used,
