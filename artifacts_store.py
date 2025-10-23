@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,8 @@ LOGGER = logging.getLogger("content_factory.artifacts")
 
 ARTIFACTS_DIR = Path("artifacts").resolve()
 INDEX_FILENAME = "index.json"
+LATEST_FILENAME = "latest.json"
+CHANGELOG_FILENAME = "changelog.json"
 
 
 @dataclass
@@ -33,6 +36,14 @@ def _index_path() -> Path:
 
 def _ensure_dir() -> None:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    _ensure_dir()
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def resolve_artifact_path(raw_path: str | Path) -> Path:
@@ -76,11 +87,50 @@ def _read_index() -> List[Dict[str, Any]]:
 
 def _write_index(entries: Sequence[Dict[str, Any]]) -> None:
     index_path = _index_path()
-    _ensure_dir()
-    index_path.write_text(
-        json.dumps(list(entries), ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    payload = json.dumps(list(entries), ensure_ascii=False, indent=2, sort_keys=True)
+    _atomic_write_text(index_path, payload)
+
+
+def _latest_path() -> Path:
+    return ARTIFACTS_DIR / LATEST_FILENAME
+
+
+def _changelog_path() -> Path:
+    return ARTIFACTS_DIR / CHANGELOG_FILENAME
+
+
+def _update_latest(record: ArtifactRecord) -> None:
+    payload = {
+        "id": record.id,
+        "path": record.path,
+        "metadata_path": record.metadata_path,
+        "updated_at": record.updated_at or datetime.utcnow().isoformat(),
+    }
+    _atomic_write_text(_latest_path(), json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _append_changelog(record: ArtifactRecord) -> None:
+    path = _changelog_path()
+    if path.exists():
+        try:
+            history = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            history = []
+    else:
+        history = []
+    if not isinstance(history, list):
+        history = []
+    entry = {
+        "id": record.id,
+        "path": record.path,
+        "metadata_path": record.metadata_path,
+        "status": record.status,
+        "updated_at": record.updated_at,
+        "recorded_at": datetime.utcnow().isoformat(),
+        "actor": os.getenv("USER") or os.getenv("USERNAME") or "unknown",
+    }
+    history.append(entry)
+    _atomic_write_text(path, json.dumps(history, ensure_ascii=False, indent=2))
 
 
 def _relative_path(path: Path) -> str:
@@ -193,6 +243,8 @@ def register_artifact(markdown_path: Path, metadata: Optional[Dict[str, Any]] = 
 
     entries = _sort_entries(entries)
     _write_index(entries)
+    _update_latest(record)
+    _append_changelog(record)
     return record
 
 

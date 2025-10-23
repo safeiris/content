@@ -1,307 +1,186 @@
-# -*- coding: utf-8 -*-
-import os
-import sys
-from datetime import datetime
+import json
+import uuid
 from pathlib import Path
 
-import pytest
-from zoneinfo import ZoneInfo
-
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-from llm_client import GenerationResult  # noqa: E402
-from orchestrate import (  # noqa: E402
-    LENGTH_EXTEND_THRESHOLD,
-    LENGTH_SHRINK_THRESHOLD,
-    _append_cta_if_needed,
-    _clean_trailing_noise,
-    _choose_section_for_extension,
-    _faq_block_format_valid,
-    _build_quality_extend_prompt,
-    _ensure_length,
-    _is_truncated,
-    _make_output_path,
-    _normalize_custom_context_text,
-    _should_force_quality_extend,
-    generate_article_from_payload,
-    make_generation_context,
-)
-from post_analysis import PostAnalysisRequirements  # noqa: E402
-from config import MAX_CUSTOM_CONTEXT_CHARS  # noqa: E402
+from deterministic_pipeline import DeterministicPipeline, PipelineStep
+from faq_builder import build_faq_block
+from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
+from length_trimmer import trim_text
+from orchestrate import generate_article_from_payload, gather_health_status
+from validators import strip_jsonld, validate_article
 
 
-def test_is_truncated_detects_comma():
-    assert _is_truncated("Незавершённое предложение,")
-
-
-def test_is_truncated_accepts_finished_sentence():
-    assert not _is_truncated("Предложение завершено.")
-
-
-def test_append_cta_appends_when_needed():
-    env_var = "DEFAULT_CTA"
-    previous = os.environ.get(env_var)
-    try:
-        os.environ[env_var] = "Тестовый CTA."
-        appended_text, appended, default_used = _append_cta_if_needed(
-            "Описание продукта,",
-            cta_text="Тестовый CTA.",
-            default_cta=True,
-        )
-        assert appended
-        assert appended_text.endswith("Тестовый CTA.")
-        assert "\n\n" in appended_text
-        assert default_used
-    finally:
-        if previous is not None:
-            os.environ[env_var] = previous
-        elif env_var in os.environ:
-            del os.environ[env_var]
-
-
-def test_choose_section_prefers_second_item():
-    data = {"structure": ["Введение", "Основная часть", "Заключение"]}
-    assert _choose_section_for_extension(data) == "Основная часть"
-
-
-def test_append_cta_respects_complete_text():
-    text = "Готовый вывод."
-    appended_text, appended, default_used = _append_cta_if_needed(
-        text,
-        cta_text="CTA",
-        default_cta=True,
+def test_keyword_injection_adds_terms_section():
+    base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
+    result = inject_keywords(base_text, ["ключевая фраза", "дополнительный термин"])
+    assert "### Разбираемся в терминах" in result.text
+    assert LOCK_START_TEMPLATE.format(term="ключевая фраза") in result.text
+    assert result.coverage["дополнительный термин"]
+    main_section = result.text.split("## FAQ", 1)[0]
+    expected_phrase = (
+        "Дополнительно рассматривается "
+        + f"{LOCK_START_TEMPLATE.format(term='ключевая фраза')}ключевая фраза<!--LOCK_END-->"
+        + " через прикладные сценарии."
     )
-    assert not appended
-    assert appended_text == text
-    assert not default_used
+    assert expected_phrase in main_section
 
 
-def test_is_truncated_detects_ellipsis():
-    assert _is_truncated("Оборванный текст...")
+def test_faq_builder_produces_jsonld_block():
+    base_text = "## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
+    faq_result = build_faq_block(base_text=base_text, topic="Долговая нагрузка", keywords=["платёж"])
+    assert faq_result.text.count("**Вопрос") == 5
+    assert faq_result.jsonld.strip().startswith('<script type="application/ld+json">')
+    payload = json.loads(faq_result.jsonld.split("\n", 1)[1].rsplit("\n", 1)[0])
+    assert payload["@type"] == "FAQPage"
+    assert len(payload["mainEntity"]) == 5
 
 
-def _make_requirements() -> PostAnalysisRequirements:
-    return PostAnalysisRequirements(
+def test_trim_preserves_locked_and_faq():
+    intro = " ".join(["Параграф с вводной информацией, который можно сократить." for _ in range(4)])
+    removable = "Дополнительный абзац с примерами, который допустимо удалить."
+    article = (
+        f"## Введение\n\n{intro}\n\n"
+        f"{LOCK_START_TEMPLATE.format(term='важный термин')}важный термин<!--LOCK_END-->\n\n"
+        f"{removable}\n\n"
+        "## FAQ\n\n<!--FAQ_START-->\n**Вопрос 1.** Что важно?\n\n**Ответ.** Ответ с деталями.\n\n<!--FAQ_END-->"
+    )
+    trimmed = trim_text(article, min_chars=200, max_chars=400)
+    assert "важный термин" in trimmed.text
+    assert "<!--FAQ_START-->" in trimmed.text
+    assert len("".join(trimmed.text.split())) <= 400
+    assert trimmed.removed_paragraphs
+
+
+def test_validator_detects_missing_keyword():
+    text = (
+        "## Введение\n\nТекст без маркеров.\n\n## FAQ\n\n<!--FAQ_START-->\n"
+        "**Вопрос 1.** Как?\n\n**Ответ.** Так.\n\n<!--FAQ_END-->\n"
+        "<script type=\"application/ld+json\">\n"
+        '{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": []}'
+        "\n</script>"
+    )
+    result = validate_article(text, keywords=["ключ"], min_chars=10, max_chars=1000)
+    assert not result.keywords_ok
+
+
+def test_validator_length_ignores_jsonld():
+    payload = {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+            {
+                "@type": "Question",
+                "name": f"Вопрос {idx}",
+                "acceptedAnswer": {"@type": "Answer", "text": f"Ответ {idx}"},
+            }
+            for idx in range(1, 6)
+        ],
+    }
+    faq_block = "\n".join(
+        [
+            "**Вопрос 1.** Что?",
+            "**Ответ.** Ответ.",
+            "",
+            "**Вопрос 2.** Что?",
+            "**Ответ.** Ответ.",
+            "",
+            "**Вопрос 3.** Что?",
+            "**Ответ.** Ответ.",
+            "",
+            "**Вопрос 4.** Что?",
+            "**Ответ.** Ответ.",
+            "",
+            "**Вопрос 5.** Что?",
+            "**Ответ.** Ответ.",
+            "",
+        ]
+    )
+    article = (
+        "## Введение\n\n"
+        f"{LOCK_START_TEMPLATE.format(term='ключ')}ключ<!--LOCK_END--> фиксирует термин.\n\n"
+        "## FAQ\n\n<!--FAQ_START-->\n"
+        f"{faq_block}\n"
+        "<!--FAQ_END-->\n"
+        "<script type=\"application/ld+json\">\n"
+        f"{json.dumps(payload, ensure_ascii=False)}\n"
+        "</script>"
+    )
+    article_no_jsonld = strip_jsonld(article)
+    base_length = len("".join(article_no_jsonld.split()))
+    full_length = len("".join(article.split()))
+    assert full_length > base_length
+    min_chars = max(10, base_length - 5)
+    max_chars = base_length + 5
+    result = validate_article(article, keywords=["ключ"], min_chars=min_chars, max_chars=max_chars)
+    assert result.length_ok
+    assert result.jsonld_ok
+
+
+def test_pipeline_produces_valid_article():
+    pipeline = DeterministicPipeline(
+        topic="Долговая нагрузка семьи",
+        base_outline=["Введение", "Аналитика", "Решения"],
+        keywords=[f"ключ {idx}" for idx in range(1, 12)],
         min_chars=3500,
         max_chars=6000,
-        keywords=["ключевое слово"],
-        keyword_mode="strict",
-        faq_questions=None,
-        sources=[],
-        style_profile="",
-        length_sources=None,
-        jsonld_enabled=False,
+    )
+    state = pipeline.run()
+    length_no_spaces = len("".join(strip_jsonld(state.text).split()))
+    assert 3500 <= length_no_spaces <= 6000
+    assert state.validation and state.validation.is_valid
+    assert state.text.count("**Вопрос") == 5
+
+
+def test_pipeline_resume_falls_back_to_available_checkpoint():
+    pipeline = DeterministicPipeline(
+        topic="Долговая нагрузка семьи",
+        base_outline=["Введение", "Основная часть", "Вывод"],
+        keywords=[f"ключ {idx}" for idx in range(1, 12)],
+        min_chars=3500,
+        max_chars=6000,
+    )
+    pipeline._run_skeleton()
+    state = pipeline.resume(PipelineStep.FAQ)
+    assert state.validation and state.validation.is_valid
+    assert any(
+        entry.step == PipelineStep.FAQ
+        and entry.status == "error"
+        and entry.notes.get("resumed_from") == PipelineStep.SKELETON.value
+        for entry in state.logs
     )
 
 
-def test_quality_extend_triggers_on_missing_faq():
-    report = {
-        "length": {"chars_no_spaces": 3600, "min": 3500, "max": 6000},
-        "missing_keywords": [],
-        "faq": {"within_range": False, "count": 1},
+def test_generate_article_returns_metadata(monkeypatch, tmp_path):
+    unique_name = f"test_{uuid.uuid4().hex}.md"
+    outfile = Path("artifacts") / unique_name
+    data = {
+        "theme": "Долговая нагрузка семьи",
+        "structure": ["Введение", "Основная часть", "Вывод"],
+        "keywords": [f"ключ {idx}" for idx in range(1, 12)],
+        "include_jsonld": True,
+        "context_source": "off",
     }
-    assert _should_force_quality_extend(report, _make_requirements())
-
-
-def test_quality_extend_prompt_mentions_keywords_and_faq():
-    report = {
-        "length": {"chars_no_spaces": 2800, "min": 3500, "max": 6000},
-        "missing_keywords": ["ключевое слово"],
-        "faq": {"within_range": False, "count": 1},
-    }
-    requirements = _make_requirements()
-    prompt = _build_quality_extend_prompt(report, requirements)
-    assert "продолжить и завершить FAQ" in prompt
-    assert "ключевое слово" in prompt
-    expected_range = f"{requirements.min_chars}\u2013{requirements.max_chars}"
-    assert expected_range in prompt
-    assert "Добавь 5 вопросов FAQ, если их нет" in prompt
-    assert "Используй недостающие ключевые фразы" in prompt
-
-
-def test_ensure_length_triggers_extend(monkeypatch):
-    captured = {}
-
-    def fake_llm(messages, **kwargs):
-        captured["prompt"] = messages[-1]["content"]
-        return GenerationResult(
-            text="Полный обновлённый текст",
-            model_used="model",
-            retry_used=False,
-            fallback_used=None,
-        )
-
-    monkeypatch.setattr("orchestrate.llm_generate", fake_llm)
-    short_text = "s"
-    assert len(short_text) < LENGTH_EXTEND_THRESHOLD
-    base_messages = [{"role": "system", "content": "base"}]
-    data = {"structure": ["Введение", "Основная часть"]}
-
-    base_result = GenerationResult(text=short_text, model_used="model", retry_used=False, fallback_used=None)
-
-    new_result, adjustment, new_messages = _ensure_length(
-        base_result,
-        base_messages,
-        data=data,
-        model_name="model",
-        temperature=0.3,
-        max_tokens=100,
-        timeout=5,
-        backoff_schedule=[0.5],
-    )
-
-    assert new_result.text == "Полный обновлённый текст"
-    assert adjustment == "extend"
-    assert len(new_messages) == len(base_messages) + 2
-    assert new_messages[-2]["role"] == "assistant"
-    assert new_messages[-2]["content"] == short_text
-    assert "Основная часть" in captured["prompt"]
-    assert "Верни полный обновлённый текст" in captured["prompt"]
-
-
-def test_ensure_length_triggers_shrink(monkeypatch):
-    captured = {}
-
-    def fake_llm(messages, **kwargs):
-        captured["prompt"] = messages[-1]["content"]
-        return GenerationResult(text="shrunk", model_used="model", retry_used=False, fallback_used=None)
-
-    monkeypatch.setattr("orchestrate.llm_generate", fake_llm)
-    long_text = "x" * (LENGTH_SHRINK_THRESHOLD + 10)
-    base_messages = [{"role": "system", "content": "base"}]
-
-    base_result = GenerationResult(text=long_text, model_used="model", retry_used=False, fallback_used=None)
-
-    new_result, adjustment, new_messages = _ensure_length(
-        base_result,
-        base_messages,
-        data={},
-        model_name="model",
-        temperature=0.3,
-        max_tokens=100,
-        timeout=5,
-        backoff_schedule=[0.5],
-    )
-
-    assert new_result.text == "shrunk"
-    assert adjustment == "shrink"
-    assert len(new_messages) == len(base_messages) + 1
-    assert "Сократи повторы" in captured["prompt"]
-
-
-def test_make_output_path_uses_belgrade_timezone(monkeypatch):
-    fixed_now = datetime(2024, 1, 2, 9, 30, tzinfo=ZoneInfo("Europe/Belgrade"))
-    monkeypatch.setattr("orchestrate._local_now", lambda: fixed_now)
-    output_path = _make_output_path("finance", None)
-    assert output_path.name == "2024-01-02_0930_finance_article.md"
-
-
-def test_make_generation_context_custom_includes_message():
-    raw_text = "Первый абзац\n\n\nВторой абзац"
-    context = make_generation_context(
-        theme="finance",
-        data={"theme": "Тест"},
-        k=3,
-        context_source="custom",
-        custom_context_text=raw_text,
-        context_filename="brief.json",
-    )
-
-    custom_messages = [
-        msg
-        for msg in context.messages
-        if msg.get("role") == "system" and str(msg.get("content", "")).startswith("CONTEXT (CUSTOM):")
-    ]
-    assert custom_messages, "Ожидался системный блок CONTEXT (CUSTOM)"
-    assert "Первый абзац" in custom_messages[0]["content"]
-    assert "Второй абзац" in custom_messages[0]["content"]
-    assert context.custom_context_len == len("Первый абзац\n\nВторой абзац")
-    assert context.custom_context_filename == "brief.json"
-    assert context.context_source == "custom"
-
-
-def test_make_generation_context_truncates_custom_text():
-    long_text = "x" * (MAX_CUSTOM_CONTEXT_CHARS + 100)
-    context = make_generation_context(
-        theme="finance",
-        data={"theme": "Тест"},
-        k=1,
-        context_source="custom",
-        custom_context_text=long_text,
-    )
-    assert context.custom_context_len == MAX_CUSTOM_CONTEXT_CHARS
-    assert context.custom_context_truncated
-
-
-def test_normalize_custom_context_text_strips_noise():
-    raw_text = "\x00Первый\r\nабзац\r\n\r\n\t\tВторой\tабзац\u0007\n\n\n"
-    normalized, truncated = _normalize_custom_context_text(raw_text)
-
-    assert "\x00" not in normalized
-    assert "\u0007" not in normalized
-    assert "\t" not in normalized
-    assert "\n\n\n" not in normalized
-    assert normalized.startswith("Первый")
-    assert normalized.rstrip().endswith("Второй абзац")
-    assert not truncated
-
-
-def test_generate_article_with_custom_context_metadata(monkeypatch):
-    def fake_llm(messages, **kwargs):
-        return GenerationResult(text="OK", model_used="model", retry_used=False, fallback_used=None)
-
-    monkeypatch.setattr("orchestrate.llm_generate", fake_llm)
-    monkeypatch.setattr("orchestrate._write_outputs", lambda path, text, metadata: {})
-
     result = generate_article_from_payload(
         theme="finance",
-        data={"theme": "Тест"},
-        k=2,
-        context_source="custom",
-        context_text="Параграф один\n\nПараграф два",
-        context_filename="notes.txt",
+        data=data,
+        k=0,
+        context_source="off",
+        outfile=str(outfile),
     )
-
     metadata = result["metadata"]
-    assert metadata["context_source"] == "custom"
-    assert metadata["context_len"] == len("Параграф один\n\nПараграф два")
-    assert metadata["context_filename"] == "notes.txt"
-    assert metadata["context_note"] == "k_ignored"
-    assert metadata["custom_context_text"].startswith("Параграф один")
+    assert metadata["validation"]["passed"]
+    assert Path(outfile).exists()
+    assert metadata["pipeline_logs"]
+    # cleanup
+    Path(outfile).unlink(missing_ok=True)
+    Path(outfile.with_suffix(".json")).unlink(missing_ok=True)
 
 
-def test_clean_trailing_noise_removes_default_cta(monkeypatch):
-    monkeypatch.setenv("DEFAULT_CTA", "Тестовый CTA.")
-    text = "Основной текст.\n\nТестовый CTA."
-    assert _clean_trailing_noise(text) == "Основной текст."
+def test_gather_health_status_handles_missing_theme(monkeypatch):
+    class DummyResponse:
+        status_code = 200
 
-
-def _build_valid_faq_block() -> str:
-    entries = []
-    for idx in range(1, 6):
-        entries.append(
-            (
-                f"**Вопрос {idx}.** Как работает пункт {idx}?\n"
-                "**Ответ.** Первое пояснение по теме. Второе предложение раскрывает деталь."
-            )
-        )
-    return "Введение\n\nFAQ\n" + "\n\n".join(entries)
-
-
-def test_faq_block_format_validator_accepts_valid_block():
-    text = _build_valid_faq_block()
-    ok, meta = _faq_block_format_valid(text, 5)
-    assert ok
-    assert meta["pairs_found"] == 5
-    assert meta["invalid_answers"] == 0
-
-
-def test_faq_block_format_validator_detects_short_answer():
-    text = _build_valid_faq_block().replace(
-        "Первое пояснение по теме. Второе предложение раскрывает деталь.",
-        "Короткое пояснение.",
-        1,
-    )
-    ok, meta = _faq_block_format_valid(text, 5)
-    assert not ok
-    assert meta["invalid_answers"] >= 1
+    monkeypatch.setattr("orchestrate.httpx.get", lambda *args, **kwargs: DummyResponse())
+    status = gather_health_status(theme="")
+    assert not status["ok"]
+    assert not status["checks"]["theme_index"]["ok"]
