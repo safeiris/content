@@ -1860,13 +1860,10 @@ def generate(
                             updated_data["metadata"] = metadata
                             _persist_raw_response(updated_data)
                             return text, parse_flags, updated_data, schema_label
-                        if upper_cap is not None and int(current_max) >= upper_cap:
-                            message = (
-                                f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
-                                "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру."
-                            )
-                            raise RuntimeError(message)
-                        if token_escalations >= RESPONSES_MAX_ESCALATIONS:
+                        cap_exhausted = (
+                            upper_cap is not None and int(current_max) >= upper_cap
+                        )
+                        if not cap_exhausted and token_escalations >= RESPONSES_MAX_ESCALATIONS:
                             if (
                                 upper_cap is not None
                                 and int(current_max) < upper_cap
@@ -1885,33 +1882,60 @@ def generate(
                                 shrink_next_attempt = False
                                 continue
                             break
-                        next_max = _compute_next_max_tokens(
-                            int(current_max), token_escalations, upper_cap
-                        )
-                        if next_max <= int(current_max):
-                            if upper_cap is not None and int(current_max) >= upper_cap:
-                                message = (
-                                    f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
-                                    "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру."
+                        if not cap_exhausted:
+                            next_max = _compute_next_max_tokens(
+                                int(current_max), token_escalations, upper_cap
+                            )
+                            if next_max <= int(current_max):
+                                if (
+                                    upper_cap is not None
+                                    and int(current_max) >= upper_cap
+                                ):
+                                    cap_exhausted = True
+                                else:
+                                    break
+                            if not cap_exhausted:
+                                cap_label = (
+                                    upper_cap if upper_cap is not None else "-"
                                 )
-                                raise RuntimeError(message)
-                            break
-                        cap_label = upper_cap if upper_cap is not None else "-"
-                        LOGGER.info(
-                            "RESP_ESCALATE_TOKENS reason=max_output_tokens from=%s to=%s cap=%s",
-                            current_payload.get("max_output_tokens"),
-                            next_max,
-                            cap_label,
-                        )
-                        token_escalations += 1
-                        current_max = next_max
-                        if upper_cap is not None and int(current_max) == upper_cap:
+                                LOGGER.info(
+                                    "RESP_ESCALATE_TOKENS reason=max_output_tokens from=%s to=%s cap=%s",
+                                    current_payload.get("max_output_tokens"),
+                                    next_max,
+                                    cap_label,
+                                )
+                                token_escalations += 1
+                                current_max = next_max
+                                if (
+                                    upper_cap is not None
+                                    and int(current_max) == upper_cap
+                                ):
+                                    cap_retry_performed = True
+                                sanitized_payload["max_output_tokens"] = max(
+                                    min_token_floor, int(current_max)
+                                )
+                                shrink_next_attempt = False
+                                continue
+                        if cap_exhausted:
+                            output_length = 0
+                            content_length = 0
+                            if isinstance(parse_flags, dict):
+                                output_length = int(
+                                    parse_flags.get("output_text_len", 0) or 0
+                                )
+                                content_length = int(
+                                    parse_flags.get("content_text_len", 0) or 0
+                                )
+                            LOGGER.warning(
+                                "LLM_WARN cap_reached limit=%s output_len=%d content_len=%d status=%s reason=%s",
+                                upper_cap,
+                                output_length,
+                                content_length,
+                                status or "",
+                                reason or "",
+                            )
                             cap_retry_performed = True
-                        sanitized_payload["max_output_tokens"] = max(
-                            min_token_floor, int(current_max)
-                        )
-                        shrink_next_attempt = False
-                        continue
+                            shrink_next_attempt = False
                     last_error = RuntimeError("responses_incomplete")
                     incomplete_retry_count += 1
                     if incomplete_retry_count >= 2:
@@ -2006,11 +2030,15 @@ def generate(
                 and upper_cap is not None
                 and int(current_max) >= upper_cap
             ):
-                message = (
-                    f"Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX={upper_cap}. "
-                    "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру."
+                LOGGER.warning(
+                    "LLM_WARN cap_reached limit=%s status=incomplete reason=max_output_tokens_final",
+                    upper_cap,
                 )
-                raise RuntimeError(message)
+                last_error = EmptyCompletionError(
+                    "Модель вернула пустой ответ",
+                    raw_response={},
+                    parse_flags={},
+                )
             if isinstance(last_error, httpx.HTTPStatusError):
                 _raise_for_last_error(last_error)
             if isinstance(last_error, (httpx.TimeoutException, httpx.TransportError)):

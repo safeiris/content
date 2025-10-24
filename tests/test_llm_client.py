@@ -572,7 +572,7 @@ def test_generate_does_not_shrink_prompt_after_content_started():
     assert second_input == first_input
 
 
-def test_generate_raises_when_incomplete_at_cap(monkeypatch):
+def test_generate_reports_empty_completion_when_incomplete_at_cap(monkeypatch):
     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 1800)
     initial_payload = {
         "id": "resp-init",
@@ -594,8 +594,8 @@ def test_generate_raises_when_incomplete_at_cap(monkeypatch):
             )
 
     message = str(excinfo.value)
-    assert "Ответ не помещается в предел G5_MAX_OUTPUT_TOKENS_MAX=1800" in message
-    assert "Увеличь G5_MAX_OUTPUT_TOKENS_MAX или упростите ТЗ/структуру" in message
+    assert "Ответ не помещается" not in message
+    assert "Модель не вернула варианты ответа." in message
 
 
 def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):

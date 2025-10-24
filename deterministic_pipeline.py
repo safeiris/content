@@ -1294,6 +1294,137 @@ class DeterministicPipeline:
         )
         return payload, result
 
+    def _run_cap_fallback_batch(
+        self,
+        batch: SkeletonBatchPlan,
+        *,
+        outline: SkeletonOutline,
+        assembly: SkeletonAssembly,
+        target_indices: Sequence[int],
+        max_tokens: int,
+        previous_response_id: Optional[str],
+    ) -> Tuple[Optional[object], Optional[GenerationResult]]:
+        if batch.kind not in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
+            return None, None
+        if not target_indices:
+            return None, None
+        messages = [dict(message) for message in self.messages]
+        outline_text = ", ".join(outline.all_headings())
+        lines: List[str] = [
+            "Аварийный режим: сформируй минимальный JSON-фрагмент.",
+            f"Тема: {self.topic}.",
+            f"План разделов: {outline_text}.",
+        ]
+        if batch.kind == SkeletonBatchKind.MAIN:
+            target_index = target_indices[0]
+            heading = (
+                outline.main_headings[target_index]
+                if target_index < len(outline.main_headings)
+                else f"Раздел {target_index + 1}"
+            )
+            ready_sections = [
+                outline.main_headings[idx]
+                for idx, body in enumerate(assembly.main_sections)
+                if body and idx != target_index
+            ]
+            if ready_sections:
+                lines.append("Уже готовы: " + "; ".join(ready_sections) + ".")
+            lines.extend(
+                [
+                    f"Нужен краткий текст для раздела №{target_index + 1}: {heading}.",
+                    "Ответ верни в JSON: {\"sections\": [{\"title\": \"...\", \"body\": \"...\"}]}",
+                    "Минимум два предложения в body.",
+                ]
+            )
+        else:
+            start_number = target_indices[0] + 1
+            lines.extend(
+                [
+                    f"Добавь пункт FAQ №{start_number}.",
+                    "Ответ в формате JSON: {\"faq\": [{\"q\": \"...\", \"a\": \"...\"}]}",
+                    "Вопрос и ответ должны быть осмысленными.",
+                ]
+            )
+        user_payload = textwrap.dedent("\n".join(lines)).strip()
+        messages.append({"role": "user", "content": user_payload})
+        schema = self._batch_schema(
+            batch,
+            outline=outline,
+            item_count=len(target_indices) or 1,
+        )
+        format_block = {"type": "json_object", "schema": schema}
+        emergency_tokens = max(320, min(max_tokens, 900))
+        LOGGER.info(
+            "CAP_FALLBACK kind=%s label=%s tokens=%d",
+            batch.kind.value,
+            batch.label,
+            emergency_tokens,
+        )
+        result = self._call_llm(
+            step=PipelineStep.SKELETON,
+            messages=messages,
+            max_tokens=emergency_tokens,
+            previous_response_id=previous_response_id,
+            responses_format=format_block,
+            allow_incomplete=True,
+        )
+        payload_obj = self._extract_response_json(result.text)
+        if not self._batch_has_payload(batch.kind, payload_obj):
+            return None, result
+        return payload_obj, result
+
+    def _build_batch_placeholder(
+        self,
+        batch: SkeletonBatchPlan,
+        *,
+        outline: SkeletonOutline,
+        target_indices: Sequence[int],
+    ) -> Optional[object]:
+        if batch.kind == SkeletonBatchKind.INTRO:
+            headers = list(outline.main_headings)
+            if not headers:
+                headers = [f"Раздел {idx + 1}" for idx in range(max(1, len(target_indices)))]
+            return {
+                "intro": (
+                    f"Введение по теме «{self.topic}» будет расширено после снятия ограничений."  # noqa: B950
+                ),
+                "main_headers": headers,
+                "conclusion_heading": outline.conclusion_heading
+                or "Заключение",
+            }
+        if batch.kind == SkeletonBatchKind.MAIN:
+            sections: List[Dict[str, str]] = []
+            indices = list(target_indices) or [0]
+            for index in indices:
+                heading = (
+                    outline.main_headings[index]
+                    if 0 <= index < len(outline.main_headings)
+                    else f"Раздел {index + 1}"
+                )
+                body = (
+                    f"Раздел «{heading}» будет детализирован в финальной версии статьи."
+                )
+                sections.append({"title": heading, "body": body})
+            return {"sections": sections}
+        if batch.kind == SkeletonBatchKind.FAQ:
+            faq_entries: List[Dict[str, str]] = []
+            indices = list(target_indices) or [0]
+            for index in indices:
+                number = index + 1
+                question = f"Что важно помнить по пункту №{number}?"
+                answer = (
+                    "Ответ будет расширен после полного завершения генерации скелета."
+                )
+                faq_entries.append({"q": question, "a": answer})
+            return {"faq": faq_entries}
+        if batch.kind == SkeletonBatchKind.CONCLUSION:
+            return {
+                "conclusion": (
+                    "Вывод будет дополнен после завершения основной генерации текста."
+                )
+            }
+        return None
+
     def _tail_fill_batch(
         self,
         batch: SkeletonBatchPlan,
@@ -1667,6 +1798,7 @@ class DeterministicPipeline:
             best_payload_obj: Optional[object] = None
             best_result: Optional[GenerationResult] = None
             best_metadata_snapshot: Dict[str, object] = {}
+            last_reason_lower = ""
 
             while True:
                 messages, format_block = self._build_batch_messages(
@@ -1706,6 +1838,7 @@ class DeterministicPipeline:
                 status = str(metadata_snapshot.get("status") or "")
                 reason = str(metadata_snapshot.get("incomplete_reason") or "")
                 reason_lower = reason.strip().lower()
+                last_reason_lower = reason_lower
                 is_incomplete = status.lower() == "incomplete" or bool(reason)
                 has_payload = self._batch_has_payload(batch.kind, payload_obj)
                 if payload_obj is not None and has_payload:
@@ -1806,6 +1939,13 @@ class DeterministicPipeline:
                         if metadata_prev_id:
                             parse_none_streaks.pop(metadata_prev_id, None)
                         break
+                    if reason_lower == "max_output_tokens":
+                        LOGGER.warning(
+                            "SKELETON_FALLBACK_SKIPPED kind=%s label=%s reason=max_output_tokens",
+                            batch.kind.value,
+                            batch.label or self._format_batch_label(batch.kind, active_indices),
+                        )
+                        break
                     raise PipelineStepError(
                         PipelineStep.SKELETON,
                         "Fallback не дал валидный ответ для скелета.",
@@ -1833,6 +1973,31 @@ class DeterministicPipeline:
 
             target_indices = list(active_indices)
 
+            if (
+                payload_obj is None
+                and best_payload_obj is None
+                and last_reason_lower == "max_output_tokens"
+                and batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ)
+                and active_indices
+            ):
+                cap_payload, cap_result = self._run_cap_fallback_batch(
+                    batch,
+                    outline=outline,
+                    assembly=assembly,
+                    target_indices=active_indices,
+                    max_tokens=last_max_tokens,
+                    previous_response_id=continuation_id,
+                )
+                if cap_payload is not None and cap_result is not None:
+                    payload_obj = cap_payload
+                    result = cap_result
+                    metadata_snapshot = cap_result.metadata or {}
+                    response_id_candidate = self._metadata_response_id(metadata_snapshot)
+                    if response_id_candidate:
+                        continuation_id = response_id_candidate
+                        parse_none_streaks.pop(response_id_candidate, None)
+                    batch_partial = True
+
             if payload_obj is None and best_payload_obj is not None:
                 payload_obj = best_payload_obj
                 result = best_result
@@ -1841,6 +2006,24 @@ class DeterministicPipeline:
                 response_id_candidate = self._metadata_response_id(metadata_snapshot)
                 if response_id_candidate:
                     parse_none_streaks.pop(response_id_candidate, None)
+            if (
+                payload_obj is None
+                and best_payload_obj is None
+                and last_reason_lower == "max_output_tokens"
+            ):
+                placeholder = self._build_batch_placeholder(
+                    batch,
+                    outline=outline,
+                    target_indices=active_indices,
+                )
+                if placeholder is not None:
+                    payload_obj = placeholder
+                    batch_partial = True
+                    LOGGER.warning(
+                        "SKELETON_PLACEHOLDER_APPLIED kind=%s label=%s", 
+                        batch.kind.value,
+                        batch.label,
+                    )
             if payload_obj is None and batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ) and active_indices:
                 fallback_payload, fallback_result = self._run_fallback_batch(
                     batch,
