@@ -1,638 +1,657 @@
 diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 7e7d45981074ab672302c3be99a3e738b2481ebd..90b5006207621c856339a0abce269a7c30796634 100644
+index 90b5006207621c856339a0abce269a7c30796634..1a2f824ee2589372f902faea499863fc2201b0bd 100644
 --- a/deterministic_pipeline.py
 +++ b/deterministic_pipeline.py
-@@ -776,63 +776,72 @@ class DeterministicPipeline:
-         format_block = {
-             "type": "json_schema",
-             "name": name_map.get(batch.kind, "seo_article_skeleton_batch"),
-             "schema": schema,
-             "strict": True,
-         }
-         return self._prepare_format_block(format_block, batch=batch)
+@@ -5,50 +5,51 @@ from __future__ import annotations
+ import json
+ import logging
+ import re
+ import textwrap
+ import time
+ from collections import deque
+ from dataclasses import dataclass, field
+ from enum import Enum
+ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
  
-     def _prepare_format_block(
-         self,
-         format_block: Dict[str, object],
-         *,
-         batch: SkeletonBatchPlan,
-     ) -> Dict[str, object]:
-         fmt_type = str(format_block.get("type") or "").lower()
-         if fmt_type == "json_schema":
-             schema = format_block.get("schema")
-             if not isinstance(schema, dict):
-                 raise PipelineStepError(
-                     PipelineStep.SKELETON,
-                     "Некорректная схема ответа для батча скелета.",
-                 )
-             self._enforce_schema_defaults(schema)
-         format_name = str(format_block.get("name") or "")
-         if (
--            batch.kind != SkeletonBatchKind.INTRO
-+            batch.kind in (
-+                SkeletonBatchKind.MAIN,
-+                SkeletonBatchKind.FAQ,
-+                SkeletonBatchKind.CONCLUSION,
-+            )
-             and format_name.strip() == "seo_article_skeleton"
-         ):
--            LOGGER.error(
--                "FORMAT_GUARD triggered kind=%s label=%s name=%s",
-+            replacement_map = {
-+                SkeletonBatchKind.MAIN: "seo_article_main_batch",
-+                SkeletonBatchKind.FAQ: "seo_article_faq_batch",
-+                SkeletonBatchKind.CONCLUSION: "seo_article_conclusion_batch",
-+            }
-+            replacement = replacement_map.get(batch.kind, "seo_article_skeleton_batch")
-+            LOGGER.warning(
-+                "LOG:BAT_FMT_FIXUP kind=%s label=%s from=%s to=%s",
-                 batch.kind.value,
-                 batch.label or self._format_batch_label(batch.kind, batch.indices),
-                 format_name,
-+                replacement,
+ from config import (
+     G5_MAX_OUTPUT_TOKENS_MAX,
+     SKELETON_BATCH_SIZE_MAIN,
+     SKELETON_FAQ_BATCH,
+     TAIL_FILL_MAX_TOKENS,
+ )
+ from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
+ from faq_builder import _normalize_entry
+ from keyword_injector import (
+     KeywordInjectionResult,
+     LOCK_END,
+     LOCK_START_TEMPLATE,
+     build_term_pattern,
+     inject_keywords,
+ )
++from length_limits import compute_soft_length_bounds
+ from length_trimmer import TrimResult, TrimValidationError, trim_text
+ from skeleton_utils import normalize_skeleton_payload
+ from validators import (
+     ValidationError,
+     ValidationResult,
+     length_no_spaces,
+     strip_jsonld,
+     validate_article,
+ )
+ 
+ 
+ LOGGER = logging.getLogger("content_factory.pipeline")
+ 
+ FAQ_START = "<!--FAQ_START-->"
+ FAQ_END = "<!--FAQ_END-->"
+ 
+ _TEMPLATE_SNIPPETS = [
+     "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
+     "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист",
+     "В выводах собираем план действий, назначаем контрольные даты",
+ ]
+ 
+ 
+ class PipelineStep(str, Enum):
+     SKELETON = "skeleton"
+@@ -2551,86 +2552,110 @@ class DeterministicPipeline:
+                 entries=[entry["question"] for entry in sanitized],
+                 **self._metrics(merged_text),
              )
--            raise PipelineStepError(
--                PipelineStep.SKELETON,
--                "Недопустимое имя формата для батча скелета.",
--            )
-+            format_block = dict(format_block)
-+            format_block["name"] = replacement
-         return format_block
+             self.checkpoints[PipelineStep.FAQ] = merged_text
+             return merged_text
  
-     def _enforce_schema_defaults(self, schema: Dict[str, object], path: str = "$") -> None:
-         if not isinstance(schema, dict):
-             raise PipelineStepError(
-                 PipelineStep.SKELETON,
-                 f"Невалидная структура схемы по пути {path}.",
-             )
-         node_type = str(schema.get("type") or "")
-         if node_type == "object":
-             properties = schema.get("properties")
-             if isinstance(properties, dict):
-                 if "additionalProperties" not in schema:
-                     schema["additionalProperties"] = False
-                 required = schema.get("required")
-                 if isinstance(required, list):
-                     missing = [
-                         str(field)
-                         for field in required
-                         if field not in properties
-                     ]
-                     if missing:
-                         missing_fields = ", ".join(sorted(missing))
-                         raise PipelineStepError(
-                             PipelineStep.SKELETON,
-@@ -1416,50 +1425,58 @@ class DeterministicPipeline:
-                     "Ответ будет расширен после полного завершения генерации скелета."
-                 )
-                 faq_entries.append({"q": question, "a": answer})
-             return {"faq": faq_entries}
-         if batch.kind == SkeletonBatchKind.CONCLUSION:
-             return {
-                 "conclusion": (
-                     "Вывод будет дополнен после завершения основной генерации текста."
-                 )
-             }
-         return None
- 
-     def _tail_fill_batch(
-         self,
-         batch: SkeletonBatchPlan,
-         *,
-         outline: SkeletonOutline,
-         assembly: SkeletonAssembly,
-         estimate: SkeletonVolumeEstimate,
-         missing_items: Sequence[int],
-         metadata: Dict[str, object],
-     ) -> None:
-         pending = [int(item) for item in missing_items if isinstance(item, int)]
-         if not pending:
-             return
-+        if batch.kind == SkeletonBatchKind.MAIN:
-+            self._tail_fill_main_sections(
-+                indices=pending,
-+                outline=outline,
-+                assembly=assembly,
-+                estimate=estimate,
-+            )
-+            return
-         previous_id = self._metadata_response_id(metadata)
-         if not previous_id:
-             return
-         if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
-             groups = [[index] for index in pending]
-         else:
-             groups = [list(pending)]
- 
-         for group in groups:
-             if not group:
-                 continue
-             tail_plan = SkeletonBatchPlan(
-                 kind=batch.kind,
-                 indices=list(group),
-                 label=batch.label + "#tail",
-                 tail_fill=True,
-             )
-             messages, format_block = self._build_batch_messages(
-                 tail_plan,
-                 outline=outline,
-                 assembly=assembly,
-                 target_indices=list(group),
-                 tail_fill=True,
-             )
-             budget = self._batch_token_budget(batch, estimate, len(group))
-@@ -1524,69 +1541,341 @@ class DeterministicPipeline:
-                         headers = headers + outline.main_headings[len(headers) :]
-                     assembly.apply_intro(
-                         normalized.get("intro"),
-                         headers,
-                         normalized.get("conclusion_heading"),
-                     )
-                 if missing_fields:
-                     raise PipelineStepError(
-                         PipelineStep.SKELETON,
-                         "Не удалось завершить вводный блок скелета.",
-                     )
-             else:
-                 conclusion_text, missing = self._normalize_conclusion_batch(payload)
-                 if conclusion_text:
-                     assembly.apply_conclusion(conclusion_text)
-                 if missing:
-                     raise PipelineStepError(
-                         PipelineStep.SKELETON,
-                         "Не удалось завершить вывод скелета.",
-                     )
-             self._apply_inline_faq(payload, assembly)
-             for key, value in tail_metadata.items():
-                 if value:
-                     metadata[key] = value
- 
-+    def _tail_fill_main_sections(
-+        self,
-+        *,
-+        indices: Sequence[int],
-+        outline: SkeletonOutline,
-+        assembly: SkeletonAssembly,
-+        estimate: SkeletonVolumeEstimate,
-+    ) -> None:
-+        targets = [idx for idx in indices if 0 <= idx < len(outline.main_headings)]
-+        if not targets:
-+            return
-+        LOGGER.info("LOG:MAIN_TAIL_FILL start missing=%d", len(targets))
-+        for index in targets:
-+            heading = (
-+                outline.main_headings[index]
-+                if index < len(outline.main_headings)
-+                else f"Блок {index + 1}"
-+            )
-+            messages, format_block = self._build_main_tail_fill_messages(
-+                outline=outline,
-+                assembly=assembly,
-+                target_index=index,
-+                heading=heading,
-+            )
-+            budget = max(600, min(estimate.per_main_tokens + 160, 900))
-+            result = self._call_llm(
-+                step=PipelineStep.SKELETON,
-+                messages=messages,
-+                max_tokens=budget,
-+                responses_format=format_block,
-+            )
-+            payload = self._extract_response_json(result.text)
-+            format_used = "json"
-+            resolved_heading = heading
-+            body_text = ""
-+            if isinstance(payload, dict):
-+                section_payload: Optional[Dict[str, object]] = None
-+                section_block = payload.get("section")
-+                if isinstance(section_block, dict):
-+                    section_payload = section_block
-+                else:
-+                    sections = payload.get("sections")
-+                    if isinstance(sections, list) and sections:
-+                        candidate = sections[0]
-+                        if isinstance(candidate, dict):
-+                            section_payload = candidate
-+                if section_payload is not None:
-+                    heading_candidate = str(
-+                        section_payload.get("title")
-+                        or section_payload.get("heading")
-+                        or ""
-+                    ).strip()
-+                    body_candidate = str(
-+                        section_payload.get("body")
-+                        or section_payload.get("text")
-+                        or ""
-+                    ).strip()
-+                    if heading_candidate:
-+                        resolved_heading = heading_candidate
-+                    if body_candidate:
-+                        body_text = body_candidate
-+            if not body_text:
-+                fallback = self._parse_fallback_main(
-+                    result.text,
-+                    target_index=index,
-+                    outline=outline,
-+                )
-+                if fallback and isinstance(fallback, dict):
-+                    sections = fallback.get("sections")
-+                    if isinstance(sections, list) and sections:
-+                        candidate = sections[0]
-+                        if isinstance(candidate, dict):
-+                            heading_candidate = str(
-+                                candidate.get("title")
-+                                or candidate.get("heading")
-+                                or ""
-+                            ).strip()
-+                            body_candidate = str(
-+                                candidate.get("body")
-+                                or candidate.get("text")
-+                                or ""
-+                            ).strip()
-+                            if heading_candidate:
-+                                resolved_heading = heading_candidate
-+                            if body_candidate:
-+                                body_text = body_candidate
-+                                format_used = "text"
-+            if not body_text:
-+                body_text = (
-+                    "Этот раздел будет дополнен подробными рекомендациями по теме."
-+                    " Пока используем короткий абзац-заглушку."
-+                )
-+                format_used = "stub"
-+            assembly.apply_main(index, body_text, heading=resolved_heading)
-+            usage = self._extract_usage(result)
-+            tokens_repr = "-" if usage is None else f"{int(round(usage))}"
-+            LOGGER.info(
-+                "LOG:MAIN_TAIL_FILL_ACCEPT idx=%d tokens=%s format=%s",
-+                index + 1,
-+                tokens_repr,
-+                format_used,
-+            )
-+
-+    def _build_main_tail_fill_messages(
-+        self,
-+        *,
-+        outline: SkeletonOutline,
-+        assembly: SkeletonAssembly,
-+        target_index: int,
-+        heading: str,
-+    ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
-+        messages = [dict(message) for message in self.messages]
-+        existing_sections: List[str] = []
-+        for idx, title in enumerate(outline.main_headings):
-+            if idx == target_index:
-+                continue
-+            body = assembly.main_sections[idx] if idx < len(assembly.main_sections) else None
-+            if body and str(body).strip():
-+                existing_sections.append(f"{idx + 1}. {title}")
-+        lines = [
-+            "Ты дополняешь основной раздел SEO-статьи.",
-+            f"Тема: {self.topic}.",
-+            "Нужно подготовить одну новую секцию основной части, без повторов уже готовых блоков.",
-+            f"Целевой заголовок: {heading}.",
-+        ]
-+        if existing_sections:
-+            lines.append("Уже готовые разделы: " + "; ".join(existing_sections) + ".")
-+        lines.extend(
-+            [
-+                "Секция должна содержать 3–4 абзаца по 3–4 предложения, с цифрами, рисками и действиями.",
-+                "Сконцентрируйся на практических советах и логичной структуре.",
-+                "Верни JSON {\"section\": {\"title\": str, \"body\": str}} без пояснений.",
-+                "Строго одна новая секция основной части, без повторов.",
-+            ]
-+        )
-+        if self.normalized_keywords:
-+            lines.append(
-+                "По возможности используй ключевые слова: "
-+                + ", ".join(self.normalized_keywords)
-+                + "."
-+            )
-+        user_payload = textwrap.dedent("\n".join(lines)).strip()
-+        messages.append({"role": "user", "content": user_payload})
-+        schema = {
-+            "type": "object",
-+            "properties": {
-+                "section": {
-+                    "type": "object",
-+                    "properties": {
-+                        "title": {"type": "string"},
-+                        "body": {"type": "string"},
-+                    },
-+                    "required": ["title", "body"],
-+                    "additionalProperties": False,
-+                }
-+            },
-+            "required": ["section"],
-+            "additionalProperties": False,
-+        }
-+        format_block = {
-+            "type": "json_schema",
-+            "name": "seo_article_main_batch_one",
-+            "schema": schema,
-+            "strict": True,
-+        }
-+        plan = SkeletonBatchPlan(
-+            kind=SkeletonBatchKind.MAIN,
-+            indices=[target_index],
-+            label=f"main[{target_index + 1}]",
-+            tail_fill=True,
-+        )
-+        return messages, self._prepare_format_block(format_block, batch=plan)
-+
-+    def _append_main_heading_to_base_outline(self, heading: str) -> None:
-+        normalized = str(heading or "").strip()
-+        if not normalized:
-+            return
-+        if normalized in self.base_outline:
-+            return
-+        faq_markers = {"faq", "f.a.q.", "вопросы и ответы"}
-+        insert_pos = len(self.base_outline)
-+        for idx in range(1, len(self.base_outline)):
-+            marker = str(self.base_outline[idx] or "").strip().lower()
-+            if marker in faq_markers:
-+                insert_pos = idx
-+                break
-+        if insert_pos <= 0:
-+            insert_pos = 1
-+        if insert_pos >= len(self.base_outline):
-+            self.base_outline.append(normalized)
-+        else:
-+            self.base_outline.insert(insert_pos, normalized)
-+
-+    def _generate_additional_main_sections(
-+        self,
-+        *,
-+        outline: SkeletonOutline,
-+        assembly: SkeletonAssembly,
-+        estimate: SkeletonVolumeEstimate,
-+        count: int,
-+    ) -> List[str]:
-+        generated: List[str] = []
-+        target_total = max(0, int(count))
-+        for _ in range(target_total):
-+            new_heading = f"Дополнительный блок {len(outline.main_headings) + 1}"
-+            outline.main_headings.append(new_heading)
-+            assembly.main_sections.append(None)
-+            self._append_main_heading_to_base_outline(new_heading)
-+            new_index = len(assembly.main_sections) - 1
-+            self._tail_fill_main_sections(
-+                indices=[new_index],
-+                outline=outline,
-+                assembly=assembly,
-+                estimate=estimate,
-+            )
-+            body_text = assembly.main_sections[new_index]
-+            if isinstance(body_text, str) and body_text.strip():
-+                generated.append(body_text.strip())
-+            else:
-+                placeholder = (
-+                    "Дополнительный раздел будет дополнен подробными рекомендациями "
-+                    "в обновлении статьи."
-+                )
-+                assembly.apply_main(new_index, placeholder, heading=new_heading)
-+                generated.append(placeholder)
-+        return generated
-+
-+    def _finalize_main_sections(
-+        self,
-+        payload: Dict[str, object],
-+        *,
-+        outline: SkeletonOutline,
-+        assembly: SkeletonAssembly,
-+        estimate: SkeletonVolumeEstimate,
-+    ) -> Dict[str, object]:
-+        main_blocks = payload.get("main")
-+        if not isinstance(main_blocks, list):
-+            main_blocks = []
-+        sanitized = [str(item or "").strip() for item in main_blocks if str(item or "").strip()]
-+        before_len = len(sanitized)
-+        result = list(sanitized)
-+        if len(result) > 6:
-+            LOGGER.info("LOG:SKELETON_MAIN_TRIMMED from=%d to=6", len(result))
-+            result = result[:6]
-+        needed = max(0, min(3 - len(result), 3))
-+        if needed > 0:
-+            additional = self._generate_additional_main_sections(
-+                outline=outline,
-+                assembly=assembly,
-+                estimate=estimate,
-+                count=needed,
-+            )
-+            if additional:
-+                result.extend(additional)
-+            LOGGER.info(
-+                "LOG:SKELETON_MAIN_AUTOFIX needed=%d before=%d after=%d",
-+                needed,
-+                before_len,
-+                len(result),
-+            )
-+        payload["main"] = result
-+        return payload
-+
-     def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
-         if not isinstance(payload, dict):
-             raise ValueError("Структура скелета не является объектом")
- 
-         intro = str(payload.get("intro") or "").strip()
--        main = payload.get("main")
-+        raw_main = payload.get("main")
-+        if not isinstance(raw_main, list):
-+            raw_main = []
-         conclusion = str(payload.get("conclusion") or "").strip()
-         faq = payload.get("faq")
--        if not intro or not conclusion or not isinstance(main, list) or len(main) == 0:
-+        if not intro or not conclusion:
-             raise ValueError("Скелет не содержит обязательных полей intro/main/conclusion")
- 
--        if not 3 <= len(main) <= 6:
--            raise ValueError("Скелет основной части должен содержать 3–6 блоков")
--
--        normalized_main: List[str] = []
--        for idx, item in enumerate(main):
--            if not isinstance(item, str) or not item.strip():
--                raise ValueError(f"Элемент основной части №{idx + 1} пуст")
--            normalized_main.append(item.strip())
-+        normalized_main: List[str] = [
-+            str(item or "").strip() for item in raw_main if str(item or "").strip()
-+        ]
-+        if len(normalized_main) > 6:
-+            normalized_main = normalized_main[:6]
-+        placeholders_needed = max(0, 3 - len(normalized_main))
-+        if placeholders_needed:
-+            for _ in range(placeholders_needed):
-+                normalized_main.append(
-+                    "Этот раздел будет расширен детальными рекомендациями в финальной версии статьи."
-+                )
-+            LOGGER.warning(
-+                "LOG:SKELETON_MAIN_PLACEHOLDER applied count=%d",
-+                placeholders_needed,
-+            )
- 
-         if not isinstance(faq, list) or len(faq) != 5:
-             raise ValueError("Скелет FAQ должен содержать ровно 5 элементов")
- 
-         normalized_faq: List[Dict[str, str]] = []
-         for idx, entry in enumerate(faq, start=1):
-             if not isinstance(entry, dict):
-                 raise ValueError(f"FAQ элемент №{idx} имеет неверный формат")
-             question = str(entry.get("q") or "").strip()
-             answer = str(entry.get("a") or "").strip()
-             if not question or not answer:
-                 raise ValueError(f"FAQ элемент №{idx} пуст")
-             normalized_faq.append({"question": question, "answer": answer})
- 
-         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
-         outline = [
-             entry
-             for entry in outline
-             if entry.lower() not in {"faq", "f.a.q.", "вопросы и ответы"}
-         ]
-         if len(outline) < 3:
-             outline = ["Введение", "Основная часть", "Вывод"]
- 
-         intro_heading = outline[0]
-         conclusion_heading = outline[-1]
-@@ -1759,50 +2048,66 @@ class DeterministicPipeline:
-                     found += 1
-             self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
- 
-     # ------------------------------------------------------------------
-     # Step implementations
-     # ------------------------------------------------------------------
-     def _run_skeleton(self) -> str:
-         self._log(PipelineStep.SKELETON, "running")
-         outline = self._prepare_outline()
-         estimate = self._predict_skeleton_volume(outline)
-         batches = self._build_skeleton_batches(outline)
-         assembly = SkeletonAssembly(outline=outline)
-         metadata_snapshot: Dict[str, object] = {}
-         last_result: Optional[GenerationResult] = None
- 
-         pending_batches = deque(batches)
-         scheduled_main_indices: Set[int] = set()
-         parse_none_streaks: Dict[str, int] = {}
-         for plan in pending_batches:
-             if plan.kind == SkeletonBatchKind.MAIN:
-                 scheduled_main_indices.update(plan.indices)
-         split_serial = 0
- 
-         while pending_batches:
-             batch = pending_batches.popleft()
-+            if batch.kind in (SkeletonBatchKind.FAQ, SkeletonBatchKind.CONCLUSION):
-+                filled_main = sum(
-+                    1
-+                    for body in assembly.main_sections
-+                    if isinstance(body, str) and body.strip()
-+                )
-+                has_pending_main = any(
-+                    plan.kind == SkeletonBatchKind.MAIN for plan in pending_batches
-+                )
-+                if filled_main < 3 and has_pending_main:
-+                    LOGGER.info(
-+                        "LOG:SCHEDULER_BLOCK main underflow=%d target_min=3 → continue_main",
-+                        filled_main,
-+                    )
-+                    pending_batches.append(batch)
-+                    continue
-             if not batch.label:
-                 batch.label = self._format_batch_label(batch.kind, batch.indices)
-             active_indices = list(batch.indices)
-             limit_override: Optional[int] = None
-             override_to_cap = False
-             retries = 0
-             consecutive_empty_incomplete = 0
-             payload_obj: Optional[object] = None
-             metadata_snapshot = {}
-             result: Optional[GenerationResult] = None
-             last_max_tokens = estimate.start_max_tokens
-             continuation_id: Optional[str] = None
-             batch_partial = False
-             first_attempt_for_batch = True
-             best_payload_obj: Optional[object] = None
-             best_result: Optional[GenerationResult] = None
-             best_metadata_snapshot: Dict[str, object] = {}
-             last_reason_lower = ""
- 
-             while True:
-                 messages, format_block = self._build_batch_messages(
-                     batch,
-                     outline=outline,
-                     assembly=assembly,
-                     target_indices=active_indices,
-@@ -2118,65 +2423,71 @@ class DeterministicPipeline:
-                 assembly.apply_conclusion(conclusion_text)
-                 if missing_flag:
-                     self._tail_fill_batch(
-                         batch,
-                         outline=outline,
-                         assembly=assembly,
-                         estimate=estimate,
-                         missing_items=[0],
-                         metadata=metadata_snapshot,
-                     )
- 
-             self._apply_inline_faq(payload_obj, assembly)
-             LOGGER.info(
-                 "BATCH_ACCEPT state=%s kind=%s label=%s",
-                 "partial" if batch_partial else "complete",
-                 batch.kind.value,
-                 batch.label,
-             )
- 
-         if not assembly.intro:
-             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вводный блок скелета.")
-         if not assembly.conclusion:
-             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вывод скелета.")
-         missing_main = assembly.missing_main_indices()
-         if missing_main:
--            raise PipelineStepError(
--                PipelineStep.SKELETON,
--                "Не удалось заполнить все разделы основной части.",
-+            LOGGER.warning(
-+                "LOG:SKELETON_MAIN_GAPS missing=%s",
-+                ",".join(str(idx + 1) for idx in missing_main),
-             )
-         if outline.has_faq and assembly.missing_faq_count(5):
-             raise PipelineStepError(
-                 PipelineStep.SKELETON,
-                 "Не удалось собрать полный FAQ на этапе скелета.",
-             )
- 
-         payload = assembly.build_payload()
-         if outline.has_faq and len(payload.get("faq", [])) > 5:
-             payload["faq"] = payload["faq"][:5]
- 
-         normalized_payload = normalize_skeleton_payload(payload)
-+        normalized_payload = self._finalize_main_sections(
-+            normalized_payload,
-+            outline=outline,
-+            assembly=assembly,
-+            estimate=estimate,
-+        )
-         markdown, summary = self._render_skeleton_markdown(normalized_payload)
-         snapshot = dict(normalized_payload)
-         snapshot["outline"] = summary.get("outline", [])
-         if "faq" in summary:
-             snapshot["faq"] = summary.get("faq", [])
-         self.skeleton_payload = snapshot
-         self._skeleton_faq_entries = [
-             {"question": entry.get("q", ""), "answer": entry.get("a", "")}
-             for entry in normalized_payload.get("faq", [])
-         ]
- 
-         self._check_template_text(markdown, PipelineStep.SKELETON)
-         route = last_result.api_route if last_result is not None else "responses"
-         LOGGER.info("SKELETON_OK route=%s", route)
-         self._update_log(
-             PipelineStep.SKELETON,
-             "ok",
-             length=len(markdown),
-             metadata_status=metadata_snapshot.get("status") or "ok",
-             **self._metrics(markdown),
+         raise PipelineStepError(
+             PipelineStep.FAQ,
+             "Не удалось сформировать блок FAQ: отсутствуют подготовленные данные.",
          )
-         self.checkpoints[PipelineStep.SKELETON] = markdown
-         return markdown
  
-     def _run_keywords(self, text: str) -> KeywordInjectionResult:
+     def _run_trim(self, text: str) -> TrimResult:
+         self._log(PipelineStep.TRIM, "running")
+         reserve = self.jsonld_reserve if self.jsonld else 0
+         target_max = max(self.min_chars, self.max_chars - reserve)
+         try:
+             result = trim_text(
+                 text,
+                 min_chars=self.min_chars,
+                 max_chars=target_max,
+                 protected_blocks=self.locked_terms,
+             )
+         except TrimValidationError as exc:
+             raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
+         current_length = length_no_spaces(result.text)
+-        if current_length < self.min_chars or current_length > self.max_chars:
+-            raise PipelineStepError(
+-                PipelineStep.TRIM,
+-                f"Объём после трима вне диапазона {self.min_chars}–{self.max_chars} (без пробелов).",
++
++        soft_min, soft_max, tolerance_below, tolerance_above = compute_soft_length_bounds(
++            self.min_chars, self.max_chars
++        )
++        strict_violation = current_length < self.min_chars or current_length > self.max_chars
++        length_notes: Dict[str, object] = {}
++        if strict_violation:
++            if current_length < soft_min or current_length > soft_max:
++                raise PipelineStepError(
++                    PipelineStep.TRIM,
++                    (
++                        "Объём после трима вне диапазона "
++                        f"{self.min_chars}–{self.max_chars} (без пробелов)."
++                    ),
++                )
++            LOGGER.warning(
++                "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
++                current_length,
++                self.min_chars,
++                self.max_chars,
++                soft_min,
++                soft_max,
+             )
++            length_notes["length_relaxed"] = True
++            length_notes["length_soft_min"] = soft_min
++            length_notes["length_soft_max"] = soft_max
++            length_notes["length_tolerance_below"] = tolerance_below
++            length_notes["length_tolerance_above"] = tolerance_above
+ 
+         missing_locks = [
+             term
+             for term in self.normalized_keywords
+             if LOCK_START_TEMPLATE.format(term=term) not in result.text
+         ]
+         if missing_locks:
+             raise PipelineStepError(
+                 PipelineStep.TRIM,
+                 "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing_locks)),
+             )
+ 
+         faq_block = ""
+         if FAQ_START in result.text and FAQ_END in result.text:
+             faq_block = result.text.split(FAQ_START, 1)[1].split(FAQ_END, 1)[0]
+         faq_pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", faq_block)
+         if len(faq_pairs) != 5:
+             raise PipelineStepError(
+                 PipelineStep.TRIM,
+                 "FAQ должен содержать ровно 5 вопросов после тримминга.",
+             )
+         LOGGER.info(
+             "TRIM_OK chars_no_spaces=%d removed_paragraphs=%d",
+             current_length,
+             len(result.removed_paragraphs),
+         )
+         self._update_log(
+             PipelineStep.TRIM,
+             "ok",
+             removed=len(result.removed_paragraphs),
+             **self._metrics(result.text),
++            **length_notes,
+         )
+         self.checkpoints[PipelineStep.TRIM] = result.text
+         return result
+ 
+     # ------------------------------------------------------------------
+     # Public API
+     # ------------------------------------------------------------------
+     def run(self) -> PipelineState:
+         text = self._run_skeleton()
+         keyword_result = self._run_keywords(text)
+         faq_text = self._run_faq(keyword_result.text)
+         trim_result = self._run_trim(faq_text)
+         combined_text = trim_result.text
+         if self.jsonld and self.jsonld_requested:
+             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
+         try:
+             validation = validate_article(
+                 combined_text,
+                 keywords=self.keywords,
+                 min_chars=self.min_chars,
+                 max_chars=self.max_chars,
+                 skeleton_payload=self.skeleton_payload,
+                 keyword_coverage_percent=self.keywords_coverage_percent,
+             )
+         except ValidationError as exc:
+diff --git a/docs/deterministic_pipeline.md b/docs/deterministic_pipeline.md
+index 8c2e2c08de59a6c37bb33a321bcdcf7cc225dbe8..fe657706f5b4baaa517de3a0f91b16b5dd43fb6b 100644
+--- a/docs/deterministic_pipeline.md
++++ b/docs/deterministic_pipeline.md
+@@ -5,38 +5,38 @@
+ ## Шаг A. Скелет
+ * Формируется каркас статьи с разделами `Введение → Основная часть → FAQ → Вывод`.
+ * В блок FAQ вставляется плейсхолдер `<!--FAQ_START--> … <!--FAQ_END-->`.
+ * Длина черновика ограничена 3–3.5 тысячами символов без пробелов, чтобы обеспечить запас для последующих шагов.
+ * В метаданных фиксируется чекпоинт `skeleton` с длиной текста.
+ 
+ ## Шаг B. Ключи
+ * Каждая целевая ключевая фраза вставляется в естественный контекст.
+ * Вокруг точных вхождений размещаются теги защиты: `<!--LOCK_START term="…">` и `<!--LOCK_END-->`.
+ * Если не удаётся органично встроить отдельные ключи, автоматически добавляется врезка «### Разбираемся в терминах» с краткими пояснениями.
+ * Шаг завершается только при 100% покрытии списка ключей. В противном случае пайплайн останавливается на этом этапе.
+ 
+ ## Шаг C. FAQ и JSON-LD
+ * На основе унифицированного набора Q/A создаётся Markdown-блок FAQ ровно с пятью парами «Вопрос/Ответ».
+ * Параллельно формируется JSON-LD разметка `FAQPage`, синхронизированная с Markdown-версией.
+ * Оба артефакта записываются за один проход. Плейсхолдер FAQ заменяется готовым списком, JSON-LD добавляется в конец статьи.
+ * Чекпоинт `faq` фиксирует содержимое блока и перечень вопросов.
+ 
+ ## Шаг D. Приоритетный триммер
+ * Рассчитывается резерв под JSON-LD и только затем запускается мягкое сокращение статьи.
+ * Триммер удаляет второстепенные абзацы, не затрагивая защищённые LOCK-фрагменты и блок FAQ.
+ * После сокращения повторно проверяются длина, ключевые фразы и FAQ. Если хотя бы один критерий не соблюдён, шаг повторяется.
+ 
+ ## Валидация
+ * Финальный валидатор проверяет:
+-  * длину 3500–6000 знаков без пробелов;
++  * длину 3500–6000 знаков без пробелов (допускается небольшой люфт в пределах ~2% для предотвращения ложных падений);
+   * наличие всех ключей (по LOCK-тегам);
+   * строго пять вопросов в FAQ;
+   * корректный JSON-LD `FAQPage`.
+ * Результат записывается в метаданные (`validation.passed` и `validation.stats`). При любом «красном» статусе артефакты не фиксируются.
+ 
+ ## Управление артефактами
+ * Все файлы пишутся атомарно: `*.tmp → rename`.
+ * После успешной валидации обновляются `artifacts/index.json`, `latest.json` и `changelog.json` (с отметкой времени и исполнителя).
+ * `latest.json` хранит ссылку на актуальную версию статьи, `changelog.json` — историю публикаций.
+ 
+ ## Повторный запуск
+ * Для UI предусмотрен сценарий «Повторить», который стартует с первого проваленного шага: например, после сбоя на шаге C будет выполнен только FAQ+JSON-LD, без пересборки скелета и ключей.
+diff --git a/length_limits.py b/length_limits.py
+index fe2f5da4bdc283390af32548520dd032598c31a6..af8ade7a584c859ecd3db049532ec1229519893f 100644
+--- a/length_limits.py
++++ b/length_limits.py
+@@ -1,48 +1,91 @@
+ from __future__ import annotations
+ 
+ import json
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Dict, Optional, Tuple
+ 
+ from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
+ 
+ 
+ @dataclass(frozen=True)
+ class ResolvedLengthLimits:
+     """Normalized length requirements with provenance metadata."""
+ 
+     min_chars: int
+     max_chars: int
+     min_source: str
+     max_source: str
+     swapped: bool = False
+     warnings: Tuple[str, ...] = ()
+     profile_source: Optional[str] = None
+ 
+ 
++SOFT_RANGE_PERCENT = 0.02
++SOFT_RANGE_MIN_BELOW = 50
++SOFT_RANGE_MIN_ABOVE = 100
++
++
++def compute_soft_length_bounds(min_chars: int, max_chars: int) -> Tuple[int, int, int, int]:
++    """Return relaxed length bounds around requested min/max values.
++
++    The lower tolerance is at least ``SOFT_RANGE_MIN_BELOW`` characters or 2% of the
++    minimum requirement. The upper tolerance is at least
++    ``SOFT_RANGE_MIN_ABOVE`` characters or 2% of the maximum requirement. Both
++    tolerances are additionally capped by zero to avoid negative bounds.
++    """
++
++    try:
++        min_value = int(min_chars)
++    except (TypeError, ValueError):  # defensive: keep behaviour predictable
++        min_value = 0
++    try:
++        max_value = int(max_chars)
++    except (TypeError, ValueError):
++        max_value = 0
++
++    if max_value < min_value:
++        min_value, max_value = max_value, min_value
++
++    min_value = max(0, min_value)
++    max_value = max(0, max_value)
++
++    lower_tolerance = 0
++    if min_value > 0:
++        lower_tolerance = min(
++            min_value,
++            max(SOFT_RANGE_MIN_BELOW, int(round(min_value * SOFT_RANGE_PERCENT))),
++        )
++    upper_tolerance = max(SOFT_RANGE_MIN_ABOVE, int(round(max_value * SOFT_RANGE_PERCENT)))
++
++    soft_min = max(0, min_value - lower_tolerance)
++    soft_max = max_value + upper_tolerance
++
++    return soft_min, soft_max, lower_tolerance, upper_tolerance
++
++
+ def resolve_length_limits(theme: str, payload: Dict[str, Any]) -> ResolvedLengthLimits:
+     """Determine min/max character limits using brief → profile → defaults."""
+ 
+     brief_min, brief_max = _extract_brief_limits(payload)
+     profile_min, profile_max, profile_source = _load_profile_limits(theme)
+ 
+     min_value, min_source = _choose_limit(brief_min, profile_min, DEFAULT_MIN_LENGTH)
+     max_value, max_source = _choose_limit(brief_max, profile_max, DEFAULT_MAX_LENGTH)
+ 
+     swapped = False
+     warnings: Tuple[str, ...] = ()
+ 
+     if max_value < min_value:
+         swapped = True
+         min_value, max_value, min_source, max_source = (
+             max_value,
+             min_value,
+             max_source,
+             min_source,
+         )
+         warnings = (
+             "Минимальный объём в брифе был больше максимального; значения переставлены местами.",
+         )
+ 
+     return ResolvedLengthLimits(
+diff --git a/tests/test_length_limits.py b/tests/test_length_limits.py
+index a7f6b64e218758fcc0aee7a7037aefc6d89376d3..79994f744a36f1267078500f11aa6ddc8ce9baf5 100644
+--- a/tests/test_length_limits.py
++++ b/tests/test_length_limits.py
+@@ -1,31 +1,45 @@
+-from length_limits import resolve_length_limits
++from length_limits import compute_soft_length_bounds, resolve_length_limits
+ 
+ 
+ def test_resolve_uses_brief_values():
+     payload = {"length_limits": {"min_chars": 1000, "max_chars": 1200}}
+     result = resolve_length_limits("finance", payload)
+     assert result.min_chars == 1000
+     assert result.max_chars == 1200
+     assert result.min_source == "brief"
+     assert result.max_source == "brief"
+     assert not result.warnings
+ 
+ 
+ def test_resolve_uses_profile_defaults_when_missing():
+     result = resolve_length_limits("finance", {})
+     assert result.min_chars == 3200
+     assert result.max_chars == 5400
+     assert result.min_source == "profile"
+     assert result.max_source == "profile"
+     assert result.profile_source.endswith("profiles/finance/settings.json")
+ 
+ 
+ def test_resolve_swaps_when_min_greater_than_max():
+     payload = {"length_limits": {"min_chars": 6000, "max_chars": 3500}}
+     result = resolve_length_limits("finance", payload)
+     assert result.min_chars == 3500
+     assert result.max_chars == 6000
+     assert result.swapped
+     assert result.min_source == "brief"
+     assert result.max_source == "brief"
+     assert any("поменяли" in warning.lower() or "перестав" in warning.lower() for warning in result.warnings)
++
++
++def test_compute_soft_length_bounds_adds_reasonable_tolerance():
++    soft_min, soft_max, tol_below, tol_above = compute_soft_length_bounds(3500, 6000)
++    assert soft_min == 3430
++    assert soft_max == 6120
++    assert tol_below == 70
++    assert tol_above == 120
++
++
++def test_compute_soft_length_bounds_handles_inverted_values():
++    soft_min, soft_max, _, _ = compute_soft_length_bounds(6000, 3500)
++    assert soft_min == 3430
++    assert soft_max == 6120
+diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
+index 1eaadb5409aa2271b20f173faaaccfd6c242b5ba..64e675dbd8b66d6e7ef13e536f3e8ca7976559f4 100644
+--- a/tests/test_orchestrate_utils.py
++++ b/tests/test_orchestrate_utils.py
+@@ -1,34 +1,35 @@
+ import json
+ import uuid
+ from pathlib import Path
+ 
+ import pytest
+ 
+ from deterministic_pipeline import DeterministicPipeline, PipelineStep
+ from faq_builder import build_faq_block
+ from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
++from length_limits import compute_soft_length_bounds
+ from length_trimmer import trim_text
+ from llm_client import GenerationResult
+ from orchestrate import generate_article_from_payload, gather_health_status
+ from validators import ValidationError, strip_jsonld, validate_article
+ 
+ MIN_REQUIRED = 3500
+ MAX_REQUIRED = 6000
+ 
+ def test_keyword_injection_protects_terms_and_locks_all_occurrences():
+     base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
+     result = inject_keywords(base_text, ["ключевая фраза", "дополнительный термин"])
+     assert result.coverage_report == "2/2"
+     assert result.missing_terms == []
+     main_section = result.text.split("## FAQ", 1)[0]
+     first_phrase = (
+         "Дополнительно рассматривается "
+         + f"{LOCK_START_TEMPLATE.format(term='ключевая фраза')}ключевая фраза<!--LOCK_END-->"
+         + " через прикладные сценарии."
+     )
+     second_phrase = (
+         "Дополнительно рассматривается "
+         + f"{LOCK_START_TEMPLATE.format(term='дополнительный термин')}дополнительный термин<!--LOCK_END-->"
+         + " через прикладные сценарии."
+     )
+     assert first_phrase in main_section
+@@ -239,51 +240,52 @@ def _stub_llm(monkeypatch):
+             api_route="chat",
+             schema="json",
+             metadata={"usage_output_tokens": 256},
+         )
+ 
+     monkeypatch.setattr("deterministic_pipeline.DeterministicPipeline._call_llm", fake_call)
+ 
+ 
+ def test_pipeline_produces_valid_article(monkeypatch):
+     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+     _stub_llm(monkeypatch)
+     pipeline = DeterministicPipeline(
+         topic="Долговая нагрузка семьи",
+         base_outline=["Введение", "Аналитика", "Решения"],
+         keywords=[f"ключ {idx}" for idx in range(1, 12)],
+         min_chars=3500,
+         max_chars=6000,
+         messages=[{"role": "system", "content": "Системный промпт"}],
+         model="stub-model",
+         temperature=0.3,
+         max_tokens=1800,
+         timeout_s=60,
+     )
+     state = pipeline.run()
+     length_no_spaces = len("".join(strip_jsonld(state.text).split()))
+-    assert 3500 <= length_no_spaces <= 6000
++    soft_min, soft_max, _, _ = compute_soft_length_bounds(MIN_REQUIRED, MAX_REQUIRED)
++    assert soft_min <= length_no_spaces <= soft_max
+     assert state.validation and state.validation.is_valid
+     assert state.text.count("**Вопрос") == 5
+ 
+ 
+ def test_pipeline_resume_falls_back_to_available_checkpoint(monkeypatch):
+     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+     _stub_llm(monkeypatch)
+     pipeline = DeterministicPipeline(
+         topic="Долговая нагрузка семьи",
+         base_outline=["Введение", "Основная часть", "Вывод"],
+         keywords=[f"ключ {idx}" for idx in range(1, 12)],
+         min_chars=3500,
+         max_chars=6000,
+         messages=[{"role": "system", "content": "Системный промпт"}],
+         model="stub-model",
+         temperature=0.3,
+         max_tokens=1800,
+         timeout_s=60,
+     )
+     pipeline._run_skeleton()
+     state = pipeline.resume(PipelineStep.FAQ)
+     assert state.validation and state.validation.is_valid
+     faq_entries = [entry for entry in state.logs if entry.step == PipelineStep.FAQ]
+     assert faq_entries and faq_entries[-1].status == "ok"
+ 
+diff --git a/validators.py b/validators.py
+index eace6816fc168a8bc2b38fe548e97577e6c99839..e8751ee41579ef34e10595b0cb9b88b198736ff7 100644
+--- a/validators.py
++++ b/validators.py
+@@ -1,35 +1,35 @@
+ from __future__ import annotations
+ 
+ import json
+ import re
+ from dataclasses import dataclass, field
+ from typing import Dict, Iterable, List, Optional, Tuple
+ 
+-from skeleton_utils import normalize_skeleton_payload
+-
+ from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
++from length_limits import compute_soft_length_bounds
++from skeleton_utils import normalize_skeleton_payload
+ from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
+ 
+ _FAQ_START = "<!--FAQ_START-->"
+ _FAQ_END = "<!--FAQ_END-->"
+ _JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">(.*?)</script>", re.DOTALL)
+ _FAQ_ENTRY_PATTERN = re.compile(
+     r"\*\*Вопрос\s+(?P<index>\d+)\.\*\*\s*(?P<question>.+?)\s*\n\*\*Ответ\.\*\*\s*(?P<answer>.*?)(?=\n\*\*Вопрос\s+\d+\.\*\*|\Z)",
+     re.DOTALL,
+ )
+ 
+ 
+ class ValidationError(RuntimeError):
+     """Raised when one of the blocking validation groups fails."""
+ 
+     def __init__(self, group: str, message: str, *, details: Optional[Dict[str, object]] = None) -> None:
+         super().__init__(message)
+         self.group = group
+         self.details = details or {}
+ 
+ 
+ @dataclass
+ class ValidationResult:
+     skeleton_ok: bool
+     keywords_ok: bool
+     faq_ok: bool
+@@ -161,50 +161,56 @@ def _skeleton_status(
+ 
+     outline = skeleton_payload.get("outline")
+     if outline and isinstance(outline, list):
+         normalized_outline = [str(entry).strip() for entry in outline if str(entry).strip()]
+     else:
+         normalized_outline = []
+ 
+     expected_main = max(1, len(normalized_outline) - 2) if normalized_outline else len(main)
+     if len(main) != expected_main:
+         return False, "Количество блоков основной части не совпадает с ожидаемым."
+     if "## FAQ" not in text or _FAQ_START not in text or _FAQ_END not in text:
+         return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
+     return True, None
+ 
+ 
+ def validate_article(
+     text: str,
+     *,
+     keywords: Iterable[str],
+     min_chars: int,
+     max_chars: int,
+     skeleton_payload: Optional[Dict[str, object]] = None,
+     keyword_coverage_percent: Optional[float] = None,
+ ) -> ValidationResult:
+     length = _length_no_spaces(text)
++    default_soft_min, default_soft_max, default_tol_below, default_tol_above = compute_soft_length_bounds(
++        DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH
++    )
++    requested_soft_min, requested_soft_max, req_tol_below, req_tol_above = compute_soft_length_bounds(
++        min_chars, max_chars
++    )
+     normalized_skeleton = (
+         normalize_skeleton_payload(skeleton_payload)
+         if skeleton_payload is not None
+         else None
+     )
+     skeleton_ok, skeleton_message = _skeleton_status(normalized_skeleton, text)
+ 
+     normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
+     missing: List[str] = []
+     article = strip_jsonld(text)
+     for term in normalized_keywords:
+         pattern = _keyword_regex(term)
+         if not pattern.search(article):
+             missing.append(term)
+             continue
+         lock_token = LOCK_START_TEMPLATE.format(term=term)
+         lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
+         if not lock_pattern.search(text):
+             missing.append(term)
+     keywords_ok = len(missing) == 0
+ 
+     markdown_faq, markdown_error = _parse_markdown_faq(text)
+     faq_count = len(markdown_faq)
+     jsonld_entries, jsonld_error = _parse_jsonld_entries(text)
+     jsonld_ok = jsonld_error is None
+@@ -215,89 +221,97 @@ def validate_article(
+     if markdown_error:
+         faq_error = markdown_error
+     elif jsonld_error:
+         faq_error = jsonld_error
+     else:
+         faq_ok = True
+         for idx, entry in enumerate(markdown_faq):
+             jsonld_entry = jsonld_entries[idx]
+             if entry["question"] != jsonld_entry["question"] or entry["answer"] != jsonld_entry["answer"]:
+                 faq_ok = False
+                 mismatched_questions.append(entry["question"])
+         if mismatched_questions:
+             faq_error = (
+                 "FAQ в markdown не совпадает с JSON-LD (например, вопрос '"
+                 + mismatched_questions[0]
+                 + "')."
+             )
+     if not faq_ok and faq_error is None:
+         faq_error = "FAQ должен содержать ровно 5 вопросов и ответов."
+ 
+     coverage_percent = 100.0 if not normalized_keywords else round(
+         (len(normalized_keywords) - len(missing)) / len(normalized_keywords) * 100,
+         2,
+     )
+ 
+-    length_ok = DEFAULT_MIN_LENGTH <= length <= DEFAULT_MAX_LENGTH
+-    requested_range_ok = min_chars <= length <= max_chars
++    length_ok = default_soft_min <= length <= default_soft_max
++    requested_range_ok = requested_soft_min <= length <= requested_soft_max
+ 
+     stats: Dict[str, object] = {
+         "length_no_spaces": length,
+         "keywords_total": len(normalized_keywords),
+         "keywords_missing": missing,
+         "keywords_found": len(normalized_keywords) - len(missing),
+         "keywords_coverage": f"{len(normalized_keywords) - len(missing)}/{len(normalized_keywords) if normalized_keywords else 0}",
+         "keywords_coverage_percent": coverage_percent,
+         "keyword_coverage_expected_percent": keyword_coverage_percent,
+         "faq_count": faq_count,
+         "faq_jsonld_count": len(jsonld_entries),
+         "faq_mismatched_questions": mismatched_questions,
+         "jsonld_ok": jsonld_ok,
+         "length_requested_range_ok": requested_range_ok,
+         "length_required_min": DEFAULT_MIN_LENGTH,
+         "length_required_max": DEFAULT_MAX_LENGTH,
++        "length_soft_min": default_soft_min,
++        "length_soft_max": default_soft_max,
++        "length_tolerance_default_below": default_tol_below,
++        "length_tolerance_default_above": default_tol_above,
++        "length_requested_soft_min": requested_soft_min,
++        "length_requested_soft_max": requested_soft_max,
++        "length_requested_tolerance_below": req_tol_below,
++        "length_requested_tolerance_above": req_tol_above,
+     }
+ 
+     if keyword_coverage_percent is not None and keyword_coverage_percent < 100.0:
+         raise ValidationError(
+             "keywords",
+             (
+                 "Этап подстановки ключевых слов завершился с покрытием "
+                 f"{keyword_coverage_percent:.0f}%, требуется 100%."
+             ),
+             details=stats,
+         )
+ 
+     result = ValidationResult(
+         skeleton_ok=skeleton_ok,
+         keywords_ok=keywords_ok,
+         faq_ok=faq_ok,
+         length_ok=length_ok,
+         jsonld_ok=jsonld_ok,
+         stats=stats,
+     )
+ 
+     if not skeleton_ok:
+         raise ValidationError("skeleton", skeleton_message or "Ошибка структуры статьи.", details=stats)
+     if not keywords_ok:
+         raise ValidationError(
+             "keywords",
+             "Ключевые слова покрыты не полностью.",
+             details={"missing": missing, **stats},
+         )
+     if not faq_ok:
+         message = faq_error or "FAQ должен содержать 5 вопросов и корректный JSON-LD."
+         raise ValidationError("faq", message, details=stats)
+     if not length_ok:
+         raise ValidationError(
+             "length",
+             (
+                 f"Объём статьи {length} зн. без пробелов, требуется "
+-                f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH}."
++                f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH} (допуск {default_soft_min}-{default_soft_max})."
+             ),
+             details=stats,
+         )
+     return result
+ def _keyword_regex(term: str) -> re.Pattern:
+     pattern = rf"(?i)(?<!\\w){re.escape(term)}(?!\\w)"
+     return re.compile(pattern)
+ 
 

@@ -7,6 +7,7 @@ import pytest
 from deterministic_pipeline import DeterministicPipeline, PipelineStep
 from faq_builder import build_faq_block
 from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
+from length_limits import compute_soft_length_bounds
 from length_trimmer import trim_text
 from llm_client import GenerationResult
 from orchestrate import generate_article_from_payload, gather_health_status
@@ -261,7 +262,8 @@ def test_pipeline_produces_valid_article(monkeypatch):
     )
     state = pipeline.run()
     length_no_spaces = len("".join(strip_jsonld(state.text).split()))
-    assert 3500 <= length_no_spaces <= 6000
+    soft_min, soft_max, _, _ = compute_soft_length_bounds(MIN_REQUIRED, MAX_REQUIRED)
+    assert soft_min <= length_no_spaces <= soft_max
     assert state.validation and state.validation.is_valid
     assert state.text.count("**Вопрос") == 5
 

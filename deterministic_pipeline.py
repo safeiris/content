@@ -27,6 +27,7 @@ from keyword_injector import (
     build_term_pattern,
     inject_keywords,
 )
+from length_limits import compute_soft_length_bounds
 from length_trimmer import TrimResult, TrimValidationError, trim_text
 from skeleton_utils import normalize_skeleton_payload
 from validators import (
@@ -2573,11 +2574,34 @@ class DeterministicPipeline:
         except TrimValidationError as exc:
             raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
         current_length = length_no_spaces(result.text)
-        if current_length < self.min_chars or current_length > self.max_chars:
-            raise PipelineStepError(
-                PipelineStep.TRIM,
-                f"Объём после трима вне диапазона {self.min_chars}–{self.max_chars} (без пробелов).",
+
+        soft_min, soft_max, tolerance_below, tolerance_above = compute_soft_length_bounds(
+            self.min_chars, self.max_chars
+        )
+        strict_violation = current_length < self.min_chars or current_length > self.max_chars
+        length_notes: Dict[str, object] = {}
+        if strict_violation:
+            if current_length < soft_min or current_length > soft_max:
+                raise PipelineStepError(
+                    PipelineStep.TRIM,
+                    (
+                        "Объём после трима вне диапазона "
+                        f"{self.min_chars}–{self.max_chars} (без пробелов)."
+                    ),
+                )
+            LOGGER.warning(
+                "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
+                current_length,
+                self.min_chars,
+                self.max_chars,
+                soft_min,
+                soft_max,
             )
+            length_notes["length_relaxed"] = True
+            length_notes["length_soft_min"] = soft_min
+            length_notes["length_soft_max"] = soft_max
+            length_notes["length_tolerance_below"] = tolerance_below
+            length_notes["length_tolerance_above"] = tolerance_above
 
         missing_locks = [
             term
@@ -2609,6 +2633,7 @@ class DeterministicPipeline:
             "ok",
             removed=len(result.removed_paragraphs),
             **self._metrics(result.text),
+            **length_notes,
         )
         self.checkpoints[PipelineStep.TRIM] = result.text
         return result

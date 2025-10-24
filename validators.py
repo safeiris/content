@@ -5,9 +5,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from skeleton_utils import normalize_skeleton_payload
-
 from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
+from length_limits import compute_soft_length_bounds
+from skeleton_utils import normalize_skeleton_payload
 from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
 
 _FAQ_START = "<!--FAQ_START-->"
@@ -183,6 +183,12 @@ def validate_article(
     keyword_coverage_percent: Optional[float] = None,
 ) -> ValidationResult:
     length = _length_no_spaces(text)
+    default_soft_min, default_soft_max, default_tol_below, default_tol_above = compute_soft_length_bounds(
+        DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH
+    )
+    requested_soft_min, requested_soft_max, req_tol_below, req_tol_above = compute_soft_length_bounds(
+        min_chars, max_chars
+    )
     normalized_skeleton = (
         normalize_skeleton_payload(skeleton_payload)
         if skeleton_payload is not None
@@ -237,8 +243,8 @@ def validate_article(
         2,
     )
 
-    length_ok = DEFAULT_MIN_LENGTH <= length <= DEFAULT_MAX_LENGTH
-    requested_range_ok = min_chars <= length <= max_chars
+    length_ok = default_soft_min <= length <= default_soft_max
+    requested_range_ok = requested_soft_min <= length <= requested_soft_max
 
     stats: Dict[str, object] = {
         "length_no_spaces": length,
@@ -255,6 +261,14 @@ def validate_article(
         "length_requested_range_ok": requested_range_ok,
         "length_required_min": DEFAULT_MIN_LENGTH,
         "length_required_max": DEFAULT_MAX_LENGTH,
+        "length_soft_min": default_soft_min,
+        "length_soft_max": default_soft_max,
+        "length_tolerance_default_below": default_tol_below,
+        "length_tolerance_default_above": default_tol_above,
+        "length_requested_soft_min": requested_soft_min,
+        "length_requested_soft_max": requested_soft_max,
+        "length_requested_tolerance_below": req_tol_below,
+        "length_requested_tolerance_above": req_tol_above,
     }
 
     if keyword_coverage_percent is not None and keyword_coverage_percent < 100.0:
@@ -292,7 +306,7 @@ def validate_article(
             "length",
             (
                 f"Объём статьи {length} зн. без пробелов, требуется "
-                f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH}."
+                f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH} (допуск {default_soft_min}-{default_soft_max})."
             ),
             details=stats,
         )

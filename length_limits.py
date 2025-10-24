@@ -21,6 +21,49 @@ class ResolvedLengthLimits:
     profile_source: Optional[str] = None
 
 
+SOFT_RANGE_PERCENT = 0.02
+SOFT_RANGE_MIN_BELOW = 50
+SOFT_RANGE_MIN_ABOVE = 100
+
+
+def compute_soft_length_bounds(min_chars: int, max_chars: int) -> Tuple[int, int, int, int]:
+    """Return relaxed length bounds around requested min/max values.
+
+    The lower tolerance is at least ``SOFT_RANGE_MIN_BELOW`` characters or 2% of the
+    minimum requirement. The upper tolerance is at least
+    ``SOFT_RANGE_MIN_ABOVE`` characters or 2% of the maximum requirement. Both
+    tolerances are additionally capped by zero to avoid negative bounds.
+    """
+
+    try:
+        min_value = int(min_chars)
+    except (TypeError, ValueError):  # defensive: keep behaviour predictable
+        min_value = 0
+    try:
+        max_value = int(max_chars)
+    except (TypeError, ValueError):
+        max_value = 0
+
+    if max_value < min_value:
+        min_value, max_value = max_value, min_value
+
+    min_value = max(0, min_value)
+    max_value = max(0, max_value)
+
+    lower_tolerance = 0
+    if min_value > 0:
+        lower_tolerance = min(
+            min_value,
+            max(SOFT_RANGE_MIN_BELOW, int(round(min_value * SOFT_RANGE_PERCENT))),
+        )
+    upper_tolerance = max(SOFT_RANGE_MIN_ABOVE, int(round(max_value * SOFT_RANGE_PERCENT)))
+
+    soft_min = max(0, min_value - lower_tolerance)
+    soft_max = max_value + upper_tolerance
+
+    return soft_min, soft_max, lower_tolerance, upper_tolerance
+
+
 def resolve_length_limits(theme: str, payload: Dict[str, Any]) -> ResolvedLengthLimits:
     """Determine min/max character limits using brief → profile → defaults."""
 

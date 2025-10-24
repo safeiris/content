@@ -1,4 +1,4 @@
-from length_limits import resolve_length_limits
+from length_limits import compute_soft_length_bounds, resolve_length_limits
 
 
 def test_resolve_uses_brief_values():
@@ -29,3 +29,17 @@ def test_resolve_swaps_when_min_greater_than_max():
     assert result.min_source == "brief"
     assert result.max_source == "brief"
     assert any("поменяли" in warning.lower() or "перестав" in warning.lower() for warning in result.warnings)
+
+
+def test_compute_soft_length_bounds_adds_reasonable_tolerance():
+    soft_min, soft_max, tol_below, tol_above = compute_soft_length_bounds(3500, 6000)
+    assert soft_min == 3430
+    assert soft_max == 6120
+    assert tol_below == 70
+    assert tol_above == 120
+
+
+def test_compute_soft_length_bounds_handles_inverted_values():
+    soft_min, soft_max, _, _ = compute_soft_length_bounds(6000, 3500)
+    assert soft_min == 3430
+    assert soft_max == 6120
