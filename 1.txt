@@ -1,637 +1,1523 @@
-diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 8730358b82cfee89d591edcc243d6225896947e3..65cfceea026ff6b27f9d254bca7afa7d0ac56b34 100644
---- a/deterministic_pipeline.py
-+++ b/deterministic_pipeline.py
-@@ -1,31 +1,32 @@
- """LLM-driven content pipeline with explicit step-level guarantees."""
+diff --git a/config.py b/config.py
+index 435a91ebb5731be02a1d998dcefc916a0c9a5d6f..24c30c6fb73470b3c04e9df8aa258c569fef2639 100644
+--- a/config.py
++++ b/config.py
+@@ -14,50 +14,55 @@ def _env_int(name: str, default: int) -> int:
  
+ 
+ def _env_float_list(name: str, default: str) -> tuple[float, ...]:
+     raw = str(os.getenv(name, "")).strip()
+     if not raw:
+         raw = default
+     parts = [part.strip() for part in raw.split(",") if part.strip()]
+     delays = []
+     for part in parts:
+         try:
+             delays.append(float(part))
+         except ValueError:
+             continue
+     if not delays:
+         delays = [float(value) for value in default.split(",") if value]
+     return tuple(delays)
+ 
+ 
+ def _env_bool(name: str, default: bool) -> bool:
+     raw = str(os.getenv(name, "")).strip().lower()
+     if not raw:
+         return default
+     return raw not in {"0", "false", "off", "no"}
+ 
+ OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
++OPENAI_TIMEOUT_S = max(1, _env_int("OPENAI_TIMEOUT_S", 60))
++OPENAI_MAX_RETRIES = max(0, _env_int("OPENAI_MAX_RETRIES", 4))
++OPENAI_RPS = max(1, _env_int("OPENAI_RPS", 2))
++OPENAI_RPM = max(OPENAI_RPS, _env_int("OPENAI_RPM", 60))
++JOB_SOFT_TIMEOUT_S = max(1, _env_int("JOB_SOFT_TIMEOUT_S", 20))
+ 
+ USE_MOCK_LLM = _env_bool("USE_MOCK_LLM", False)
+ OFFLINE_MODE = _env_bool("OFFLINE_MODE", False)
+ PIPELINE_FAST_PATH = _env_bool("PIPELINE_FAST_PATH", False)
+ MODEL_PROVIDER = str(os.getenv("MODEL_PROVIDER", "openai")).strip() or "openai"
+ 
+ _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
+ FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
+ 
+ # GPT-5 Responses tuning
+ G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1500)
+ G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2200)
+ G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 2600)
+ G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3600)
+ _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
+ G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
+ G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
+ G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
+ 
+ SKELETON_BATCH_SIZE_MAIN = max(1, _env_int("SKELETON_BATCH_SIZE_MAIN", 2))
+ SKELETON_FAQ_BATCH = max(1, _env_int("SKELETON_FAQ_BATCH", 3))
+ TAIL_FILL_MAX_TOKENS = max(200, _env_int("TAIL_FILL_MAX_TOKENS", 700))
+ 
+ # Дефолтные настройки ядра
+ DEFAULT_TONE = "экспертный, дружелюбный"
+diff --git a/domain/__init__.py b/domain/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..548479f14dc8f517726ac8504ea7ad2cf28f2478
+--- /dev/null
++++ b/domain/__init__.py
+@@ -0,0 +1,11 @@
++"""Domain-level helpers for prompt and policy management."""
++
++from .prompt_builder import build_prompt  # noqa: F401
++from .generation_policy import TokenBudget, build_token_budget, estimate_tokens  # noqa: F401
++
++__all__ = [
++    "build_prompt",
++    "TokenBudget",
++    "build_token_budget",
++    "estimate_tokens",
++]
+diff --git a/domain/generation_policy.py b/domain/generation_policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..062f71cbdc7ef6b07cfbefd9032724e66fd1ea6f
+--- /dev/null
++++ b/domain/generation_policy.py
+@@ -0,0 +1,60 @@
++"""Helpers describing generation policies and token budgeting."""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import List, Sequence
++
++AVERAGE_CHARS_PER_TOKEN = 4
++JSONLD_RESERVE_TOKENS = 320
++FAQ_RESERVE_TOKENS = 180
++
++
++@dataclass
++class TokenBudget:
++    total_limit: int
++    estimated_prompt_tokens: int
++    available_for_body: int
++    needs_segmentation: bool
++    segments: List[str]
++
++
++def estimate_tokens(system: str, messages: Sequence[dict]) -> int:
++    """Rough token estimation without external dependencies."""
++
++    total_chars = len(system or "")
++    for message in messages:
++        content = str(message.get("content", ""))
++        total_chars += len(content)
++    tokens = max(1, int(total_chars / AVERAGE_CHARS_PER_TOKEN))
++    return tokens
++
++
++def _segment_structure(structure: Sequence[str]) -> List[str]:
++    segments: List[str] = []
++    for item in structure:
++        normalized = (item or "").strip()
++        if not normalized:
++            continue
++        if normalized.lower().startswith("основ"):
++            segments.append(f"{normalized} — часть 1")
++            segments.append(f"{normalized} — часть 2")
++        else:
++            segments.append(normalized)
++    return segments or ["Введение", "Основная часть", "FAQ", "Вывод"]
++
++
++def build_token_budget(structure: Sequence[str], *, max_tokens: int, system: str, messages: Sequence[dict]) -> TokenBudget:
++    estimated_prompt = estimate_tokens(system, messages)
++    reserve = JSONLD_RESERVE_TOKENS + FAQ_RESERVE_TOKENS
++    available = max(0, max_tokens - reserve)
++    needs_segmentation = estimated_prompt > available and available > 0
++    segments = list(structure)
++    if needs_segmentation:
++        segments = _segment_structure(structure)
++    return TokenBudget(
++        total_limit=max_tokens,
++        estimated_prompt_tokens=estimated_prompt,
++        available_for_body=available,
++        needs_segmentation=needs_segmentation,
++        segments=segments,
++    )
+diff --git a/domain/prompt_builder.py b/domain/prompt_builder.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b4eae43e03a7c16696074ac50bdaffd054272aa8
+--- /dev/null
++++ b/domain/prompt_builder.py
+@@ -0,0 +1,56 @@
++"""Pure prompt construction utilities."""
++from __future__ import annotations
++
++from typing import Dict, Iterable, List, Sequence, Tuple
++
++_DEFAULT_TONE = "экспертный, дружелюбный"
++_DEFAULT_GOAL = "Сформируй структурированную SEO-статью."
++
++
++def _format_keywords(keywords: Iterable[str]) -> str:
++    cleaned = [kw.strip() for kw in keywords if kw and kw.strip()]
++    if not cleaned:
++        return ""
++    return "Ключевые слова: " + ", ".join(cleaned)
++
++
++def build_prompt(
++    *,
++    theme: str,
++    tone: str,
++    audience: str,
++    keywords: Sequence[str],
++    structure: Sequence[str],
++    goal: str,
++) -> Tuple[str, List[Dict[str, str]]]:
++    """Build system and user messages for the generation request."""
++
++    system_parts = [
++        "Ты профессиональный русскоязычный автор, который пишет без воды и повторов.",
++        f"Пиши в тоне: {tone or _DEFAULT_TONE}.",
++        "Всегда придерживайся указанной структуры и не добавляй лишних разделов.",
++    ]
++    if audience:
++        system_parts.append(f"Целевая аудитория: {audience}.")
++    if goal:
++        system_parts.append(goal)
++    else:
++        system_parts.append(_DEFAULT_GOAL)
++
++    structure_lines = "\n".join(f"- {item}" for item in structure if item)
++    keyword_line = _format_keywords(keywords)
++
++    user_payload = [
++        f"Тема: {theme.strip()}.",
++        "Используй структуру:\n" + structure_lines,
++    ]
++    if keyword_line:
++        user_payload.append(keyword_line)
++
++    messages = [
++        {
++            "role": "user",
++            "content": "\n\n".join(segment for segment in user_payload if segment),
++        }
++    ]
++    return " \n".join(system_parts), messages
+diff --git a/jobs/__init__.py b/jobs/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6103fb6dd4defe1d521fb8a0efc794b1c68d123
+--- /dev/null
++++ b/jobs/__init__.py
+@@ -0,0 +1,14 @@
++"""Job management primitives for asynchronous generation."""
++
++from .models import Job, JobStatus, JobStep, JobStepStatus  # noqa: F401
++from .store import JobStore  # noqa: F401
++from .runner import JobRunner  # noqa: F401
++
++__all__ = [
++    "Job",
++    "JobStatus",
++    "JobStep",
++    "JobStepStatus",
++    "JobStore",
++    "JobRunner",
++]
+diff --git a/jobs/models.py b/jobs/models.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7897a6245dd4c4be196caa89e71e2045621e6257
+--- /dev/null
++++ b/jobs/models.py
+@@ -0,0 +1,114 @@
++"""Data models describing asynchronous generation jobs."""
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
++from enum import Enum
++from typing import Any, Dict, List, Optional
++
++ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
++
++
++def utcnow() -> datetime:
++    """Return a timezone-aware UTC datetime."""
++
++    return datetime.now(timezone.utc)
++
++
++class JobStatus(str, Enum):
++    """Lifecycle states for a background job."""
++
++    PENDING = "pending"
++    RUNNING = "running"
++    SUCCEEDED = "succeeded"
++    FAILED = "failed"
++
++
++class JobStepStatus(str, Enum):
++    """Lifecycle states for an individual pipeline step."""
++
++    PENDING = "pending"
++    RUNNING = "running"
++    SUCCEEDED = "succeeded"
++    FAILED = "failed"
++    SKIPPED = "skipped"
++
++
++@dataclass
++class JobStep:
++    """Progress information for a single pipeline step."""
++
++    name: str
++    status: JobStepStatus = JobStepStatus.PENDING
++    started_at: Optional[datetime] = None
++    finished_at: Optional[datetime] = None
++    payload: Dict[str, Any] = field(default_factory=dict)
++
++    def mark_running(self) -> None:
++        self.status = JobStepStatus.RUNNING
++        self.started_at = self.started_at or utcnow()
++
++    def mark_succeeded(self, **payload: Any) -> None:
++        self.status = JobStepStatus.SUCCEEDED
++        if payload:
++            self.payload.update(payload)
++        self.finished_at = utcnow()
++
++    def mark_failed(self, **payload: Any) -> None:
++        self.status = JobStepStatus.FAILED
++        if payload:
++            self.payload.update(payload)
++        self.finished_at = utcnow()
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "name": self.name,
++            "status": self.status.value,
++            "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
++            "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
++            "payload": self.payload or None,
++        }
++
++
++@dataclass
++class Job:
++    """Representation of a long-running generation request."""
++
++    id: str
++    status: JobStatus = JobStatus.PENDING
++    created_at: datetime = field(default_factory=utcnow)
++    started_at: Optional[datetime] = None
++    finished_at: Optional[datetime] = None
++    steps: List[JobStep] = field(default_factory=list)
++    result: Optional[Dict[str, Any]] = None
++    error: Optional[str] = None
++    degradation_flags: List[str] = field(default_factory=list)
++
++    def mark_running(self) -> None:
++        self.status = JobStatus.RUNNING
++        self.started_at = self.started_at or utcnow()
++
++    def mark_succeeded(self, result: Dict[str, Any]) -> None:
++        self.status = JobStatus.SUCCEEDED
++        self.result = result
++        self.finished_at = utcnow()
++
++    def mark_failed(self, error: str, *, degradation_flags: Optional[List[str]] = None) -> None:
++        self.status = JobStatus.FAILED
++        self.error = error
++        self.finished_at = utcnow()
++        if degradation_flags:
++            self.degradation_flags.extend(flag for flag in degradation_flags if flag)
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "id": self.id,
++            "status": self.status.value,
++            "created_at": self.created_at.strftime(ISO_FORMAT),
++            "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
++            "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
++            "steps": [step.to_dict() for step in self.steps],
++            "result": self.result,
++            "error": self.error,
++            "degradation_flags": list(self.degradation_flags) or None,
++        }
+diff --git a/jobs/runner.py b/jobs/runner.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b00469b0eca5ad2b3e410a82d7c397d29ab6840
+--- /dev/null
++++ b/jobs/runner.py
+@@ -0,0 +1,161 @@
++"""Background runner executing generation jobs."""
++from __future__ import annotations
++
++import queue
++import threading
++import uuid
++from dataclasses import dataclass
++from typing import Any, Dict, Optional
++
++from config import JOB_SOFT_TIMEOUT_S
++from observability.logger import get_logger, log_step
++from orchestrate import generate_article_from_payload
++from services.guardrails import parse_jsonld_or_repair
++
++from .models import Job, JobStep
++from .store import JobStore
++
++LOGGER = get_logger("content_factory.jobs")
++
++
++@dataclass
++class RunnerTask:
++    job_id: str
++    payload: Dict[str, Any]
++
++
++class JobRunner:
++    """Serial job runner executing pipeline tasks in a background thread."""
++
++    def __init__(self, store: JobStore, *, soft_timeout_s: int = JOB_SOFT_TIMEOUT_S) -> None:
++        self._store = store
++        self._soft_timeout_s = soft_timeout_s
++        self._tasks: "queue.Queue[RunnerTask]" = queue.Queue()
++        self._events: Dict[str, threading.Event] = {}
++        self._events_lock = threading.Lock()
++        self._thread = threading.Thread(target=self._worker, name="job-runner", daemon=True)
++        self._started = False
++        self._shutdown = False
++
++    def start(self) -> None:
++        if not self._started:
++            self._thread.start()
++            self._started = True
++
++    def stop(self) -> None:
++        self._shutdown = True
++        self._tasks.put(RunnerTask(job_id="__shutdown__", payload={}))
++        if self._started:
++            self._thread.join(timeout=1.0)
++
++    def submit(self, payload: Dict[str, Any]) -> Job:
++        job_id = uuid.uuid4().hex
++        steps = [
++            JobStep(name="draft"),
++            JobStep(name="refine"),
++            JobStep(name="jsonld"),
++            JobStep(name="post-analysis"),
++        ]
++        job = Job(id=job_id, steps=steps)
++        self._store.create(job)
++        event = threading.Event()
++        with self._events_lock:
++            self._events[job_id] = event
++        self._tasks.put(RunnerTask(job_id=job_id, payload=payload))
++        self.start()
++        LOGGER.info("job_enqueued", extra={"job_id": job_id})
++        return job
++
++    def wait(self, job_id: str, timeout: Optional[float] = None) -> bool:
++        with self._events_lock:
++            event = self._events.get(job_id)
++        if not event:
++            return False
++        return event.wait(timeout)
++
++    def get_job(self, job_id: str) -> Optional[dict]:
++        return self._store.snapshot(job_id)
++
++    def _worker(self) -> None:
++        while not self._shutdown:
++            task = self._tasks.get()
++            if task.job_id == "__shutdown__":
++                break
++            try:
++                self._run_job(task)
++            except Exception as exc:  # noqa: BLE001
++                LOGGER.exception("job_failed", extra={"job_id": task.job_id, "error": str(exc)})
++            finally:
++                with self._events_lock:
++                    event = self._events.pop(task.job_id, None)
++                if event:
++                    event.set()
++
++    def _run_job(self, task: RunnerTask) -> None:
++        job = self._store.get(task.job_id)
++        if not job:
++            LOGGER.warning("job_missing", extra={"job_id": task.job_id})
++            return
++
++        job.mark_running()
++        self._store.touch(job.id)
++
++        draft_step, refine_step, jsonld_step, post_step = job.steps
++
++        # Draft
++        draft_step.mark_running()
++        log_step(LOGGER, job_id=job.id, step=draft_step.name, status=draft_step.status.value)
++        try:
++            result = generate_article_from_payload(**task.payload)
++            draft_step.mark_succeeded()
++        except Exception as exc:  # noqa: BLE001
++            draft_step.mark_failed(error=str(exc))
++            job.mark_failed(str(exc))
++            self._store.touch(job.id)
++            log_step(
++                LOGGER,
++                job_id=job.id,
++                step=draft_step.name,
++                status=draft_step.status.value,
++                error=str(exc),
++            )
++            return
++
++        log_step(LOGGER, job_id=job.id, step=draft_step.name, status=draft_step.status.value)
++
++        # Refine (placeholder for future incremental refinements)
++        refine_step.mark_running()
++        log_step(LOGGER, job_id=job.id, step=refine_step.name, status=refine_step.status.value)
++        refine_step.mark_succeeded()
++        log_step(LOGGER, job_id=job.id, step=refine_step.name, status=refine_step.status.value)
++
++        metadata = result.get("metadata") if isinstance(result, dict) else None
++        raw_jsonld = ""
++        if isinstance(metadata, dict):
++            raw_jsonld = str(metadata.get("jsonld") or "")
++
++        # JSON-LD repair
++        jsonld_step.mark_running()
++        log_step(LOGGER, job_id=job.id, step=jsonld_step.name, status=jsonld_step.status.value)
++        faq_entries, repair_attempts, degraded = parse_jsonld_or_repair(raw_jsonld)
++        jsonld_payload: Dict[str, Any] = {"repair_attempts": repair_attempts, "faq_entries": faq_entries}
++        if degraded:
++            job.degradation_flags.append("jsonld_repaired")
++            jsonld_payload["degraded"] = True
++        jsonld_step.mark_succeeded(**jsonld_payload)
++        log_step(LOGGER, job_id=job.id, step=jsonld_step.name, status=jsonld_step.status.value)
++
++        # Post analysis step
++        post_step.mark_running()
++        log_step(LOGGER, job_id=job.id, step=post_step.name, status=post_step.status.value)
++        post_payload = {"jsonld_repair_attempts": repair_attempts}
++        if faq_entries:
++            post_payload["faq_preview"] = faq_entries[:2]
++        post_step.mark_succeeded(**post_payload)
++        log_step(LOGGER, job_id=job.id, step=post_step.name, status=post_step.status.value)
++
++        job.mark_succeeded(result)
++        self._store.touch(job.id)
++
++    def soft_timeout(self) -> int:
++        return self._soft_timeout_s
+diff --git a/jobs/store.py b/jobs/store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b0663f0abda1dd77727eabedd7092ce3ba6c22ec
+--- /dev/null
++++ b/jobs/store.py
+@@ -0,0 +1,56 @@
++"""In-memory job store with TTL semantics."""
++from __future__ import annotations
++
++import threading
++import time
++from typing import Dict, Optional
++
++from .models import Job
++
++
++class JobStore:
++    """Thread-safe in-memory storage for jobs."""
++
++    def __init__(self, *, ttl_seconds: int = 3600) -> None:
++        self._ttl_seconds = max(1, int(ttl_seconds))
++        self._jobs: Dict[str, Job] = {}
++        self._expiry: Dict[str, float] = {}
++        self._lock = threading.RLock()
++
++    def create(self, job: Job) -> Job:
++        with self._lock:
++            self._jobs[job.id] = job
++            self._expiry[job.id] = time.time() + self._ttl_seconds
++            self._purge_expired_locked()
++            return job
++
++    def get(self, job_id: str) -> Optional[Job]:
++        with self._lock:
++            self._purge_expired_locked()
++            return self._jobs.get(job_id)
++
++    def touch(self, job_id: str) -> None:
++        with self._lock:
++            if job_id in self._jobs:
++                self._expiry[job_id] = time.time() + self._ttl_seconds
++
++    def delete(self, job_id: str) -> None:
++        with self._lock:
++            self._jobs.pop(job_id, None)
++            self._expiry.pop(job_id, None)
++
++    def snapshot(self, job_id: str) -> Optional[dict]:
++        job = self.get(job_id)
++        return job.to_dict() if job else None
++
++    def _purge_expired_locked(self) -> None:
++        now = time.time()
++        expired = [job_id for job_id, deadline in self._expiry.items() if deadline <= now]
++        for job_id in expired:
++            self._jobs.pop(job_id, None)
++            self._expiry.pop(job_id, None)
++
++    def __len__(self) -> int:  # pragma: no cover - trivial
++        with self._lock:
++            self._purge_expired_locked()
++            return len(self._jobs)
+diff --git a/observability/__init__.py b/observability/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e812eae7172cb784807694ad0d3216d02eeba966
+--- /dev/null
++++ b/observability/__init__.py
+@@ -0,0 +1,11 @@
++"""Observability helpers."""
++
++from .logger import bind_trace_id, clear_trace_id, configure_logging, get_logger, log_step  # noqa: F401
++
++__all__ = [
++    "bind_trace_id",
++    "clear_trace_id",
++    "configure_logging",
++    "get_logger",
++    "log_step",
++]
+diff --git a/observability/logger.py b/observability/logger.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca4a97fc02420a31b80e7d27f99d505fc06b897b
+--- /dev/null
++++ b/observability/logger.py
+@@ -0,0 +1,69 @@
++"""JSON logger helpers with request trace support."""
++from __future__ import annotations
++
++import contextvars
++import json
++import logging
++import sys
++from datetime import datetime, timezone
++from typing import Any, Dict
++
++_TRACE_ID = contextvars.ContextVar("trace_id", default=None)
++_CONFIGURED = False
++
++
++class JsonFormatter(logging.Formatter):
++    """Serialize log records as JSON lines."""
++
++    def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
++        payload: Dict[str, Any] = {
++            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
++            "level": record.levelname,
++            "logger": record.name,
++            "message": record.getMessage(),
++        }
++        trace_id = getattr(record, "trace_id", None) or _TRACE_ID.get()
++        if trace_id:
++            payload["trace_id"] = trace_id
++        if record.exc_info:
++            payload["exc_info"] = self.formatException(record.exc_info)
++        for key, value in record.__dict__.items():
++            if key.startswith("_"):
++                continue
++            if key in {"args", "levelname", "levelno", "msg", "pathname", "filename", "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName", "created", "msecs", "relativeCreated", "thread", "threadName", "processName", "process", "message", "asctime"}:
++                continue
++            payload.setdefault(key, value)
++        return json.dumps(payload, ensure_ascii=False)
++
++
++def configure_logging() -> None:
++    global _CONFIGURED
++    if _CONFIGURED:
++        return
++    handler = logging.StreamHandler(sys.stdout)
++    handler.setFormatter(JsonFormatter())
++    root = logging.getLogger()
++    root.handlers.clear()
++    root.addHandler(handler)
++    root.setLevel(logging.INFO)
++    _CONFIGURED = True
++
++
++def get_logger(name: str) -> logging.Logger:
++    configure_logging()
++    return logging.getLogger(name)
++
++
++def bind_trace_id(trace_id: str) -> None:
++    _TRACE_ID.set(trace_id)
++
++
++def clear_trace_id() -> None:
++    _TRACE_ID.set(None)
++
++
++def log_step(logger: logging.Logger, *, job_id: str, step: str, status: str, **details: Any) -> None:
++    logger.info(
++        "job_step",
++        extra={"job_id": job_id, "step": step, "step_status": status, "details": details or None},
++    )
+diff --git a/server/__init__.py b/server/__init__.py
+index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d6485c412c9 100644
+--- a/server/__init__.py
++++ b/server/__init__.py
+@@ -1,78 +1,79 @@
+ """Flask application exposing the content factory pipeline via HTTP."""
  from __future__ import annotations
  
  import json
- import logging
-+import math
- import re
- import textwrap
- import time
- from collections import deque
- from dataclasses import dataclass, field
- from enum import Enum
- from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+-import logging
+ import mimetypes
+ import os
+ import secrets
++import uuid
+ from datetime import datetime
+ from functools import wraps
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Tuple
+ from urllib.parse import urljoin, urlparse
  
- from config import (
-     G5_MAX_OUTPUT_TOKENS_MAX,
-     SKELETON_BATCH_SIZE_MAIN,
-     SKELETON_FAQ_BATCH,
-     TAIL_FILL_MAX_TOKENS,
+ from dotenv import load_dotenv
+ from flask import (
+     Flask,
+     abort,
+     flash,
+     jsonify,
++    g,
+     redirect,
+     render_template,
+     request,
+     session,
+     send_file,
+     send_from_directory,
+     url_for,
  )
- from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
- from faq_builder import _normalize_entry
- from keyword_injector import (
-     KeywordInjectionResult,
-     LOCK_END,
-     LOCK_START_TEMPLATE,
-     build_term_pattern,
-     inject_keywords,
+ from flask_cors import CORS
+ from werkzeug.security import check_password_hash
+ 
+ from assemble_messages import invalidate_style_profile_cache
+-from config import DEFAULT_STRUCTURE
+-from orchestrate import (
+-    gather_health_status,
+-    generate_article_from_payload,
+-    make_generation_context,
+-)
++from config import DEFAULT_STRUCTURE, OPENAI_RPM, OPENAI_RPS
++from jobs import JobRunner, JobStatus, JobStore
++from orchestrate import gather_health_status, make_generation_context
+ from retrieval import build_index
+ from artifacts_store import (
+     cleanup_index as cleanup_artifact_index,
+     delete_artifact as delete_artifact_entry,
+     list_artifacts as list_artifact_cards,
+     resolve_artifact_path,
  )
- from length_controller import ensure_article_length
- from length_limits import compute_soft_length_bounds
-@@ -285,50 +286,75 @@ class DeterministicPipeline:
-             PipelineLogEntry(step=step, started_at=time.time(), finished_at=time.time(), status=status, notes=dict(notes))
++from observability.logger import bind_trace_id, clear_trace_id, get_logger
+ 
+ load_dotenv()
+ 
+-LOGGER = logging.getLogger("content_factory.api")
+-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
++LOGGER = get_logger("content_factory.api")
+ 
+ PIPELINE_CONFIG_FILENAME = "pipeline.json"
+ 
++JOB_STORE = JobStore(ttl_seconds=3600)
++JOB_RUNNER = JobRunner(JOB_STORE)
++
+ USERS: Dict[str, Dict[str, str]] = {
+     "admin": {
+         "display_name": "Admin",
+         "password_hash": (
+             "scrypt:32768:8:1$poFMhgLX1D2jug2W$724005a9a37b1f699ddda576ee89fb022c3bdcd28660826d1f9f5710c3116c6"
+             "b847ea20c926c9124fbcfa9fee55967a26d488e3d04a3b58e2776f002a124d003"
+         ),
+     },
+     "dmitriy": {
+         "display_name": "Dmitriy",
+         "password_hash": (
+             "scrypt:32768:8:1$FRtm9J7DjkoGICbY$4f859f2fecaf592d3cffdec70a6c8ddb598a97e4851aa2f7c80d17ef5d87c02"
+             "0b651cef85d9f82bf112f4ea46de4f25d17952a92c45c347000e3a413a0739af9"
+         ),
+     },
+ }
+ 
+ 
+ def login_required(view_func):
+     """Decorator ensuring that a user is authenticated before accessing a view."""
+ 
+     @wraps(view_func)
+     def wrapper(*args, **kwargs):
+         if not session.get("user"):
+             next_url = request.full_path if request.query_string else request.path
+@@ -89,67 +90,108 @@ def login_required(view_func):
+ 
+ class ApiError(Exception):
+     """Exception translated into an HTTP error response."""
+ 
+     def __init__(self, message: str, status_code: int = 400) -> None:
+         super().__init__(message)
+         self.status_code = status_code
+         self.message = message
+ 
+ 
+ def create_app() -> Flask:
+     frontend_root = (Path(__file__).resolve().parent.parent / "frontend_demo").resolve()
+     template_root = frontend_root / "templates"
+     app = Flask(__name__, template_folder=str(template_root))
+     if hasattr(app, "json"):
+         app.json.ensure_ascii = False
+     CORS(app, resources={r"/api/*": {"origins": "*"}})
+ 
+     secret_key = os.environ.get("FLASK_SECRET_KEY")
+     if not secret_key:
+         LOGGER.warning("FLASK_SECRET_KEY is not set; generating a temporary secret key")
+     app.secret_key = secret_key or secrets.token_hex(32)
+ 
+     index_path = frontend_root / "index.html"
+ 
++    @app.before_request
++    def _bind_request_trace() -> None:
++        trace_id = request.headers.get("X-Trace-Id") or uuid.uuid4().hex
++        g.trace_id = trace_id
++        bind_trace_id(trace_id)
++
++    @app.after_request
++    def _append_trace(response):  # type: ignore[override]
++        trace_id = getattr(g, "trace_id", None)
++        if trace_id:
++            response.headers.setdefault("X-Trace-Id", trace_id)
++        clear_trace_id()
++        return response
++
++    @app.teardown_request
++    def _teardown_trace(_exc):  # type: ignore[override]
++        clear_trace_id()
++
+     @app.context_processor
+     def inject_current_user():
+         username = session.get("user")
+         return {
+             "current_user": USERS.get(username),
+             "current_username": username,
+         }
+ 
+     @app.errorhandler(ApiError)
+     def _handle_api_error(exc: ApiError):  # type: ignore[override]
+-        LOGGER.warning("API error: %s", exc.message)
+-        return jsonify({"error": exc.message}), exc.status_code
++        LOGGER.warning("API error", extra={"message": exc.message, "code": exc.status_code})
++        trace_id = getattr(g, "trace_id", None)
++        return (
++            jsonify(
++                {
++                    "error": {
++                        "message": exc.message,
++                        "code": exc.status_code,
++                        "trace_id": trace_id,
++                    }
++                }
++            ),
++            exc.status_code,
++        )
+ 
+     @app.errorhandler(Exception)
+     def _handle_generic_error(exc: Exception):  # type: ignore[override]
+         LOGGER.exception("Unhandled error")
+-        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
++        trace_id = getattr(g, "trace_id", None)
++        return (
++            jsonify(
++                {
++                    "error": {
++                        "message": "Внутренняя ошибка сервера",
++                        "trace_id": trace_id,
++                    }
++                }
++            ),
++            500,
++        )
+ 
+     @app.route("/login", methods=["GET", "POST"])
+     def login():
+         next_param = _get_safe_redirect_target(
+             request.args.get("next") or request.form.get("next")
          )
  
-     def _register_llm_result(self, result: GenerationResult, usage: Optional[float]) -> None:
-         if result.model_used:
-             self._model_used = result.model_used
-         elif self._model_used is None:
-             self._model_used = self.model
-         if result.fallback_used:
-             self._fallback_used = result.fallback_used
-         if result.fallback_reason:
-             self._fallback_reason = result.fallback_reason
-         if result.api_route:
-             self._api_route = result.api_route
-         if usage is not None:
-             self._token_usage = usage
+         if session.get("user"):
+             if next_param:
+                 return redirect(next_param)
+             return redirect(url_for("serve_frontend", path=""))
  
-     def _prompt_length(self, messages: Sequence[Dict[str, object]]) -> int:
-         length = 0
-         for message in messages:
-             content = message.get("content")
-             if isinstance(content, str):
-                 length += len(content)
-         return length
+         username = ""
+         if request.method == "POST":
+             username = str(request.form.get("username", "")).strip()
+             password = request.form.get("password", "")
+             user = USERS.get(username)
  
-+    def _approx_prompt_tokens(self, messages: Sequence[Dict[str, object]]) -> int:
-+        """Rough token estimate based on message character count."""
+             if user and check_password_hash(user["password_hash"], password):
+                 session.clear()
+                 session["user"] = username
+                 session["authenticated_at"] = datetime.utcnow().isoformat()
+                 redirect_target = next_param or url_for("serve_frontend", path="")
+                 return redirect(redirect_target)
+ 
+@@ -271,95 +313,120 @@ def create_app() -> Flask:
+         if not isinstance(raw_data, dict):
+             raise ApiError("Поле data должно быть объектом")
+         raw_data = dict(raw_data)
+ 
+         style_payload = payload.get("style")
+         if isinstance(style_payload, dict):
+             raw_data["style"] = style_payload
+ 
+         k = _safe_int(payload.get("k"))
+         if k < 0:
+             k = 0
+ 
+         context_source, context_text, context_filename = _extract_context_settings(payload, raw_data)
+         effective_k = k
+         if context_source in {"off", "custom"}:
+             effective_k = 0
+ 
+         style_profile_override = _style_profile_override_from_request(request)
+         if payload.get("dry_run"):
+             return jsonify(_make_dry_run_response(theme=theme, data=raw_data, k=effective_k))
+ 
+         model = payload.get("model")
+         temperature = _safe_float(payload.get("temperature", 0.3), default=0.3)
+         temperature = max(0.0, min(2.0, temperature))
+         max_tokens = max(1, _safe_int(payload.get("max_tokens", 1400), default=1400))
+-
+-        try:
+-            result = generate_article_from_payload(
+-                theme=theme,
+-                data=raw_data,
+-                k=k,
+-                model=model,
+-                temperature=temperature,
+-                max_tokens=max_tokens,
+-                append_style_profile=style_profile_override,
+-                context_source=context_source,
+-                context_text=context_text,
+-                context_filename=context_filename,
+-            )
+-        except ApiError:
+-            raise
+-        except RuntimeError as exc:
+-            status_code = getattr(exc, "status_code", 503)
+-            raise ApiError(str(exc), status_code=status_code)
+-        except Exception as exc:  # noqa: BLE001
+-            LOGGER.exception("Generation failed")
+-            raise ApiError("Не удалось завершить генерацию", status_code=500) from exc
+-
+-        response_payload: Dict[str, Any] = {
+-            "markdown": result["text"],
+-            "meta_json": result["metadata"],
+-            "artifact_paths": result["artifact_paths"],
++        task_payload = {
++            "theme": theme,
++            "data": raw_data,
++            "k": k,
++            "model": model,
++            "temperature": temperature,
++            "max_tokens": max_tokens,
++            "append_style_profile": style_profile_override,
++            "context_source": context_source,
++            "context_text": context_text,
++            "context_filename": context_filename,
+         }
+ 
+-        metadata = result.get("metadata") or {}
+-        if isinstance(metadata, dict) and metadata.get("style_profile_applied"):
+-            response_payload["style_profile_applied"] = True
+-            if metadata.get("style_profile_source"):
+-                response_payload["style_profile_source"] = metadata["style_profile_source"]
+-            if metadata.get("style_profile_variant"):
+-                response_payload["style_profile_variant"] = metadata["style_profile_variant"]
+-        if isinstance(metadata, dict) and metadata.get("keywords_manual") is not None:
+-            response_payload["keywords_manual"] = metadata.get("keywords_manual")
+-        if isinstance(metadata, dict):
+-            response_payload["model_used"] = metadata.get("model_used")
+-            response_payload["fallback_used"] = metadata.get("fallback_used")
+-            response_payload["fallback_reason"] = metadata.get("fallback_reason")
+-            response_payload["api_route"] = metadata.get("api_route")
+-
+-        return jsonify(response_payload)
++        job = JOB_RUNNER.submit(task_payload)
++        sync_raw = payload.get("sync", request.args.get("sync"))
++        sync_requested = str(sync_raw).lower() in {"1", "true", "yes"}
 +
-+        total_chars = self._prompt_length(messages)
-+        if total_chars <= 0:
-+            return 0
-+        # Empirical heuristic: ~4 characters per token for mixed Russian text.
-+        return max(1, int(math.ceil(total_chars / 4.0)))
++        if sync_requested:
++            finished = JOB_RUNNER.wait(job.id, timeout=JOB_RUNNER.soft_timeout())
++            snapshot = JOB_RUNNER.get_job(job.id)
++            if finished and snapshot:
++                status = snapshot.get("status")
++                if status == JobStatus.SUCCEEDED.value and snapshot.get("result"):
++                    response_payload = _format_generation_success(snapshot["result"])
++                    response_payload["job_id"] = job.id
++                    response_payload["degradation_flags"] = snapshot.get("degradation_flags")
++                    return jsonify(response_payload)
++                if status == JobStatus.FAILED.value:
++                    trace_id = getattr(g, "trace_id", None)
++                    return (
++                        jsonify(
++                            {
++                                "error": {
++                                    "message": snapshot.get("error") or "Generation failed",
++                                    "trace_id": trace_id,
++                                },
++                                "job_id": job.id,
++                                "status": status,
++                            }
++                        ),
++                        500,
++                    )
 +
-+    def _should_force_single_main_batches(
-+        self,
-+        outline: SkeletonOutline,
-+        estimate: "SkeletonVolumeEstimate",
-+    ) -> bool:
-+        """Return True when main batches must be generated one-by-one."""
++        snapshot = JOB_RUNNER.get_job(job.id) or job.to_dict()
++        response_payload = {
++            "job_id": job.id,
++            "status": snapshot.get("status", JobStatus.PENDING.value),
++            "steps": snapshot.get("steps"),
++            "result": snapshot.get("result"),
++            "degradation_flags": snapshot.get("degradation_flags"),
++        }
++        return jsonify(response_payload), 202
 +
-+        approx_tokens = self._approx_prompt_tokens(self.messages)
-+        if approx_tokens >= 3400:
-+            return True
-+        if estimate.requires_chunking:
-+            return True
-+        if len(outline.main_headings) >= 5 and estimate.cap_tokens:
-+            return True
-+        return False
-+
-     def _extract_usage(self, result: GenerationResult) -> Optional[float]:
-         metadata = result.metadata or {}
-         if not isinstance(metadata, dict):
-             return None
-         candidates = [
-             metadata.get("usage_output_tokens"),
-             metadata.get("token_usage"),
-             metadata.get("output_tokens"),
-         ]
-         usage_block = metadata.get("usage")
-         if isinstance(usage_block, dict):
-             candidates.append(usage_block.get("output_tokens"))
-             candidates.append(usage_block.get("total_tokens"))
-         for candidate in candidates:
-             if isinstance(candidate, (int, float)):
-                 return float(candidate)
-         return None
- 
-     def _call_llm(
-         self,
-         *,
-         step: PipelineStep,
-         messages: Sequence[Dict[str, object]],
-         max_tokens: Optional[int] = None,
-         override_model: Optional[str] = None,
-@@ -477,55 +503,62 @@ class DeterministicPipeline:
-         per_main_tokens = max(220, int(remaining_for_main / main_count)) if main_count else 0
-         predicted = intro_tokens + conclusion_tokens + per_main_tokens * main_count + per_faq_tokens * faq_count
-         start_max = int(predicted * 1.2)
-         if cap is not None and cap > 0:
-             start_max = min(start_max, cap)
-         start_max = max(600, start_max)
-         requires_chunking = bool(cap is not None and predicted > cap)
-         LOGGER.info(
-             "SKELETON_ESTIMATE predicted=%d start_max=%d cap=%s → resolved max_output_tokens=%d",
-             predicted,
-             start_max,
-             cap if cap is not None else "-",
-             start_max,
-         )
-         return SkeletonVolumeEstimate(
-             predicted_tokens=predicted,
-             start_max_tokens=start_max,
-             cap_tokens=cap,
-             intro_tokens=intro_tokens,
-             conclusion_tokens=conclusion_tokens,
-             per_main_tokens=per_main_tokens,
-             per_faq_tokens=per_faq_tokens,
-             requires_chunking=requires_chunking,
-         )
- 
--    def _build_skeleton_batches(self, outline: SkeletonOutline) -> List[SkeletonBatchPlan]:
-+    def _build_skeleton_batches(
-+        self,
-+        outline: SkeletonOutline,
-+        estimate: SkeletonVolumeEstimate,
-+    ) -> List[SkeletonBatchPlan]:
-         batches: List[SkeletonBatchPlan] = [SkeletonBatchPlan(kind=SkeletonBatchKind.INTRO, label="intro")]
-         main_count = len(outline.main_headings)
-         if main_count > 0:
--            batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
-+            if self._should_force_single_main_batches(outline, estimate):
-+                batch_size = 1
-+            else:
-+                batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
-             start = 0
-             while start < main_count:
-                 end = min(start + batch_size, main_count)
-                 indices = list(range(start, end))
-                 if len(indices) == 1:
-                     label = f"main[{indices[0] + 1}]"
-                 else:
-                     label = f"main[{indices[0] + 1}-{indices[-1] + 1}]"
-                 batches.append(
-                     SkeletonBatchPlan(
-                         kind=SkeletonBatchKind.MAIN,
-                         indices=indices,
-                         label=label,
-                     )
-                 )
-                 start = end
-         if outline.has_faq:
-             total_faq = 5
-             produced = 0
-             first_batch = min(SKELETON_FAQ_BATCH, total_faq)
-             if first_batch > 0:
-                 indices = list(range(produced, produced + first_batch))
-                 label = (
-                     f"faq[{indices[0] + 1}-{indices[-1] + 1}]"
-                     if len(indices) > 1
-@@ -1436,50 +1469,74 @@ class DeterministicPipeline:
-             }
-         return None
- 
-     def _tail_fill_batch(
-         self,
-         batch: SkeletonBatchPlan,
-         *,
-         outline: SkeletonOutline,
-         assembly: SkeletonAssembly,
-         estimate: SkeletonVolumeEstimate,
-         missing_items: Sequence[int],
-         metadata: Dict[str, object],
-     ) -> None:
-         pending = [int(item) for item in missing_items if isinstance(item, int)]
-         if not pending:
-             return
-         if batch.kind == SkeletonBatchKind.MAIN:
-             self._tail_fill_main_sections(
-                 indices=pending,
-                 outline=outline,
-                 assembly=assembly,
-                 estimate=estimate,
-             )
-             return
-         previous_id = self._metadata_response_id(metadata)
-+        if not previous_id and batch.kind == SkeletonBatchKind.FAQ:
-+            budget = self._batch_token_budget(batch, estimate, 1)
-+            max_tokens = max(320, min(budget, TAIL_FILL_MAX_TOKENS))
-+            for index in pending:
-+                fallback_plan = SkeletonBatchPlan(
-+                    kind=SkeletonBatchKind.FAQ,
-+                    indices=[index],
-+                    label=self._format_batch_label(SkeletonBatchKind.FAQ, [index]),
-+                    tail_fill=True,
-+                )
-+                payload, result = self._run_fallback_batch(
-+                    fallback_plan,
-+                    outline=outline,
-+                    assembly=assembly,
-+                    target_indices=[index],
-+                    max_tokens=max_tokens,
-+                    previous_response_id=None,
-+                )
-+                if payload is None or result is None:
-+                    continue
-+                normalized_entries, _ = self._normalize_faq_batch(payload, [index])
-+                for _, question, answer in normalized_entries:
-+                    assembly.apply_faq(question, answer)
-+            return
-         if not previous_id:
-             return
-         if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
-             groups = [[index] for index in pending]
-         else:
-             groups = [list(pending)]
- 
-         for group in groups:
-             if not group:
-                 continue
-             tail_plan = SkeletonBatchPlan(
-                 kind=batch.kind,
-                 indices=list(group),
-                 label=batch.label + "#tail",
-                 tail_fill=True,
-             )
-             messages, format_block = self._build_batch_messages(
-                 tail_plan,
-                 outline=outline,
-                 assembly=assembly,
-                 target_indices=list(group),
-                 tail_fill=True,
-             )
-             budget = self._batch_token_budget(batch, estimate, len(group))
-             max_tokens = max(400, min(budget, TAIL_FILL_MAX_TOKENS, 800))
-@@ -2035,99 +2092,100 @@ class DeterministicPipeline:
-                 ),
-             },
-             {"role": "user", "content": f"{payload}\n\n{article_block}"},
-         ]
- 
-     def _sync_locked_terms(self, text: str) -> None:
-         pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
-         self.locked_terms = pattern.findall(text)
-         if self.normalized_keywords:
-             article = strip_jsonld(text)
-             found = 0
-             for term in self.normalized_keywords:
-                 lock_token = LOCK_START_TEMPLATE.format(term=term)
-                 lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-                 if lock_pattern.search(text) and build_term_pattern(term).search(article):
-                     found += 1
-             self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
- 
-     # ------------------------------------------------------------------
-     # Step implementations
-     # ------------------------------------------------------------------
-     def _run_skeleton(self) -> str:
-         self._log(PipelineStep.SKELETON, "running")
-         outline = self._prepare_outline()
-         estimate = self._predict_skeleton_volume(outline)
--        batches = self._build_skeleton_batches(outline)
-+        batches = self._build_skeleton_batches(outline, estimate)
-         assembly = SkeletonAssembly(outline=outline)
-         metadata_snapshot: Dict[str, object] = {}
-         last_result: Optional[GenerationResult] = None
- 
-         pending_batches = deque(batches)
-         scheduled_main_indices: Set[int] = set()
-         parse_none_streaks: Dict[str, int] = {}
-         for plan in pending_batches:
-             if plan.kind == SkeletonBatchKind.MAIN:
-                 scheduled_main_indices.update(plan.indices)
-         split_serial = 0
- 
-         while pending_batches:
-             batch = pending_batches.popleft()
-             if batch.kind in (SkeletonBatchKind.FAQ, SkeletonBatchKind.CONCLUSION):
-                 filled_main = sum(
-                     1
-                     for body in assembly.main_sections
-                     if isinstance(body, str) and body.strip()
-                 )
-                 has_pending_main = any(
-                     plan.kind == SkeletonBatchKind.MAIN for plan in pending_batches
-                 )
-                 if filled_main < 3 and has_pending_main:
-                     LOGGER.info(
-                         "LOG:SCHEDULER_BLOCK main underflow=%d target_min=3 → continue_main",
-                         filled_main,
-                     )
-                     pending_batches.append(batch)
-                     continue
-             if not batch.label:
-                 batch.label = self._format_batch_label(batch.kind, batch.indices)
-             active_indices = list(batch.indices)
-             limit_override: Optional[int] = None
-             override_to_cap = False
-             retries = 0
-             consecutive_empty_incomplete = 0
-             payload_obj: Optional[object] = None
-             metadata_snapshot = {}
-             result: Optional[GenerationResult] = None
-             last_max_tokens = estimate.start_max_tokens
-             continuation_id: Optional[str] = None
-             batch_partial = False
-             first_attempt_for_batch = True
-             best_payload_obj: Optional[object] = None
-             best_result: Optional[GenerationResult] = None
-             best_metadata_snapshot: Dict[str, object] = {}
-             last_reason_lower = ""
-+            forced_tail_indices: List[int] = []
- 
-             while True:
-                 messages, format_block = self._build_batch_messages(
-                     batch,
-                     outline=outline,
-                     assembly=assembly,
-                     target_indices=active_indices,
-                     tail_fill=batch.tail_fill,
-                 )
-                 base_budget = self._batch_token_budget(batch, estimate, len(active_indices) or 1)
-                 if first_attempt_for_batch:
-                     max_tokens_to_use = estimate.start_max_tokens
-                 else:
-                     max_tokens_to_use = base_budget
-                 if limit_override is not None:
-                     if override_to_cap:
-                         max_tokens_to_use = max(max_tokens_to_use, limit_override)
-                     else:
-                         max_tokens_to_use = min(max_tokens_to_use, limit_override)
-                 last_max_tokens = max_tokens_to_use
-                 first_attempt_for_batch = False
-                 request_prev_id = continuation_id or ""
-                 result = self._call_llm(
-                     step=PipelineStep.SKELETON,
-                     messages=messages,
-@@ -2152,57 +2210,56 @@ class DeterministicPipeline:
-                     best_payload_obj = payload_obj
-                     best_result = result
-                     best_metadata_snapshot = dict(metadata_snapshot)
-                 metadata_prev_id = str(
-                     metadata_snapshot.get("previous_response_id")
-                     or request_prev_id
-                     or ""
-                 )
-                 schema_label = str(result.schema or "")
-                 schema_is_none = schema_label.endswith(".none")
-                 parse_none_count = 0
-                 if metadata_prev_id:
-                     if schema_is_none and is_incomplete and not has_payload:
-                         parse_none_count = parse_none_streaks.get(metadata_prev_id, 0) + 1
-                         parse_none_streaks[metadata_prev_id] = parse_none_count
-                     else:
-                         parse_none_streaks.pop(metadata_prev_id, None)
-                 if not is_incomplete or has_payload:
-                     batch_partial = bool(is_incomplete and has_payload)
-                     if metadata_prev_id:
-                         parse_none_streaks.pop(metadata_prev_id, None)
-                     if request_prev_id and request_prev_id != metadata_prev_id:
-                         parse_none_streaks.pop(request_prev_id, None)
-                     break
-                 consecutive_empty_incomplete += 1
--                should_autosplit = (
--                    self._can_split_batch(batch.kind, active_indices)
--                    and len(active_indices) > 1
--                    and consecutive_empty_incomplete >= 2
--                    and reason_lower == "max_output_tokens"
--                    and parse_none_count >= 2
--                )
-+                should_autosplit = False
-+                if self._can_split_batch(batch.kind, active_indices) and len(active_indices) > 1:
-+                    if reason_lower == "max_output_tokens" and consecutive_empty_incomplete >= 1:
-+                        should_autosplit = True
-+                    elif consecutive_empty_incomplete >= 2 and parse_none_count >= 2:
-+                        should_autosplit = True
-                 if should_autosplit:
-                     keep, remainder = self._split_batch_indices(active_indices)
-                     original_size = len(active_indices)
-                     if remainder:
-                         split_serial += 1
-                         remainder_label = self._format_batch_label(
-                             batch.kind,
-                             remainder,
-                             suffix=f"#split{split_serial}",
-                         )
-                         pending_batches.appendleft(
-                             SkeletonBatchPlan(
-                                 kind=batch.kind,
-                                 indices=list(remainder),
-                                 label=remainder_label,
-                                 tail_fill=batch.tail_fill,
-                             )
-                         )
-                     LOGGER.info(
-                         "BATCH_AUTOSPLIT kind=%s label=%s from=%d to=%d",
-                         batch.kind.value,
-                         batch.label or self._format_batch_label(batch.kind, active_indices),
-                         original_size,
-                         len(keep) or 0,
-                     )
-@@ -2304,175 +2361,210 @@ class DeterministicPipeline:
-                         continuation_id = response_id_candidate
-                         parse_none_streaks.pop(response_id_candidate, None)
-                     batch_partial = True
- 
-             if payload_obj is None and best_payload_obj is not None:
-                 payload_obj = best_payload_obj
-                 result = best_result
-                 metadata_snapshot = dict(best_metadata_snapshot)
-                 batch_partial = True
-                 response_id_candidate = self._metadata_response_id(metadata_snapshot)
-                 if response_id_candidate:
-                     parse_none_streaks.pop(response_id_candidate, None)
-             if (
-                 payload_obj is None
-                 and best_payload_obj is None
-                 and last_reason_lower == "max_output_tokens"
-             ):
-                 placeholder = self._build_batch_placeholder(
-                     batch,
-                     outline=outline,
-                     target_indices=active_indices,
-                 )
-                 if placeholder is not None:
-                     payload_obj = placeholder
-                     batch_partial = True
-+                    if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
-+                        forced_tail_indices = list(active_indices)
-                     LOGGER.warning(
--                        "SKELETON_PLACEHOLDER_APPLIED kind=%s label=%s", 
-+                        "SKELETON_PLACEHOLDER_APPLIED kind=%s label=%s",
-                         batch.kind.value,
-                         batch.label,
-                     )
-             if payload_obj is None and batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ) and active_indices:
-                 fallback_payload, fallback_result = self._run_fallback_batch(
-                     batch,
-                     outline=outline,
-                     assembly=assembly,
-                     target_indices=active_indices,
-                     max_tokens=last_max_tokens,
-                     previous_response_id=continuation_id,
-                 )
-                 if fallback_payload is not None and fallback_result is not None:
-                     payload_obj = fallback_payload
-                     result = fallback_result
-                     metadata_snapshot = fallback_result.metadata or {}
-                     response_id_candidate = self._metadata_response_id(metadata_snapshot)
-                     if response_id_candidate:
-                         continuation_id = response_id_candidate
-                         parse_none_streaks.pop(response_id_candidate, None)
-                     batch_partial = True
-             if payload_obj is None:
-                 raise PipelineStepError(
-                     PipelineStep.SKELETON,
-                     "Скелет не содержит данных после генерации.",
-                 )
- 
-             if batch.kind == SkeletonBatchKind.INTRO:
-                 normalized, missing_fields = self._normalize_intro_batch(payload_obj, outline)
-                 intro_text = normalized.get("intro", "")
-                 headers = normalized.get("main_headers") or []
-                 if len(headers) < len(outline.main_headings):
-                     headers = headers + outline.main_headings[len(headers) :]
-                 assembly.apply_intro(intro_text, headers, normalized.get("conclusion_heading"))
-                 current_total = len(assembly.main_sections)
-                 new_indices = [
-                     idx for idx in range(current_total) if idx not in scheduled_main_indices
-                 ]
-                 if new_indices:
-                     start_pos = 0
--                    batch_size = max(1, SKELETON_BATCH_SIZE_MAIN)
-+                    if self._should_force_single_main_batches(outline, estimate):
-+                        batch_size = 1
-+                    else:
-+                        batch_size = max(1, SKELETON_BATCH_SIZE_MAIN)
-                     while start_pos < len(new_indices):
-                         chunk = new_indices[start_pos : start_pos + batch_size]
-                         if not chunk:
-                             break
-                         chunk_label = self._format_batch_label(SkeletonBatchKind.MAIN, chunk)
-                         pending_batches.append(
-                             SkeletonBatchPlan(
-                                 kind=SkeletonBatchKind.MAIN,
-                                 indices=list(chunk),
-                                 label=chunk_label,
-                             )
-                         )
-                         scheduled_main_indices.update(chunk)
-                         start_pos += batch_size
-                 if missing_fields:
-                     self._tail_fill_batch(
-                         batch,
-                         outline=outline,
-                         assembly=assembly,
-                         estimate=estimate,
-                         missing_items=[0],
-                         metadata=metadata_snapshot,
-                     )
-             elif batch.kind == SkeletonBatchKind.MAIN:
-                 normalized_sections, missing_indices = self._normalize_main_batch(
-                     payload_obj, target_indices, outline
-                 )
-                 for index, heading, body in normalized_sections:
-                     assembly.apply_main(index, body, heading=heading)
--                if missing_indices:
-+                if forced_tail_indices:
-+                    merged = list(dict.fromkeys(missing_indices + forced_tail_indices))
-+                else:
-+                    merged = list(missing_indices)
-+                if merged:
-                     self._tail_fill_batch(
-                         batch,
-                         outline=outline,
-                         assembly=assembly,
-                         estimate=estimate,
--                        missing_items=missing_indices,
-+                        missing_items=merged,
-                         metadata=metadata_snapshot,
-                     )
-             elif batch.kind == SkeletonBatchKind.FAQ:
-                 normalized_entries, missing_faq = self._normalize_faq_batch(payload_obj, target_indices)
-                 for _, question, answer in normalized_entries:
-                     assembly.apply_faq(question, answer)
--                if missing_faq:
-+                if forced_tail_indices:
-+                    merged_faq = list(dict.fromkeys(missing_faq + forced_tail_indices))
-+                else:
-+                    merged_faq = list(missing_faq)
-+                if merged_faq:
-                     self._tail_fill_batch(
-                         batch,
-                         outline=outline,
-                         assembly=assembly,
-                         estimate=estimate,
--                        missing_items=missing_faq,
-+                        missing_items=merged_faq,
-                         metadata=metadata_snapshot,
-                     )
-             else:
-                 conclusion_text, missing_flag = self._normalize_conclusion_batch(payload_obj)
-                 assembly.apply_conclusion(conclusion_text)
-                 if missing_flag:
-                     self._tail_fill_batch(
-                         batch,
-                         outline=outline,
-                         assembly=assembly,
-                         estimate=estimate,
-                         missing_items=[0],
-                         metadata=metadata_snapshot,
-                     )
- 
-             self._apply_inline_faq(payload_obj, assembly)
-             LOGGER.info(
-                 "BATCH_ACCEPT state=%s kind=%s label=%s",
-                 "partial" if batch_partial else "complete",
-                 batch.kind.value,
-                 batch.label,
-             )
- 
-         if not assembly.intro:
-             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вводный блок скелета.")
-         if not assembly.conclusion:
-             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вывод скелета.")
-         missing_main = assembly.missing_main_indices()
-         if missing_main:
-             LOGGER.warning(
-                 "LOG:SKELETON_MAIN_GAPS missing=%s",
-                 ",".join(str(idx + 1) for idx in missing_main),
-             )
-+            self._tail_fill_main_sections(
-+                indices=missing_main,
-+                outline=outline,
-+                assembly=assembly,
-+                estimate=estimate,
++    @app.get("/api/jobs/<job_id>")
++    def job_status(job_id: str):
++        snapshot = JOB_RUNNER.get_job(job_id)
++        if not snapshot:
++            trace_id = getattr(g, "trace_id", None)
++            return (
++                jsonify(
++                    {
++                        "error": {
++                            "message": "Job not found",
++                            "trace_id": trace_id,
++                        }
++                    }
++                ),
++                404,
 +            )
-+            missing_main = assembly.missing_main_indices()
-+            if missing_main:
-+                for index in missing_main:
-+                    heading = (
-+                        outline.main_headings[index]
-+                        if 0 <= index < len(outline.main_headings)
-+                        else f"Раздел {index + 1}"
-+                    )
-+                    placeholder = (
-+                        f"Раздел «{heading}» будет дополнен после завершения генерации статьи."
-+                    )
-+                    assembly.apply_main(index, placeholder, heading=heading)
-+                LOGGER.warning(
-+                    "LOG:SKELETON_MAIN_PLACEHOLDER_FINAL count=%d",
-+                    len(missing_main),
-+                )
-         if outline.has_faq and assembly.missing_faq_count(5):
-             raise PipelineStepError(
-                 PipelineStep.SKELETON,
-                 "Не удалось собрать полный FAQ на этапе скелета.",
-             )
++        return jsonify(snapshot)
  
-         payload = assembly.build_payload()
-         if outline.has_faq and len(payload.get("faq", [])) > 5:
-             payload["faq"] = payload["faq"][:5]
+     @app.post("/api/reindex")
+     def reindex():
+         payload = _require_json(request)
+         theme = str(payload.get("theme", "")).strip()
+         if not theme:
+             raise ApiError("Не указана тема (theme)")
  
-         normalized_payload = normalize_skeleton_payload(payload)
-         normalized_payload = self._finalize_main_sections(
-             normalized_payload,
-             outline=outline,
-             assembly=assembly,
-             estimate=estimate,
+         try:
+             stats = build_index(theme)
+         except FileNotFoundError as exc:
+             raise ApiError(str(exc), status_code=404) from exc
+         except RuntimeError as exc:
+             raise ApiError(str(exc), status_code=400) from exc
+ 
+         invalidate_style_profile_cache()
+         return jsonify(stats)
+ 
+     @app.get("/api/artifacts")
+     def list_artifacts():
+         theme = request.args.get("theme")
+         items = list_artifact_cards(theme, auto_cleanup=True)
+         return jsonify(items)
+ 
+     @app.delete("/api/artifacts")
+@@ -395,50 +462,59 @@ def create_app() -> Flask:
+     @app.get("/api/artifacts/download")
+     def download_artifact():
+         raw_path = request.args.get("path")
+         if not raw_path:
+             raise ApiError("Не указан путь к артефакту", status_code=400)
+ 
+         try:
+             artifact_path = resolve_artifact_path(raw_path)
+         except ValueError as exc:
+             raise ApiError(str(exc), status_code=400) from exc
+         if not artifact_path.exists() or not artifact_path.is_file():
+             return jsonify({"error": "file_not_found"}), 404
+ 
+         mime_type, _ = mimetypes.guess_type(artifact_path.name)
+         return send_file(
+             artifact_path,
+             mimetype=mime_type or "application/octet-stream",
+             as_attachment=True,
+             download_name=artifact_path.name,
          )
-         markdown, summary = self._render_skeleton_markdown(normalized_payload)
-         snapshot = dict(normalized_payload)
-         snapshot["outline"] = summary.get("outline", [])
-         if "faq" in summary:
-             snapshot["faq"] = summary.get("faq", [])
-         self.skeleton_payload = snapshot
-         self._skeleton_faq_entries = [
-             {"question": entry.get("q", ""), "answer": entry.get("a", "")}
+ 
+     @app.get("/api/health")
+     def health():
+         theme = request.args.get("theme")
+         status = gather_health_status(theme)
++        checks = status.setdefault("checks", {})
++        checks["openai_rate_limits"] = {
++            "ok": True,
++            "message": f"Лимиты клиента активны: {OPENAI_RPS} rps / {OPENAI_RPM} rpm",
++        }
++        checks["job_runner"] = {
++            "ok": True,
++            "message": f"Очередь заданий: {len(JOB_STORE)}; soft timeout={JOB_RUNNER.soft_timeout()}s",
++        }
+         http_status = 200 if status.get("ok") else 503
+         return jsonify(status), http_status
+ 
+     @app.get("/", defaults={"path": ""})
+     @app.get("/<path:path>")
+     @login_required
+     def serve_frontend(path: str):
+         if path.startswith("api/"):
+             raise ApiError("Endpoint not found", status_code=404)
+ 
+         candidate = (frontend_root / path).resolve()
+         try:
+             candidate.relative_to(frontend_root)
+         except ValueError:
+             abort(404)
+ 
+         if candidate.is_file():
+             relative_path = candidate.relative_to(frontend_root)
+             return send_from_directory(frontend_root, relative_path.as_posix())
+ 
+         if index_path.exists():
+             return send_from_directory(frontend_root, index_path.name)
+ 
+         if (template_root / "index.html").exists():
+             return render_template("index.html")
+@@ -610,50 +686,73 @@ def _extract_keywords(glossary_path: Path) -> List[str]:
+     keywords: List[str] = []
+     for line in glossary_path.read_text(encoding="utf-8").splitlines():
+         cleaned = line.strip()
+         if not cleaned:
+             continue
+         keyword = cleaned.split("—", 1)[0].strip()
+         if keyword:
+             keywords.append(keyword)
+         if len(keywords) >= 6:
+             break
+     return keywords
+ 
+ 
+ def _load_pipeline_config(theme_dir: Path) -> Dict[str, Any]:
+     config_path = theme_dir / PIPELINE_CONFIG_FILENAME
+     if not config_path.exists():
+         return {}
+     try:
+         payload = json.loads(config_path.read_text(encoding="utf-8"))
+     except json.JSONDecodeError:
+         LOGGER.warning("Повреждён pipeline config: %s", config_path)
+         return {}
+     return payload if isinstance(payload, dict) else {}
+ 
+ 
++def _format_generation_success(result: Dict[str, Any]) -> Dict[str, Any]:
++    payload: Dict[str, Any] = {
++        "markdown": result.get("text"),
++        "meta_json": result.get("metadata"),
++        "artifact_paths": result.get("artifact_paths"),
++    }
++    metadata = result.get("metadata") or {}
++    if isinstance(metadata, dict):
++        if metadata.get("style_profile_applied"):
++            payload["style_profile_applied"] = True
++            if metadata.get("style_profile_source"):
++                payload["style_profile_source"] = metadata["style_profile_source"]
++            if metadata.get("style_profile_variant"):
++                payload["style_profile_variant"] = metadata["style_profile_variant"]
++        if metadata.get("keywords_manual") is not None:
++            payload["keywords_manual"] = metadata.get("keywords_manual")
++        payload["model_used"] = metadata.get("model_used")
++        payload["fallback_used"] = metadata.get("fallback_used")
++        payload["fallback_reason"] = metadata.get("fallback_reason")
++        payload["api_route"] = metadata.get("api_route")
++    return payload
++
++
+ def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[str, Any]:
+     topic = str(data.get("theme") or data.get("goal") or theme).strip() or "Тема не указана"
+     markdown = (
+         f"# Черновик (dry run)\n\n"
+         f"Тематика: {theme}\n\n"
+         f"Запрошенная тема: {topic}\n\n"
+         "Этот ответ сформирован без обращения к модели."
+     )
+     generated_at = datetime.utcnow().isoformat()
+     metadata: Dict[str, Any] = {
+         "model_used": "dry-run",
+         "characters": len(markdown),
+         "generated_at": generated_at,
+         "theme": theme,
+         "retrieval_k": k,
+         "input_data": data,
+         "clips": [],
+         "context_used": False,
+         "context_index_missing": False,
+         "context_budget_tokens_est": 0,
+         "context_budget_tokens_limit": 0,
+         "system_prompt_preview": "",
+         "user_prompt_preview": "",
+         "retry_used": False,
+         "plagiarism_detected": False,
+diff --git a/services/__init__.py b/services/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12e78ef468516ef20527bd8dbb560e5e86e764b0
+--- /dev/null
++++ b/services/__init__.py
+@@ -0,0 +1,14 @@
++"""Service layer utilities."""
++
++from .llm_client import OpenAIClient, RetryPolicy, get_default_client  # noqa: F401
++from .guardrails import parse_jsonld_or_repair  # noqa: F401
++from .rag_client import RAGClient, RAGResult  # noqa: F401
++
++__all__ = [
++    "OpenAIClient",
++    "RetryPolicy",
++    "get_default_client",
++    "parse_jsonld_or_repair",
++    "RAGClient",
++    "RAGResult",
++]
+diff --git a/services/guardrails.py b/services/guardrails.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c53de6999c0000509149c107c4ac73430cc126f8
+--- /dev/null
++++ b/services/guardrails.py
+@@ -0,0 +1,128 @@
++"""Post-generation guardrails and repair routines."""
++from __future__ import annotations
++
++import json
++import logging
++import re
++from typing import Dict, Iterable, List, Tuple
++
++LOGGER = logging.getLogger("content_factory.guardrails")
++
++_SCRIPT_RE = re.compile(r"<script[^>]*>(?P<body>.*?)</script>", re.DOTALL | re.IGNORECASE)
++
++
++def _strip_script_tag(payload: str) -> str:
++    match = _SCRIPT_RE.search(payload)
++    if not match:
++        return payload
++    return match.group("body").strip()
++
++
++def _normalize_json(candidate: str) -> str:
++    """Apply lightweight normalisation to improve JSON parsing odds."""
++
++    normalized = candidate.strip()
++    if not normalized:
++        return normalized
++    # Replace smart quotes and ensure standard quotes are used.
++    normalized = normalized.replace("\u201c", '"').replace("\u201d", '"')
++    normalized = normalized.replace("\u2018", '"').replace("\u2019", '"')
++    # Remove trailing commas before closing braces/brackets.
++    normalized = re.sub(r",\s*(\]|\})", r"\1", normalized)
++    return normalized
++
++
++def _extract_faq_entries(document: Dict[str, object]) -> List[Dict[str, str]]:
++    entities: Iterable[object] = []
++    if isinstance(document, dict):
++        if document.get("@type") == "FAQPage" and isinstance(document.get("mainEntity"), list):
++            entities = document.get("mainEntity", [])
++        elif isinstance(document.get("faq"), list):
++            entities = document.get("faq", [])
++    parsed: List[Dict[str, str]] = []
++    for entity in entities:
++        if not isinstance(entity, dict):
++            continue
++        if entity.get("@type") == "Question":
++            question = str(entity.get("name", "")).strip()
++            answer_block = entity.get("acceptedAnswer")
++            if isinstance(answer_block, dict):
++                answer_text = str(answer_block.get("text", "")).strip()
++            else:
++                answer_text = str(answer_block or "").strip()
++        else:
++            question = str(entity.get("question", "")).strip()
++            answer_text = str(entity.get("answer", "")).strip()
++        if question and answer_text:
++            parsed.append({"question": question, "answer": answer_text})
++    return parsed
++
++
++def parse_jsonld_or_repair(text: str) -> Tuple[List[Dict[str, str]], int, bool]:
++    """Parse FAQ JSON-LD, attempting repairs when needed."""
++
++    attempts = 0
++    degraded = False
++    if not text:
++        return [], attempts, degraded
++
++    candidates = [text, _strip_script_tag(text)]
++    normalized_candidates = []
++    for candidate in candidates:
++        normalized = _normalize_json(candidate)
++        if normalized and normalized not in normalized_candidates:
++            normalized_candidates.append(normalized)
++
++    for candidate in normalized_candidates:
++        attempts += 1
++        try:
++            document = json.loads(candidate)
++        except json.JSONDecodeError as exc:
++            LOGGER.debug("Failed to parse JSON-LD candidate: %s", exc)
++            continue
++        faq_entries = _extract_faq_entries(document)
++        if faq_entries:
++            return faq_entries, attempts, degraded
++
++    # Second pass: try to wrap bare arrays/objects into a FAQ schema.
++    for candidate in normalized_candidates:
++        attempts += 1
++        try:
++            document = json.loads(candidate)
++        except json.JSONDecodeError:
++            continue
++        if isinstance(document, list):
++            faq_entries = []
++            for idx, item in enumerate(document, start=1):
++                if isinstance(item, dict):
++                    question = str(item.get("q") or item.get("question") or "").strip()
++                    answer = str(item.get("a") or item.get("answer") or "").strip()
++                    if question and answer:
++                        faq_entries.append({"question": question, "answer": answer})
++                elif isinstance(item, (list, tuple)) and len(item) >= 2:
++                    question = str(item[0]).strip()
++                    answer = str(item[1]).strip()
++                    if question and answer:
++                        faq_entries.append({"question": question, "answer": answer})
++            if faq_entries:
++                degraded = True
++                return faq_entries, attempts, degraded
++        if isinstance(document, dict):
++            faq_field = document.get("faq")
++            if isinstance(faq_field, list):
++                repaired = []
++                for entry in faq_field:
++                    if not isinstance(entry, dict):
++                        continue
++                    question = str(entry.get("q") or entry.get("question") or "").strip()
++                    answer = str(entry.get("a") or entry.get("answer") or "").strip()
++                    if question and answer:
++                        repaired.append({"question": question, "answer": answer})
++                if repaired:
++                    degraded = True
++                    return repaired, attempts, degraded
++
++    # Parsing failed
++    degraded = True
++    LOGGER.warning("JSON-LD parsing failed after %d attempts", attempts)
++    return [], attempts, degraded
+diff --git a/services/llm_client.py b/services/llm_client.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9cef7fc9ebfbeb3b4025f579541e7f2a209295fc
+--- /dev/null
++++ b/services/llm_client.py
+@@ -0,0 +1,142 @@
++"""Unified OpenAI client facade with rate limiting and idempotency."""
++from __future__ import annotations
++
++import hashlib
++import json
++import random
++import threading
++import time
++from collections import deque
++from dataclasses import dataclass
++from typing import Dict, Iterable, List, Optional, Sequence
++
++from config import OPENAI_MAX_RETRIES, OPENAI_RPM, OPENAI_RPS, OPENAI_TIMEOUT_S
++from llm_client import GenerationResult, generate as _legacy_generate
++
++
++@dataclass
++class RetryPolicy:
++    max_retries: int = OPENAI_MAX_RETRIES
++    base_delay: float = 0.4
++    jitter: float = 0.3
++
++
++class _RateLimiter:
++    def __init__(self, *, rps: int, rpm: int) -> None:
++        self._rps = max(1, rps)
++        self._rpm = max(self._rps, rpm)
++        self._per_second: deque[float] = deque()
++        self._per_minute: deque[float] = deque()
++        self._lock = threading.Lock()
++
++    def acquire(self) -> None:
++        while True:
++            with self._lock:
++                now = time.monotonic()
++                self._trim(now)
++                if len(self._per_second) < self._rps and len(self._per_minute) < self._rpm:
++                    self._per_second.append(now)
++                    self._per_minute.append(now)
++                    return
++                wait_options: List[float] = []
++                if self._per_second:
++                    wait_options.append(1.0 - (now - self._per_second[0]))
++                if self._per_minute:
++                    wait_options.append(60.0 - (now - self._per_minute[0]))
++            delay = max(0.05, min(wait_options) if wait_options else 0.05)
++            time.sleep(delay)
++
++    def _trim(self, now: float) -> None:
++        while self._per_second and now - self._per_second[0] >= 1.0:
++            self._per_second.popleft()
++        while self._per_minute and now - self._per_minute[0] >= 60.0:
++            self._per_minute.popleft()
++
++
++class OpenAIClient:
++    """High-level facade delegating to the legacy generator with safeguards."""
++
++    def __init__(self) -> None:
++        self._limiter = _RateLimiter(rps=OPENAI_RPS, rpm=OPENAI_RPM)
++        self._cache: Dict[str, GenerationResult] = {}
++        self._lock = threading.Lock()
++
++    def _make_key(
++        self,
++        *,
++        system: str,
++        messages: Sequence[Dict[str, str]],
++        seed: Optional[str],
++        structure: Optional[Iterable[str]],
++    ) -> str:
++        payload = {
++            "system": system or "",
++            "messages": list(messages),
++            "seed": seed or "",
++            "structure": list(structure) if structure else [],
++        }
++        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
++        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
++
++    def generate(
++        self,
++        *,
++        system: str,
++        messages: Sequence[Dict[str, str]],
++        model: str = "gpt-5",
++        response_format: str = "text",
++        timeout: Optional[int] = None,
++        retry_policy: Optional[RetryPolicy] = None,
++        seed: Optional[str] = None,
++        structure: Optional[Iterable[str]] = None,
++        temperature: float = 0.3,
++        max_tokens: int = 1400,
++    ) -> GenerationResult:
++        policy = retry_policy or RetryPolicy()
++        key = self._make_key(system=system, messages=messages, seed=seed, structure=structure)
++        with self._lock:
++            cached = self._cache.get(key)
++        if cached:
++            return cached
++
++        full_messages: List[Dict[str, str]] = []
++        if system:
++            full_messages.append({"role": "system", "content": system})
++        full_messages.extend(dict(message) for message in messages)
++
++        attempts = 0
++        last_error: Optional[Exception] = None
++        while attempts <= policy.max_retries:
++            attempts += 1
++            self._limiter.acquire()
++            try:
++                result = _legacy_generate(
++                    full_messages,
++                    model=model,
++                    temperature=temperature,
++                    max_tokens=max_tokens,
++                    timeout_s=timeout or OPENAI_TIMEOUT_S,
++                )
++                with self._lock:
++                    self._cache[key] = result
++                return result
++            except Exception as exc:  # noqa: BLE001
++                last_error = exc
++                if attempts > policy.max_retries:
++                    break
++                delay = policy.base_delay * (2 ** (attempts - 1))
++                jitter = random.random() * policy.jitter
++                time.sleep(delay + jitter)
++        if last_error:
++            raise last_error
++        raise RuntimeError("OpenAI client failed without raising an error")
++
++
++_default_client = OpenAIClient()
++
++
++def get_default_client() -> OpenAIClient:
++    return _default_client
++
++
++__all__ = ["OpenAIClient", "RetryPolicy", "get_default_client"]
+diff --git a/services/rag_client.py b/services/rag_client.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd5e7ddd2a0738d321753f9b5a62216ea9ac7b0f
+--- /dev/null
++++ b/services/rag_client.py
+@@ -0,0 +1,45 @@
++"""Resilient retrieval helper wrapping the legacy index utilities."""
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass
++from typing import List, Sequence
++
++from assemble_messages import ContextBundle, retrieve_context
++
++LOGGER = logging.getLogger("content_factory.rag")
++
++
++@dataclass
++class RAGResult:
++    documents: Sequence[dict]
++    context_used: bool
++    warnings: List[str]
++
++
++class RAGClient:
++    """Best-effort RAG client that never interrupts the pipeline."""
++
++    def __init__(self, *, default_k: int = 3) -> None:
++        self._default_k = max(0, int(default_k))
++
++    def fetch(self, *, theme: str, query: str, k: int | None = None) -> RAGResult:
++        effective_k = self._default_k if k is None else max(0, int(k))
++        if effective_k == 0:
++            return RAGResult(documents=[], context_used=False, warnings=["retrieval_disabled"])
++        try:
++            bundle: ContextBundle = retrieve_context(theme_slug=theme, query=query, k=effective_k)
++        except FileNotFoundError:
++            LOGGER.warning("RAG index missing for theme=%s", theme)
++            return RAGResult(documents=[], context_used=False, warnings=["index_missing"])
++        except Exception as exc:  # noqa: BLE001
++            LOGGER.warning("RAG retrieval failed: %s", exc)
++            return RAGResult(documents=[], context_used=False, warnings=["retrieval_error"])
++
++        if not bundle.items:
++            LOGGER.info("RAG returned no documents", extra={"theme": theme})
++            return RAGResult(documents=[], context_used=False, warnings=["empty_result"])
++        return RAGResult(documents=bundle.items, context_used=bundle.context_used, warnings=[])
++
++
++__all__ = ["RAGClient", "RAGResult"]
 

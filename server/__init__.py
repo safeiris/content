@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import json
-import logging
 import mimetypes
 import os
 import secrets
+import uuid
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -18,6 +18,7 @@ from flask import (
     abort,
     flash,
     jsonify,
+    g,
     redirect,
     render_template,
     request,
@@ -30,12 +31,9 @@ from flask_cors import CORS
 from werkzeug.security import check_password_hash
 
 from assemble_messages import invalidate_style_profile_cache
-from config import DEFAULT_STRUCTURE
-from orchestrate import (
-    gather_health_status,
-    generate_article_from_payload,
-    make_generation_context,
-)
+from config import DEFAULT_STRUCTURE, OPENAI_RPM, OPENAI_RPS
+from jobs import JobRunner, JobStatus, JobStore
+from orchestrate import gather_health_status, make_generation_context
 from retrieval import build_index
 from artifacts_store import (
     cleanup_index as cleanup_artifact_index,
@@ -43,13 +41,16 @@ from artifacts_store import (
     list_artifacts as list_artifact_cards,
     resolve_artifact_path,
 )
+from observability.logger import bind_trace_id, clear_trace_id, get_logger
 
 load_dotenv()
 
-LOGGER = logging.getLogger("content_factory.api")
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
+LOGGER = get_logger("content_factory.api")
 
 PIPELINE_CONFIG_FILENAME = "pipeline.json"
+
+JOB_STORE = JobStore(ttl_seconds=3600)
+JOB_RUNNER = JobRunner(JOB_STORE)
 
 USERS: Dict[str, Dict[str, str]] = {
     "admin": {
@@ -111,6 +112,24 @@ def create_app() -> Flask:
 
     index_path = frontend_root / "index.html"
 
+    @app.before_request
+    def _bind_request_trace() -> None:
+        trace_id = request.headers.get("X-Trace-Id") or uuid.uuid4().hex
+        g.trace_id = trace_id
+        bind_trace_id(trace_id)
+
+    @app.after_request
+    def _append_trace(response):  # type: ignore[override]
+        trace_id = getattr(g, "trace_id", None)
+        if trace_id:
+            response.headers.setdefault("X-Trace-Id", trace_id)
+        clear_trace_id()
+        return response
+
+    @app.teardown_request
+    def _teardown_trace(_exc):  # type: ignore[override]
+        clear_trace_id()
+
     @app.context_processor
     def inject_current_user():
         username = session.get("user")
@@ -121,13 +140,36 @@ def create_app() -> Flask:
 
     @app.errorhandler(ApiError)
     def _handle_api_error(exc: ApiError):  # type: ignore[override]
-        LOGGER.warning("API error: %s", exc.message)
-        return jsonify({"error": exc.message}), exc.status_code
+        LOGGER.warning("API error", extra={"message": exc.message, "code": exc.status_code})
+        trace_id = getattr(g, "trace_id", None)
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": exc.message,
+                        "code": exc.status_code,
+                        "trace_id": trace_id,
+                    }
+                }
+            ),
+            exc.status_code,
+        )
 
     @app.errorhandler(Exception)
     def _handle_generic_error(exc: Exception):  # type: ignore[override]
         LOGGER.exception("Unhandled error")
-        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
+        trace_id = getattr(g, "trace_id", None)
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Внутренняя ошибка сервера",
+                        "trace_id": trace_id,
+                    }
+                }
+            ),
+            500,
+        )
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
@@ -293,51 +335,76 @@ def create_app() -> Flask:
         temperature = _safe_float(payload.get("temperature", 0.3), default=0.3)
         temperature = max(0.0, min(2.0, temperature))
         max_tokens = max(1, _safe_int(payload.get("max_tokens", 1400), default=1400))
-
-        try:
-            result = generate_article_from_payload(
-                theme=theme,
-                data=raw_data,
-                k=k,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                append_style_profile=style_profile_override,
-                context_source=context_source,
-                context_text=context_text,
-                context_filename=context_filename,
-            )
-        except ApiError:
-            raise
-        except RuntimeError as exc:
-            status_code = getattr(exc, "status_code", 503)
-            raise ApiError(str(exc), status_code=status_code)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Generation failed")
-            raise ApiError("Не удалось завершить генерацию", status_code=500) from exc
-
-        response_payload: Dict[str, Any] = {
-            "markdown": result["text"],
-            "meta_json": result["metadata"],
-            "artifact_paths": result["artifact_paths"],
+        task_payload = {
+            "theme": theme,
+            "data": raw_data,
+            "k": k,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "append_style_profile": style_profile_override,
+            "context_source": context_source,
+            "context_text": context_text,
+            "context_filename": context_filename,
         }
 
-        metadata = result.get("metadata") or {}
-        if isinstance(metadata, dict) and metadata.get("style_profile_applied"):
-            response_payload["style_profile_applied"] = True
-            if metadata.get("style_profile_source"):
-                response_payload["style_profile_source"] = metadata["style_profile_source"]
-            if metadata.get("style_profile_variant"):
-                response_payload["style_profile_variant"] = metadata["style_profile_variant"]
-        if isinstance(metadata, dict) and metadata.get("keywords_manual") is not None:
-            response_payload["keywords_manual"] = metadata.get("keywords_manual")
-        if isinstance(metadata, dict):
-            response_payload["model_used"] = metadata.get("model_used")
-            response_payload["fallback_used"] = metadata.get("fallback_used")
-            response_payload["fallback_reason"] = metadata.get("fallback_reason")
-            response_payload["api_route"] = metadata.get("api_route")
+        job = JOB_RUNNER.submit(task_payload)
+        sync_raw = payload.get("sync", request.args.get("sync"))
+        sync_requested = str(sync_raw).lower() in {"1", "true", "yes"}
 
-        return jsonify(response_payload)
+        if sync_requested:
+            finished = JOB_RUNNER.wait(job.id, timeout=JOB_RUNNER.soft_timeout())
+            snapshot = JOB_RUNNER.get_job(job.id)
+            if finished and snapshot:
+                status = snapshot.get("status")
+                if status == JobStatus.SUCCEEDED.value and snapshot.get("result"):
+                    response_payload = _format_generation_success(snapshot["result"])
+                    response_payload["job_id"] = job.id
+                    response_payload["degradation_flags"] = snapshot.get("degradation_flags")
+                    return jsonify(response_payload)
+                if status == JobStatus.FAILED.value:
+                    trace_id = getattr(g, "trace_id", None)
+                    return (
+                        jsonify(
+                            {
+                                "error": {
+                                    "message": snapshot.get("error") or "Generation failed",
+                                    "trace_id": trace_id,
+                                },
+                                "job_id": job.id,
+                                "status": status,
+                            }
+                        ),
+                        500,
+                    )
+
+        snapshot = JOB_RUNNER.get_job(job.id) or job.to_dict()
+        response_payload = {
+            "job_id": job.id,
+            "status": snapshot.get("status", JobStatus.PENDING.value),
+            "steps": snapshot.get("steps"),
+            "result": snapshot.get("result"),
+            "degradation_flags": snapshot.get("degradation_flags"),
+        }
+        return jsonify(response_payload), 202
+
+    @app.get("/api/jobs/<job_id>")
+    def job_status(job_id: str):
+        snapshot = JOB_RUNNER.get_job(job_id)
+        if not snapshot:
+            trace_id = getattr(g, "trace_id", None)
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "Job not found",
+                            "trace_id": trace_id,
+                        }
+                    }
+                ),
+                404,
+            )
+        return jsonify(snapshot)
 
     @app.post("/api/reindex")
     def reindex():
@@ -417,6 +484,15 @@ def create_app() -> Flask:
     def health():
         theme = request.args.get("theme")
         status = gather_health_status(theme)
+        checks = status.setdefault("checks", {})
+        checks["openai_rate_limits"] = {
+            "ok": True,
+            "message": f"Лимиты клиента активны: {OPENAI_RPS} rps / {OPENAI_RPM} rpm",
+        }
+        checks["job_runner"] = {
+            "ok": True,
+            "message": f"Очередь заданий: {len(JOB_STORE)}; soft timeout={JOB_RUNNER.soft_timeout()}s",
+        }
         http_status = 200 if status.get("ok") else 503
         return jsonify(status), http_status
 
@@ -630,6 +706,29 @@ def _load_pipeline_config(theme_dir: Path) -> Dict[str, Any]:
         LOGGER.warning("Повреждён pipeline config: %s", config_path)
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _format_generation_success(result: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "markdown": result.get("text"),
+        "meta_json": result.get("metadata"),
+        "artifact_paths": result.get("artifact_paths"),
+    }
+    metadata = result.get("metadata") or {}
+    if isinstance(metadata, dict):
+        if metadata.get("style_profile_applied"):
+            payload["style_profile_applied"] = True
+            if metadata.get("style_profile_source"):
+                payload["style_profile_source"] = metadata["style_profile_source"]
+            if metadata.get("style_profile_variant"):
+                payload["style_profile_variant"] = metadata["style_profile_variant"]
+        if metadata.get("keywords_manual") is not None:
+            payload["keywords_manual"] = metadata.get("keywords_manual")
+        payload["model_used"] = metadata.get("model_used")
+        payload["fallback_used"] = metadata.get("fallback_used")
+        payload["fallback_reason"] = metadata.get("fallback_reason")
+        payload["api_route"] = metadata.get("api_route")
+    return payload
 
 
 def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[str, Any]:
