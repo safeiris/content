@@ -169,7 +169,6 @@ def test_generate_retries_with_min_token_bump(monkeypatch):
         result = generate(
             messages=[{"role": "user", "content": "ping"}],
             model="gpt-5",
-            temperature=0.0,
             max_tokens=8,
         )
 
@@ -209,8 +208,7 @@ def test_generate_retries_on_missing_format_name(monkeypatch):
     ) as mock_logger:
         result = generate(
             messages=[{"role": "user", "content": "ping"}],
-            model="gpt-5", 
-            temperature=0.0,
+            model="gpt-5",
             max_tokens=64,
         )
 

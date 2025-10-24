@@ -53,8 +53,6 @@ const titleInput = document.getElementById("title-input");
 const audienceInput = document.getElementById("audience-input");
 const goalInput = document.getElementById("goal-input");
 const kInput = document.getElementById("k-input");
-const temperatureInput = document.getElementById("temperature-input");
-const temperatureHint = document.querySelector('[data-role="temperature-hint"]');
 const maxTokensInput = document.getElementById("max-tokens-input");
 const modelInput = document.getElementById("model-input");
 const includeFaq = document.getElementById("include-faq");
@@ -195,7 +193,6 @@ if (!devActionsConfig.show && advancedSupportSection) {
 const interactiveElements = [
   generateBtn,
   kInput,
-  temperatureInput,
   maxTokensInput,
   modelInput,
 ];
@@ -221,7 +218,7 @@ if (retryBtn) {
   retryBtn.addEventListener("click", handleRetryClick);
 }
 if (modelInput) {
-  modelInput.addEventListener("change", () => updateTemperatureControlState(modelInput.value));
+  modelInput.value = "gpt-5";
 }
 if (styleProfileSelect) {
   styleProfileSelect.addEventListener("change", handleStyleProfileChange);
@@ -273,7 +270,6 @@ if (clearLogBtn) {
 }
 
 setupAdvancedSettings();
-updateTemperatureControlState(modelInput?.value);
 handleStyleProfileChange();
 handleFaqToggle();
 handleContextSourceChange();
@@ -1014,23 +1010,6 @@ function inlineFormat(text) {
     .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
-function isTemperatureLocked(modelValue) {
-  return typeof modelValue === "string" && modelValue.toLowerCase().includes("gpt-5");
-}
-
-function updateTemperatureControlState(modelValue) {
-  const locked = isTemperatureLocked(modelValue);
-  if (temperatureInput) {
-    temperatureInput.disabled = locked;
-    if (locked) {
-      temperatureInput.value = "0.3";
-    }
-  }
-  if (temperatureHint) {
-    temperatureHint.hidden = !locked;
-  }
-}
-
 function applyStructurePreset(presetKey) {
   if (presetKey === "custom") {
     return;
@@ -1052,9 +1031,8 @@ function applyPipeDefaults(pipeId) {
   if (!goalInput.value) {
     goalInput.value = "SEO-статья";
   }
-  if (modelInput && !modelInput.value && pipe.default_model) {
-    modelInput.value = pipe.default_model;
-    updateTemperatureControlState(pipe.default_model);
+  if (modelInput) {
+    modelInput.value = "gpt-5";
   }
 }
 
@@ -1107,7 +1085,6 @@ async function handleGenerate(event) {
       data: payload.data,
       k: payload.k,
       model: requestModel,
-      temperature: payload.temperature,
       max_tokens: payload.maxTokens,
       context_source: payload.context_source,
       keywords: Array.isArray(payload.data?.keywords) ? payload.data.keywords : [],
@@ -1417,32 +1394,9 @@ function buildRequestPayload() {
     delete data.context_filename;
   }
 
-  let model = (modelInput?.value || "").trim();
-  if (!model) {
-    const pipeDefaults = state.pipes.get(theme);
-    if (pipeDefaults?.default_model) {
-      model = pipeDefaults.default_model;
-      if (modelInput) {
-        modelInput.value = model;
-      }
-    }
-  }
-  const temperatureLocked = isTemperatureLocked(model);
-  let temperature;
-  if (temperatureLocked) {
-    temperature = undefined;
-    if (temperatureInput) {
-      temperatureInput.value = "0.3";
-    }
-  } else {
-    const temperatureValue = String(temperatureInput?.value ?? "").trim();
-    temperature = temperatureValue === "" ? 0.3 : Number.parseFloat(temperatureValue);
-    if (Number.isNaN(temperature) || temperature < 0 || temperature > 1) {
-      throw new Error("Temperature должна быть числом от 0 до 1");
-    }
-    if (temperatureInput) {
-      temperatureInput.value = String(temperature);
-    }
+  const model = "gpt-5";
+  if (modelInput) {
+    modelInput.value = model;
   }
 
   const maxTokensValue = String(maxTokensInput?.value ?? "").trim();
@@ -1458,7 +1412,6 @@ function buildRequestPayload() {
     theme,
     data,
     k,
-    temperature: temperatureLocked ? undefined : temperature,
     maxTokens,
     model: model || undefined,
     context_source: contextSource,

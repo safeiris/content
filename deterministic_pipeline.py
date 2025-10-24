@@ -20,7 +20,7 @@ from config import (
     SKELETON_FAQ_BATCH,
     TAIL_FILL_MAX_TOKENS,
 )
-from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
+from llm_client import GenerationResult, generate as llm_generate
 from faq_builder import _normalize_entry
 from keyword_injector import (
     KeywordInjectionResult,
@@ -229,7 +229,6 @@ class DeterministicPipeline:
         max_chars: int,
         messages: Sequence[Dict[str, object]],
         model: str,
-        temperature: float,
         max_tokens: int,
         timeout_s: int,
         backoff_schedule: Optional[List[float]] = None,
@@ -248,7 +247,6 @@ class DeterministicPipeline:
         self.max_chars = int(max_chars)
         self.messages = [dict(message) for message in messages]
         self.model = str(model).strip()
-        self.temperature = float(temperature)
         self.max_tokens = int(max_tokens) if max_tokens else 0
         self.timeout_s = int(timeout_s)
         self.backoff_schedule = list(backoff_schedule) if backoff_schedule else None
@@ -391,7 +389,6 @@ class DeterministicPipeline:
                 result = llm_generate(
                     list(messages),
                     model=model_to_use,
-                    temperature=self.temperature,
                     max_tokens=limit,
                     timeout_s=self.timeout_s,
                     backoff_schedule=self.backoff_schedule,

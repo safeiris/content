@@ -28,19 +28,21 @@ from config import (
     G5_MAX_OUTPUT_TOKENS_STEP2,
     G5_POLL_INTERVALS,
     G5_POLL_MAX_ATTEMPTS,
+    G5_ESCALATION_LADDER,
+    LLM_ALLOW_FALLBACK,
+    LLM_MODEL,
+    LLM_ROUTE,
 )
 
 
-DEFAULT_MODEL = "gpt-5"
-MAX_RETRIES = 3
-BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
-FALLBACK_MODEL = DEFAULT_MODEL
+DEFAULT_MODEL = LLM_MODEL
+MAX_RETRIES = 5
+BACKOFF_SCHEDULE = [1.0, 2.0, 4.0, 6.0, 8.0]
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 RESPONSES_ALLOWED_KEYS = (
     "model",
     "input",
     "max_output_tokens",
-    "temperature",
     "text",
     "previous_response_id",
 )
@@ -52,15 +54,6 @@ MAX_RESPONSES_POLL_ATTEMPTS = (
 if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
-
-
-def _supports_temperature(model: str) -> bool:
-    """Return True if the target model accepts the temperature parameter."""
-
-    model_name = (model or "").strip().lower()
-    return not model_name.startswith("gpt-5")
-
-
 def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
     """Detect the specific 400 error about max_output_tokens being too small."""
 
@@ -219,7 +212,7 @@ class GenerationResult:
     retry_used: bool
     fallback_used: Optional[str]
     fallback_reason: Optional[str] = None
-    api_route: str = "chat"
+    api_route: str = LLM_ROUTE
     schema: str = "none"
     metadata: Optional[Dict[str, object]] = None
 
@@ -304,8 +297,6 @@ def build_responses_payload(
     }
     if previous_response_id and previous_response_id.strip():
         payload["previous_response_id"] = previous_response_id.strip()
-    if _supports_temperature(model):
-        payload["temperature"] = 0.3
     return payload
 
 
@@ -574,12 +565,6 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
         if key == "max_output_tokens":
             try:
                 sanitized[key] = int(value)
-            except (TypeError, ValueError):
-                continue
-            continue
-        if key == "temperature":
-            try:
-                sanitized[key] = float(value)
             except (TypeError, ValueError):
                 continue
             continue
@@ -914,7 +899,8 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
     parse_flags: Dict[str, object] = {}
 
     resp_keys = sorted(str(key) for key in data.keys())
-    parse_flags["resp_keys"] = resp_keys
+    filtered_resp_keys = [key for key in resp_keys if key != "temperature"]
+    parse_flags["resp_keys"] = filtered_resp_keys
 
     output_text_raw = data.get("output_text")
     if isinstance(output_text_raw, str):
@@ -984,7 +970,7 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
     )
     LOGGER.info(
         "responses parse resp_keys=%s root=%s segments=%d schema=%s",
-        resp_keys,
+        filtered_resp_keys,
         root_used,
         parse_flags.get("segments", 0),
         schema_label,
@@ -997,9 +983,14 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
 
 
 def _resolve_model_name(model: Optional[str]) -> str:
-    env_model = os.getenv("LLM_MODEL")
-    candidate = (model or env_model or DEFAULT_MODEL).strip()
-    return candidate or DEFAULT_MODEL
+    requested = (model or "").strip()
+    if requested and requested != DEFAULT_MODEL:
+        LOGGER.warning(
+            "model override '%s' ignored; using %s",
+            requested,
+            DEFAULT_MODEL,
+        )
+    return DEFAULT_MODEL
 
 
 def _resolve_provider(model_name: str) -> str:
@@ -1128,30 +1119,6 @@ def _should_retry(exc: BaseException) -> bool:
         return True
     if isinstance(exc, httpx.TransportError):
         return True
-    return False
-
-
-def _is_responses_fallback_allowed(exc: BaseException) -> bool:
-    inspected: List[BaseException] = []
-    current: Optional[BaseException] = exc
-    while current is not None and current not in inspected:
-        inspected.append(current)
-        if isinstance(current, (httpx.TimeoutException, httpx.TransportError)):
-            return True
-        if isinstance(current, httpx.HTTPStatusError):
-            response = current.response
-            status = response.status_code if response is not None else None
-            if getattr(current, "responses_no_fallback", False):
-                return False
-            if status and status >= 500:
-                return True
-            if status in {408, 409, 425, 429}:
-                return True
-            if status == 400 and response is not None:
-                message = _extract_error_message(response).lower()
-                if "text.format" in message or "max_output_tokens" in message:
-                    return False
-        current = getattr(current, "__cause__", None)
     return False
 
 
@@ -1329,7 +1296,6 @@ def generate(
     messages: List[Dict[str, str]],
     *,
     model: Optional[str] = None,
-    temperature: float = 0.3,
     max_tokens: int = 1400,
     timeout_s: int = 60,
     backoff_schedule: Optional[List[float]] = None,
@@ -1353,8 +1319,14 @@ def generate(
         timeout_value = float(raw_timeout)
     except (TypeError, ValueError):
         timeout_value = 60.0
-    effective_timeout = min(max(timeout_value, 1.0), 25.0)
-    timeout = httpx.Timeout(effective_timeout)
+    effective_timeout = min(max(timeout_value, 1.0), 90.0)
+    timeout = httpx.Timeout(
+        timeout=effective_timeout,
+        connect=min(15.0, effective_timeout),
+        read=effective_timeout,
+        write=effective_timeout,
+        pool=None,
+    )
     http_client = httpx.Client(timeout=timeout)
 
     schedule = _resolve_backoff_schedule(backoff_schedule)
@@ -1386,43 +1358,6 @@ def generate(
                 gpt5_messages_cache = _augment_gpt5_messages(messages)
             return gpt5_messages_cache
         return messages
-
-    def _prepare_chat_payload(target_model: str) -> Dict[str, object]:
-        payload_messages = _messages_for_model(target_model)
-        payload: Dict[str, object] = {
-            "model": target_model,
-            "messages": payload_messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        if "tools" not in payload:
-            LOGGER.info("chat payload: tool_choice omitted (no tools)")
-        LOGGER.info("openai payload blueprint: %s", _summarize_payload(payload))
-        return payload
-
-    def _call_chat_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
-        nonlocal retry_used
-        payload = _prepare_chat_payload(target_model)
-        LOGGER.info("dispatch route=chat model=%s", target_model)
-        data, shimmed = _make_request(
-            http_client,
-            api_url=api_url,
-            headers=headers,
-            payload=payload,
-            schedule=schedule,
-        )
-        if shimmed:
-            retry_used = True
-        text, parse_flags, schema_label = _extract_response_text(data)
-        if not text:
-            LOGGER.warning("Пустой ответ модели %s (schema=%s)", target_model, schema_label)
-            raise EmptyCompletionError(
-                "Модель вернула пустой ответ",
-                raw_response=data,
-                parse_flags=parse_flags,
-            )
-        _persist_raw_response(data)
-        return text, parse_flags, data, schema_label
 
     def _call_responses_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
         nonlocal retry_used
@@ -1552,24 +1487,8 @@ def generate(
             upper_cap if upper_cap is not None else "-",
         )
 
-        temperature_ignored = False
-        supports_temperature = _supports_temperature(target_model)
-        if supports_temperature:
-            raw_temperature = sanitized_payload.get("temperature", temperature)
-            if raw_temperature is None:
-                raw_temperature = 0.3
-            try:
-                sanitized_payload["temperature"] = float(raw_temperature)
-            except (TypeError, ValueError):
-                sanitized_payload["temperature"] = 0.3
-        else:
-            temperature_ignored = True
-            if "temperature" in sanitized_payload:
-                sanitized_payload.pop("temperature", None)
-            LOGGER.info(
-                "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
-                target_model,
-            )
+        if "temperature" in sanitized_payload:
+            sanitized_payload.pop("temperature", None)
 
         def _log_payload(snapshot: Dict[str, object]) -> None:
             keys = sorted(snapshot.keys())
@@ -1645,8 +1564,11 @@ def generate(
                 "previous_response_id": prev_response_id,
                 "finish_reason": finish_reason,
             }
-            if temperature_ignored:
-                metadata["temperature_ignored"] = True
+            metadata["model_effective"] = target_model
+            metadata["api_route"] = LLM_ROUTE
+            metadata["allow_fallback"] = LLM_ALLOW_FALLBACK
+            metadata["temperature_applied"] = False
+            metadata["escalation_caps"] = list(G5_ESCALATION_LADDER)
             return metadata
 
         attempts = 0
@@ -1670,25 +1592,21 @@ def generate(
 
         def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
             ladder: List[int] = []
-            for value in (
-                G5_MAX_OUTPUT_TOKENS_STEP1,
-                G5_MAX_OUTPUT_TOKENS_STEP2,
-                G5_MAX_OUTPUT_TOKENS_MAX,
-            ):
+            for value in G5_ESCALATION_LADDER:
                 try:
                     normalized = int(value)
                 except (TypeError, ValueError):
                     continue
                 if normalized <= 0:
                     continue
-                ladder.append(normalized)
-            ladder = sorted(dict.fromkeys(ladder))
+                if normalized not in ladder:
+                    ladder.append(normalized)
             for target in ladder:
                 if target > current:
                     return target if cap is None else min(target, cap)
             if cap is not None and cap > current:
                 return int(cap)
-            return current + 200
+            return current
 
         def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
             poll_attempt = 0
@@ -2081,8 +1999,6 @@ def generate(
     is_gpt5_model = lower_model.startswith("gpt-5")
 
     retry_used = False
-    fallback_used: Optional[str] = None
-    fallback_reason: Optional[str] = None
 
     try:
         if is_gpt5_model:
@@ -2118,14 +2034,14 @@ def generate(
                     retry_used=retry_used,
                     fallback_used=None,
                     fallback_reason=None,
-                    api_route="responses",
+                    api_route=LLM_ROUTE,
                     schema=schema_category,
                     metadata=metadata_block,
                 )
             except EmptyCompletionError as responses_empty:
                 _persist_raw_response(responses_empty.raw_response)
                 _log_parse_chain(responses_empty.parse_flags, retry=0, fallback="responses")
-                LOGGER.warning(
+                LOGGER.error(
                     "empty completion from Responses API %s (schema=%s)",
                     model_name,
                     responses_empty.parse_flags.get("schema", "unknown"),
@@ -2138,17 +2054,21 @@ def generate(
                 diagnostics["segments"] = parse_flags.get("segments")
                 metadata_block = parse_flags.get("metadata")
                 if isinstance(metadata_block, dict):
-                    diagnostics["status"] = metadata_block.get("status")
-                    diagnostics["incomplete_reason"] = metadata_block.get("incomplete_reason")
-                    diagnostics["usage_output_tokens"] = metadata_block.get("usage_output_tokens")
-                    diagnostics["finish_reason"] = metadata_block.get("finish_reason")
-                    diagnostics["previous_response_id"] = metadata_block.get("previous_response_id")
+                    diagnostics.update(
+                        {
+                            "status": metadata_block.get("status"),
+                            "incomplete_reason": metadata_block.get("incomplete_reason"),
+                            "usage_output_tokens": metadata_block.get("usage_output_tokens"),
+                            "finish_reason": metadata_block.get("finish_reason"),
+                            "previous_response_id": metadata_block.get("previous_response_id"),
+                        }
+                    )
                 response_id = responses_empty.raw_response.get("id")
                 if isinstance(response_id, str) and response_id.strip():
                     diagnostics["response_id"] = response_id.strip()
                 if FORCE_MODEL:
                     raise _build_force_model_error("responses_empty", diagnostics) from responses_empty
-                fallback_reason = "empty_completion_gpt5_responses"
+                raise RuntimeError("GPT-5 вернул пустой ответ после эскалации") from responses_empty
             except Exception as responses_error:  # noqa: BLE001
                 LOGGER.warning("Responses API call failed: %s", responses_error)
                 if FORCE_MODEL:
@@ -2174,62 +2094,8 @@ def generate(
                                     error_details["error_type"] = error_block.get("type")
                                     error_details["error_message"] = error_block.get("message")
                     raise _build_force_model_error("responses_error", error_details) from responses_error
-                if not _is_responses_fallback_allowed(responses_error):
-                    raise
-                fallback_reason = "api_error_gpt5_responses"
-            fallback_used = model_name
-            LOGGER.warning(
-                "switching route to chat for model %s (reason=%s)",
-                fallback_used,
-                fallback_reason,
-            )
-            text, parse_flags_fallback, _, schema_fallback = _call_chat_model(fallback_used)
-            schema_category = _categorize_schema(parse_flags_fallback)
-            LOGGER.info(
-                "fallback completion schema category=%s (schema=%s, route=chat)",
-                schema_category,
-                schema_fallback,
-            )
-            metadata_block = None
-            if isinstance(parse_flags_fallback, dict):
-                meta_candidate = parse_flags_fallback.get("metadata")
-                if isinstance(meta_candidate, dict):
-                    metadata_block = dict(meta_candidate)
-            if fallback_reason == "empty_completion_gpt5_responses":
-                retry_used = False
-            return GenerationResult(
-                text=text,
-                model_used=fallback_used,
-                retry_used=retry_used,
-                fallback_used=fallback_used,
-                fallback_reason=fallback_reason,
-                api_route="chat",
-                schema=schema_category,
-                metadata=metadata_block,
-            )
-
-        text, parse_flags_initial, _, schema_initial_call = _call_chat_model(model_name)
-        schema_category = _categorize_schema(parse_flags_initial)
-        LOGGER.info(
-            "completion schema category=%s (schema=%s, route=chat)",
-            schema_category,
-            schema_initial_call,
-        )
-        metadata_block = None
-        if isinstance(parse_flags_initial, dict):
-            meta_candidate = parse_flags_initial.get("metadata")
-            if isinstance(meta_candidate, dict):
-                metadata_block = dict(meta_candidate)
-        return GenerationResult(
-            text=text,
-            model_used=model_name,
-            retry_used=False,
-            fallback_used=None,
-            fallback_reason=None,
-            api_route="chat",
-            schema=schema_category,
-            metadata=metadata_block,
-        )
+                raise
+        raise RuntimeError(f"Поддерживается только модель {LLM_MODEL.upper()} для маршрута {LLM_ROUTE}")
     finally:
         http_client.close()
 

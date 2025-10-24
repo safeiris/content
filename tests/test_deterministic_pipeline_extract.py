@@ -3,6 +3,7 @@ from deterministic_pipeline import (
     SkeletonBatchKind,
     SkeletonBatchPlan,
 )
+from config import LLM_ROUTE
 from llm_client import GenerationResult
 
 
@@ -15,7 +16,6 @@ def make_pipeline() -> DeterministicPipeline:
         max_chars=2000,
         messages=[{"role": "system", "content": "Ты модель"}],
         model="stub-model",
-        temperature=0.1,
         max_tokens=500,
         timeout_s=30,
     )
@@ -64,7 +64,7 @@ def test_run_skeleton_uses_placeholder_when_cap(monkeypatch):
             retry_used=False,
             fallback_used=None,
             fallback_reason=None,
-            api_route="responses",
+            api_route=LLM_ROUTE,
             schema="json",
             metadata={"status": "incomplete", "incomplete_reason": "max_output_tokens"},
         )

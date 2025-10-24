@@ -42,7 +42,14 @@ OPENAI_RPS = max(1, _env_int("OPENAI_RPS", 2))
 OPENAI_RPM = max(OPENAI_RPS, _env_int("OPENAI_RPM", 60))
 OPENAI_CACHE_TTL_S = max(1, _env_int("OPENAI_CACHE_TTL_S", 30))
 OPENAI_CLIENT_MAX_QUEUE = max(1, _env_int("OPENAI_CLIENT_MAX_QUEUE", 16))
-OPENAI_MODEL = str(os.getenv("OPENAI_MODEL", "gpt-5")).strip() or "gpt-5"
+LLM_MODEL = "gpt-5"
+LLM_ROUTE = "responses"
+LLM_ALLOW_FALLBACK = False
+
+# Исторически OPENAI_MODEL можно было переопределить через окружение, но после
+# перехода на Responses и GPT-5 фиксируем его жёстко, чтобы не допустить
+# расхождений между фронтом и бэкендом.
+OPENAI_MODEL = LLM_MODEL
 
 JOB_SOFT_TIMEOUT_S = max(1, _env_int("JOB_SOFT_TIMEOUT_S", 20))
 JOB_STORE_TTL_S = max(JOB_SOFT_TIMEOUT_S, _env_int("JOB_STORE_TTL_S", 900))
@@ -57,10 +64,15 @@ _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "fa
 FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
 
 # GPT-5 Responses tuning
-G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 950)
-G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 1200)
-G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 1500)
+G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1780)
+G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2670)
+G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 3600)
 G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3600)
+G5_ESCALATION_LADDER = (
+    G5_MAX_OUTPUT_TOKENS_BASE,
+    G5_MAX_OUTPUT_TOKENS_STEP1,
+    G5_MAX_OUTPUT_TOKENS_STEP2,
+)
 _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
 G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
 G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))

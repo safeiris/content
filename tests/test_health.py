@@ -9,6 +9,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import orchestrate
+from config import LLM_ALLOW_FALLBACK, LLM_ROUTE
 
 
 class DummyHealthClient:
@@ -72,8 +73,8 @@ def test_health_ping_success(monkeypatch):
     result = orchestrate._run_health_ping()
 
     assert result["ok"] is True
-    assert result["route"] == "responses"
-    assert result["fallback_used"] is False
+    assert result["route"] == LLM_ROUTE
+    assert result["fallback_used"] is LLM_ALLOW_FALLBACK
     expected_label = f"Responses OK (gpt-5, {orchestrate.HEALTH_INITIAL_MAX_TOKENS} токена)"
     assert expected_label in result["message"]
 

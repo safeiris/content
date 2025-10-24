@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from config import LLM_ALLOW_FALLBACK, LLM_ROUTE
 from deterministic_pipeline import DeterministicPipeline, PipelineStep
 from faq_builder import build_faq_block
 from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
@@ -256,7 +257,6 @@ def test_pipeline_produces_valid_article(monkeypatch):
         max_chars=6000,
         messages=[{"role": "system", "content": "Системный промпт"}],
         model="stub-model",
-        temperature=0.3,
         max_tokens=1800,
         timeout_s=60,
     )
@@ -279,7 +279,6 @@ def test_pipeline_resume_falls_back_to_available_checkpoint(monkeypatch):
         max_chars=6000,
         messages=[{"role": "system", "content": "Системный промпт"}],
         model="stub-model",
-        temperature=0.3,
         max_tokens=1800,
         timeout_s=60,
     )
@@ -304,7 +303,12 @@ def test_generate_article_returns_metadata(monkeypatch, tmp_path):
     }
     monkeypatch.setattr(
         "orchestrate._run_health_ping",
-        lambda: {"ok": True, "message": "stub", "route": "responses", "fallback_used": False},
+        lambda: {
+            "ok": True,
+            "message": "stub",
+            "route": LLM_ROUTE,
+            "fallback_used": LLM_ALLOW_FALLBACK,
+        },
     )
     result = generate_article_from_payload(
         theme="finance",
@@ -328,6 +332,6 @@ def test_gather_health_status_handles_missing_theme(monkeypatch):
     assert not status["ok"]
     assert not status["checks"]["theme_index"]["ok"]
     llm_ping = status["checks"]["llm_ping"]
-    assert llm_ping["route"] == "responses"
-    assert llm_ping["fallback_used"] is False
+    assert llm_ping["route"] == LLM_ROUTE
+    assert llm_ping["fallback_used"] is LLM_ALLOW_FALLBACK
     assert not llm_ping["ok"]

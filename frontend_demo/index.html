@@ -194,29 +194,10 @@
                           <label class="field-label" for="model-input">
                             <span>Модель</span>
                           </label>
-                          <select id="model-input">
-                            <option value="gpt-5" selected>GPT-5 — OpenAI (по умолчанию)</option>
-                            <option value="gpt-4o">GPT-4o — OpenAI</option>
-                            <option value="gpt-4o-mini">GPT-4o-mini — OpenAI</option>
+                          <select id="model-input" disabled>
+                            <option value="gpt-5" selected>GPT-5 — OpenAI (фиксировано)</option>
                           </select>
-                          <p class="field-hint">Выберите модель для генерации.</p>
-                        </div>
-                        <div class="form-row">
-                          <label class="field-label" for="temperature-input">
-                            <span>Temperature</span>
-                            <span
-                              class="info-icon"
-                              tabindex="0"
-                              role="img"
-                              aria-label="0.2–0.5 — стабильнее"
-                              title="0.2–0.5 — стабильнее"
-                              >🛈</span
-                            >
-                          </label>
-                          <input id="temperature-input" type="number" min="0" max="1" step="0.1" value="0.3" />
-                          <p class="field-hint" data-role="temperature-hint" hidden>
-                            Для GPT-5 температура фиксирована и не настраивается.
-                          </p>
+                          <p class="field-hint">Используется маршрут Responses без fallback.</p>
                         </div>
                         <div class="form-row">
                           <label class="field-label" for="max-tokens-input">

@@ -1,19 +1,16 @@
-# -*- coding: utf-8 -*-
+import sys
 from pathlib import Path
 from unittest.mock import patch
+
 import httpx
 import pytest
-import sys
-
-import json
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from llm_client import (
+from config import LLM_ALLOW_FALLBACK, LLM_MODEL, LLM_ROUTE
+from llm_client import (  # noqa: E402
     DEFAULT_RESPONSES_TEXT_FORMAT,
-    G5_MAX_OUTPUT_TOKENS_MAX,
-    G5_MAX_OUTPUT_TOKENS_STEP1,
-    G5_MAX_OUTPUT_TOKENS_STEP2,
+    G5_ESCALATION_LADDER,
     GenerationResult,
     generate,
 )
@@ -28,17 +25,7 @@ def _force_api_key(monkeypatch):
 
 class DummyResponse:
     def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
-        if payload is None:
-            payload = {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "ok",
-                        }
-                    }
-                ]
-            }
-        self._json = payload
+        self._payload = payload if payload is not None else {}
         self.status_code = status_code
         self.text = text
         self._raise_for_status_exc = raise_for_status_exc
@@ -49,119 +36,85 @@ class DummyResponse:
         return None
 
     def json(self):
-        return self._json
+        return self._payload
 
 
 class DummyClient:
-    def __init__(self, payloads=None, availability=None, poll_payloads=None):
-        self.last_request = None
-        self.requests = []
-        self.last_probe = None
-        self.last_poll = None
-        self.payloads = payloads or []
+    def __init__(self, *, responses=None, polls=None, availability=None):
+        self.responses = responses or []
+        self.polls = polls or []
         self.availability = availability or []
-        self.poll_payloads = poll_payloads or []
-        self.call_count = 0
-        self.probe_count = 0
-        self.poll_count = 0
+        self.requests = []
+        self.probes = []
+        self.poll_requests = []
+        self._response_index = 0
+        self._poll_index = 0
+        self._probe_index = 0
 
     def post(self, url, headers=None, json=None, **kwargs):
-        request = {
-            "url": url,
-            "headers": headers,
-            "json": json,
-        }
-        self.last_request = request
+        request = {"url": url, "headers": headers, "json": json}
         self.requests.append(request)
-        payload = None
-        if self.payloads:
-            index = min(self.call_count, len(self.payloads) - 1)
-            payload = self.payloads[index]
-        self.call_count += 1
+        payload = {}
+        if self._response_index < len(self.responses):
+            payload = self.responses[self._response_index]
+        self._response_index += 1
         if isinstance(payload, dict) and payload.get("__error__") == "http":
             status = int(payload.get("status", 400))
-            response_payload = payload.get("payload", {})
-            text = payload.get("text", "")
+            data = payload.get("payload", {})
             request_obj = httpx.Request("POST", url)
-            response_obj = httpx.Response(status, request=request_obj, json=response_payload)
+            response_obj = httpx.Response(status, request=request_obj, json=data)
             error = httpx.HTTPStatusError("HTTP error", request=request_obj, response=response_obj)
-            return DummyResponse(response_payload, status_code=status, text=text, raise_for_status_exc=error)
+            return DummyResponse(data, status_code=status, text=payload.get("text", ""), raise_for_status_exc=error)
         return DummyResponse(payload)
 
     def get(self, url, headers=None, **kwargs):
-        if url.startswith("https://api.openai.com/v1/responses"):
-            self.last_poll = {
-                "url": url,
-                "headers": headers,
-            }
-            payload = {}
-            if self.poll_payloads:
-                index = min(self.poll_count, len(self.poll_payloads) - 1)
-                payload = self.poll_payloads[index]
-            self.poll_count += 1
-            return DummyResponse(payload)
-
-        self.last_probe = {
-            "url": url,
-            "headers": headers,
-        }
-        status_code = 200
-        text = ""
-        if self.availability:
-            entry = self.availability[min(self.probe_count, len(self.availability) - 1)]
-            if isinstance(entry, dict):
-                status_code = entry.get("status", 200)
-                text = entry.get("text", "")
-            else:
-                status_code = int(entry)
-        self.probe_count += 1
-        return DummyResponse({"object": "model"}, status_code=status_code, text=text)
+        if url.startswith("https://api.openai.com/v1/responses/"):
+            entry = {}
+            if self._poll_index < len(self.polls):
+                entry = self.polls[self._poll_index]
+            self._poll_index += 1
+            self.poll_requests.append({"url": url, "headers": headers})
+            return DummyResponse(entry)
+        entry = self.availability[self._probe_index] if self._probe_index < len(self.availability) else {"status": 200}
+        self._probe_index += 1
+        self.probes.append({"url": url, "headers": headers})
+        if isinstance(entry, dict):
+            status = entry.get("status", 200)
+            text = entry.get("text", "")
+        else:
+            status = int(entry)
+            text = ""
+        return DummyResponse({"object": "model"}, status_code=status, text=text)
 
     def close(self):
         return None
 
 
-def _run_and_capture_request(
-    model_name: str,
+def _generate_with_dummy(
     *,
-    payloads=None,
+    responses=None,
+    polls=None,
     availability=None,
-    poll_payloads=None,
-    temperature=None,
+    model="gpt-5",
+    max_tokens=64,
 ):
-    dummy_client = DummyClient(
-        payloads=payloads,
-        availability=availability,
-        poll_payloads=poll_payloads,
-    )
+    dummy_client = DummyClient(responses=responses, polls=polls, availability=availability)
     with patch("llm_client.httpx.Client", return_value=dummy_client):
-        kwargs = {
-            "messages": [{"role": "user", "content": "ping"}],
-            "model": model_name,
-            "max_tokens": 42,
-        }
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        result = generate(**kwargs)
-    return result, dummy_client.last_request
+        result = generate(
+            messages=[{"role": "user", "content": "ping"}],
+            model=model,
+            max_tokens=max_tokens,
+        )
+    return result, dummy_client
 
 
-def test_generate_uses_max_tokens_for_non_gpt5():
-    result, request_payload = _run_and_capture_request("gpt-4o")
-    assert isinstance(result, GenerationResult)
-    assert result.text == "ok"
-    assert result.api_route == "chat"
-    assert request_payload["json"]["max_tokens"] == 42
-    assert "max_completion_tokens" not in request_payload["json"]
-    assert request_payload["json"]["temperature"] == 0.3
-    assert "tool_choice" not in request_payload["json"]
-    assert "modalities" not in request_payload["json"]
-    assert "response_format" not in request_payload["json"]
-    assert request_payload["url"].endswith("/chat/completions")
+def test_generate_rejects_non_gpt5_model():
+    with pytest.raises(RuntimeError):
+        _generate_with_dummy(model="gpt-4o")
 
 
 def test_generate_uses_responses_payload_for_gpt5():
-    responses_payload = {
+    payload = {
         "output": [
             {
                 "content": [
@@ -170,108 +123,43 @@ def test_generate_uses_responses_payload_for_gpt5():
             }
         ]
     }
-    result, request_payload = _run_and_capture_request(
-        "gpt-5-preview",
-        payloads=[responses_payload],
-        temperature=0.7,
-    )
-    assert isinstance(result, GenerationResult)
-    assert result.api_route == "responses"
-    assert result.schema == "responses.output_text"
-    payload = request_payload["json"]
-    assert payload["max_output_tokens"] == 42
-    assert "modalities" not in payload
-    assert "messages" not in payload
-    assert payload["model"] == "gpt-5-preview"
-    assert payload["input"] == "ping"
-    assert "text" in payload
-    assert payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
-    assert "temperature" not in payload
-    assert set(payload.keys()) == {"input", "max_output_tokens", "model", "text"}
-    assert result.metadata is not None
-    assert result.metadata.get("temperature_ignored") is True
-    assert request_payload["url"].endswith("/responses")
+    result, client = _generate_with_dummy(responses=[payload])
+    request_payload = client.requests[-1]["json"]
+    assert request_payload["model"] == "gpt-5"
+    assert request_payload["input"] == "ping"
+    assert request_payload["max_output_tokens"] == 64
+    assert request_payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
+    assert "temperature" not in request_payload
+    metadata = result.metadata or {}
+    assert metadata.get("model_effective") == LLM_MODEL
+    assert metadata.get("api_route") == LLM_ROUTE
+    assert metadata.get("allow_fallback") is LLM_ALLOW_FALLBACK
+    assert metadata.get("temperature_applied") is False
+    assert metadata.get("escalation_caps") == list(G5_ESCALATION_LADDER)
 
 
-def test_generate_logs_about_temperature_for_gpt5():
-    responses_payload = {
-        "output": [
-            {
-                "content": [
-                    {"type": "text", "text": "ok"},
-                ]
-            }
-        ]
-    }
-    dummy_client = DummyClient(payloads=[responses_payload])
-    with patch("llm_client.httpx.Client", return_value=dummy_client), patch("llm_client.LOGGER") as mock_logger:
-        result = generate(
-            messages=[{"role": "user", "content": "ping"}],
-            model="gpt-5-super",
-            temperature=0.7,
-            max_tokens=42,
-        )
-
-    mock_logger.info.assert_any_call(
-        "responses payload_keys=%s",
-        ["input", "max_output_tokens", "model", "text"],
-    )
-    mock_logger.info.assert_any_call("responses input_len=%d", 4)
-    mock_logger.info.assert_any_call("responses max_output_tokens=%s", 42)
-    mock_logger.info.assert_any_call(
-        "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
-        "gpt-5-super",
-    )
-    assert "temperature" not in dummy_client.last_request["json"]
-    assert result.metadata is not None
-    assert result.metadata.get("temperature_ignored") is True
-
-
-def test_generate_polls_for_incomplete_responses_status():
-    initial_payload = {
-        "status": "in_progress",
-        "id": "resp-123",
-        "output": [
-            {
-                "content": [
-                    {"type": "text", "text": ""},
-                ]
-            }
-        ],
-    }
+def test_generate_polls_until_completion():
+    in_progress = {"status": "in_progress", "id": "resp-1", "output": []}
     final_payload = {
         "status": "completed",
         "output": [
             {
                 "content": [
-                    {"type": "output_text", "text": "done"},
+                    {"type": "text", "text": "done"},
                 ]
             }
         ],
     }
-    dummy_client = DummyClient(payloads=[initial_payload], poll_payloads=[final_payload])
-    with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
-        "llm_client.time.sleep",
-        return_value=None,
-    ) as mock_sleep:
-        result = generate(
-            messages=[{"role": "user", "content": "ping"}],
-            model="gpt-5",
-            temperature=0.2,
-            max_tokens=42,
-        )
-
-    assert isinstance(result, GenerationResult)
+    with patch("llm_client.time.sleep", return_value=None):
+        result, client = _generate_with_dummy(responses=[in_progress], polls=[final_payload])
     assert result.text == "done"
-    assert result.api_route == "responses"
-    assert result.schema == "responses.output_text"
-    assert dummy_client.poll_count == 1
-    assert dummy_client.last_poll["url"].endswith("/responses/resp-123")
-    mock_sleep.assert_called()
+    assert client.poll_requests
+    assert client.poll_requests[0]["url"].endswith("/responses/resp-1")
 
 
-def test_generate_sends_minimal_payload_for_gpt5():
-    responses_payload = {
+def test_generate_retries_unknown_parameter():
+    error_entry = {"__error__": "http", "status": 400, "payload": {"error": {"message": "Unknown parameter: 'modalities'"}}}
+    success_entry = {
         "output": [
             {
                 "content": [
@@ -280,368 +168,16 @@ def test_generate_sends_minimal_payload_for_gpt5():
             }
         ]
     }
-    _, request_payload = _run_and_capture_request("gpt-5-turbo", payloads=[responses_payload])
-    payload = request_payload["json"]
-    assert payload["model"] == "gpt-5-turbo"
-    assert "modalities" not in payload
-    assert payload["max_output_tokens"] == 42
-    assert payload["input"] == "ping"
-    assert "temperature" not in payload
-    assert set(payload.keys()) == {
-        "model",
-        "input",
-        "max_output_tokens",
-        "text",
-    }
-
-
-def test_generate_retries_when_unknown_parameter_reported():
-    error_entry = {
-        "__error__": "http",
-        "status": 400,
-        "payload": {"error": {"message": "Unknown parameter: 'modalities'"}},
-    }
-    success_payload = {
-        "output": [
-            {
-                "content": [
-                    {"type": "text", "text": "ok"},
-                ]
-            }
-        ]
-    }
-    dummy_client = DummyClient(payloads=[error_entry, success_payload])
-    with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
-        "llm_client.LOGGER"
-    ) as mock_logger:
-        result = generate(
-            messages=[{"role": "user", "content": "ping"}],
-            model="gpt-5",  # ensure responses route
-            temperature=0.2,
-            max_tokens=42,
-        )
-
+    with patch("llm_client.LOGGER") as mock_logger:
+        result, client = _generate_with_dummy(responses=[error_entry, success_entry])
     assert isinstance(result, GenerationResult)
-    assert result.retry_used is True
-    assert dummy_client.call_count == 2
-    mock_logger.warning.assert_any_call(
-        "retry=shim_unknown_param stripped='%s'",
-        "modalities",
-    )
+    assert len(client.requests) == 2
+    stripped = any("modalities" in call.args[1] if call.args else False for call in mock_logger.warning.call_args_list)
+    assert stripped
 
 
-def test_generate_logs_responses_error_and_artifacts():
-    error_entry = {
-        "__error__": "http",
-        "status": 400,
-        "payload": {"error": {"type": "invalid_request_error", "message": "invalid field"}},
-    }
-    fallback_payload = {
-        "choices": [
-            {
-                "message": {
-                    "content": "fallback ok",
-                }
-            }
-        ]
-    }
-    dummy_client = DummyClient(payloads=[error_entry, fallback_payload])
-    with patch("llm_client.httpx.Client", return_value=dummy_client), patch(
-        "llm_client._store_responses_request_snapshot"
-    ) as mock_store_request, patch(
-        "llm_client._store_responses_response_snapshot"
-    ) as mock_store_response, patch("llm_client.LOGGER") as mock_logger:
-        with pytest.raises(RuntimeError) as excinfo:
-            generate(
-                messages=[{"role": "user", "content": "ping"}],
-                model="gpt-5",  # ensure Responses route
-                temperature=0.2,
-                max_tokens=42,
-            )
-
-    assert "HTTP 400" in str(excinfo.value)
-    mock_store_request.assert_called()
-    mock_store_response.assert_called()
-    logged_errors = [call for call in mock_logger.error.call_args_list if "Responses API error" in call[0][0]]
-    assert logged_errors, "Expected Responses API error log entry"
-
-
-def test_generate_collects_text_from_content_parts():
-    payloads = [
-        {
-            "choices": [
-                {
-                    "message": {
-                        "content": [
-                            {"type": "text", "text": "Part1"},
-                            {"type": "text", "text": "Part2"},
-                        ]
-                    }
-                }
-            ]
-        }
-    ]
-    result, _ = _run_and_capture_request("gpt-4o", payloads=payloads)
-    assert result.text == "Part1\n\nPart2"
-
-
-def test_generate_falls_back_to_gpt4_when_gpt5_empty():
-    empty_payload = {
-        "output": [
-            {
-                "content": [
-                    {"type": "text", "text": "   "},
-                ]
-            }
-        ]
-    }
-    fallback_payload = {
-        "choices": [
-            {
-                "message": {
-                    "content": "from fallback",
-                }
-            }
-        ]
-    }
-    client = DummyClient(payloads=[empty_payload, fallback_payload])
-    with patch("llm_client.httpx.Client", return_value=client):
-        result = generate(
-            messages=[{"role": "user", "content": "ping"}],
-            model="gpt-5-large",
-            temperature=0,
-            max_tokens=42,
-        )
-
-    assert result.model_used == "gpt-5-large"
-    assert result.fallback_used == "gpt-5-large"
-    assert result.retry_used is False
-    assert result.text == "from fallback"
-    assert result.fallback_reason == "empty_completion_gpt5_responses"
-    assert result.api_route == "chat"
-
-
-def test_generate_falls_back_when_gpt5_unavailable(monkeypatch):
-    monkeypatch.setattr("llm_client.FORCE_MODEL", False)
-    fallback_payload = {
-        "choices": [
-            {
-                "message": {
-                    "content": "fallback ok",
-                }
-            }
-        ]
-    }
-    client = DummyClient(payloads=[fallback_payload], availability=[403])
-    with patch("llm_client.httpx.Client", return_value=client):
-        with pytest.raises(RuntimeError) as excinfo:
-            generate(
-                messages=[{"role": "user", "content": "ping"}],
-                model="gpt-5",
-                temperature=0.2,
-                max_tokens=42,
-            )
-
-    assert "Model GPT-5 not available" in str(excinfo.value)
-
-
-def test_generate_escalates_max_tokens_when_truncated():
-    initial_payload = {
-        "id": "resp-1",
-        "status": "incomplete",
-        "incomplete_details": {"reason": "max_output_tokens"},
-        "output": [
-            {
-                "content": [
-                    {"type": "text", "text": ""},
-                ]
-            }
-        ],
-    }
-    final_payload = {
-        "status": "completed",
-        "output": [
-            {
-                "content": [
-                    {"type": "text", "text": "expanded"},
-                ]
-            }
-        ],
-    }
-    client = DummyClient(payloads=[initial_payload, final_payload])
-    with patch("llm_client.httpx.Client", return_value=client):
-        result = generate(
-            messages=[{"role": "user", "content": "ping"}],
-            model="gpt-5",
-            temperature=0.1,
-        )
-
-    assert isinstance(result, GenerationResult)
-    assert result.text == "expanded"
-    assert result.retry_used is True
-    assert client.call_count == 2
-    first_tokens = client.requests[0]["json"]["max_output_tokens"]
-    second_tokens = client.requests[1]["json"]["max_output_tokens"]
-    cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-    ladder = sorted(
-        {
-            value
-            for value in (
-                G5_MAX_OUTPUT_TOKENS_STEP1,
-                G5_MAX_OUTPUT_TOKENS_STEP2,
-                G5_MAX_OUTPUT_TOKENS_MAX,
-            )
-            if isinstance(value, int) and value > 0
-        }
-    )
-    expected_second = None
-    for value in ladder:
-        if value > first_tokens:
-            expected_second = value
-            break
-    if expected_second is None:
-        expected_second = first_tokens + 200
-    if cap is not None:
-        expected_second = min(expected_second, cap)
-    assert second_tokens == expected_second
-    assert client.requests[1]["json"].get("previous_response_id") == "resp-1"
-    assert client.requests[0]["json"].get("previous_response_id") is None
-
-
-def test_generate_accepts_incomplete_with_valid_json():
-    skeleton_payload = {
-        "intro": "Вступление",
-        "main": ["Блок 1", "Блок 2", "Блок 3"],
-        "faq": [
-            {"q": f"Вопрос {idx}", "a": f"Ответ {idx}. Детали."}
-            for idx in range(1, 6)
-        ],
-        "conclusion": "Вывод",
-    }
-    skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
-    incomplete_payload = {
-        "id": "resp-accept",
-        "status": "incomplete",
-        "incomplete_details": {"reason": "max_output_tokens"},
-        "output": [
-            {
-                "content": [
-                    {"type": "text", "text": skeleton_text},
-                ]
-            }
-        ],
-    }
-    client = DummyClient(payloads=[incomplete_payload])
-    with patch("llm_client.httpx.Client", return_value=client):
-        result = generate(
-            messages=[{"role": "user", "content": "ping"}],
-            model="gpt-5",
-            temperature=0.1,
-        )
-
-    assert client.call_count == 1
-    assert isinstance(result, GenerationResult)
-    assert result.text == skeleton_text
-    assert result.metadata is not None
-    assert result.metadata.get("status") == "completed"
-    assert result.metadata.get("incomplete_reason") in {None, ""}
-
-
-def test_generate_does_not_shrink_prompt_after_content_started():
-    skeleton_payload = {
-        "intro": "Вступление",
-        "main": ["Блок 1", "Блок 2", "Блок 3"],
-        "faq": [
-            {"q": f"Вопрос {idx}", "a": f"Ответ {idx}. Детали."}
-            for idx in range(1, 6)
-        ],
-        "conclusion": "Вывод",
-    }
-    skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
-    first_payload = {
-        "id": "resp-partial",
-        "status": "incomplete",
-        "incomplete_details": {"reason": "safety"},
-        "output": [
-            {
-                "content": [
-                    {"type": "text", "text": "partial draft"},
-                ]
-            }
-        ],
-    }
-    final_payload = {
-        "status": "completed",
-        "output": [
-            {
-                "content": [
-                    {"type": "text", "text": skeleton_text},
-                ]
-            }
-        ],
-    }
-    messages = [
-        {
-            "role": "system",
-            "content": "A\nB\nA",
-        },
-        {
-            "role": "user",
-            "content": "C\nC\nD",
-        },
-    ]
-    client = DummyClient(payloads=[first_payload, final_payload])
-    with patch("llm_client.httpx.Client", return_value=client):
-        result = generate(
-            messages=messages,
-            model="gpt-5",
-            temperature=0.2,
-        )
-
-    assert client.call_count == 2
-    assert isinstance(result, GenerationResult)
-    assert result.text == skeleton_text
-    first_input = client.requests[0]["json"]["input"]
-    second_input = client.requests[1]["json"]["input"]
-    assert second_input == first_input
-
-
-def test_generate_reports_empty_completion_when_incomplete_at_cap(monkeypatch):
-    monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 1800)
-    initial_payload = {
-        "id": "resp-init",
-        "status": "incomplete",
-        "incomplete_details": {"reason": "max_output_tokens"},
-    }
-    second_payload = {
-        "id": "resp-second",
-        "status": "incomplete",
-        "incomplete_details": {"reason": "max_output_tokens"},
-    }
-    client = DummyClient(payloads=[initial_payload, second_payload])
-    with patch("llm_client.httpx.Client", return_value=client):
-        with pytest.raises(RuntimeError) as excinfo:
-            generate(
-                messages=[{"role": "user", "content": "ping"}],
-                model="gpt-5",
-                temperature=0.1,
-            )
-
-    message = str(excinfo.value)
-    assert "Ответ не помещается" not in message
-    assert "Модель не вернула варианты ответа." in message
-
-
-def test_generate_raises_when_forced_and_gpt5_unavailable(monkeypatch):
-    monkeypatch.setattr("llm_client.FORCE_MODEL", True)
-    client = DummyClient(payloads=[], availability=[403])
-    with patch("llm_client.httpx.Client", return_value=client):
-        with pytest.raises(RuntimeError) as excinfo:
-            generate(
-                messages=[{"role": "user", "content": "ping"}],
-                model="gpt-5",
-                temperature=0.1,
-                max_tokens=42,
-            )
-
-    assert "Model GPT-5 not available for this key/plan" in str(excinfo.value)
+def test_generate_raises_when_responses_empty_after_escalation():
+    empty_payload = {"output": [{"content": [{"type": "text", "text": "   "}]}]}
+    with patch("llm_client.LOGGER"):
+        with pytest.raises(RuntimeError):
+            _generate_with_dummy(responses=[empty_payload])

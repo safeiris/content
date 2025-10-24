@@ -19,6 +19,8 @@ from artifacts_store import _atomic_write_text as store_atomic_write_text, regis
 from config import (
     DEFAULT_MAX_LENGTH,
     DEFAULT_MIN_LENGTH,
+    LLM_ALLOW_FALLBACK,
+    LLM_ROUTE,
     MAX_CUSTOM_CONTEXT_CHARS,
     OPENAI_API_KEY,
 )
@@ -431,7 +433,6 @@ def _generate_variant(
     data_path: str,
     k: int,
     model_name: str,
-    temperature: float,
     max_tokens: int,
     timeout: int,
     mode: str,
@@ -477,7 +478,6 @@ def _generate_variant(
         max_chars=max_chars,
         messages=generation_context.messages,
         model=model_name,
-        temperature=temperature,
         max_tokens=max_tokens,
         timeout_s=timeout,
         backoff_schedule=backoff_schedule,
@@ -521,7 +521,6 @@ def generate_article_from_payload(
     data: Dict[str, Any],
     k: int,
     model: Optional[str] = None,
-    temperature: float = 0.0,
     max_tokens: int = 0,
     timeout: Optional[int] = None,
     mode: Optional[str] = None,
@@ -545,7 +544,6 @@ def generate_article_from_payload(
         data_path="<inline>",
         k=k,
         model_name=resolved_model,
-        temperature=temperature,
         max_tokens=max_tokens,
         timeout=resolved_timeout,
         mode=mode or "final",
@@ -605,8 +603,8 @@ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
         checks["llm_ping"] = {
             "ok": False,
             "message": "Responses недоступен: ключ не задан",
-            "route": "responses",
-            "fallback_used": False,
+            "route": LLM_ROUTE,
+            "fallback_used": LLM_ALLOW_FALLBACK,
         }
 
     theme_slug = (theme or "").strip()
@@ -666,15 +664,14 @@ def _run_health_ping() -> Dict[str, object]:
     sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
     sanitized_payload["text"] = {"format": deepcopy(text_format)}
     sanitized_payload["max_output_tokens"] = max_tokens
-    sanitized_payload.pop("temperature", None)
 
     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
     if not api_key:
         return {
             "ok": False,
             "message": "Responses недоступен: ключ не задан",
-            "route": "responses",
-            "fallback_used": False,
+            "route": LLM_ROUTE,
+            "fallback_used": LLM_ALLOW_FALLBACK,
         }
 
     headers = {
@@ -682,8 +679,8 @@ def _run_health_ping() -> Dict[str, object]:
         "Content-Type": "application/json",
     }
 
-    route = "responses"
-    fallback_used = False
+    route = LLM_ROUTE
+    fallback_used = LLM_ALLOW_FALLBACK
     model_url = f"https://api.openai.com/v1/models/{model}"
 
     start = time.perf_counter()
@@ -710,7 +707,7 @@ def _run_health_ping() -> Dict[str, object]:
                         + (f" — {detail}" if detail else "")
                     ),
                     "route": "models",
-                    "fallback_used": False,
+                    "fallback_used": LLM_ALLOW_FALLBACK,
                     "latency_ms": latency_ms,
                 }
 
@@ -857,7 +854,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--outfile", help="Override output path")
     parser.add_argument("--k", type=int, default=0, help="Number of exemplar clips")
     parser.add_argument("--model", help="Optional model label for metadata")
-    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=0, dest="max_tokens")
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--mode", default="final")
@@ -895,7 +891,6 @@ def main() -> None:
         data_path=args.data,
         k=args.k,
         model_name=(args.model or DEFAULT_MODEL).strip(),
-        temperature=args.temperature,
         max_tokens=args.max_tokens,
         timeout=args.timeout,
         mode=args.mode,

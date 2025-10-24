@@ -12,6 +12,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 from config import (
     G5_MAX_OUTPUT_TOKENS_MAX,
+    LLM_MODEL,
     OPENAI_CACHE_TTL_S,
     OPENAI_CLIENT_MAX_QUEUE,
     OPENAI_MAX_RETRIES,
@@ -86,7 +87,6 @@ class OpenAIClient:
         seed: Optional[str],
         structure: Optional[Iterable[str]],
         model: str,
-        temperature: float,
         max_tokens: int,
         response_format: str,
     ) -> str:
@@ -96,7 +96,6 @@ class OpenAIClient:
             "seed": seed or "",
             "structure": list(structure) if structure else [],
             "model": model,
-            "temperature": temperature,
             "max_tokens": max_tokens,
             "response_format": response_format,
         }
@@ -134,13 +133,12 @@ class OpenAIClient:
         *,
         system: str,
         messages: Sequence[Dict[str, str]],
-        model: str = "gpt-5",
+        model: str = LLM_MODEL,
         response_format: str = "text",
         timeout: Optional[int] = None,
         retry_policy: Optional[RetryPolicy] = None,
         seed: Optional[str] = None,
         structure: Optional[Iterable[str]] = None,
-        temperature: float = 0.3,
         max_tokens: int = 1400,
     ) -> GenerationResult:
         policy = retry_policy or RetryPolicy()
@@ -150,7 +148,6 @@ class OpenAIClient:
             seed=seed,
             structure=structure,
             model=model,
-            temperature=temperature,
             max_tokens=max_tokens,
             response_format=response_format,
         )
@@ -187,7 +184,6 @@ class OpenAIClient:
                     result = _legacy_generate(
                         full_messages,
                         model=model,
-                        temperature=temperature,
                         max_tokens=resolved_max_tokens,
                         timeout_s=timeout or OPENAI_TIMEOUT_S,
                     )

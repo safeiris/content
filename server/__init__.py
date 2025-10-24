@@ -368,15 +368,12 @@ def create_app() -> Flask:
                 DEFAULT_MODEL,
             )
         model = DEFAULT_MODEL
-        temperature = _safe_float(payload.get("temperature", 0.3), default=0.3)
-        temperature = max(0.0, min(2.0, temperature))
         max_tokens = max(1, _safe_int(payload.get("max_tokens", 1400), default=1400))
         task_payload = {
             "theme": theme,
             "data": raw_data,
             "k": k,
             "model": model,
-            "temperature": temperature,
             "max_tokens": max_tokens,
             "append_style_profile": style_profile_override,
             "context_source": context_source,
