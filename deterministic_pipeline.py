@@ -15,6 +15,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from config import (
     G5_MAX_OUTPUT_TOKENS_MAX,
+    G5_MAX_OUTPUT_TOKENS_STEP1,
     SKELETON_BATCH_SIZE_MAIN,
     SKELETON_FAQ_BATCH,
     TAIL_FILL_MAX_TOKENS,
@@ -511,8 +512,10 @@ class DeterministicPipeline:
         per_main_tokens = max(220, int(remaining_for_main / main_count)) if main_count else 0
         predicted = intro_tokens + conclusion_tokens + per_main_tokens * main_count + per_faq_tokens * faq_count
         start_max = int(predicted * 1.2)
+        step1_cap = G5_MAX_OUTPUT_TOKENS_STEP1 if G5_MAX_OUTPUT_TOKENS_STEP1 > 0 else 1200
         if cap is not None and cap > 0:
             start_max = min(start_max, cap)
+        start_max = min(start_max, step1_cap)
         start_max = max(600, start_max)
         requires_chunking = bool(cap is not None and predicted > cap)
         LOGGER.info(

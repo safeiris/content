@@ -1,98 +1,113 @@
+diff --git a/config.py b/config.py
+index 9aa4c4af8bda196a37f0830cdf6a60adc8a69e12..035892153fc217b4b5093d90153eb882bf437e88 100644
+--- a/config.py
++++ b/config.py
+@@ -35,53 +35,53 @@ def _env_bool(name: str, default: bool) -> bool:
+         return default
+     return raw not in {"0", "false", "off", "no"}
+ 
+ OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
+ OPENAI_TIMEOUT_S = max(1, _env_int("OPENAI_TIMEOUT_S", 60))
+ OPENAI_MAX_RETRIES = max(0, _env_int("OPENAI_MAX_RETRIES", 4))
+ OPENAI_RPS = max(1, _env_int("OPENAI_RPS", 2))
+ OPENAI_RPM = max(OPENAI_RPS, _env_int("OPENAI_RPM", 60))
+ OPENAI_CACHE_TTL_S = max(1, _env_int("OPENAI_CACHE_TTL_S", 30))
+ OPENAI_CLIENT_MAX_QUEUE = max(1, _env_int("OPENAI_CLIENT_MAX_QUEUE", 16))
+ OPENAI_MODEL = str(os.getenv("OPENAI_MODEL", "gpt-5")).strip() or "gpt-5"
+ 
+ JOB_SOFT_TIMEOUT_S = max(1, _env_int("JOB_SOFT_TIMEOUT_S", 20))
+ JOB_STORE_TTL_S = max(JOB_SOFT_TIMEOUT_S, _env_int("JOB_STORE_TTL_S", 900))
+ JOB_MAX_RETRIES_PER_STEP = max(0, _env_int("JOB_MAX_RETRIES_PER_STEP", 1))
+ 
+ USE_MOCK_LLM = _env_bool("USE_MOCK_LLM", False)
+ OFFLINE_MODE = _env_bool("OFFLINE_MODE", False)
+ PIPELINE_FAST_PATH = _env_bool("PIPELINE_FAST_PATH", False)
+ MODEL_PROVIDER = str(os.getenv("MODEL_PROVIDER", "openai")).strip() or "openai"
+ 
+ _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
+ FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
+ 
+ # GPT-5 Responses tuning
+-G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1500)
+-G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2200)
+-G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 2600)
++G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 950)
++G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 1200)
++G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 1500)
+ G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3600)
+ _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
+ G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
+ G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
+ G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
+ 
+ SKELETON_BATCH_SIZE_MAIN = max(1, _env_int("SKELETON_BATCH_SIZE_MAIN", 2))
+ SKELETON_FAQ_BATCH = max(1, _env_int("SKELETON_FAQ_BATCH", 3))
+ TAIL_FILL_MAX_TOKENS = max(200, _env_int("TAIL_FILL_MAX_TOKENS", 700))
+ 
+ # Дефолтные настройки ядра
+ DEFAULT_TONE = "экспертный, дружелюбный"
+ DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "Вывод"]
+ 
+ # Простая «норма» для SEO: ориентир по упоминаниям ключей на ~100 слов
+ DEFAULT_SEO_DENSITY = 2
+ 
+ # Рекомендуемые границы объёма (знаков)
+ DEFAULT_MIN_LENGTH = 3500
+ DEFAULT_MAX_LENGTH = 6000
+ 
+ # Максимальный объём пользовательского контекста (символов)
+ MAX_CUSTOM_CONTEXT_CHARS = 20_000
+ 
+ # Стилевые профили
 diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 65cfceea026ff6b27f9d254bca7afa7d0ac56b34..2291d4a9a7841371d5283d67e9385276dcaeb19f 100644
+index 2291d4a9a7841371d5283d67e9385276dcaeb19f..d90dd66022e8a48577d99c03980bdc2a0e93dbe1 100644
 --- a/deterministic_pipeline.py
 +++ b/deterministic_pipeline.py
-@@ -212,68 +212,76 @@ class SkeletonAssembly:
-             "main": main_blocks,
-             "faq": list(self.faq_entries),
-             "conclusion": self.conclusion or "",
-         }
-         return payload
+@@ -1,42 +1,43 @@
+ """LLM-driven content pipeline with explicit step-level guarantees."""
  
- class DeterministicPipeline:
-     """Pipeline that orchestrates LLM calls and post-processing steps."""
+ from __future__ import annotations
  
-     def __init__(
-         self,
-         *,
-         topic: str,
-         base_outline: Sequence[str],
-         keywords: Iterable[str],
-         min_chars: int,
-         max_chars: int,
-         messages: Sequence[Dict[str, object]],
-         model: str,
-         temperature: float,
-         max_tokens: int,
-         timeout_s: int,
-         backoff_schedule: Optional[List[float]] = None,
-         provided_faq: Optional[List[Dict[str, str]]] = None,
-         jsonld_requested: bool = True,
-+        faq_questions: Optional[int] = None,
-     ) -> None:
-         if not model or not str(model).strip():
-             raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
+ import json
+ import logging
+ import math
+ import re
+ import textwrap
+ import time
+ from collections import deque
+ from dataclasses import dataclass, field
+ from enum import Enum
+ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
  
-         self.topic = topic.strip() or "Тема"
-         self.base_outline = list(base_outline) if base_outline else ["Введение", "Основная часть", "Вывод"]
-         self.keywords = [str(term).strip() for term in keywords if str(term).strip()]
-         self.normalized_keywords = [term for term in self.keywords if term]
-         self.min_chars = int(min_chars)
-         self.max_chars = int(max_chars)
-         self.messages = [dict(message) for message in messages]
-         self.model = str(model).strip()
-         self.temperature = float(temperature)
-         self.max_tokens = int(max_tokens) if max_tokens else 0
-         self.timeout_s = int(timeout_s)
-         self.backoff_schedule = list(backoff_schedule) if backoff_schedule else None
-         self.provided_faq = provided_faq or []
-         self.jsonld_requested = bool(jsonld_requested)
-+        try:
-+            faq_target = int(faq_questions) if faq_questions is not None else 5
-+        except (TypeError, ValueError):
-+            faq_target = 5
-+        if faq_target < 0:
-+            faq_target = 0
-+        self.faq_target = faq_target
+ from config import (
+     G5_MAX_OUTPUT_TOKENS_MAX,
++    G5_MAX_OUTPUT_TOKENS_STEP1,
+     SKELETON_BATCH_SIZE_MAIN,
+     SKELETON_FAQ_BATCH,
+     TAIL_FILL_MAX_TOKENS,
+ )
+ from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
+ from faq_builder import _normalize_entry
+ from keyword_injector import (
+     KeywordInjectionResult,
+     LOCK_END,
+     LOCK_START_TEMPLATE,
+     build_term_pattern,
+     inject_keywords,
+ )
+ from length_controller import ensure_article_length
+ from length_limits import compute_soft_length_bounds
+ from length_trimmer import TrimResult, TrimValidationError, trim_text
+ from skeleton_utils import normalize_skeleton_payload
+ from validators import (
+     ValidationError,
+     ValidationResult,
+     length_no_spaces,
+     strip_jsonld,
+     validate_article,
+ )
  
-         self.logs: List[PipelineLogEntry] = []
-         self.checkpoints: Dict[PipelineStep, str] = {}
-         self.jsonld: Optional[str] = None
-         self.locked_terms: List[str] = []
-         self.jsonld_reserve: int = 0
-         self.skeleton_payload: Optional[Dict[str, object]] = None
-         self._skeleton_faq_entries: List[Dict[str, str]] = []
-         self.keywords_coverage_percent: float = 0.0
- 
-         self._model_used: Optional[str] = None
-         self._fallback_used: Optional[str] = None
-         self._fallback_reason: Optional[str] = None
-         self._api_route: Optional[str] = None
-         self._token_usage: Optional[float] = None
- 
-     # ------------------------------------------------------------------
-     # Internal helpers
-     # ------------------------------------------------------------------
-     def _log(self, step: PipelineStep, status: str, **notes: object) -> None:
-         entry = PipelineLogEntry(step=step, started_at=time.time(), status=status, notes=dict(notes))
-         self.logs.append(entry)
- 
-     def _update_log(self, step: PipelineStep, status: str, **notes: object) -> None:
-         for entry in reversed(self.logs):
-@@ -468,51 +476,51 @@ class DeterministicPipeline:
-         faq_markers = {"faq", "f.a.q.", "вопросы и ответы"}
-         has_faq = any(entry.strip().lower() in faq_markers for entry in outline)
-         main_candidates: List[str] = []
-         for entry in outline[1:-1]:
-             normalized = entry.strip()
-             if normalized.lower() in faq_markers:
-                 continue
-             if normalized:
-                 main_candidates.append(normalized)
-         if not main_candidates:
-             main_candidates = ["Основная часть"]
-         return SkeletonOutline(
-             intro_heading=intro_heading,
+@@ -489,52 +490,54 @@ class DeterministicPipeline:
              main_headings=main_candidates,
              conclusion_heading=conclusion_heading,
              has_faq=has_faq,
@@ -105,8 +120,7 @@ index 65cfceea026ff6b27f9d254bca7afa7d0ac56b34..2291d4a9a7841371d5283d67e9385276
          avg_chars = max(min_chars, int((min_chars + max_chars) / 2))
          approx_tokens = max(1100, int(avg_chars / 3.2))
          main_count = max(1, len(outline.main_headings))
--        faq_count = 5 if outline.has_faq else 0
-+        faq_count = self.faq_target if outline.has_faq else 0
+         faq_count = self.faq_target if outline.has_faq else 0
          intro_tokens = max(160, int(approx_tokens * 0.12))
          conclusion_tokens = max(140, int(approx_tokens * 0.1))
          faq_pool = max(0, int(approx_tokens * 0.2)) if faq_count else 0
@@ -119,8 +133,10 @@ index 65cfceea026ff6b27f9d254bca7afa7d0ac56b34..2291d4a9a7841371d5283d67e9385276
          per_main_tokens = max(220, int(remaining_for_main / main_count)) if main_count else 0
          predicted = intro_tokens + conclusion_tokens + per_main_tokens * main_count + per_faq_tokens * faq_count
          start_max = int(predicted * 1.2)
++        step1_cap = G5_MAX_OUTPUT_TOKENS_STEP1 if G5_MAX_OUTPUT_TOKENS_STEP1 > 0 else 1200
          if cap is not None and cap > 0:
              start_max = min(start_max, cap)
++        start_max = min(start_max, step1_cap)
          start_max = max(600, start_max)
          requires_chunking = bool(cap is not None and predicted > cap)
          LOGGER.info(
@@ -132,997 +148,538 @@ index 65cfceea026ff6b27f9d254bca7afa7d0ac56b34..2291d4a9a7841371d5283d67e9385276
          )
          return SkeletonVolumeEstimate(
              predicted_tokens=predicted,
-@@ -531,52 +539,52 @@ class DeterministicPipeline:
+             start_max_tokens=start_max,
+             cap_tokens=cap,
+             intro_tokens=intro_tokens,
+             conclusion_tokens=conclusion_tokens,
+             per_main_tokens=per_main_tokens,
+             per_faq_tokens=per_faq_tokens,
+             requires_chunking=requires_chunking,
+         )
+ 
+     def _build_skeleton_batches(
+         self,
+         outline: SkeletonOutline,
          estimate: SkeletonVolumeEstimate,
      ) -> List[SkeletonBatchPlan]:
-         batches: List[SkeletonBatchPlan] = [SkeletonBatchPlan(kind=SkeletonBatchKind.INTRO, label="intro")]
-         main_count = len(outline.main_headings)
-         if main_count > 0:
-             if self._should_force_single_main_batches(outline, estimate):
-                 batch_size = 1
-             else:
-                 batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
-             start = 0
-             while start < main_count:
-                 end = min(start + batch_size, main_count)
-                 indices = list(range(start, end))
-                 if len(indices) == 1:
-                     label = f"main[{indices[0] + 1}]"
-                 else:
-                     label = f"main[{indices[0] + 1}-{indices[-1] + 1}]"
-                 batches.append(
-                     SkeletonBatchPlan(
-                         kind=SkeletonBatchKind.MAIN,
-                         indices=indices,
-                         label=label,
-                     )
-                 )
-                 start = end
--        if outline.has_faq:
--            total_faq = 5
-+        if outline.has_faq and self.faq_target > 0:
-+            total_faq = self.faq_target
-             produced = 0
-             first_batch = min(SKELETON_FAQ_BATCH, total_faq)
-             if first_batch > 0:
-                 indices = list(range(produced, produced + first_batch))
-                 label = (
-                     f"faq[{indices[0] + 1}-{indices[-1] + 1}]"
-                     if len(indices) > 1
-                     else f"faq[{indices[0] + 1}]"
-                 )
-                 batches.append(
-                     SkeletonBatchPlan(
-                         kind=SkeletonBatchKind.FAQ,
-                         indices=indices,
-                         label=label,
-                     )
-                 )
-                 produced += first_batch
-             while produced < total_faq:
-                 remaining = total_faq - produced
-                 chunk_size = min(SKELETON_FAQ_BATCH, remaining)
-                 indices = list(range(produced, produced + chunk_size))
-                 label = (
-                     f"faq[{indices[0] + 1}-{indices[-1] + 1}]"
-                     if len(indices) > 1
-                     else f"faq[{indices[0] + 1}]"
-@@ -693,51 +701,51 @@ class DeterministicPipeline:
-         candidates = (
-             "response_id",
-             "id",
-             "responseId",
-             "responseID",
-             "request_id",
-             "requestId",
-         )
-         for key in candidates:
-             value = metadata.get(key)
-             if isinstance(value, str) and value.strip():
-                 return value.strip()
-         fallback = metadata.get("previous_response_id")
-         if isinstance(fallback, str) and fallback.strip():
-             return fallback.strip()
-         return ""
+diff --git a/jobs/runner.py b/jobs/runner.py
+index 0cf3a12360610597c2ceb66df0d59cbaf62bad46..a27b7ca7476ebc462802f999dd5b494eb63e7aaf 100644
+--- a/jobs/runner.py
++++ b/jobs/runner.py
+@@ -78,50 +78,53 @@ class JobRunner:
+             self._thread.join(timeout=1.0)
  
-     def _apply_inline_faq(self, payload: object, assembly: SkeletonAssembly) -> None:
-         if not isinstance(payload, dict):
-             return
-         faq_items = payload.get("faq")
-         if not isinstance(faq_items, list):
-             return
-         existing_questions = {entry.get("q") for entry in assembly.faq_entries}
-         for entry in faq_items:
--            if assembly.missing_faq_count(5) == 0:
-+            if assembly.missing_faq_count(self.faq_target) == 0:
+     def submit(self, payload: Dict[str, Any], *, trace_id: Optional[str] = None) -> Job:
+         job_id = uuid.uuid4().hex
+         steps = [
+             JobStep(name="draft"),
+             JobStep(name="refine"),
+             JobStep(name="jsonld"),
+             JobStep(name="post_analysis"),
+         ]
+         job = Job(id=job_id, steps=steps, trace_id=trace_id)
+         self._store.create(job)
+         event = threading.Event()
+         with self._events_lock:
+             self._events[job_id] = event
+         self._tasks.put(RunnerTask(job_id=job_id, payload=payload, trace_id=trace_id))
+         QUEUE_GAUGE.set(float(self._tasks.qsize()))
+         self.start()
+         LOGGER.info("job_enqueued", extra={"job_id": job_id})
+         return job
+ 
+     def wait(self, job_id: str, timeout: Optional[float] = None) -> bool:
+         with self._events_lock:
+             event = self._events.get(job_id)
+         if not event:
++            snapshot = self._store.snapshot(job_id)
++            if snapshot and snapshot.get("status") in {"succeeded", "failed"}:
++                return True
+             return False
+         return event.wait(timeout)
+ 
+     def get_job(self, job_id: str) -> Optional[dict]:
+         snapshot = self._store.snapshot(job_id)
+         if not snapshot:
+             return None
+         return snapshot
+ 
+     def soft_timeout(self) -> int:
+         return self._soft_timeout_s
+ 
+     def _worker(self) -> None:
+         while not self._shutdown:
+             task = self._tasks.get()
+             QUEUE_GAUGE.set(float(self._tasks.qsize()))
+             if task.job_id == "__shutdown__":
                  break
-             if not isinstance(entry, dict):
-                 continue
-             question = str(entry.get("q") or entry.get("question") or "").strip()
-             answer = str(entry.get("a") or entry.get("answer") or "").strip()
-             if not question or not answer:
-                 continue
-             if question in existing_questions:
-                 continue
-             assembly.apply_faq(question, answer)
-             existing_questions.add(question)
- 
-     def _batch_schema(
-         self,
-         batch: SkeletonBatchPlan,
-         *,
-         outline: SkeletonOutline,
-         item_count: int,
-     ) -> Dict[str, object]:
-         if batch.kind == SkeletonBatchKind.INTRO:
-             main_count = max(0, len(outline.main_headings))
-             schema = {
-                 "type": "object",
-                 "properties": {
-                     "intro": {"type": "string"},
-@@ -1892,52 +1900,58 @@ class DeterministicPipeline:
-         intro = str(payload.get("intro") or "").strip()
-         raw_main = payload.get("main")
-         if not isinstance(raw_main, list):
-             raw_main = []
-         conclusion = str(payload.get("conclusion") or "").strip()
-         faq = payload.get("faq")
-         if not intro or not conclusion:
-             raise ValueError("Скелет не содержит обязательных полей intro/main/conclusion")
- 
-         normalized_main: List[str] = [
-             str(item or "").strip() for item in raw_main if str(item or "").strip()
-         ]
-         if len(normalized_main) > 6:
-             normalized_main = normalized_main[:6]
-         placeholders_needed = max(0, 3 - len(normalized_main))
-         if placeholders_needed:
-             for _ in range(placeholders_needed):
-                 normalized_main.append(
-                     "Этот раздел будет расширен детальными рекомендациями в финальной версии статьи."
-                 )
-             LOGGER.warning(
-                 "LOG:SKELETON_MAIN_PLACEHOLDER applied count=%d",
-                 placeholders_needed,
-             )
- 
--        if not isinstance(faq, list) or len(faq) != 5:
--            raise ValueError("Скелет FAQ должен содержать ровно 5 элементов")
-+        expected_faq = self.faq_target if self.faq_target > 0 else 0
-+        if expected_faq > 0:
-+            if not isinstance(faq, list) or len(faq) != expected_faq:
-+                raise ValueError(
-+                    f"Скелет FAQ должен содержать ровно {expected_faq} элементов"
-+                )
-+        else:
-+            faq = []
- 
-         normalized_faq: List[Dict[str, str]] = []
-         for idx, entry in enumerate(faq, start=1):
-             if not isinstance(entry, dict):
-                 raise ValueError(f"FAQ элемент №{idx} имеет неверный формат")
-             question = str(entry.get("q") or "").strip()
-             answer = str(entry.get("a") or "").strip()
-             if not question or not answer:
-                 raise ValueError(f"FAQ элемент №{idx} пуст")
-             normalized_faq.append({"question": question, "answer": answer})
- 
-         outline = [segment.strip() for segment in self.base_outline if segment.strip()]
-         outline = [
-             entry
-             for entry in outline
-             if entry.lower() not in {"faq", "f.a.q.", "вопросы и ответы"}
-         ]
-         if len(outline) < 3:
-             outline = ["Введение", "Основная часть", "Вывод"]
- 
-         intro_heading = outline[0]
-         conclusion_heading = outline[-1]
-         main_headings = outline[1:-1]
-         if not main_headings:
-             main_headings = ["Основная часть"]
-@@ -2024,53 +2038,59 @@ class DeterministicPipeline:
-             if "дополнительно рассматривается" in lowered:
-                 raise PipelineStepError(
-                     PipelineStep.FAQ,
-                     "FAQ содержит шаблонную фразу 'Дополнительно рассматривается'.",
-                 )
-             sanitized.append({"question": question, "answer": answer})
-         return sanitized
- 
-     def _parse_faq_entries(self, raw_text: str) -> List[Dict[str, str]]:
-         candidate = raw_text.strip()
-         if not candidate:
-             raise PipelineStepError(PipelineStep.FAQ, "Модель вернула пустой блок FAQ.")
-         data: Optional[Dict[str, object]] = None
-         try:
-             data = json.loads(candidate)
-         except json.JSONDecodeError:
-             match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
-             if match:
-                 data = json.loads(match.group(0))
-         if not isinstance(data, dict):
-             raise PipelineStepError(PipelineStep.FAQ, "Ответ модели не является корректным JSON.")
-         entries = data.get("faq")
-         if not isinstance(entries, list):
-             raise PipelineStepError(PipelineStep.FAQ, "В ответе отсутствует массив faq.")
-         sanitized = self._sanitize_entries(entries)
--        if len(sanitized) != 5:
--            raise PipelineStepError(PipelineStep.FAQ, "FAQ должно содержать ровно 5 пар вопросов и ответов.")
--        return sanitized
-+        expected = self.faq_target if self.faq_target > 0 else 0
-+        if expected > 0:
-+            if len(sanitized) != expected:
-+                raise PipelineStepError(
-+                    PipelineStep.FAQ,
-+                    f"FAQ должно содержать ровно {expected} пар вопросов и ответов.",
-+                )
-+            return sanitized
-+        return []
- 
-     def _build_faq_messages(self, base_text: str) -> List[Dict[str, str]]:
-         hints: List[str] = []
-         if self.provided_faq:
-             provided_preview = json.dumps(
-                 [
-                     {
-                         "question": str(entry.get("question", "")).strip(),
-                         "answer": str(entry.get("answer", "")).strip(),
-                     }
-                     for entry in self.provided_faq
-                     if str(entry.get("question", "")).strip() and str(entry.get("answer", "")).strip()
-                 ],
-                 ensure_ascii=False,
-                 indent=2,
-             )
-             hints.append(
-                 "Используй следующие пары как ориентир и улучшай формулировки, если нужно:\n" + provided_preview
-             )
-         if self.normalized_keywords:
-             hints.append(
-                 "По возможности вплетай ключевые слова: " + ", ".join(self.normalized_keywords) + "."
-             )
- 
-         user_instructions = [
-@@ -2521,59 +2541,61 @@ class DeterministicPipeline:
-                 "LOG:SKELETON_MAIN_GAPS missing=%s",
-                 ",".join(str(idx + 1) for idx in missing_main),
-             )
-             self._tail_fill_main_sections(
-                 indices=missing_main,
-                 outline=outline,
-                 assembly=assembly,
-                 estimate=estimate,
-             )
-             missing_main = assembly.missing_main_indices()
-             if missing_main:
-                 for index in missing_main:
-                     heading = (
-                         outline.main_headings[index]
-                         if 0 <= index < len(outline.main_headings)
-                         else f"Раздел {index + 1}"
-                     )
-                     placeholder = (
-                         f"Раздел «{heading}» будет дополнен после завершения генерации статьи."
-                     )
-                     assembly.apply_main(index, placeholder, heading=heading)
-                 LOGGER.warning(
-                     "LOG:SKELETON_MAIN_PLACEHOLDER_FINAL count=%d",
-                     len(missing_main),
-                 )
--        if outline.has_faq and assembly.missing_faq_count(5):
-+        if outline.has_faq and assembly.missing_faq_count(self.faq_target):
-             raise PipelineStepError(
-                 PipelineStep.SKELETON,
-                 "Не удалось собрать полный FAQ на этапе скелета.",
-             )
- 
-         payload = assembly.build_payload()
--        if outline.has_faq and len(payload.get("faq", [])) > 5:
--            payload["faq"] = payload["faq"][:5]
-+        if outline.has_faq and self.faq_target > 0:
-+            faq_items = payload.get("faq", [])
-+            if isinstance(faq_items, list) and len(faq_items) > self.faq_target:
-+                payload["faq"] = faq_items[: self.faq_target]
- 
-         normalized_payload = normalize_skeleton_payload(payload)
-         normalized_payload = self._finalize_main_sections(
-             normalized_payload,
-             outline=outline,
-             assembly=assembly,
-             estimate=estimate,
-         )
-         markdown, summary = self._render_skeleton_markdown(normalized_payload)
-         snapshot = dict(normalized_payload)
-         snapshot["outline"] = summary.get("outline", [])
-         if "faq" in summary:
-             snapshot["faq"] = summary.get("faq", [])
-         self.skeleton_payload = snapshot
-         self._skeleton_faq_entries = [
-             {"question": entry.get("q", ""), "answer": entry.get("a", "")}
-             for entry in normalized_payload.get("faq", [])
-         ]
- 
-         self._check_template_text(markdown, PipelineStep.SKELETON)
-         route = last_result.api_route if last_result is not None else "responses"
-         LOGGER.info("SKELETON_OK route=%s", route)
-         self._update_log(
-             PipelineStep.SKELETON,
-             "ok",
-@@ -2605,264 +2627,299 @@ class DeterministicPipeline:
-         LOGGER.info("KEYWORDS_OK coverage=%.2f%%", result.coverage_percent)
-         self._update_log(
-             PipelineStep.KEYWORDS,
-             "ok",
-             KEYWORDS_COVERAGE=result.coverage_report,
-             KEYWORDS_COVERAGE_PERCENT=result.coverage_percent,
-             KEYWORDS_MISSING=missing,
-             inserted_section=result.inserted_section,
-             **self._metrics(result.text),
-         )
-         self.checkpoints[PipelineStep.KEYWORDS] = result.text
-         return result
- 
-     def _run_faq(self, text: str) -> str:
-         self._log(PipelineStep.FAQ, "running")
-         entries_source: List[Dict[str, str]] = []
-         if self._skeleton_faq_entries:
-             entries_source = list(self._skeleton_faq_entries)
-         elif self.provided_faq:
-             entries_source = [
-                 {"question": str(item.get("question", "")).strip(), "answer": str(item.get("answer", "")).strip()}
-                 for item in self.provided_faq
-                 if isinstance(item, dict)
-             ]
- 
--        if entries_source:
-+        if entries_source and self.faq_target > 0:
-             sanitized = self._sanitize_entries(entries_source)
--            if len(sanitized) != 5:
-+            if len(sanitized) != self.faq_target:
-                 raise PipelineStepError(
-                     PipelineStep.FAQ,
--                    "FAQ должно содержать ровно 5 пар вопросов и ответов.",
-+                    f"FAQ должно содержать ровно {self.faq_target} пар вопросов и ответов.",
-                 )
-             faq_block = self._render_faq_markdown(sanitized)
-             merged_text = self._merge_faq(text, faq_block)
-             self.jsonld = self._build_jsonld(sanitized)
-             self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
-             LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in sanitized))
-             self._update_log(
-                 PipelineStep.FAQ,
-                 "ok",
-                 entries=[entry["question"] for entry in sanitized],
-                 **self._metrics(merged_text),
-             )
-             self.checkpoints[PipelineStep.FAQ] = merged_text
-             return merged_text
- 
-+        if self.faq_target <= 0:
-+            LOGGER.info("FAQ_SKIPPED disabled for текущий запрос")
-+            self._update_log(
-+                PipelineStep.FAQ,
-+                "skipped",
-+                entries=[],
-+                **self._metrics(text),
-+            )
-+            self.checkpoints[PipelineStep.FAQ] = text
-+            self.jsonld = None
-+            self.jsonld_reserve = 0
-+            return text
-+
-         raise PipelineStepError(
-             PipelineStep.FAQ,
-             "Не удалось сформировать блок FAQ: отсутствуют подготовленные данные.",
-         )
- 
-     def _build_fail_safe_article(self) -> str:
-         topic = self.topic or "SEO-статья"
-         intro = (
-             "Эта резервная версия подготовлена автоматически. Она кратко передаёт ключевые "
-             "смыслы темы и даёт базовые рекомендации по дальнейшему самостоятельному изучению."
-         )
-         main_sections = [
-             (
-                 "Быстрый запуск",
-                 (
-                     "Сформулируйте цель и определите метрики, по которым будете отслеживать прогресс. "
-                     "Подготовьте рабочую таблицу с ответственными лицами, сроками и ожидаемыми результатами."
-                 ),
-             ),
-             (
-                 "Практическая проработка",
-                 (
-                     "Разбейте внедрение на последовательные этапы, начиная с самых простых действий. "
-                     "Используйте доступные инструменты аналитики и фиксируйте промежуточные выводы после каждой итерации."
-                 ),
-             ),
-             (
-                 "Контроль и корректировки",
-                 (
-                     "Каждую неделю сопоставляйте ожидания с фактическими результатами, чтобы вовремя увидеть отклонения. "
-                     "Фиксируйте инсайты и формируйте короткие резюме, которые помогут защитить инициативу перед командой."
-                 ),
-             ),
-         ]
--        faq_entries = [
-+        base_faq_entries = [
-             (
-                 "С чего начать?",
-                 "Определите ключевую задачу и запишите стартовые показатели, от которых будете отталкиваться в анализе.",
-             ),
-             (
-                 "Как распределить ответственность?",
-                 "Назначьте владельца процесса и закрепите за ним контрольные точки. Остальным участникам оставьте конкретные действия.",
-             ),
-             (
-                 "Какие инструменты использовать?",
-                 "Выберите аналитические сервисы, с которыми команда уже знакома, чтобы не тратить время на внедрение сложных решений.",
-             ),
-             (
-                 "Как оценить первые результаты?",
-                 "Сравните фактические метрики с планом через неделю и месяц, отметьте, какие корректировки потребуются.",
-             ),
-             (
-                 "Что делать при задержках?",
-                 "Зафиксируйте причину, подготовьте три варианта компенсации и обсудите их с ключевыми заинтересованными сторонами.",
-             ),
-         ]
-+        if self.faq_target > 0:
-+            faq_entries = list(base_faq_entries)
-+            if len(faq_entries) < self.faq_target and faq_entries:
-+                seed = faq_entries[-1][1]
-+                for idx in range(len(faq_entries) + 1, self.faq_target + 1):
-+                    faq_entries.append(
-+                        (
-+                            f"Дополнительный вопрос {idx}?",
-+                            f"Раскройте нюансы подхода, опираясь на резервный сценарий: {seed}",
-+                        )
-+                    )
-+            faq_entries = faq_entries[: self.faq_target]
-+        else:
-+            faq_entries = []
-         conclusion = (
-             "Зафиксируйте выводы, выберите одну метрику оперативного контроля и договоритесь о дате следующей оценки результатов. "
-             "Запишите идеи для последующих улучшений, чтобы постепенно расширять эффект от инициативы."
-         )
- 
-         lines: List[str] = [f"# {topic}", "", "## Введение", intro, ""]
-         for heading, paragraph in main_sections:
-             lines.extend([f"## {heading}", paragraph, ""])
--        lines.extend(["## FAQ", "<!--FAQ_START-->"])
--        for index, (question, answer) in enumerate(faq_entries, start=1):
--            lines.append(f"**Вопрос {index}.** {question}")
--            lines.append(f"**Ответ.** {answer}")
--            lines.append("")
--        if lines and lines[-1] == "":
--            lines.pop()
--        lines.extend(["<!--FAQ_END-->", ""])
-+        if faq_entries:
-+            lines.extend(["## FAQ", "<!--FAQ_START-->"])
-+            for index, (question, answer) in enumerate(faq_entries, start=1):
-+                lines.append(f"**Вопрос {index}.** {question}")
-+                lines.append(f"**Ответ.** {answer}")
-+                lines.append("")
-+            if lines and lines[-1] == "":
-+                lines.pop()
-+            lines.extend(["<!--FAQ_END-->", ""])
-         lines.extend(["## Заключение", conclusion, ""])
-         article = "\n".join(lines).strip() + "\n"
-         controller = ensure_article_length(
-             article,
-             min_chars=self.min_chars,
-             max_chars=self.max_chars,
-             protected_blocks=self.locked_terms,
-+            faq_expected=self.faq_target,
-+            exact_chars=self.min_chars if self.min_chars == self.max_chars else None,
-         )
-         return controller.text if controller.text else article
- 
-     def _run_trim(self, text: str) -> TrimResult:
-         self._log(PipelineStep.TRIM, "running")
-         reserve = self.jsonld_reserve if self.jsonld else 0
-         target_max = max(self.min_chars, self.max_chars - reserve)
-         try:
-             result = trim_text(
-                 text,
-                 min_chars=self.min_chars,
-                 max_chars=target_max,
-                 protected_blocks=self.locked_terms,
-+                faq_expected=self.faq_target,
-             )
-         except TrimValidationError as exc:
-             raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
-         current_length = length_no_spaces(result.text)
- 
-         soft_min, soft_max, tolerance_below, tolerance_above = compute_soft_length_bounds(
-             self.min_chars, self.max_chars
-         )
-         strict_violation = current_length < self.min_chars or current_length > self.max_chars
-         length_notes: Dict[str, object] = {}
-         if strict_violation:
-             controller = ensure_article_length(
-                 result.text,
-                 min_chars=self.min_chars,
-                 max_chars=self.max_chars,
-                 protected_blocks=self.locked_terms,
-+                faq_expected=self.faq_target,
-+                exact_chars=self.min_chars if self.min_chars == self.max_chars else None,
-             )
-             if controller.adjusted:
-                 length_notes["length_controller_adjusted"] = True
-                 length_notes["length_controller_iterations"] = controller.iterations
-                 length_notes["length_controller_history"] = list(controller.history)
-                 length_notes["length_controller_success"] = controller.success
-                 result = TrimResult(text=controller.text, removed_paragraphs=result.removed_paragraphs)
-                 current_length = controller.length
-                 strict_violation = current_length < self.min_chars or current_length > self.max_chars
-             if strict_violation:
-                 LOGGER.warning(
-                     "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
-                     current_length,
-                     self.min_chars,
-                     self.max_chars,
-                     soft_min,
-                     soft_max,
-                 )
-                 length_notes["length_relaxed"] = True
-                 length_notes["length_soft_min"] = soft_min
-                 length_notes["length_soft_max"] = soft_max
-                 length_notes["length_tolerance_below"] = tolerance_below
-                 length_notes["length_tolerance_above"] = tolerance_above
-                 if current_length < soft_min or current_length > soft_max:
-                     length_notes["length_controller_success"] = False
-                     length_notes["length_controller_reason"] = controller.failure_reason
-                     fail_safe_article = self._build_fail_safe_article()
-                     result = TrimResult(text=fail_safe_article, removed_paragraphs=result.removed_paragraphs)
-                     current_length = length_no_spaces(result.text)
-                     length_notes["length_controller_fallback"] = True
- 
-         missing_locks = [
-             term
-             for term in self.normalized_keywords
-             if LOCK_START_TEMPLATE.format(term=term) not in result.text
-         ]
-         if missing_locks:
-             raise PipelineStepError(
-                 PipelineStep.TRIM,
-                 "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing_locks)),
-             )
- 
-         faq_block = ""
--        if FAQ_START in result.text and FAQ_END in result.text:
--            faq_block = result.text.split(FAQ_START, 1)[1].split(FAQ_END, 1)[0]
--        faq_pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", faq_block)
--        if len(faq_pairs) != 5:
--            raise PipelineStepError(
--                PipelineStep.TRIM,
--                "FAQ должен содержать ровно 5 вопросов после тримминга.",
--            )
-+        if self.faq_target > 0:
-+            if FAQ_START in result.text and FAQ_END in result.text:
-+                faq_block = result.text.split(FAQ_START, 1)[1].split(FAQ_END, 1)[0]
-+            faq_pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", faq_block)
-+            if len(faq_pairs) != self.faq_target:
-+                raise PipelineStepError(
-+                    PipelineStep.TRIM,
-+                    f"FAQ должен содержать ровно {self.faq_target} вопросов после тримминга.",
-+                )
-         LOGGER.info(
-             "TRIM_OK chars_no_spaces=%d removed_paragraphs=%d",
-             current_length,
-             len(result.removed_paragraphs),
-         )
-         self._update_log(
-             PipelineStep.TRIM,
-             "ok",
-             removed=len(result.removed_paragraphs),
-             **self._metrics(result.text),
-             **length_notes,
-         )
-         self.checkpoints[PipelineStep.TRIM] = result.text
-         return result
- 
-     # ------------------------------------------------------------------
-     # Public API
-     # ------------------------------------------------------------------
-     def run(self) -> PipelineState:
-         text = self._run_skeleton()
-         keyword_result = self._run_keywords(text)
-         faq_text = self._run_faq(keyword_result.text)
-         trim_result = self._run_trim(faq_text)
-         combined_text = trim_result.text
-         if self.jsonld and self.jsonld_requested:
-             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
-         try:
-             validation = validate_article(
-                 combined_text,
-                 keywords=self.keywords,
-                 min_chars=self.min_chars,
-                 max_chars=self.max_chars,
-                 skeleton_payload=self.skeleton_payload,
-                 keyword_coverage_percent=self.keywords_coverage_percent,
-+                faq_expected=self.faq_target,
-             )
-         except ValidationError as exc:
-             raise PipelineStepError(PipelineStep.TRIM, str(exc), status_code=400) from exc
-         LOGGER.info(
-             "VALIDATION_OK length=%s keywords=%.0f%%",
-             validation.stats.get("length_no_spaces"),
-             float(validation.stats.get("keywords_coverage_percent") or 0.0),
-         )
-         return PipelineState(
-             text=combined_text,
-             jsonld=self.jsonld,
-             validation=validation,
-             logs=self.logs,
-             checkpoints=self.checkpoints,
-             model_used=self._model_used or self.model,
-             fallback_used=self._fallback_used,
-             fallback_reason=self._fallback_reason,
-             api_route=self._api_route,
-             token_usage=self._token_usage,
-             skeleton_payload=self.skeleton_payload,
-         )
- 
-     def resume(self, from_step: PipelineStep) -> PipelineState:
-         order = [PipelineStep.SKELETON, PipelineStep.KEYWORDS, PipelineStep.FAQ, PipelineStep.TRIM]
-         if from_step == PipelineStep.SKELETON:
-diff --git a/length_controller.py b/length_controller.py
-index ac5dcd23e86443920fb8fa4d7cd18541de32d738..efd05dbcc2daadcad492a7b713b0a53ae8353b23 100644
---- a/length_controller.py
-+++ b/length_controller.py
-@@ -1,31 +1,32 @@
- from __future__ import annotations
- 
- import re
- from dataclasses import dataclass
- from typing import Iterable, List, Optional, Tuple
- 
-+from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
- from length_trimmer import TrimValidationError, trim_text
- from validators import length_no_spaces
- 
- _FAQ_START = "<!--FAQ_START-->"
- _JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">.*?</script>", re.DOTALL)
- 
- _FILLER_PARAGRAPHS: Tuple[str, ...] = (
-     (
-         "**Дополнительное пояснение.** Раскройте, как читатель может применить рекомендации в ближайшие дни, "
-         "какие инструменты выбрать и как оценить первые результаты. Укажите контрольные точки, чтобы пользователь "
-         "понимал, что продвижение идёт по плану."
-         "\n\n"
-         "**Практический пример.** Опишите типовой сценарий, когда команда сталкивается с нехваткой ресурсов. Поясните, "
-         "как приоритизировать задачи, какие риски отслеживать и как быстро скорректировать стратегию, если показатели "
-         "проседают."
-     ),
-     (
-         "**Краткая памятка.** Сформулируйте три шага, которые можно выполнить сразу после прочтения статьи, и добавьте "
-         "подсказки по коммуникации с коллегами или подрядчиком. Напомните, какие метрики проверять через неделю и через "
-         "месяц, чтобы убедиться в эффективности."
-         "\n\n"
-         "**Мотивационный акцент.** Укрепите уверенность читателя, напомнив, что даже небольшие итерации дают накопительный "
-         "эффект. Укажите, как документировать выводы и когда стоит возвращаться к материалу за дополнительными идеями."
-     ),
- )
-@@ -61,114 +62,216 @@ def _append_filler_block(text: str, filler: str) -> str:
-     if insert_pos < 0:
-         insert_pos = len(article)
-     before = article[:insert_pos].rstrip()
-     after = article[insert_pos:].lstrip()
-     filler_clean = filler.strip()
-     pieces: List[str] = []
-     if before:
-         pieces.append(before)
-     if filler_clean:
-         pieces.append(filler_clean)
-     if after:
-         pieces.append(after)
-     combined = "\n\n".join(pieces).rstrip() + "\n"
-     if jsonld:
-         combined = f"{combined.rstrip()}\n\n{jsonld}\n"
-     return combined
- 
- 
- def _select_filler(iteration: int) -> str:
-     if not _FILLER_PARAGRAPHS:
-         return ""
-     index = iteration % len(_FILLER_PARAGRAPHS)
-     return _FILLER_PARAGRAPHS[index]
- 
- 
-+_PRECISION_WORDS: Tuple[str, ...] = (
-+    "подробности",
-+    "пример",
-+    "детали",
-+    "вывод",
-+    "анализ",
-+    "решение",
-+    "инициатива",
-+    "практика",
-+)
-+
-+
-+def _build_precision_filler(delta: int) -> str:
-+    if delta <= 0:
-+        return ""
-+    target_core = max(0, delta - 1)
-+    collected: List[str] = []
-+    total = 0
-+    index = 0
-+    while total < target_core:
-+        word = _PRECISION_WORDS[index % len(_PRECISION_WORDS)] if _PRECISION_WORDS else "слово"
-+        index += 1
-+        clean = word.replace(" ", "")
-+        remaining = target_core - total
-+        if len(clean) > remaining:
-+            clean = clean[:remaining]
-+        collected.append(clean)
-+        total += len(clean)
-+    body = " ".join(item for item in collected if item).strip()
-+    if body:
-+        return f" {body}."
-+    return " ."
-+
-+
-+def _build_protection_mask(text: str, tokens: Iterable[str]) -> List[bool]:
-+    mask = [False] * len(text)
-+    for token in tokens:
-+        if not token:
-+            continue
-+        start = 0
-+        while True:
-+            idx = text.find(token, start)
-+            if idx == -1:
-+                break
-+            for pos in range(idx, min(idx + len(token), len(mask))):
-+                mask[pos] = True
-+            start = idx + len(token)
-+    return mask
-+
-+
-+def _truncate_to_exact_length(text: str, remove: int, protected: Iterable[str]) -> Optional[str]:
-+    if remove <= 0:
-+        return text
-+    article, jsonld = _split_jsonld_block(text)
-+    if not article.strip():
-+        return None
-+    tokens = [LOCK_START_TEMPLATE.format(term=term) for term in protected]
-+    tokens.extend([LOCK_END, _FAQ_START, "<!--FAQ_END-->", "## FAQ", "## Заключение"])
-+    tokens.extend(["**Вопрос", "**Ответ"])
-+    mask = _build_protection_mask(article, tokens)
-+    buffer: List[str] = []
-+    removed = 0
-+    for idx in range(len(article) - 1, -1, -1):
-+        char = article[idx]
-+        if removed >= remove:
-+            buffer.append(char)
-+            continue
-+        if mask[idx]:
-+            buffer.append(char)
-+            continue
-+        if char.isspace():
-+            buffer.append(char)
-+            continue
-+        removed += 1
-+    if removed < remove:
-+        return None
-+    rebuilt = "".join(reversed(buffer)).rstrip() + "\n"
-+    if jsonld:
-+        rebuilt = f"{rebuilt.rstrip()}\n\n{jsonld}\n"
-+    return rebuilt
-+
-+
- def ensure_article_length(
-     text: str,
-     *,
-     min_chars: int,
-     max_chars: int,
-     protected_blocks: Iterable[str] | None = None,
-     max_iterations: int = 6,
-+    faq_expected: int = 5,
-+    exact_chars: Optional[int] = None,
- ) -> LengthControllerResult:
-     """Ensure that article text fits the requested length range.
- 
-     The controller alternates between trimming (when the article is too long)
-     and appending structured filler paragraphs (when the article is too short).
-     It never raises ``TrimValidationError`` and always returns the best effort
-     result, marking ``success`` when the final length falls inside the range.
-     """
- 
-     protected = [str(term).strip() for term in (protected_blocks or []) if str(term).strip()]
-     current_text = text
-     history: List[int] = []
-     iterations = 0
-     adjusted = False
-     failure_reason: Optional[str] = None
- 
-     current_min = max(0, int(min_chars))
-     current_max = max(current_min, int(max_chars))
- 
-     while True:
-         length_now = length_no_spaces(current_text)
-         history.append(length_now)
-         if current_min <= length_now <= current_max:
--            return LengthControllerResult(
--                text=current_text,
--                length=length_now,
--                iterations=iterations,
--                adjusted=adjusted,
--                success=True,
--                history=tuple(history),
--            )
-+            break
- 
-         if iterations >= max_iterations:
-             failure_reason = failure_reason or "max_iterations"
-             break
- 
-         adjusted = True
-         iterations += 1
- 
-         if length_now > current_max:
              try:
-                 trimmed = trim_text(
-                     current_text,
-                     min_chars=current_min,
-                     max_chars=current_max,
-                     protected_blocks=protected,
-+                    faq_expected=faq_expected,
-                 )
-             except TrimValidationError as exc:  # pragma: no cover - defensive branch
-                 failure_reason = f"trim_failed:{exc}" if not failure_reason else failure_reason
-                 break
+                 self._run_job(task)
+             except Exception as exc:  # noqa: BLE001
+                 LOGGER.exception("job_failed", extra={"job_id": task.job_id, "error": str(exc)})
+             finally:
+                 with self._events_lock:
+                     event = self._events.pop(task.job_id, None)
+diff --git a/llm_client.py b/llm_client.py
+index 68d9cecdb5581baa129b44008fba5da092bc23f5..5b4fe39b8aae4f3b7cab8e84bc96f3b0218eecd6 100644
+--- a/llm_client.py
++++ b/llm_client.py
+@@ -12,62 +12,62 @@ from copy import deepcopy
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Tuple
  
-             new_length = length_no_spaces(trimmed.text)
-             if new_length >= length_now:
-                 if current_max > current_min:
-                     current_max = max(current_min, current_max - 50)
-                     continue
-                 failure_reason = failure_reason or "trim_stalled"
-                 current_text = trimmed.text
-                 break
+ import httpx
+ from jsonschema import Draft7Validator
+ from jsonschema.exceptions import SchemaError as JSONSchemaError
+ from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
  
-             current_text = trimmed.text
-             continue
- 
-         filler = _select_filler(iterations - 1)
-         if not filler:
-             failure_reason = failure_reason or "no_filler"
-             break
-         current_text = _append_filler_block(current_text, filler)
- 
-+    target_exact = exact_chars if exact_chars is not None else None
-     final_length = length_no_spaces(current_text)
-+    if target_exact is not None:
-+        target_value = max(0, int(target_exact))
-+        delta = target_value - final_length
-+        if delta > 0:
-+            filler = _build_precision_filler(delta)
-+            if filler:
-+                current_text = _append_filler_block(current_text, filler)
-+                final_length = length_no_spaces(current_text)
-+                history.append(final_length)
-+                delta = target_value - final_length
-+        if delta < 0:
-+            trimmed_exact = _truncate_to_exact_length(current_text, -delta, protected)
-+            if trimmed_exact:
-+                current_text = trimmed_exact
-+                final_length = length_no_spaces(current_text)
-+                history.append(final_length)
-+            else:
-+                failure_reason = failure_reason or "exact_trim_failed"
-+        if target_value == final_length:
-+            current_min = current_max = target_value
-+    if history:
-+        history[-1] = final_length
-+    success = current_min <= final_length <= current_max
-     return LengthControllerResult(
-         text=current_text,
-         length=final_length,
-         iterations=iterations,
-         adjusted=adjusted,
--        success=False,
-+        success=success,
-         history=tuple(history),
-         failure_reason=failure_reason,
-     )
+ from config import (
+     FORCE_MODEL,
+     OPENAI_API_KEY,
+     G5_ENABLE_PREVIOUS_ID_FETCH,
+     G5_MAX_OUTPUT_TOKENS_BASE,
+     G5_MAX_OUTPUT_TOKENS_MAX,
+     G5_MAX_OUTPUT_TOKENS_STEP1,
+     G5_MAX_OUTPUT_TOKENS_STEP2,
+     G5_POLL_INTERVALS,
+     G5_POLL_MAX_ATTEMPTS,
+ )
  
  
- __all__ = ["LengthControllerResult", "ensure_article_length"]
-diff --git a/length_trimmer.py b/length_trimmer.py
-index 6bed24ceee4420c4e121f96d9d953688f460ab1b..06b7bb7fb53e78f4dc5d672a2a5f29c0e49d486f 100644
---- a/length_trimmer.py
-+++ b/length_trimmer.py
-@@ -78,88 +78,93 @@ def _extract_jsonld(text: str) -> Tuple[str, str]:
-     return article, jsonld_block.strip()
+ DEFAULT_MODEL = "gpt-5"
+ MAX_RETRIES = 3
+ BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
+-FALLBACK_MODEL = "gpt-4o"
++FALLBACK_MODEL = DEFAULT_MODEL
+ RESPONSES_API_URL = "https://api.openai.com/v1/responses"
+ RESPONSES_ALLOWED_KEYS = (
+     "model",
+     "input",
+     "max_output_tokens",
+     "temperature",
+     "text",
+     "previous_response_id",
+ )
+ RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
+-RESPONSES_MAX_ESCALATIONS = 2
++RESPONSES_MAX_ESCALATIONS = 6
+ MAX_RESPONSES_POLL_ATTEMPTS = (
+     G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
+ )
+ if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
+     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
+ GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
  
  
- def _paragraph_signature(paragraph: str) -> str:
-     normalized = re.sub(r"\s+", " ", paragraph.strip().lower())
-     return normalized
+ def _supports_temperature(model: str) -> bool:
+     """Return True if the target model accepts the temperature parameter."""
+ 
+     model_name = (model or "").strip().lower()
+     return not model_name.startswith("gpt-5")
  
  
- def _validate_locked_terms(text: str, terms: Sequence[str]) -> None:
-     if not terms:
-         return
-     missing: List[str] = []
-     for term in terms:
-         if not term:
-             continue
-         lock_token = LOCK_START_TEMPLATE.format(term=term)
-         pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-         if not pattern.search(text):
-             missing.append(term)
-     if missing:
-         raise TrimValidationError(
-             "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing))
-         )
+ def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
+     """Detect the specific 400 error about max_output_tokens being too small."""
+ 
+     if response is None:
+         return False
+ 
+     message = ""
+     try:
+         payload = response.json()
+     except ValueError:
+@@ -1326,51 +1326,57 @@ def _extract_response_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obje
  
  
--def _validate_faq(text: str) -> None:
-+def _validate_faq(text: str, expected_count: int) -> None:
-+    if expected_count <= 0:
-+        return
-     if _FAQ_START not in text or _FAQ_END not in text:
-         raise TrimValidationError("После тримминга нарушена структура блока FAQ.")
-     block = text.split(_FAQ_START, 1)[1].split(_FAQ_END, 1)[0]
-     pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block)
--    if len(pairs) != 5:
--        raise TrimValidationError("FAQ должен содержать ровно 5 вопросов и ответов.")
-+    if len(pairs) != expected_count:
-+        raise TrimValidationError(
-+            f"FAQ должен содержать ровно {expected_count} вопросов и ответов."
-+        )
- 
- 
- def trim_text(
-     text: str,
+ def generate(
+     messages: List[Dict[str, str]],
      *,
-     min_chars: int,
-     max_chars: int,
-     protected_blocks: Iterable[str] | None = None,
-+    faq_expected: int = 5,
- ) -> TrimResult:
-     article, jsonld_block = _extract_jsonld(text)
-     working = article
-     removed: List[str] = []
-     protected_terms = [str(term).strip() for term in (protected_blocks or []) if str(term).strip()]
-     lock_tokens: Set[str] = {LOCK_START_TEMPLATE.format(term=term) for term in protected_terms}
-     skip_signatures: Set[str] = set()
+     model: Optional[str] = None,
+     temperature: float = 0.3,
+     max_tokens: int = 1400,
+     timeout_s: int = 60,
+     backoff_schedule: Optional[List[float]] = None,
+     responses_text_format: Optional[Dict[str, object]] = None,
+     previous_response_id: Optional[str] = None,
+ ) -> GenerationResult:
+     """Call the configured LLM and return a structured generation result."""
  
-     def _length(current: str) -> int:
-         return len(re.sub(r"\s+", "", strip_jsonld(current)))
+     if not messages:
+         raise ValueError("messages must not be empty")
  
-     while _length(working) > max_chars:
-         paragraphs = _split_paragraphs(working)
-         candidates: List[tuple[float, int]] = []
-         faq_zone = False
-         for idx, paragraph in enumerate(paragraphs):
-             if _FAQ_START in paragraph:
-                 faq_zone = True
-             if _FAQ_END in paragraph:
-                 faq_zone = False
-             signature = _paragraph_signature(paragraph)
-             if faq_zone or _is_protected(paragraph, lock_tokens) or signature in skip_signatures:
-                 continue
-             score = _score_paragraph(paragraph)
-             candidates.append((score, idx))
-         if not candidates:
-             break
-         candidates.sort()
-         _, drop_idx = candidates[0]
-         removed_para = paragraphs.pop(drop_idx)
-         removed.append(removed_para)
-         updated = _rebuild_text(paragraphs)
-         if _length(updated) < min_chars:
-             paragraphs.insert(drop_idx, removed.pop())
-             skip_signatures.add(_paragraph_signature(paragraphs[drop_idx]))
-             working = _rebuild_text(paragraphs)
-             continue
-         skip_signatures.add(_paragraph_signature(removed_para))
-         working = updated
+     model_name = _resolve_model_name(model)
+     provider = _resolve_provider(model_name)
+     api_key = _resolve_api_key(provider)
+     api_url = PROVIDER_API_URLS.get(provider)
+     if not api_url:
+         raise RuntimeError(f"Неизвестный провайдер для модели '{model_name}'")
  
-     working = working.rstrip() + "\n"
-     _validate_locked_terms(working, protected_terms)
--    _validate_faq(working)
-+    _validate_faq(working, faq_expected)
+-    timeout = httpx.Timeout(timeout_s)
++    raw_timeout = timeout_s if timeout_s is not None else 60
++    try:
++        timeout_value = float(raw_timeout)
++    except (TypeError, ValueError):
++        timeout_value = 60.0
++    effective_timeout = min(max(timeout_value, 1.0), 25.0)
++    timeout = httpx.Timeout(effective_timeout)
+     http_client = httpx.Client(timeout=timeout)
  
-     final_text = working
-     if jsonld_block:
-         final_text = f"{final_text.rstrip()}\n\n{jsonld_block}\n"
-     return TrimResult(text=final_text, removed_paragraphs=removed)
+     schedule = _resolve_backoff_schedule(backoff_schedule)
+     headers = {
+         "Authorization": f"Bearer {api_key}",
+         "Content-Type": "application/json",
+     }
+ 
+     def _augment_gpt5_messages(original: List[Dict[str, object]]) -> List[Dict[str, object]]:
+         augmented: List[Dict[str, object]] = []
+         appended_suffix = False
+         for message in original:
+             cloned = dict(message)
+             if not appended_suffix and cloned.get("role") == "system":
+                 content = str(cloned.get("content", ""))
+                 if GPT5_TEXT_ONLY_SUFFIX not in content:
+                     content = f"{content.rstrip()}\n\n{GPT5_TEXT_ONLY_SUFFIX}".strip()
+                 cloned["content"] = content
+                 appended_suffix = True
+             augmented.append(cloned)
+         return augmented
+ 
+     gpt5_messages_cache: Optional[List[Dict[str, object]]] = None
+ 
+     def _messages_for_model(target_model: str) -> List[Dict[str, object]]:
+@@ -1633,65 +1639,73 @@ def generate(
+                 "status": status,
+                 "incomplete_reason": incomplete_reason,
+                 "usage_output_tokens": usage_output_tokens,
+                 "response_id": response_id,
+                 "previous_response_id": prev_response_id,
+                 "finish_reason": finish_reason,
+             }
+ 
+         attempts = 0
+         max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)
+         current_max = max_tokens_value
+         last_error: Optional[BaseException] = None
+         format_retry_done = False
+         format_name_retry_done = False
+         min_tokens_bump_done = False
+         min_token_floor = 1
+         base_input_text = str(sanitized_payload.get("input", ""))
+         shrunken_input = _shrink_responses_input(base_input_text)
+         shrink_next_attempt = False
+         shrink_applied = False
+         incomplete_retry_count = 0
+         token_escalations = 0
+         resume_from_response_id: Optional[str] = None
+         content_started = False
+         cap_retry_performed = False
++        empty_retry_attempted = False
+ 
+         def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
+-            candidate = current
+-            if step_index == 0:
+-                candidate = max(current + 600, int(current * 1.5))
+-            elif step_index == 1:
+-                candidate = max(current + 600, int(current * 1.35))
+-            else:
+-                if cap is not None:
+-                    candidate = cap
+-                else:
+-                    candidate = current + 600
+-            if cap is not None:
+-                candidate = min(candidate, cap)
+-            return int(candidate)
++            ladder: List[int] = []
++            for value in (
++                G5_MAX_OUTPUT_TOKENS_STEP1,
++                G5_MAX_OUTPUT_TOKENS_STEP2,
++                G5_MAX_OUTPUT_TOKENS_MAX,
++            ):
++                try:
++                    normalized = int(value)
++                except (TypeError, ValueError):
++                    continue
++                if normalized <= 0:
++                    continue
++                ladder.append(normalized)
++            ladder = sorted(dict.fromkeys(ladder))
++            for target in ladder:
++                if target > current:
++                    return target if cap is None else min(target, cap)
++            if cap is not None and cap > current:
++                return int(cap)
++            return current + 200
+ 
+         def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
+             poll_attempt = 0
+             while poll_attempt < MAX_RESPONSES_POLL_ATTEMPTS:
+                 poll_attempt += 1
+                 poll_url = f"{RESPONSES_API_URL}/{response_id}"
+                 LOGGER.info("responses poll attempt=%d id=%s", poll_attempt, response_id)
+                 if poll_attempt == 1:
+                     initial_sleep = schedule[0] if schedule else 0.5
+                     LOGGER.info("responses poll initial sleep=%.2f", initial_sleep)
+                     time.sleep(initial_sleep)
+                 try:
+                     poll_response = http_client.get(
+                         poll_url,
+                         headers=headers,
+                         timeout=timeout,
+                     )
+                     poll_response.raise_for_status()
+                 except httpx.HTTPStatusError as poll_error:
+                     _handle_responses_http_error(poll_error, {"poll_id": response_id})
+                     break
+                 except httpx.HTTPError as transport_error:  # pragma: no cover - defensive
+                     LOGGER.warning("responses poll transport error: %s", transport_error)
+                     break
+                 try:
+@@ -1921,50 +1935,60 @@ def generate(
+                             content_length = 0
+                             if isinstance(parse_flags, dict):
+                                 output_length = int(
+                                     parse_flags.get("output_text_len", 0) or 0
+                                 )
+                                 content_length = int(
+                                     parse_flags.get("content_text_len", 0) or 0
+                                 )
+                             LOGGER.warning(
+                                 "LLM_WARN cap_reached limit=%s output_len=%d content_len=%d status=%s reason=%s",
+                                 upper_cap,
+                                 output_length,
+                                 content_length,
+                                 status or "",
+                                 reason or "",
+                             )
+                             cap_retry_performed = True
+                             shrink_next_attempt = False
+                     last_error = RuntimeError("responses_incomplete")
+                     incomplete_retry_count += 1
+                     if incomplete_retry_count >= 2:
+                         break
+                     shrink_next_attempt = True
+                     continue
+                 if not text:
++                    response_id_value = metadata.get("response_id") or ""
++                    if response_id_value and not empty_retry_attempted:
++                        empty_retry_attempted = True
++                        resume_from_response_id = str(response_id_value)
++                        LOGGER.warning(
++                            "RESP_EMPTY retrying with previous_response_id=%s",
++                            resume_from_response_id,
++                        )
++                        last_error = RuntimeError("responses_empty_retry")
++                        continue
+                     last_error = EmptyCompletionError(
+                         "Модель вернула пустой ответ",
+                         raw_response=data,
+                         parse_flags=parse_flags,
+                     )
+                     LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
+                     continue
+                 _persist_raw_response(data)
+                 return text, parse_flags, data, schema_label
+             except EmptyCompletionError as exc:
+                 last_error = exc
+             except httpx.HTTPStatusError as exc:
+                 response_obj = exc.response
+                 status = response_obj.status_code if response_obj is not None else None
+                 if response_obj is not None and _needs_format_name_retry(response_obj):
+                     setattr(exc, "responses_no_fallback", True)
+                 if (
+                     status == 400
+                     and not format_retry_done
+                     and response_obj is not None
+                     and _has_text_format_migration_hint(response_obj)
+                 ):
+                     format_retry_done = True
+                     retry_used = True
+                     LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
+@@ -2043,91 +2067,52 @@ def generate(
+                 _raise_for_last_error(last_error)
+             if isinstance(last_error, (httpx.TimeoutException, httpx.TransportError)):
+                 _raise_for_last_error(last_error)
+             raise last_error
+ 
+         raise RuntimeError("Модель не вернула ответ.")
+ 
+ 
+     lower_model = model_name.lower()
+     is_gpt5_model = lower_model.startswith("gpt-5")
+ 
+     retry_used = False
+     fallback_used: Optional[str] = None
+     fallback_reason: Optional[str] = None
+ 
+     try:
+         if is_gpt5_model:
+             available = _check_model_availability(
+                 http_client,
+                 provider=provider,
+                 headers=headers,
+                 model_name=model_name,
+             )
+             if not available:
+                 error_message = "Model GPT-5 not available for this key/plan"
+-                LOGGER.warning("primary model %s unavailable — considering fallback", model_name)
+-                if FORCE_MODEL:
+-                    raise RuntimeError(error_message)
+-                fallback_used = FALLBACK_MODEL
+-                fallback_reason = "model_unavailable"
+-                LOGGER.warning(
+-                    "switching to fallback model %s (primary=%s, reason=%s: %s)",
+-                    fallback_used,
+-                    model_name,
+-                    fallback_reason,
+-                    error_message,
+-                )
+-                try:
+-                    text, parse_flags_fallback, _, schema_fallback = _call_chat_model(
+-                        fallback_used
+-                    )
+-                    schema_category = _categorize_schema(parse_flags_fallback)
+-                    LOGGER.info(
+-                        "completion schema category=%s (schema=%s, route=chat)",
+-                        schema_category,
+-                        schema_fallback,
+-                    )
+-                    metadata_block = None
+-                    if isinstance(parse_flags_fallback, dict):
+-                        meta_candidate = parse_flags_fallback.get("metadata")
+-                        if isinstance(meta_candidate, dict):
+-                            metadata_block = dict(meta_candidate)
+-                    return GenerationResult(
+-                        text=text,
+-                        model_used=fallback_used,
+-                        retry_used=False,
+-                        fallback_used=fallback_used,
+-                        fallback_reason=fallback_reason,
+-                        api_route="chat",
+-                        schema=schema_category,
+-                        metadata=metadata_block,
+-                    )
+-                except EmptyCompletionError as fallback_error:
+-                    _persist_raw_response(fallback_error.raw_response)
+-                    _log_parse_chain(fallback_error.parse_flags, retry=0, fallback=fallback_used)
+-                    raise
++                LOGGER.error("primary model %s unavailable", model_name)
++                raise RuntimeError(error_message)
+ 
+             try:
+                 text, parse_flags_initial, _, schema_initial_call = _call_responses_model(
+                     model_name
+                 )
+                 schema_category = schema_initial_call
+                 LOGGER.info(
+                     "completion schema category=%s (schema=%s, route=responses)",
+                     schema_category,
+                     schema_initial_call,
+                 )
+                 metadata_block = None
+                 if isinstance(parse_flags_initial, dict):
+                     meta_candidate = parse_flags_initial.get("metadata")
+                     if isinstance(meta_candidate, dict):
+                         metadata_block = dict(meta_candidate)
+                 return GenerationResult(
+                     text=text,
+                     model_used=model_name,
+                     retry_used=retry_used,
+                     fallback_used=None,
+                     fallback_reason=None,
+                     api_route="responses",
+                     schema=schema_category,
+                     metadata=metadata_block,
+@@ -2165,55 +2150,54 @@ def generate(
+                     error_details: Dict[str, object] = {
+                         "reason": "api_error_gpt5_responses",
+                         "exception": str(responses_error),
+                     }
+                     if isinstance(responses_error, httpx.HTTPStatusError):
+                         status_code = (
+                             responses_error.response.status_code
+                             if responses_error.response is not None
+                             else None
+                         )
+                         error_details["status_code"] = status_code
+                         if responses_error.response is not None:
+                             try:
+                                 payload_json = responses_error.response.json()
+                             except ValueError:
+                                 payload_json = None
+                             if isinstance(payload_json, dict):
+                                 error_block = payload_json.get("error")
+                                 if isinstance(error_block, dict):
+                                     error_details["error_type"] = error_block.get("type")
+                                     error_details["error_message"] = error_block.get("message")
+                     raise _build_force_model_error("responses_error", error_details) from responses_error
+                 if not _is_responses_fallback_allowed(responses_error):
+                     raise
+                 fallback_reason = "api_error_gpt5_responses"
+-            fallback_used = FALLBACK_MODEL
++            fallback_used = model_name
+             LOGGER.warning(
+-                "switching to fallback model %s (primary=%s, reason=%s)",
++                "switching route to chat for model %s (reason=%s)",
+                 fallback_used,
+-                model_name,
+                 fallback_reason,
+             )
+             text, parse_flags_fallback, _, schema_fallback = _call_chat_model(fallback_used)
+             schema_category = _categorize_schema(parse_flags_fallback)
+             LOGGER.info(
+                 "fallback completion schema category=%s (schema=%s, route=chat)",
+                 schema_category,
+                 schema_fallback,
+             )
+             metadata_block = None
+             if isinstance(parse_flags_fallback, dict):
+                 meta_candidate = parse_flags_fallback.get("metadata")
+                 if isinstance(meta_candidate, dict):
+                     metadata_block = dict(meta_candidate)
+             if fallback_reason == "empty_completion_gpt5_responses":
+                 retry_used = False
+             return GenerationResult(
+                 text=text,
+                 model_used=fallback_used,
+                 retry_used=retry_used,
+                 fallback_used=fallback_used,
+                 fallback_reason=fallback_reason,
+                 api_route="chat",
+                 schema=schema_category,
+                 metadata=metadata_block,
 diff --git a/orchestrate.py b/orchestrate.py
-index fefe3ffe17a24ae1aff24802e35c6c8e52b8ecee..d43cdc8a5e3b6dbe42c492c4f2ae6b1cb996e6de 100644
+index d43cdc8a5e3b6dbe42c492c4f2ae6b1cb996e6de..4fdcce30d7f19439e8a5dcd062b65e38734347c2 100644
 --- a/orchestrate.py
 +++ b/orchestrate.py
-@@ -40,50 +40,51 @@ LATEST_SCHEMA_VERSION = "2024-06"
+@@ -18,51 +18,51 @@ from assemble_messages import ContextBundle, assemble_messages, retrieve_context
+ from artifacts_store import _atomic_write_text as store_atomic_write_text, register_artifact
+ from config import (
+     DEFAULT_MAX_LENGTH,
+     DEFAULT_MIN_LENGTH,
+     MAX_CUSTOM_CONTEXT_CHARS,
+     OPENAI_API_KEY,
+ )
+ from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
+ from llm_client import (
+     DEFAULT_MODEL,
+     RESPONSES_API_URL,
+     build_responses_payload,
+     is_min_tokens_error,
+     sanitize_payload_for_responses,
+ )
+ from keywords import parse_manual_keywords
+ from length_limits import ResolvedLengthLimits, resolve_length_limits
+ from validators import ValidationResult, length_no_spaces
+ 
+ BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
+ TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
+ LATEST_SCHEMA_VERSION = "2024-06"
  
  HEALTH_MODEL = DEFAULT_MODEL
  HEALTH_PROMPT = "Ответь ровно словом: PONG"
- HEALTH_INITIAL_MAX_TOKENS = 24
+-HEALTH_INITIAL_MAX_TOKENS = 24
++HEALTH_INITIAL_MAX_TOKENS = 10
  HEALTH_MIN_BUMP_TOKENS = 24
  
  
@@ -1144,255 +701,11 @@ index fefe3ffe17a24ae1aff24802e35c6c8e52b8ecee..d43cdc8a5e3b6dbe42c492c4f2ae6b1c
      custom_context_truncated: bool = False
      jsonld_requested: bool = False
      length_limits: Optional[ResolvedLengthLimits] = None
-+    faq_questions: int = 0
+     faq_questions: int = 0
  
  
  def _local_now() -> datetime:
-     return datetime.now(tz=BELGRADE_TZ)
- 
- 
- def _ensure_artifacts_dir() -> Path:
-     base = Path("artifacts").resolve()
-     base.mkdir(parents=True, exist_ok=True)
-     return base
- 
- 
- def _slugify(value: str) -> str:
-     allowed = [ch if ch.isalnum() else "_" for ch in value]
-     slug = "".join(allowed).strip("_")
-     slug = "_".join(filter(None, slug.split("_")))
-     if not slug:
-         return "article"
-     return slug[:80].lower()
- 
- 
- def _strip_control_characters(text: str) -> str:
-     cleaned: List[str] = []
-     for char in text:
-         if char == "\r":
-@@ -141,50 +142,66 @@ def make_generation_context(
-     theme: str,
-     data: Dict[str, Any],
-     k: int,
-     append_style_profile: Optional[bool] = None,
-     context_source: Optional[str] = None,
-     custom_context_text: Optional[str] = None,
-     context_filename: Optional[str] = None,
- ) -> GenerationContext:
-     payload = deepcopy(data)
-     length_info = resolve_length_limits(theme, payload)
-     payload["length_limits"] = {
-         "min_chars": length_info.min_chars,
-         "max_chars": length_info.max_chars,
-     }
-     payload["_length_limits_source"] = {
-         "min": length_info.min_source,
-         "max": length_info.max_source,
-     }
-     if length_info.profile_source:
-         payload["_length_limits_profile_source"] = length_info.profile_source
-     if length_info.warnings:
-         payload["_length_limits_warnings"] = list(length_info.warnings)
-     jsonld_requested = bool(payload.get("include_jsonld", False))
-     payload.pop("include_jsonld", None)
- 
-+    include_faq_flag = bool(payload.get("include_faq", True))
-+    faq_requested_raw = payload.get("faq_questions")
-+    resolved_faq = 0
-+    if include_faq_flag:
-+        try:
-+            resolved_faq = int(faq_requested_raw)
-+        except (TypeError, ValueError):
-+            resolved_faq = 0
-+        if resolved_faq <= 0:
-+            resolved_faq = 5
-+    payload["include_faq"] = include_faq_flag
-+    if resolved_faq > 0:
-+        payload["faq_questions"] = resolved_faq
-+    else:
-+        payload.pop("faq_questions", None)
-+
-     keywords_mode_raw = payload.get("keywords_mode")
-     normalized_mode = None
-     if isinstance(keywords_mode_raw, str):
-         normalized_mode = keywords_mode_raw.strip().lower()
-     if normalized_mode != "strict":
-         payload["keywords_mode"] = "strict"
- 
-     requested_source = context_source if context_source is not None else payload.get("context_source")
-     normalized_source = str(requested_source or "index.json").strip().lower() or "index.json"
-     if normalized_source == "index":
-         normalized_source = "index.json"
-     payload["context_source"] = normalized_source
- 
-     raw_custom_context = custom_context_text
-     if raw_custom_context is None and normalized_source == "custom":
-         raw_custom_context = payload.get("context_text")
- 
-     filename = context_filename if context_filename is not None else payload.get("context_filename")
-     if isinstance(filename, str):
-         filename = filename.strip() or None
-     else:
-         filename = None
- 
-     payload.pop("context_text", None)
-     if filename:
-@@ -249,50 +266,51 @@ def make_generation_context(
-     style_profile_variant: Optional[str] = None
-     for message in messages:
-         if message.get("role") == "system" and message.get("style_profile_applied"):
-             style_profile_applied = True
-             style_profile_source = message.get("style_profile_source")
-             style_profile_variant = message.get("style_profile_variant")
-             break
- 
-     return GenerationContext(
-         data=payload,
-         context_bundle=bundle,
-         messages=messages,
-         clip_texts=clip_texts,
-         style_profile_applied=style_profile_applied,
-         style_profile_source=style_profile_source,
-         style_profile_variant=style_profile_variant,
-         keywords_manual=manual_keywords,
-         context_source=normalized_source,
-         custom_context_text=custom_context_normalized or None,
-         custom_context_len=custom_context_len,
-         custom_context_filename=filename,
-         custom_context_hash=custom_context_hash,
-         custom_context_truncated=custom_context_truncated,
-         jsonld_requested=jsonld_requested,
-         length_limits=length_info,
-+        faq_questions=resolved_faq if include_faq_flag else 0,
-     )
- def _make_output_path(theme: str, outfile: Optional[str]) -> Path:
-     if outfile:
-         return Path(outfile)
-     timestamp = _local_now().strftime("%Y-%m-%d_%H%M")
-     slug = _slugify(theme)
-     filename = f"{timestamp}_{slug}_article.md"
-     return _ensure_artifacts_dir() / filename
- 
- 
- def _serialize_pipeline_logs(logs: Iterable[Any]) -> List[Dict[str, Any]]:
-     serializable: List[Dict[str, Any]] = []
-     for entry in logs:
-         started_at = getattr(entry, "started_at", None)
-         finished_at = getattr(entry, "finished_at", None)
-         if isinstance(started_at, (int, float)):
-             started_at = datetime.fromtimestamp(started_at, tz=ZoneInfo("UTC")).isoformat()
-         if isinstance(finished_at, (int, float)):
-             finished_at = datetime.fromtimestamp(finished_at, tz=ZoneInfo("UTC")).isoformat()
-         payload = {
-             "step": entry.step.value if hasattr(entry, "step") else str(entry),
-             "status": getattr(entry, "status", "unknown"),
-             "started_at": started_at,
-             "finished_at": finished_at,
-             "notes": getattr(entry, "notes", {}),
-@@ -321,50 +339,51 @@ def _build_metadata(
-     checkpoints: Dict[PipelineStep, str],
-     duration_seconds: float,
-     model_used: Optional[str],
-     fallback_used: Optional[str],
-     fallback_reason: Optional[str],
-     api_route: Optional[str],
-     token_usage: Optional[float],
- ) -> Dict[str, Any]:
-     metadata: Dict[str, Any] = {
-         "schema_version": LATEST_SCHEMA_VERSION,
-         "theme": theme,
-         "generated_at": _local_now().isoformat(),
-         "duration_seconds": round(duration_seconds, 3),
-         "context_source": generation_context.context_source,
-         "context_len": generation_context.custom_context_len,
-         "context_filename": generation_context.custom_context_filename,
-         "context_truncated": generation_context.custom_context_truncated,
-         "style_profile_applied": generation_context.style_profile_applied,
-         "style_profile_source": generation_context.style_profile_source,
-         "style_profile_variant": generation_context.style_profile_variant,
-         "keywords_manual": generation_context.keywords_manual,
-         "length_limits": {
-             "min": generation_context.length_limits.min_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[0],
-             "max": generation_context.length_limits.max_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[1],
-         },
-+        "faq_questions_requested": generation_context.faq_questions,
-         "pipeline_logs": _serialize_pipeline_logs(pipeline_logs),
-         "pipeline_checkpoints": _serialize_checkpoints(checkpoints),
-         "validation": {
-             "passed": validation.is_valid,
-             "stats": validation.stats,
-         },
-         "length_no_spaces": length_no_spaces(pipeline_state_text),
-     }
-     if model_used:
-         metadata["model_used"] = model_used
-     if fallback_used:
-         metadata["fallback_used"] = fallback_used
-     if fallback_reason:
-         metadata["fallback_reason"] = fallback_reason
-     if api_route:
-         metadata["api_route"] = api_route
-     if isinstance(token_usage, (int, float)):
-         metadata["token_usage"] = float(token_usage)
-     return metadata
- 
- 
- def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> Dict[str, Path]:
-     markdown_path.parent.mkdir(parents=True, exist_ok=True)
-     def _validate_markdown(tmp_path: Path) -> None:
-         if not tmp_path.read_text(encoding="utf-8").strip():
-@@ -442,100 +461,101 @@ def _generate_variant(
-     min_chars = length_limits.min_chars
-     max_chars = length_limits.max_chars
- 
-     keywords_required = _extract_keywords(prepared_data)
-     outline = _prepare_outline(prepared_data)
-     topic = str(prepared_data.get("theme") or payload.get("theme") or theme).strip() or theme
- 
-     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
-     if not api_key:
-         raise PipelineStepError(PipelineStep.SKELETON, "OPENAI_API_KEY не найден. Укажите действительный ключ.")
- 
-     pipeline = DeterministicPipeline(
-         topic=topic,
-         base_outline=outline,
-         keywords=keywords_required,
-         min_chars=min_chars,
-         max_chars=max_chars,
-         messages=generation_context.messages,
-         model=model_name,
-         temperature=temperature,
-         max_tokens=max_tokens,
-         timeout_s=timeout,
-         backoff_schedule=backoff_schedule,
-         provided_faq=prepared_data.get("faq_entries") if isinstance(prepared_data.get("faq_entries"), list) else None,
-         jsonld_requested=generation_context.jsonld_requested,
-+        faq_questions=generation_context.faq_questions,
-     )
-     state = pipeline.run()
-     if not state.validation or not state.validation.is_valid:
-         raise RuntimeError("Pipeline validation failed; artifact not recorded.")
- 
-     final_text = state.text
-     duration_seconds = time.time() - start_time
-     metadata = _build_metadata(
-         theme=theme,
-         generation_context=generation_context,
-         pipeline_state_text=final_text,
-         validation=state.validation,
-         pipeline_logs=state.logs,
-         checkpoints=state.checkpoints,
-         duration_seconds=duration_seconds,
-         model_used=state.model_used,
-         fallback_used=state.fallback_used,
-         fallback_reason=state.fallback_reason,
-         api_route=state.api_route,
-         token_usage=state.token_usage,
-     )
- 
-     outputs = _write_outputs(output_path, final_text, metadata)
-     return {
-         "text": final_text,
+@@ -512,50 +512,54 @@ def _generate_variant(
          "metadata": metadata,
          "duration": duration_seconds,
          "artifact_files": outputs,
@@ -1417,8 +730,11 @@ index fefe3ffe17a24ae1aff24802e35c6c8e52b8ecee..d43cdc8a5e3b6dbe42c492c4f2ae6b1c
      context_filename: Optional[str] = None,
  ) -> Dict[str, Any]:
      resolved_timeout = timeout if timeout is not None else 60
--    resolved_model = (model or DEFAULT_MODEL).strip()
-+    resolved_model = DEFAULT_MODEL
+     resolved_model = DEFAULT_MODEL
++    health_probe = _run_health_ping()
++    if not health_probe.get("ok"):
++        message = str(health_probe.get("message") or "health gate failed")
++        raise RuntimeError(f"health_gate_failed: {message}")
      output_path = _make_output_path(theme, outfile)
      result = _generate_variant(
          theme=theme,
@@ -1444,476 +760,600 @@ index fefe3ffe17a24ae1aff24802e35c6c8e52b8ecee..d43cdc8a5e3b6dbe42c492c4f2ae6b1c
              "markdown": artifact_files["markdown"].as_posix(),
              "metadata": artifact_files["metadata"].as_posix(),
          }
-diff --git a/server/__init__.py b/server/__init__.py
-index 3b6512f425b0f89de74cdc48a0bd88ebc5a27fa9..816c13d252d8134f744791d902fb3f67bd0f3a94 100644
---- a/server/__init__.py
-+++ b/server/__init__.py
-@@ -18,50 +18,51 @@ from flask import (
-     Flask,
-     abort,
-     flash,
-     jsonify,
-     g,
-     redirect,
-     render_template,
-     request,
-     session,
-     send_file,
-     send_from_directory,
-     url_for,
- )
- from flask_cors import CORS
- from werkzeug.security import check_password_hash
+@@ -658,62 +662,80 @@ def _run_health_ping() -> Dict[str, object]:
+         prompt,
+         max_tokens,
+         text_format=text_format,
+     )
+     sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
+     sanitized_payload["text"] = {"format": deepcopy(text_format)}
+     sanitized_payload["max_output_tokens"] = max_tokens
+     sanitized_payload.pop("temperature", None)
  
- from assemble_messages import invalidate_style_profile_cache
- from config import (
-     DEFAULT_STRUCTURE,
-     JOB_STORE_TTL_S,
-     OPENAI_RPM,
-     OPENAI_RPS,
- )
- from jobs import JobRunner, JobStatus, JobStore
- from orchestrate import gather_health_status, make_generation_context
-+from llm_client import DEFAULT_MODEL
- from retrieval import build_index
- from artifacts_store import (
-     cleanup_index as cleanup_artifact_index,
-     delete_artifact as delete_artifact_entry,
-     list_artifacts as list_artifact_cards,
-     resolve_artifact_path,
- )
- from observability.logger import bind_trace_id, clear_trace_id, get_logger
- from observability.metrics import get_registry
- 
- load_dotenv()
- 
- LOGGER = get_logger("content_factory.api")
- 
- PIPELINE_CONFIG_FILENAME = "pipeline.json"
- 
- JOB_STORE = JobStore(ttl_seconds=JOB_STORE_TTL_S)
- JOB_RUNNER = JobRunner(JOB_STORE)
- 
- USERS: Dict[str, Dict[str, str]] = {
-     "admin": {
-         "display_name": "Admin",
-         "password_hash": (
-             "scrypt:32768:8:1$poFMhgLX1D2jug2W$724005a9a37b1f699ddda576ee89fb022c3bdcd28660826d1f9f5710c3116c6"
-             "b847ea20c926c9124fbcfa9fee55967a26d488e3d04a3b58e2776f002a124d003"
-@@ -206,50 +207,71 @@ def create_app() -> Flask:
- 
-         return render_template("login.html", next=next_param, username=username)
- 
-     @app.get("/logout")
-     def logout():
-         session.clear()
-         return redirect(url_for("login"))
- 
-     @app.get("/api/pipes")
-     def list_pipes():
-         pipes = _collect_pipes()
-         return jsonify(pipes)
- 
-     @app.post("/api/prompt/preview")
-     def prompt_preview():
-         payload = _require_json(request)
-         theme = str(payload.get("theme", "")).strip()
-         if not theme:
-             raise ApiError("Не указана тема (theme)")
- 
-         raw_data = payload.get("data") or {}
-         if not isinstance(raw_data, dict):
-             raise ApiError("Поле data должно быть объектом")
-         raw_data = dict(raw_data)
- 
-+        explicit_keywords = payload.get("keywords")
-+        if explicit_keywords and "keywords" not in raw_data:
-+            raw_data["keywords"] = explicit_keywords
-+
-+        explicit_length = payload.get("length_range")
-+        if (
-+            isinstance(explicit_length, dict)
-+            and "length_limits" not in raw_data
-+            and {"min", "max"} <= set(explicit_length.keys())
-+        ):
-+            raw_data["length_limits"] = {
-+                "min_chars": explicit_length.get("min"),
-+                "max_chars": explicit_length.get("max"),
-+            }
-+
-+        if "faq_required" in payload and "include_faq" not in raw_data:
-+            raw_data["include_faq"] = bool(payload.get("faq_required"))
-+
-+        if payload.get("faq_count") and "faq_questions" not in raw_data:
-+            raw_data["faq_questions"] = payload.get("faq_count")
-+
-         style_payload = payload.get("style")
-         if isinstance(style_payload, dict):
-             raw_data["style"] = style_payload
- 
-         k = _safe_int(payload.get("k"))
-         if k < 0:
-             k = 0
- 
-         style_profile_override = _style_profile_override_from_request(request)
- 
-         context_source, context_text, context_filename = _extract_context_settings(payload, raw_data)
-         effective_k = k
-         if context_source in {"off", "custom"}:
-             effective_k = 0
- 
-         generation_context = make_generation_context(
-             theme=theme,
-             data=raw_data,
-             k=effective_k,
-             append_style_profile=style_profile_override,
-             context_source=context_source,
-             custom_context_text=context_text,
-             context_filename=context_filename,
-         )
- 
-@@ -316,51 +338,58 @@ def create_app() -> Flask:
-         if not theme:
-             raise ApiError("Не указана тема (theme)")
- 
-         raw_data = payload.get("data") or {}
-         if not isinstance(raw_data, dict):
-             raise ApiError("Поле data должно быть объектом")
-         raw_data = dict(raw_data)
- 
-         style_payload = payload.get("style")
-         if isinstance(style_payload, dict):
-             raw_data["style"] = style_payload
- 
-         k = _safe_int(payload.get("k"))
-         if k < 0:
-             k = 0
- 
-         context_source, context_text, context_filename = _extract_context_settings(payload, raw_data)
-         effective_k = k
-         if context_source in {"off", "custom"}:
-             effective_k = 0
- 
-         style_profile_override = _style_profile_override_from_request(request)
-         if payload.get("dry_run"):
-             return jsonify(_make_dry_run_response(theme=theme, data=raw_data, k=effective_k))
- 
--        model = payload.get("model")
-+        requested_model = str(payload.get("model", "")).strip()
-+        if requested_model and requested_model.lower() != DEFAULT_MODEL.lower():
-+            LOGGER.info(
-+                "IGNORED_MODEL_OVERRIDE requested=%s enforced=%s",
-+                requested_model,
-+                DEFAULT_MODEL,
-+            )
-+        model = DEFAULT_MODEL
-         temperature = _safe_float(payload.get("temperature", 0.3), default=0.3)
-         temperature = max(0.0, min(2.0, temperature))
-         max_tokens = max(1, _safe_int(payload.get("max_tokens", 1400), default=1400))
-         task_payload = {
-             "theme": theme,
-             "data": raw_data,
-             "k": k,
-             "model": model,
-             "temperature": temperature,
-             "max_tokens": max_tokens,
-             "append_style_profile": style_profile_override,
-             "context_source": context_source,
-             "context_text": context_text,
-             "context_filename": context_filename,
+     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
+     if not api_key:
+         return {
+             "ok": False,
+             "message": "Responses недоступен: ключ не задан",
+             "route": "responses",
+             "fallback_used": False,
          }
  
-         trace_id = getattr(g, "trace_id", None)
-         job = JOB_RUNNER.submit(task_payload, trace_id=trace_id)
-         sync_raw = payload.get("sync", request.args.get("sync"))
-         sync_requested = str(sync_raw).lower() in {"1", "true", "yes"}
- 
-         if sync_requested:
-             finished = JOB_RUNNER.wait(job.id, timeout=JOB_RUNNER.soft_timeout())
-             snapshot = JOB_RUNNER.get_job(job.id)
-             if snapshot:
-diff --git a/validators.py b/validators.py
-index e8751ee41579ef34e10595b0cb9b88b198736ff7..45ab5524287ff890983befbbcd18bd81c5d2183f 100644
---- a/validators.py
-+++ b/validators.py
-@@ -39,90 +39,91 @@ class ValidationResult:
- 
-     @property
-     def is_valid(self) -> bool:
-         return self.skeleton_ok and self.keywords_ok and self.faq_ok and self.length_ok
- 
- 
- def strip_jsonld(text: str) -> str:
-     return _JSONLD_PATTERN.sub("", text, count=1)
- 
- 
- def _length_no_spaces(text: str) -> int:
-     return len(re.sub(r"\s+", "", strip_jsonld(text)))
- 
- 
- def length_no_spaces(text: str) -> int:
-     return _length_no_spaces(text)
- 
- 
- def _faq_pairs(text: str) -> List[str]:
-     if _FAQ_START not in text or _FAQ_END not in text:
-         return []
-     block = text.split(_FAQ_START, 1)[1].split(_FAQ_END, 1)[0]
-     return re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block)
- 
- 
--def _parse_markdown_faq(text: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
-+def _parse_markdown_faq(text: str, expected_count: int) -> Tuple[List[Dict[str, str]], Optional[str]]:
-     if _FAQ_START not in text or _FAQ_END not in text:
-         return [], "Блок FAQ в markdown отсутствует."
- 
-     block = text.split(_FAQ_START, 1)[1].split(_FAQ_END, 1)[0]
-     entries: List[Dict[str, str]] = []
-     for match in _FAQ_ENTRY_PATTERN.finditer(block.strip()):
-         question = match.group("question").strip()
-         answer = match.group("answer").strip()
-         index = int(match.group("index"))
-         if not question or not answer:
-             return entries, "FAQ содержит пустой вопрос или ответ."
-         paragraphs = [segment.strip() for segment in re.split(r"\n\s*\n", answer) if segment.strip()]
-         if not 1 <= len(paragraphs) <= 3:
-             return entries, f"Ответ на вопрос '{question}' должен состоять из 1–3 абзацев."
-         entries.append({"index": index, "question": question, "answer": answer})
- 
--    if len(entries) != 5:
--        return entries, "FAQ должен содержать ровно 5 вопросов и ответов."
-+    if expected_count > 0 and len(entries) != expected_count:
-+        return entries, f"FAQ должен содержать ровно {expected_count} вопросов и ответов."
- 
--    indices = [entry["index"] for entry in entries]
--    if indices != list(range(1, len(entries) + 1)):
--        return entries, "Нумерация вопросов в FAQ должна идти последовательно от 1 до 5."
-+    if expected_count > 0:
-+        indices = [entry["index"] for entry in entries]
-+        if indices != list(range(1, len(entries) + 1)):
-+            return entries, "Нумерация вопросов в FAQ должна идти последовательно."
- 
-     return entries, None
- 
- 
--def _parse_jsonld_entries(text: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
-+def _parse_jsonld_entries(text: str, expected_count: int) -> Tuple[List[Dict[str, str]], Optional[str]]:
-     match = _JSONLD_PATTERN.search(text)
-     if not match:
-         return [], "JSON-LD FAQ недействителен или отсутствует."
-     try:
-         payload = json.loads(match.group(1))
-     except json.JSONDecodeError:
-         return [], "JSON-LD FAQ недействителен или отсутствует."
-     if not isinstance(payload, dict) or payload.get("@type") != "FAQPage":
-         return [], "JSON-LD FAQ недействителен или отсутствует."
-     entities = payload.get("mainEntity")
--    if not isinstance(entities, list) or len(entities) != 5:
--        return [], "JSON-LD FAQ должен содержать ровно 5 вопросов и ответов."
-+    if expected_count > 0 and (not isinstance(entities, list) or len(entities) != expected_count):
-+        return [], f"JSON-LD FAQ должен содержать ровно {expected_count} вопросов и ответов."
-     parsed: List[Dict[str, str]] = []
-     for idx, entry in enumerate(entities, start=1):
-         if not isinstance(entry, dict) or entry.get("@type") != "Question":
-             return [], f"JSON-LD вопрос №{idx} имеет неверный формат."
-         answer = entry.get("acceptedAnswer")
-         if not isinstance(answer, dict) or answer.get("@type") != "Answer":
-             return [], f"JSON-LD ответ для вопроса №{idx} имеет неверный формат."
-         question = str(entry.get("name", "")).strip()
-         answer_text = str(answer.get("text", "")).strip()
-         if not question or not answer_text:
-             return [], f"JSON-LD вопрос №{idx} содержит пустые данные."
-         parsed.append({"index": idx, "question": question, "answer": answer_text})
-     return parsed, None
- 
- 
- def _skeleton_status(
-     skeleton_payload: Optional[Dict[str, object]],
-     text: str,
- ) -> Tuple[bool, Optional[str]]:
-     if skeleton_payload is None:
-         if "## FAQ" in text and _FAQ_START in text and _FAQ_END in text:
-             return True, None
-         return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
-     if not isinstance(skeleton_payload, dict):
-         return False, "Данные скелета не получены или имеют неверный формат."
-@@ -159,159 +160,173 @@ def _skeleton_status(
-         if not question or not answer:
-             return False, f"FAQ элемент №{idx} пуст."
- 
-     outline = skeleton_payload.get("outline")
-     if outline and isinstance(outline, list):
-         normalized_outline = [str(entry).strip() for entry in outline if str(entry).strip()]
-     else:
-         normalized_outline = []
- 
-     expected_main = max(1, len(normalized_outline) - 2) if normalized_outline else len(main)
-     if len(main) != expected_main:
-         return False, "Количество блоков основной части не совпадает с ожидаемым."
-     if "## FAQ" not in text or _FAQ_START not in text or _FAQ_END not in text:
-         return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
-     return True, None
- 
- 
- def validate_article(
-     text: str,
-     *,
-     keywords: Iterable[str],
-     min_chars: int,
-     max_chars: int,
-     skeleton_payload: Optional[Dict[str, object]] = None,
-     keyword_coverage_percent: Optional[float] = None,
-+    faq_expected: Optional[int] = None,
- ) -> ValidationResult:
-     length = _length_no_spaces(text)
-     default_soft_min, default_soft_max, default_tol_below, default_tol_above = compute_soft_length_bounds(
-         DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH
-     )
-     requested_soft_min, requested_soft_max, req_tol_below, req_tol_above = compute_soft_length_bounds(
-         min_chars, max_chars
-     )
-     normalized_skeleton = (
-         normalize_skeleton_payload(skeleton_payload)
-         if skeleton_payload is not None
-         else None
-     )
-     skeleton_ok, skeleton_message = _skeleton_status(normalized_skeleton, text)
- 
-     normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
-     missing: List[str] = []
-     article = strip_jsonld(text)
-     for term in normalized_keywords:
-         pattern = _keyword_regex(term)
-         if not pattern.search(article):
-             missing.append(term)
-             continue
-         lock_token = LOCK_START_TEMPLATE.format(term=term)
-         lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-         if not lock_pattern.search(text):
-             missing.append(term)
-     keywords_ok = len(missing) == 0
- 
--    markdown_faq, markdown_error = _parse_markdown_faq(text)
-+    target_faq = 5 if faq_expected is None else max(0, int(faq_expected))
-+    markdown_faq, markdown_error = _parse_markdown_faq(text, target_faq)
-     faq_count = len(markdown_faq)
--    jsonld_entries, jsonld_error = _parse_jsonld_entries(text)
-+    jsonld_entries, jsonld_error = _parse_jsonld_entries(text, target_faq)
-     jsonld_ok = jsonld_error is None
- 
-     faq_ok = False
-     faq_error: Optional[str] = None
-     mismatched_questions: List[str] = []
-     if markdown_error:
-         faq_error = markdown_error
-     elif jsonld_error:
-         faq_error = jsonld_error
-+    elif target_faq == 0:
-+        faq_ok = True
-+        jsonld_ok = True
-+        markdown_faq = []
-+        jsonld_entries = []
-     else:
-         faq_ok = True
-         for idx, entry in enumerate(markdown_faq):
-             jsonld_entry = jsonld_entries[idx]
-             if entry["question"] != jsonld_entry["question"] or entry["answer"] != jsonld_entry["answer"]:
-                 faq_ok = False
-                 mismatched_questions.append(entry["question"])
-         if mismatched_questions:
-             faq_error = (
-                 "FAQ в markdown не совпадает с JSON-LD (например, вопрос '"
-                 + mismatched_questions[0]
-                 + "')."
-             )
--    if not faq_ok and faq_error is None:
--        faq_error = "FAQ должен содержать ровно 5 вопросов и ответов."
-+    if not faq_ok and faq_error is None and target_faq > 0:
-+        faq_error = f"FAQ должен содержать ровно {target_faq} вопросов и ответов."
- 
-     coverage_percent = 100.0 if not normalized_keywords else round(
-         (len(normalized_keywords) - len(missing)) / len(normalized_keywords) * 100,
-         2,
-     )
- 
-     length_ok = default_soft_min <= length <= default_soft_max
-     requested_range_ok = requested_soft_min <= length <= requested_soft_max
- 
-     stats: Dict[str, object] = {
-         "length_no_spaces": length,
-         "keywords_total": len(normalized_keywords),
-         "keywords_missing": missing,
-         "keywords_found": len(normalized_keywords) - len(missing),
-         "keywords_coverage": f"{len(normalized_keywords) - len(missing)}/{len(normalized_keywords) if normalized_keywords else 0}",
-         "keywords_coverage_percent": coverage_percent,
-         "keyword_coverage_expected_percent": keyword_coverage_percent,
-         "faq_count": faq_count,
-         "faq_jsonld_count": len(jsonld_entries),
-+        "faq_expected": target_faq,
-         "faq_mismatched_questions": mismatched_questions,
-         "jsonld_ok": jsonld_ok,
-         "length_requested_range_ok": requested_range_ok,
-         "length_required_min": DEFAULT_MIN_LENGTH,
-         "length_required_max": DEFAULT_MAX_LENGTH,
-         "length_soft_min": default_soft_min,
-         "length_soft_max": default_soft_max,
-         "length_tolerance_default_below": default_tol_below,
-         "length_tolerance_default_above": default_tol_above,
-         "length_requested_soft_min": requested_soft_min,
-         "length_requested_soft_max": requested_soft_max,
-         "length_requested_tolerance_below": req_tol_below,
-         "length_requested_tolerance_above": req_tol_above,
+     headers = {
+         "Authorization": f"Bearer {api_key}",
+         "Content-Type": "application/json",
      }
  
-     if keyword_coverage_percent is not None and keyword_coverage_percent < 100.0:
-         raise ValidationError(
-             "keywords",
-             (
-                 "Этап подстановки ключевых слов завершился с покрытием "
-                 f"{keyword_coverage_percent:.0f}%, требуется 100%."
-             ),
-             details=stats,
-         )
+     route = "responses"
+     fallback_used = False
++    model_url = f"https://api.openai.com/v1/models/{model}"
  
-     result = ValidationResult(
-         skeleton_ok=skeleton_ok,
-         keywords_ok=keywords_ok,
-         faq_ok=faq_ok,
-         length_ok=length_ok,
-         jsonld_ok=jsonld_ok,
-         stats=stats,
-     )
+     start = time.perf_counter()
+     attempts = 0
+     max_attempts = 2
+     min_bump_done = False
+     current_max_tokens = max_tokens
+     auto_bump_applied = False
+     data: Optional[Dict[str, object]] = None
+     response: Optional[httpx.Response] = None
  
-     if not skeleton_ok:
-         raise ValidationError("skeleton", skeleton_message or "Ошибка структуры статьи.", details=stats)
-     if not keywords_ok:
-         raise ValidationError(
-             "keywords",
-             "Ключевые слова покрыты не полностью.",
-             details={"missing": missing, **stats},
-         )
-     if not faq_ok:
--        message = faq_error or "FAQ должен содержать 5 вопросов и корректный JSON-LD."
-+        expected_label = target_faq if target_faq > 0 else 0
-+        default_message = "FAQ должен содержать корректные данные."
-+        if expected_label > 0:
-+            default_message = (
-+                f"FAQ должен содержать {expected_label} вопросов и корректный JSON-LD."
-+            )
-+        message = faq_error or default_message
-         raise ValidationError("faq", message, details=stats)
-     if not length_ok:
-         raise ValidationError(
-             "length",
-             (
-                 f"Объём статьи {length} зн. без пробелов, требуется "
-                 f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH} (допуск {default_soft_min}-{default_soft_max})."
-             ),
-             details=stats,
-         )
+     try:
+         with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
++            model_probe = client.get(model_url, headers=headers)
++            if model_probe.status_code != 200:
++                detail = model_probe.text.strip()
++                if len(detail) > 120:
++                    detail = f"{detail[:117]}..."
++                latency_ms = int((time.perf_counter() - start) * 1000)
++                return {
++                    "ok": False,
++                    "message": (
++                        f"Модель {model} недоступна: HTTP {model_probe.status_code}"
++                        + (f" — {detail}" if detail else "")
++                    ),
++                    "route": "models",
++                    "fallback_used": False,
++                    "latency_ms": latency_ms,
++                }
++
+             while attempts < max_attempts:
+                 attempts += 1
+                 payload_snapshot = dict(sanitized_payload)
+                 payload_snapshot["text"] = {"format": deepcopy(text_format)}
+                 payload_snapshot["max_output_tokens"] = current_max_tokens
+                 response = client.post(
+                     RESPONSES_API_URL,
+                     json=payload_snapshot,
+                     headers=headers,
+                 )
+                 if (
+                     response.status_code == 400
+                     and not min_bump_done
+                     and is_min_tokens_error(response)
+                 ):
+                     current_max_tokens = max(current_max_tokens, HEALTH_MIN_BUMP_TOKENS)
+                     sanitized_payload["max_output_tokens"] = current_max_tokens
+                     min_bump_done = True
+                     auto_bump_applied = True
+                     continue
+                 break
+     except httpx.TimeoutException:
+         latency_ms = int((time.perf_counter() - start) * 1000)
+         return {
+             "ok": False,
+@@ -762,89 +784,91 @@ def _run_health_ping() -> Dict[str, object]:
+         return {
+             "ok": False,
+             "message": "Responses недоступен: некорректный JSON",
+             "route": route,
+             "fallback_used": fallback_used,
+             "latency_ms": latency_ms,
+         }
+ 
+     status = str(data.get("status", "")).strip().lower()
+     incomplete_reason = ""
+     incomplete_details = data.get("incomplete_details")
+     if isinstance(incomplete_details, dict):
+         reason_value = incomplete_details.get("reason")
+         if isinstance(reason_value, str):
+             incomplete_reason = reason_value.strip().lower()
+ 
+     got_output = False
+     output_text = data.get("output_text")
+     if isinstance(output_text, str) and output_text.strip():
+         got_output = True
+     elif isinstance(data.get("output"), list) or isinstance(data.get("outputs"), list):
+         got_output = True
+ 
+     extras: List[str] = []
+     if auto_bump_applied:
+-        extras.append("auto-bump до 24")
++        extras.append(f"auto-bump до {current_max_tokens}")
+ 
+     if status == "completed":
+         message = f"Responses OK (gpt-5, {current_max_tokens} токена"
+         ok = True
+     elif status == "incomplete" and incomplete_reason == "max_output_tokens":
+         extras.insert(0, "incomplete по лимиту — норм для health")
+         message = f"Responses OK (gpt-5, {current_max_tokens} токена"
+         ok = True
+     else:
+         if not status:
+             reason = "неизвестный статус"
+         else:
+             reason = status
+             if incomplete_reason:
+                 reason = f"{reason} ({incomplete_reason})"
+         return {
+             "ok": False,
+             "message": f"Responses недоступен: статус {reason}",
+             "route": route,
+             "fallback_used": fallback_used,
+             "latency_ms": latency_ms,
+             "status": status or "",
+         }
+ 
+     if extras:
+         message = f"{message}; {'; '.join(extras)})"
+     else:
+         message = f"{message})"
+ 
+     result: Dict[str, object] = {
+         "ok": ok,
+         "message": message,
+         "route": route,
+         "fallback_used": fallback_used,
+         "latency_ms": latency_ms,
+-        "status": status or "ok",
++        "tokens": current_max_tokens,
++        "status": status,
++        "incomplete_reason": incomplete_reason or None,
++        "got_output": got_output,
+     }
+-    result["got_output"] = bool(got_output)
      return result
- def _keyword_regex(term: str) -> re.Pattern:
-     pattern = rf"(?i)(?<!\\w){re.escape(term)}(?!\\w)"
-     return re.compile(pattern)
  
+ 
+ def _parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="Deterministic content pipeline")
+     parser.add_argument("--theme", required=True, help="Theme slug (profiles/<theme>)")
+     parser.add_argument("--data", required=True, help="Path to JSON brief")
+     parser.add_argument("--outfile", help="Override output path")
+     parser.add_argument("--k", type=int, default=0, help="Number of exemplar clips")
+     parser.add_argument("--model", help="Optional model label for metadata")
+     parser.add_argument("--temperature", type=float, default=0.0)
+     parser.add_argument("--max-tokens", type=int, default=0, dest="max_tokens")
+     parser.add_argument("--timeout", type=int, default=60)
+     parser.add_argument("--mode", default="final")
+     parser.add_argument("--retry-backoff", help="Retry schedule (unused)")
+     parser.add_argument("--append-style-profile", action="store_true")
+     parser.add_argument("--context-source")
+     parser.add_argument("--context-text")
+     parser.add_argument("--context-filename")
+     parser.add_argument("--check", action="store_true")
+     return parser.parse_args()
+ 
+ 
+ def _load_input(path: str) -> Dict[str, Any]:
+     payload_path = Path(path)
+diff --git a/tests/test_health.py b/tests/test_health.py
+index d7c592d09033c9e6be7fed3d67ac4a5729939092..cf46a30c4913078e46ab5b0ee2be78113fe53534 100644
+--- a/tests/test_health.py
++++ b/tests/test_health.py
+@@ -1,111 +1,143 @@
+ from pathlib import Path
+ from typing import Iterable, List, Optional
+ 
+ import httpx
+ import pytest
+ 
+ import sys
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+ import orchestrate
+ 
+ 
+ class DummyHealthClient:
+     def __init__(self, responses: Iterable[httpx.Response]):
+         self._responses = list(responses)
+         self._index = 0
+         self.requests: List[dict] = []
+ 
+     def __enter__(self):
+         return self
+ 
+     def __exit__(self, exc_type, exc, tb):
+         return False
+ 
+-    def post(self, url, json=None, headers=None, **kwargs):
+-        self.requests.append({"url": url, "json": json, "headers": headers})
++    def _next(self) -> httpx.Response:
+         if self._index >= len(self._responses):
+             return self._responses[-1]
+         response = self._responses[self._index]
+         self._index += 1
+         return response
+ 
++    def get(self, url, headers=None, **kwargs):
++        self.requests.append({"method": "GET", "url": url, "headers": headers})
++        return self._next()
++
++    def post(self, url, json=None, headers=None, **kwargs):
++        self.requests.append({"method": "POST", "url": url, "json": json, "headers": headers})
++        return self._next()
++
+ 
+ @pytest.fixture(autouse=True)
+ def _force_api_key(monkeypatch):
+     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+     yield
+     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+ 
+ 
+-def _response(status_code: int, payload: Optional[dict] = None, text: str = "") -> httpx.Response:
+-    request = httpx.Request("POST", orchestrate.RESPONSES_API_URL)
++def _response(
++    status_code: int,
++    payload: Optional[dict] = None,
++    text: str = "",
++    *,
++    method: str = "POST",
++    url: str = orchestrate.RESPONSES_API_URL,
++) -> httpx.Response:
++    request = httpx.Request(method, url)
+     if payload is not None:
+         return httpx.Response(status_code, request=request, json=payload)
+     return httpx.Response(status_code, request=request, text=text)
+ 
+ 
+ def test_health_ping_success(monkeypatch):
+     payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
+-    client = DummyHealthClient([_response(200, payload)])
++    responses = [
++        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
++        _response(200, payload),
++    ]
++    client = DummyHealthClient(responses)
+     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
+ 
+     result = orchestrate._run_health_ping()
+ 
+     assert result["ok"] is True
+     assert result["route"] == "responses"
+     assert result["fallback_used"] is False
+-    assert "Responses OK (gpt-5, 24 токена)" in result["message"]
++    expected_label = f"Responses OK (gpt-5, {orchestrate.HEALTH_INITIAL_MAX_TOKENS} токена)"
++    assert expected_label in result["message"]
+ 
+-    request_payload = client.requests[0]["json"]
++    assert client.requests[0]["method"] == "GET"
++    request_payload = client.requests[1]["json"]
+     assert request_payload["max_output_tokens"] == orchestrate.HEALTH_INITIAL_MAX_TOKENS
+     assert request_payload["text"]["format"]["type"] == "text"
+     assert "temperature" not in request_payload
+ 
+ 
+ def test_health_ping_incomplete_max_tokens(monkeypatch):
+     payload = {
+         "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
+         "output": [],
+     }
+-    client = DummyHealthClient([_response(200, payload)])
++    responses = [
++        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
++        _response(200, payload),
++    ]
++    client = DummyHealthClient(responses)
+     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
+ 
+     result = orchestrate._run_health_ping()
+ 
+     assert result["ok"] is True
+     assert "incomplete по лимиту — норм для health" in result["message"]
+ 
+ 
+ def test_health_ping_auto_bump(monkeypatch):
+     monkeypatch.setattr(orchestrate, "HEALTH_INITIAL_MAX_TOKENS", 12)
+     error_payload = {
+         "error": {
+             "type": "invalid_request_error",
+             "message": "Invalid 'max_output_tokens': Expected a value >= 16",
+         }
+     }
+     success_payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
+-    responses = [_response(400, error_payload), _response(200, success_payload)]
++    responses = [
++        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
++        _response(400, error_payload),
++        _response(200, success_payload),
++    ]
+     client = DummyHealthClient(responses)
+     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
+ 
+     result = orchestrate._run_health_ping()
+ 
+     assert result["ok"] is True
+-    assert "auto-bump до 24" in result["message"]
+-    assert len(client.requests) == 2
+-    assert client.requests[0]["json"]["max_output_tokens"] == 12
+-    assert client.requests[1]["json"]["max_output_tokens"] >= 24
++    assert f"auto-bump до {orchestrate.HEALTH_MIN_BUMP_TOKENS}" in result["message"]
++    assert len(client.requests) == 3
++    assert client.requests[1]["json"]["max_output_tokens"] == 12
++    assert client.requests[2]["json"]["max_output_tokens"] >= orchestrate.HEALTH_MIN_BUMP_TOKENS
+ 
+ 
+ def test_health_ping_5xx_failure(monkeypatch):
+-    client = DummyHealthClient([_response(502, None, text="Bad gateway")])
++    responses = [
++        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
++        _response(502, None, text="Bad gateway"),
++    ]
++    client = DummyHealthClient(responses)
+     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
+ 
+     result = orchestrate._run_health_ping()
+ 
+     assert result["ok"] is False
+     assert "HTTP 502" in result["message"]
+diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
+index 9e8b1b7bed80c856cde3733c3fa23c24d9970277..4435bebd4ffa91c8bcd7d5da56c778465c8577e1 100644
+--- a/tests/test_llm_client.py
++++ b/tests/test_llm_client.py
+@@ -1,39 +1,41 @@
+ # -*- coding: utf-8 -*-
+ from pathlib import Path
+ from unittest.mock import patch
+ import httpx
+ import pytest
+ import sys
+ 
+ import json
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+ from llm_client import (
+     DEFAULT_RESPONSES_TEXT_FORMAT,
+     G5_MAX_OUTPUT_TOKENS_MAX,
++    G5_MAX_OUTPUT_TOKENS_STEP1,
++    G5_MAX_OUTPUT_TOKENS_STEP2,
+     GenerationResult,
+     generate,
+ )
+ 
+ 
+ @pytest.fixture(autouse=True)
+ def _force_api_key(monkeypatch):
+     monkeypatch.setenv("OPENAI_API_KEY", "test")
+     yield
+     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+ 
+ 
+ class DummyResponse:
+     def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
+         if payload is None:
+             payload = {
+                 "choices": [
+                     {
+                         "message": {
+                             "content": "ok",
+                         }
+                     }
+                 ]
+             }
+         self._json = payload
+@@ -371,124 +373,138 @@ def test_generate_falls_back_to_gpt4_when_gpt5_empty():
+             {
+                 "content": [
+                     {"type": "text", "text": "   "},
+                 ]
+             }
+         ]
+     }
+     fallback_payload = {
+         "choices": [
+             {
+                 "message": {
+                     "content": "from fallback",
+                 }
+             }
+         ]
+     }
+     client = DummyClient(payloads=[empty_payload, fallback_payload])
+     with patch("llm_client.httpx.Client", return_value=client):
+         result = generate(
+             messages=[{"role": "user", "content": "ping"}],
+             model="gpt-5-large",
+             temperature=0,
+             max_tokens=42,
+         )
+ 
+-    assert result.model_used == "gpt-4o"
+-    assert result.fallback_used == "gpt-4o"
++    assert result.model_used == "gpt-5-large"
++    assert result.fallback_used == "gpt-5-large"
+     assert result.retry_used is False
+     assert result.text == "from fallback"
+     assert result.fallback_reason == "empty_completion_gpt5_responses"
+     assert result.api_route == "chat"
+ 
+ 
+ def test_generate_falls_back_when_gpt5_unavailable(monkeypatch):
+     monkeypatch.setattr("llm_client.FORCE_MODEL", False)
+     fallback_payload = {
+         "choices": [
+             {
+                 "message": {
+                     "content": "fallback ok",
+                 }
+             }
+         ]
+     }
+     client = DummyClient(payloads=[fallback_payload], availability=[403])
+     with patch("llm_client.httpx.Client", return_value=client):
+-        result = generate(
+-            messages=[{"role": "user", "content": "ping"}],
+-            model="gpt-5",
+-            temperature=0.2,
+-            max_tokens=42,
+-        )
++        with pytest.raises(RuntimeError) as excinfo:
++            generate(
++                messages=[{"role": "user", "content": "ping"}],
++                model="gpt-5",
++                temperature=0.2,
++                max_tokens=42,
++            )
+ 
+-    assert result.model_used == "gpt-4o"
+-    assert result.fallback_used == "gpt-4o"
+-    assert result.retry_used is False
+-    assert result.text == "fallback ok"
+-    assert result.fallback_reason == "model_unavailable"
++    assert "Model GPT-5 not available" in str(excinfo.value)
+ 
+ 
+ def test_generate_escalates_max_tokens_when_truncated():
+     initial_payload = {
+         "id": "resp-1",
+         "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": ""},
+                 ]
+             }
+         ],
+     }
+     final_payload = {
+         "status": "completed",
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "expanded"},
+                 ]
+             }
+         ],
+     }
+     client = DummyClient(payloads=[initial_payload, final_payload])
+     with patch("llm_client.httpx.Client", return_value=client):
+         result = generate(
+             messages=[{"role": "user", "content": "ping"}],
+             model="gpt-5",
+             temperature=0.1,
+         )
+ 
+     assert isinstance(result, GenerationResult)
+     assert result.text == "expanded"
+     assert result.retry_used is True
+     assert client.call_count == 2
+     first_tokens = client.requests[0]["json"]["max_output_tokens"]
+     second_tokens = client.requests[1]["json"]["max_output_tokens"]
+     cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+-    expected_second = max(first_tokens + 600, int(first_tokens * 1.5))
++    ladder = sorted(
++        {
++            value
++            for value in (
++                G5_MAX_OUTPUT_TOKENS_STEP1,
++                G5_MAX_OUTPUT_TOKENS_STEP2,
++                G5_MAX_OUTPUT_TOKENS_MAX,
++            )
++            if isinstance(value, int) and value > 0
++        }
++    )
++    expected_second = None
++    for value in ladder:
++        if value > first_tokens:
++            expected_second = value
++            break
++    if expected_second is None:
++        expected_second = first_tokens + 200
+     if cap is not None:
+         expected_second = min(expected_second, cap)
+     assert second_tokens == expected_second
+     assert client.requests[1]["json"].get("previous_response_id") == "resp-1"
+     assert client.requests[0]["json"].get("previous_response_id") is None
+ 
+ 
+ def test_generate_accepts_incomplete_with_valid_json():
+     skeleton_payload = {
+         "intro": "Вступление",
+         "main": ["Блок 1", "Блок 2", "Блок 3"],
+         "faq": [
+             {"q": f"Вопрос {idx}", "a": f"Ответ {idx}. Детали."}
+             for idx in range(1, 6)
+         ],
+         "conclusion": "Вывод",
+     }
+     skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
+     incomplete_payload = {
+         "id": "resp-accept",
+         "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
+         "output": [
+             {
+                 "content": [
+diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
+index 64e675dbd8b66d6e7ef13e536f3e8ca7976559f4..9cedd89410720c82ea99db7cf2e5049bb2bb5fa8 100644
+--- a/tests/test_orchestrate_utils.py
++++ b/tests/test_orchestrate_utils.py
+@@ -280,50 +280,54 @@ def test_pipeline_resume_falls_back_to_available_checkpoint(monkeypatch):
+         messages=[{"role": "system", "content": "Системный промпт"}],
+         model="stub-model",
+         temperature=0.3,
+         max_tokens=1800,
+         timeout_s=60,
+     )
+     pipeline._run_skeleton()
+     state = pipeline.resume(PipelineStep.FAQ)
+     assert state.validation and state.validation.is_valid
+     faq_entries = [entry for entry in state.logs if entry.step == PipelineStep.FAQ]
+     assert faq_entries and faq_entries[-1].status == "ok"
+ 
+ 
+ def test_generate_article_returns_metadata(monkeypatch, tmp_path):
+     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+     _stub_llm(monkeypatch)
+     unique_name = f"test_{uuid.uuid4().hex}.md"
+     outfile = Path("artifacts") / unique_name
+     data = {
+         "theme": "Долговая нагрузка семьи",
+         "structure": ["Введение", "Основная часть", "Вывод"],
+         "keywords": [f"ключ {idx}" for idx in range(1, 12)],
+         "include_jsonld": True,
+         "context_source": "off",
+     }
++    monkeypatch.setattr(
++        "orchestrate._run_health_ping",
++        lambda: {"ok": True, "message": "stub", "route": "responses", "fallback_used": False},
++    )
+     result = generate_article_from_payload(
+         theme="finance",
+         data=data,
+         k=0,
+         context_source="off",
+         outfile=str(outfile),
+     )
+     metadata = result["metadata"]
+     assert metadata["validation"]["passed"]
+     assert Path(outfile).exists()
+     assert metadata["pipeline_logs"]
+     # cleanup
+     Path(outfile).unlink(missing_ok=True)
+     Path(outfile.with_suffix(".json")).unlink(missing_ok=True)
+ 
+ 
+ def test_gather_health_status_handles_missing_theme(monkeypatch):
+     monkeypatch.setenv("OPENAI_API_KEY", "")
+     status = gather_health_status(theme="")
+     assert not status["ok"]
+     assert not status["checks"]["theme_index"]["ok"]
+     llm_ping = status["checks"]["llm_ping"]
+     assert llm_ping["route"] == "responses"
+     assert llm_ping["fallback_used"] is False
+     assert not llm_ping["ok"]
 

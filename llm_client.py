@@ -34,7 +34,7 @@ from config import (
 DEFAULT_MODEL = "gpt-5"
 MAX_RETRIES = 3
 BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
-FALLBACK_MODEL = "gpt-4o"
+FALLBACK_MODEL = DEFAULT_MODEL
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 RESPONSES_ALLOWED_KEYS = (
     "model",
@@ -45,7 +45,7 @@ RESPONSES_ALLOWED_KEYS = (
     "previous_response_id",
 )
 RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
-RESPONSES_MAX_ESCALATIONS = 2
+RESPONSES_MAX_ESCALATIONS = 6
 MAX_RESPONSES_POLL_ATTEMPTS = (
     G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
 )
@@ -1348,7 +1348,13 @@ def generate(
     if not api_url:
         raise RuntimeError(f"Неизвестный провайдер для модели '{model_name}'")
 
-    timeout = httpx.Timeout(timeout_s)
+    raw_timeout = timeout_s if timeout_s is not None else 60
+    try:
+        timeout_value = float(raw_timeout)
+    except (TypeError, ValueError):
+        timeout_value = 60.0
+    effective_timeout = min(max(timeout_value, 1.0), 25.0)
+    timeout = httpx.Timeout(effective_timeout)
     http_client = httpx.Client(timeout=timeout)
 
     schedule = _resolve_backoff_schedule(backoff_schedule)
@@ -1655,21 +1661,29 @@ def generate(
         resume_from_response_id: Optional[str] = None
         content_started = False
         cap_retry_performed = False
+        empty_retry_attempted = False
 
         def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
-            candidate = current
-            if step_index == 0:
-                candidate = max(current + 600, int(current * 1.5))
-            elif step_index == 1:
-                candidate = max(current + 600, int(current * 1.35))
-            else:
-                if cap is not None:
-                    candidate = cap
-                else:
-                    candidate = current + 600
-            if cap is not None:
-                candidate = min(candidate, cap)
-            return int(candidate)
+            ladder: List[int] = []
+            for value in (
+                G5_MAX_OUTPUT_TOKENS_STEP1,
+                G5_MAX_OUTPUT_TOKENS_STEP2,
+                G5_MAX_OUTPUT_TOKENS_MAX,
+            ):
+                try:
+                    normalized = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if normalized <= 0:
+                    continue
+                ladder.append(normalized)
+            ladder = sorted(dict.fromkeys(ladder))
+            for target in ladder:
+                if target > current:
+                    return target if cap is None else min(target, cap)
+            if cap is not None and cap > current:
+                return int(cap)
+            return current + 200
 
         def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
             poll_attempt = 0
@@ -1943,6 +1957,16 @@ def generate(
                     shrink_next_attempt = True
                     continue
                 if not text:
+                    response_id_value = metadata.get("response_id") or ""
+                    if response_id_value and not empty_retry_attempted:
+                        empty_retry_attempted = True
+                        resume_from_response_id = str(response_id_value)
+                        LOGGER.warning(
+                            "RESP_EMPTY retrying with previous_response_id=%s",
+                            resume_from_response_id,
+                        )
+                        last_error = RuntimeError("responses_empty_retry")
+                        continue
                     last_error = EmptyCompletionError(
                         "Модель вернула пустой ответ",
                         raw_response=data,
@@ -2065,47 +2089,8 @@ def generate(
             )
             if not available:
                 error_message = "Model GPT-5 not available for this key/plan"
-                LOGGER.warning("primary model %s unavailable — considering fallback", model_name)
-                if FORCE_MODEL:
-                    raise RuntimeError(error_message)
-                fallback_used = FALLBACK_MODEL
-                fallback_reason = "model_unavailable"
-                LOGGER.warning(
-                    "switching to fallback model %s (primary=%s, reason=%s: %s)",
-                    fallback_used,
-                    model_name,
-                    fallback_reason,
-                    error_message,
-                )
-                try:
-                    text, parse_flags_fallback, _, schema_fallback = _call_chat_model(
-                        fallback_used
-                    )
-                    schema_category = _categorize_schema(parse_flags_fallback)
-                    LOGGER.info(
-                        "completion schema category=%s (schema=%s, route=chat)",
-                        schema_category,
-                        schema_fallback,
-                    )
-                    metadata_block = None
-                    if isinstance(parse_flags_fallback, dict):
-                        meta_candidate = parse_flags_fallback.get("metadata")
-                        if isinstance(meta_candidate, dict):
-                            metadata_block = dict(meta_candidate)
-                    return GenerationResult(
-                        text=text,
-                        model_used=fallback_used,
-                        retry_used=False,
-                        fallback_used=fallback_used,
-                        fallback_reason=fallback_reason,
-                        api_route="chat",
-                        schema=schema_category,
-                        metadata=metadata_block,
-                    )
-                except EmptyCompletionError as fallback_error:
-                    _persist_raw_response(fallback_error.raw_response)
-                    _log_parse_chain(fallback_error.parse_flags, retry=0, fallback=fallback_used)
-                    raise
+                LOGGER.error("primary model %s unavailable", model_name)
+                raise RuntimeError(error_message)
 
             try:
                 text, parse_flags_initial, _, schema_initial_call = _call_responses_model(
@@ -2187,11 +2172,10 @@ def generate(
                 if not _is_responses_fallback_allowed(responses_error):
                     raise
                 fallback_reason = "api_error_gpt5_responses"
-            fallback_used = FALLBACK_MODEL
+            fallback_used = model_name
             LOGGER.warning(
-                "switching to fallback model %s (primary=%s, reason=%s)",
+                "switching route to chat for model %s (reason=%s)",
                 fallback_used,
-                model_name,
                 fallback_reason,
             )
             text, parse_flags_fallback, _, schema_fallback = _call_chat_model(fallback_used)

@@ -302,6 +302,10 @@ def test_generate_article_returns_metadata(monkeypatch, tmp_path):
         "include_jsonld": True,
         "context_source": "off",
     }
+    monkeypatch.setattr(
+        "orchestrate._run_health_ping",
+        lambda: {"ok": True, "message": "stub", "route": "responses", "fallback_used": False},
+    )
     result = generate_article_from_payload(
         theme="finance",
         data=data,

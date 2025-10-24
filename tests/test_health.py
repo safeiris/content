@@ -23,13 +23,20 @@ class DummyHealthClient:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def post(self, url, json=None, headers=None, **kwargs):
-        self.requests.append({"url": url, "json": json, "headers": headers})
+    def _next(self) -> httpx.Response:
         if self._index >= len(self._responses):
             return self._responses[-1]
         response = self._responses[self._index]
         self._index += 1
         return response
+
+    def get(self, url, headers=None, **kwargs):
+        self.requests.append({"method": "GET", "url": url, "headers": headers})
+        return self._next()
+
+    def post(self, url, json=None, headers=None, **kwargs):
+        self.requests.append({"method": "POST", "url": url, "json": json, "headers": headers})
+        return self._next()
 
 
 @pytest.fixture(autouse=True)
@@ -39,8 +46,15 @@ def _force_api_key(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
 
-def _response(status_code: int, payload: Optional[dict] = None, text: str = "") -> httpx.Response:
-    request = httpx.Request("POST", orchestrate.RESPONSES_API_URL)
+def _response(
+    status_code: int,
+    payload: Optional[dict] = None,
+    text: str = "",
+    *,
+    method: str = "POST",
+    url: str = orchestrate.RESPONSES_API_URL,
+) -> httpx.Response:
+    request = httpx.Request(method, url)
     if payload is not None:
         return httpx.Response(status_code, request=request, json=payload)
     return httpx.Response(status_code, request=request, text=text)
@@ -48,7 +62,11 @@ def _response(status_code: int, payload: Optional[dict] = None, text: str = "") 
 
 def test_health_ping_success(monkeypatch):
     payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
-    client = DummyHealthClient([_response(200, payload)])
+    responses = [
+        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
+        _response(200, payload),
+    ]
+    client = DummyHealthClient(responses)
     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
 
     result = orchestrate._run_health_ping()
@@ -56,9 +74,11 @@ def test_health_ping_success(monkeypatch):
     assert result["ok"] is True
     assert result["route"] == "responses"
     assert result["fallback_used"] is False
-    assert "Responses OK (gpt-5, 24 токена)" in result["message"]
+    expected_label = f"Responses OK (gpt-5, {orchestrate.HEALTH_INITIAL_MAX_TOKENS} токена)"
+    assert expected_label in result["message"]
 
-    request_payload = client.requests[0]["json"]
+    assert client.requests[0]["method"] == "GET"
+    request_payload = client.requests[1]["json"]
     assert request_payload["max_output_tokens"] == orchestrate.HEALTH_INITIAL_MAX_TOKENS
     assert request_payload["text"]["format"]["type"] == "text"
     assert "temperature" not in request_payload
@@ -70,7 +90,11 @@ def test_health_ping_incomplete_max_tokens(monkeypatch):
         "incomplete_details": {"reason": "max_output_tokens"},
         "output": [],
     }
-    client = DummyHealthClient([_response(200, payload)])
+    responses = [
+        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
+        _response(200, payload),
+    ]
+    client = DummyHealthClient(responses)
     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
 
     result = orchestrate._run_health_ping()
@@ -88,21 +112,29 @@ def test_health_ping_auto_bump(monkeypatch):
         }
     }
     success_payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
-    responses = [_response(400, error_payload), _response(200, success_payload)]
+    responses = [
+        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
+        _response(400, error_payload),
+        _response(200, success_payload),
+    ]
     client = DummyHealthClient(responses)
     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
 
     result = orchestrate._run_health_ping()
 
     assert result["ok"] is True
-    assert "auto-bump до 24" in result["message"]
-    assert len(client.requests) == 2
-    assert client.requests[0]["json"]["max_output_tokens"] == 12
-    assert client.requests[1]["json"]["max_output_tokens"] >= 24
+    assert f"auto-bump до {orchestrate.HEALTH_MIN_BUMP_TOKENS}" in result["message"]
+    assert len(client.requests) == 3
+    assert client.requests[1]["json"]["max_output_tokens"] == 12
+    assert client.requests[2]["json"]["max_output_tokens"] >= orchestrate.HEALTH_MIN_BUMP_TOKENS
 
 
 def test_health_ping_5xx_failure(monkeypatch):
-    client = DummyHealthClient([_response(502, None, text="Bad gateway")])
+    responses = [
+        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
+        _response(502, None, text="Bad gateway"),
+    ]
+    client = DummyHealthClient(responses)
     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
 
     result = orchestrate._run_health_ping()

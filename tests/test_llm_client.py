@@ -12,6 +12,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from llm_client import (
     DEFAULT_RESPONSES_TEXT_FORMAT,
     G5_MAX_OUTPUT_TOKENS_MAX,
+    G5_MAX_OUTPUT_TOKENS_STEP1,
+    G5_MAX_OUTPUT_TOKENS_STEP2,
     GenerationResult,
     generate,
 )
@@ -393,8 +395,8 @@ def test_generate_falls_back_to_gpt4_when_gpt5_empty():
             max_tokens=42,
         )
 
-    assert result.model_used == "gpt-4o"
-    assert result.fallback_used == "gpt-4o"
+    assert result.model_used == "gpt-5-large"
+    assert result.fallback_used == "gpt-5-large"
     assert result.retry_used is False
     assert result.text == "from fallback"
     assert result.fallback_reason == "empty_completion_gpt5_responses"
@@ -414,18 +416,15 @@ def test_generate_falls_back_when_gpt5_unavailable(monkeypatch):
     }
     client = DummyClient(payloads=[fallback_payload], availability=[403])
     with patch("llm_client.httpx.Client", return_value=client):
-        result = generate(
-            messages=[{"role": "user", "content": "ping"}],
-            model="gpt-5",
-            temperature=0.2,
-            max_tokens=42,
-        )
+        with pytest.raises(RuntimeError) as excinfo:
+            generate(
+                messages=[{"role": "user", "content": "ping"}],
+                model="gpt-5",
+                temperature=0.2,
+                max_tokens=42,
+            )
 
-    assert result.model_used == "gpt-4o"
-    assert result.fallback_used == "gpt-4o"
-    assert result.retry_used is False
-    assert result.text == "fallback ok"
-    assert result.fallback_reason == "model_unavailable"
+    assert "Model GPT-5 not available" in str(excinfo.value)
 
 
 def test_generate_escalates_max_tokens_when_truncated():
@@ -466,7 +465,24 @@ def test_generate_escalates_max_tokens_when_truncated():
     first_tokens = client.requests[0]["json"]["max_output_tokens"]
     second_tokens = client.requests[1]["json"]["max_output_tokens"]
     cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-    expected_second = max(first_tokens + 600, int(first_tokens * 1.5))
+    ladder = sorted(
+        {
+            value
+            for value in (
+                G5_MAX_OUTPUT_TOKENS_STEP1,
+                G5_MAX_OUTPUT_TOKENS_STEP2,
+                G5_MAX_OUTPUT_TOKENS_MAX,
+            )
+            if isinstance(value, int) and value > 0
+        }
+    )
+    expected_second = None
+    for value in ladder:
+        if value > first_tokens:
+            expected_second = value
+            break
+    if expected_second is None:
+        expected_second = first_tokens + 200
     if cap is not None:
         expected_second = min(expected_second, cap)
     assert second_tokens == expected_second

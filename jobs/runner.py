@@ -100,6 +100,9 @@ class JobRunner:
         with self._events_lock:
             event = self._events.get(job_id)
         if not event:
+            snapshot = self._store.snapshot(job_id)
+            if snapshot and snapshot.get("status") in {"succeeded", "failed"}:
+                return True
             return False
         return event.wait(timeout)
 

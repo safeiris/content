@@ -40,7 +40,7 @@ LATEST_SCHEMA_VERSION = "2024-06"
 
 HEALTH_MODEL = DEFAULT_MODEL
 HEALTH_PROMPT = "Ответь ровно словом: PONG"
-HEALTH_INITIAL_MAX_TOKENS = 24
+HEALTH_INITIAL_MAX_TOKENS = 10
 HEALTH_MIN_BUMP_TOKENS = 24
 
 
@@ -534,6 +534,10 @@ def generate_article_from_payload(
 ) -> Dict[str, Any]:
     resolved_timeout = timeout if timeout is not None else 60
     resolved_model = DEFAULT_MODEL
+    health_probe = _run_health_ping()
+    if not health_probe.get("ok"):
+        message = str(health_probe.get("message") or "health gate failed")
+        raise RuntimeError(f"health_gate_failed: {message}")
     output_path = _make_output_path(theme, outfile)
     result = _generate_variant(
         theme=theme,
@@ -680,6 +684,7 @@ def _run_health_ping() -> Dict[str, object]:
 
     route = "responses"
     fallback_used = False
+    model_url = f"https://api.openai.com/v1/models/{model}"
 
     start = time.perf_counter()
     attempts = 0
@@ -692,6 +697,23 @@ def _run_health_ping() -> Dict[str, object]:
 
     try:
         with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
+            model_probe = client.get(model_url, headers=headers)
+            if model_probe.status_code != 200:
+                detail = model_probe.text.strip()
+                if len(detail) > 120:
+                    detail = f"{detail[:117]}..."
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                return {
+                    "ok": False,
+                    "message": (
+                        f"Модель {model} недоступна: HTTP {model_probe.status_code}"
+                        + (f" — {detail}" if detail else "")
+                    ),
+                    "route": "models",
+                    "fallback_used": False,
+                    "latency_ms": latency_ms,
+                }
+
             while attempts < max_attempts:
                 attempts += 1
                 payload_snapshot = dict(sanitized_payload)
@@ -784,7 +806,7 @@ def _run_health_ping() -> Dict[str, object]:
 
     extras: List[str] = []
     if auto_bump_applied:
-        extras.append("auto-bump до 24")
+        extras.append(f"auto-bump до {current_max_tokens}")
 
     if status == "completed":
         message = f"Responses OK (gpt-5, {current_max_tokens} токена"
@@ -820,9 +842,11 @@ def _run_health_ping() -> Dict[str, object]:
         "route": route,
         "fallback_used": fallback_used,
         "latency_ms": latency_ms,
-        "status": status or "ok",
+        "tokens": current_max_tokens,
+        "status": status,
+        "incomplete_reason": incomplete_reason or None,
+        "got_output": got_output,
     }
-    result["got_output"] = bool(got_output)
     return result
 
 
