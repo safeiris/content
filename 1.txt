@@ -1,354 +1,98 @@
-diff --git a/config.py b/config.py
-index 9aa4c4af8bda196a37f0830cdf6a60adc8a69e12..035892153fc217b4b5093d90153eb882bf437e88 100644
---- a/config.py
-+++ b/config.py
-@@ -35,53 +35,53 @@ def _env_bool(name: str, default: bool) -> bool:
-         return default
-     return raw not in {"0", "false", "off", "no"}
- 
- OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
- OPENAI_TIMEOUT_S = max(1, _env_int("OPENAI_TIMEOUT_S", 60))
- OPENAI_MAX_RETRIES = max(0, _env_int("OPENAI_MAX_RETRIES", 4))
- OPENAI_RPS = max(1, _env_int("OPENAI_RPS", 2))
- OPENAI_RPM = max(OPENAI_RPS, _env_int("OPENAI_RPM", 60))
- OPENAI_CACHE_TTL_S = max(1, _env_int("OPENAI_CACHE_TTL_S", 30))
- OPENAI_CLIENT_MAX_QUEUE = max(1, _env_int("OPENAI_CLIENT_MAX_QUEUE", 16))
- OPENAI_MODEL = str(os.getenv("OPENAI_MODEL", "gpt-5")).strip() or "gpt-5"
- 
- JOB_SOFT_TIMEOUT_S = max(1, _env_int("JOB_SOFT_TIMEOUT_S", 20))
- JOB_STORE_TTL_S = max(JOB_SOFT_TIMEOUT_S, _env_int("JOB_STORE_TTL_S", 900))
- JOB_MAX_RETRIES_PER_STEP = max(0, _env_int("JOB_MAX_RETRIES_PER_STEP", 1))
- 
- USE_MOCK_LLM = _env_bool("USE_MOCK_LLM", False)
- OFFLINE_MODE = _env_bool("OFFLINE_MODE", False)
- PIPELINE_FAST_PATH = _env_bool("PIPELINE_FAST_PATH", False)
- MODEL_PROVIDER = str(os.getenv("MODEL_PROVIDER", "openai")).strip() or "openai"
- 
- _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
- FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
- 
- # GPT-5 Responses tuning
--G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 1500)
--G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 2200)
--G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 2600)
-+G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 950)
-+G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 1200)
-+G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 1500)
- G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3600)
- _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
- G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
- G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
- G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
- 
- SKELETON_BATCH_SIZE_MAIN = max(1, _env_int("SKELETON_BATCH_SIZE_MAIN", 2))
- SKELETON_FAQ_BATCH = max(1, _env_int("SKELETON_FAQ_BATCH", 3))
- TAIL_FILL_MAX_TOKENS = max(200, _env_int("TAIL_FILL_MAX_TOKENS", 700))
- 
- # Дефолтные настройки ядра
- DEFAULT_TONE = "экспертный, дружелюбный"
- DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "Вывод"]
- 
- # Простая «норма» для SEO: ориентир по упоминаниям ключей на ~100 слов
- DEFAULT_SEO_DENSITY = 2
- 
- # Рекомендуемые границы объёма (знаков)
- DEFAULT_MIN_LENGTH = 3500
- DEFAULT_MAX_LENGTH = 6000
- 
- # Максимальный объём пользовательского контекста (символов)
- MAX_CUSTOM_CONTEXT_CHARS = 20_000
- 
- # Стилевые профили
-diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 2291d4a9a7841371d5283d67e9385276dcaeb19f..d90dd66022e8a48577d99c03980bdc2a0e93dbe1 100644
---- a/deterministic_pipeline.py
-+++ b/deterministic_pipeline.py
-@@ -1,42 +1,43 @@
- """LLM-driven content pipeline with explicit step-level guarantees."""
- 
- from __future__ import annotations
- 
- import json
- import logging
- import math
- import re
- import textwrap
- import time
- from collections import deque
- from dataclasses import dataclass, field
- from enum import Enum
- from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
- 
- from config import (
-     G5_MAX_OUTPUT_TOKENS_MAX,
-+    G5_MAX_OUTPUT_TOKENS_STEP1,
-     SKELETON_BATCH_SIZE_MAIN,
-     SKELETON_FAQ_BATCH,
-     TAIL_FILL_MAX_TOKENS,
- )
- from llm_client import FALLBACK_MODEL, GenerationResult, generate as llm_generate
- from faq_builder import _normalize_entry
- from keyword_injector import (
-     KeywordInjectionResult,
-     LOCK_END,
-     LOCK_START_TEMPLATE,
-     build_term_pattern,
-     inject_keywords,
- )
- from length_controller import ensure_article_length
- from length_limits import compute_soft_length_bounds
- from length_trimmer import TrimResult, TrimValidationError, trim_text
- from skeleton_utils import normalize_skeleton_payload
- from validators import (
-     ValidationError,
-     ValidationResult,
-     length_no_spaces,
-     strip_jsonld,
-     validate_article,
- )
- 
-@@ -489,52 +490,54 @@ class DeterministicPipeline:
-             main_headings=main_candidates,
-             conclusion_heading=conclusion_heading,
-             has_faq=has_faq,
-         )
- 
-     def _predict_skeleton_volume(self, outline: SkeletonOutline) -> SkeletonVolumeEstimate:
-         cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-         min_chars = max(3200, int(self.min_chars) if self.min_chars > 0 else 3200)
-         max_chars = max(min_chars + 400, int(self.max_chars) if self.max_chars > 0 else min_chars + 1200)
-         avg_chars = max(min_chars, int((min_chars + max_chars) / 2))
-         approx_tokens = max(1100, int(avg_chars / 3.2))
-         main_count = max(1, len(outline.main_headings))
-         faq_count = self.faq_target if outline.has_faq else 0
-         intro_tokens = max(160, int(approx_tokens * 0.12))
-         conclusion_tokens = max(140, int(approx_tokens * 0.1))
-         faq_pool = max(0, int(approx_tokens * 0.2)) if faq_count else 0
-         per_faq_tokens = max(70, int(faq_pool / faq_count)) if faq_count else 0
-         allocated_faq = per_faq_tokens * faq_count
-         remaining_for_main = max(
-             approx_tokens - intro_tokens - conclusion_tokens - allocated_faq,
-             220 * main_count,
-         )
-         per_main_tokens = max(220, int(remaining_for_main / main_count)) if main_count else 0
-         predicted = intro_tokens + conclusion_tokens + per_main_tokens * main_count + per_faq_tokens * faq_count
-         start_max = int(predicted * 1.2)
-+        step1_cap = G5_MAX_OUTPUT_TOKENS_STEP1 if G5_MAX_OUTPUT_TOKENS_STEP1 > 0 else 1200
-         if cap is not None and cap > 0:
-             start_max = min(start_max, cap)
-+        start_max = min(start_max, step1_cap)
-         start_max = max(600, start_max)
-         requires_chunking = bool(cap is not None and predicted > cap)
-         LOGGER.info(
-             "SKELETON_ESTIMATE predicted=%d start_max=%d cap=%s → resolved max_output_tokens=%d",
-             predicted,
-             start_max,
-             cap if cap is not None else "-",
-             start_max,
-         )
-         return SkeletonVolumeEstimate(
-             predicted_tokens=predicted,
-             start_max_tokens=start_max,
-             cap_tokens=cap,
-             intro_tokens=intro_tokens,
-             conclusion_tokens=conclusion_tokens,
-             per_main_tokens=per_main_tokens,
-             per_faq_tokens=per_faq_tokens,
-             requires_chunking=requires_chunking,
-         )
- 
-     def _build_skeleton_batches(
-         self,
-         outline: SkeletonOutline,
-         estimate: SkeletonVolumeEstimate,
-     ) -> List[SkeletonBatchPlan]:
-diff --git a/jobs/runner.py b/jobs/runner.py
-index 0cf3a12360610597c2ceb66df0d59cbaf62bad46..a27b7ca7476ebc462802f999dd5b494eb63e7aaf 100644
---- a/jobs/runner.py
-+++ b/jobs/runner.py
-@@ -78,50 +78,53 @@ class JobRunner:
-             self._thread.join(timeout=1.0)
- 
-     def submit(self, payload: Dict[str, Any], *, trace_id: Optional[str] = None) -> Job:
-         job_id = uuid.uuid4().hex
-         steps = [
-             JobStep(name="draft"),
-             JobStep(name="refine"),
-             JobStep(name="jsonld"),
-             JobStep(name="post_analysis"),
-         ]
-         job = Job(id=job_id, steps=steps, trace_id=trace_id)
-         self._store.create(job)
-         event = threading.Event()
-         with self._events_lock:
-             self._events[job_id] = event
-         self._tasks.put(RunnerTask(job_id=job_id, payload=payload, trace_id=trace_id))
-         QUEUE_GAUGE.set(float(self._tasks.qsize()))
-         self.start()
-         LOGGER.info("job_enqueued", extra={"job_id": job_id})
-         return job
- 
-     def wait(self, job_id: str, timeout: Optional[float] = None) -> bool:
-         with self._events_lock:
-             event = self._events.get(job_id)
-         if not event:
-+            snapshot = self._store.snapshot(job_id)
-+            if snapshot and snapshot.get("status") in {"succeeded", "failed"}:
-+                return True
-             return False
-         return event.wait(timeout)
- 
-     def get_job(self, job_id: str) -> Optional[dict]:
-         snapshot = self._store.snapshot(job_id)
-         if not snapshot:
-             return None
-         return snapshot
- 
-     def soft_timeout(self) -> int:
-         return self._soft_timeout_s
- 
-     def _worker(self) -> None:
-         while not self._shutdown:
-             task = self._tasks.get()
-             QUEUE_GAUGE.set(float(self._tasks.qsize()))
-             if task.job_id == "__shutdown__":
-                 break
-             try:
-                 self._run_job(task)
-             except Exception as exc:  # noqa: BLE001
-                 LOGGER.exception("job_failed", extra={"job_id": task.job_id, "error": str(exc)})
-             finally:
-                 with self._events_lock:
-                     event = self._events.pop(task.job_id, None)
 diff --git a/llm_client.py b/llm_client.py
-index 68d9cecdb5581baa129b44008fba5da092bc23f5..5b4fe39b8aae4f3b7cab8e84bc96f3b0218eecd6 100644
+index 5b4fe39b8aae4f3b7cab8e84bc96f3b0218eecd6..cb750f7ad83f6e22d974019d44a8062d8ae47492 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -12,62 +12,62 @@ from copy import deepcopy
- from dataclasses import dataclass
- from pathlib import Path
- from typing import Any, Dict, List, Optional, Tuple
+@@ -1530,60 +1530,62 @@ def generate(
  
- import httpx
- from jsonschema import Draft7Validator
- from jsonschema.exceptions import SchemaError as JSONSchemaError
- from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
+         raw_max_tokens = sanitized_payload.get("max_output_tokens")
+         try:
+             max_tokens_value = int(raw_max_tokens)
+         except (TypeError, ValueError):
+             max_tokens_value = 0
+         if max_tokens_value <= 0:
+             fallback_default = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
+             max_tokens_value = fallback_default
+         upper_cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+         if upper_cap is not None and max_tokens_value > upper_cap:
+             LOGGER.info(
+                 "responses max_output_tokens clamped requested=%s limit=%s",
+                 raw_max_tokens,
+                 upper_cap,
+             )
+             max_tokens_value = upper_cap
+         sanitized_payload["max_output_tokens"] = max_tokens_value
+         LOGGER.info(
+             "resolved max_output_tokens=%s (requested=%s, cap=%s)",
+             max_tokens_value,
+             raw_max_tokens if raw_max_tokens is not None else "-",
+             upper_cap if upper_cap is not None else "-",
+         )
  
- from config import (
-     FORCE_MODEL,
-     OPENAI_API_KEY,
-     G5_ENABLE_PREVIOUS_ID_FETCH,
-     G5_MAX_OUTPUT_TOKENS_BASE,
-     G5_MAX_OUTPUT_TOKENS_MAX,
-     G5_MAX_OUTPUT_TOKENS_STEP1,
-     G5_MAX_OUTPUT_TOKENS_STEP2,
-     G5_POLL_INTERVALS,
-     G5_POLL_MAX_ATTEMPTS,
- )
++        temperature_ignored = False
+         supports_temperature = _supports_temperature(target_model)
+         if supports_temperature:
+             raw_temperature = sanitized_payload.get("temperature", temperature)
+             if raw_temperature is None:
+                 raw_temperature = 0.3
+             try:
+                 sanitized_payload["temperature"] = float(raw_temperature)
+             except (TypeError, ValueError):
+                 sanitized_payload["temperature"] = 0.3
+         else:
++            temperature_ignored = True
+             if "temperature" in sanitized_payload:
+                 sanitized_payload.pop("temperature", None)
+             LOGGER.info(
+                 "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
+                 target_model,
+             )
  
- 
- DEFAULT_MODEL = "gpt-5"
- MAX_RETRIES = 3
- BACKOFF_SCHEDULE = [0.5, 1.0, 2.0]
--FALLBACK_MODEL = "gpt-4o"
-+FALLBACK_MODEL = DEFAULT_MODEL
- RESPONSES_API_URL = "https://api.openai.com/v1/responses"
- RESPONSES_ALLOWED_KEYS = (
-     "model",
-     "input",
-     "max_output_tokens",
-     "temperature",
-     "text",
-     "previous_response_id",
- )
- RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
--RESPONSES_MAX_ESCALATIONS = 2
-+RESPONSES_MAX_ESCALATIONS = 6
- MAX_RESPONSES_POLL_ATTEMPTS = (
-     G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
- )
- if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
-     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
- GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
- 
- 
- def _supports_temperature(model: str) -> bool:
-     """Return True if the target model accepts the temperature parameter."""
- 
-     model_name = (model or "").strip().lower()
-     return not model_name.startswith("gpt-5")
- 
- 
- def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
-     """Detect the specific 400 error about max_output_tokens being too small."""
- 
-     if response is None:
-         return False
- 
-     message = ""
-     try:
-         payload = response.json()
-     except ValueError:
-@@ -1326,51 +1326,57 @@ def _extract_response_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obje
- 
- 
- def generate(
-     messages: List[Dict[str, str]],
-     *,
-     model: Optional[str] = None,
-     temperature: float = 0.3,
-     max_tokens: int = 1400,
-     timeout_s: int = 60,
-     backoff_schedule: Optional[List[float]] = None,
-     responses_text_format: Optional[Dict[str, object]] = None,
-     previous_response_id: Optional[str] = None,
- ) -> GenerationResult:
-     """Call the configured LLM and return a structured generation result."""
- 
-     if not messages:
-         raise ValueError("messages must not be empty")
- 
-     model_name = _resolve_model_name(model)
-     provider = _resolve_provider(model_name)
-     api_key = _resolve_api_key(provider)
-     api_url = PROVIDER_API_URLS.get(provider)
-     if not api_url:
-         raise RuntimeError(f"Неизвестный провайдер для модели '{model_name}'")
- 
--    timeout = httpx.Timeout(timeout_s)
-+    raw_timeout = timeout_s if timeout_s is not None else 60
-+    try:
-+        timeout_value = float(raw_timeout)
-+    except (TypeError, ValueError):
-+        timeout_value = 60.0
-+    effective_timeout = min(max(timeout_value, 1.0), 25.0)
-+    timeout = httpx.Timeout(effective_timeout)
-     http_client = httpx.Client(timeout=timeout)
- 
-     schedule = _resolve_backoff_schedule(backoff_schedule)
-     headers = {
-         "Authorization": f"Bearer {api_key}",
-         "Content-Type": "application/json",
-     }
- 
-     def _augment_gpt5_messages(original: List[Dict[str, object]]) -> List[Dict[str, object]]:
-         augmented: List[Dict[str, object]] = []
-         appended_suffix = False
-         for message in original:
-             cloned = dict(message)
-             if not appended_suffix and cloned.get("role") == "system":
-                 content = str(cloned.get("content", ""))
-                 if GPT5_TEXT_ONLY_SUFFIX not in content:
-                     content = f"{content.rstrip()}\n\n{GPT5_TEXT_ONLY_SUFFIX}".strip()
-                 cloned["content"] = content
-                 appended_suffix = True
-             augmented.append(cloned)
-         return augmented
- 
-     gpt5_messages_cache: Optional[List[Dict[str, object]]] = None
- 
-     def _messages_for_model(target_model: str) -> List[Dict[str, object]]:
-@@ -1633,65 +1639,73 @@ def generate(
+         def _log_payload(snapshot: Dict[str, object]) -> None:
+             keys = sorted(snapshot.keys())
+             LOGGER.info("responses payload_keys=%s", keys)
+             input_candidate = snapshot.get("input", "")
+             length = len(input_candidate) if isinstance(input_candidate, str) else 0
+             LOGGER.info("responses input_len=%d", length)
+             LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
+             text_block = snapshot.get("text")
+             format_type = "-"
+             format_name = "-"
+             has_schema = False
+             if isinstance(text_block, dict):
+                 format_block = text_block.get("format")
+                 if isinstance(format_block, dict):
+                     fmt = format_block.get("type")
+                     if isinstance(fmt, str) and fmt.strip():
+                         format_type = fmt.strip()
+                     name_candidate = format_block.get("name")
+@@ -1613,58 +1615,61 @@ def generate(
+                 if isinstance(raw_usage, (int, float)):
+                     usage_output_tokens = float(raw_usage)
+                 elif isinstance(raw_usage, dict):
+                     for value in raw_usage.values():
+                         if isinstance(value, (int, float)):
+                             usage_output_tokens = float(value)
+                             break
+             response_id = ""
+             raw_response_id = payload.get("id")
+             if isinstance(raw_response_id, str):
+                 response_id = raw_response_id.strip()
+             prev_response_id = ""
+             raw_prev = payload.get("previous_response_id")
+             if isinstance(raw_prev, str):
+                 prev_response_id = raw_prev.strip()
+             metadata_block = payload.get("metadata")
+             if isinstance(metadata_block, dict):
+                 if not prev_response_id:
+                     prev_candidate = metadata_block.get("previous_response_id")
+                     if isinstance(prev_candidate, str):
+                         prev_response_id = prev_candidate.strip()
+             finish_reason = ""
+             finish_block = payload.get("finish_reason")
+             if isinstance(finish_block, str):
+                 finish_reason = finish_block.strip().lower()
+-            return {
++            metadata: Dict[str, object] = {
                  "status": status,
                  "incomplete_reason": incomplete_reason,
                  "usage_output_tokens": usage_output_tokens,
@@ -356,6 +100,9 @@ index 68d9cecdb5581baa129b44008fba5da092bc23f5..5b4fe39b8aae4f3b7cab8e84bc96f3b0
                  "previous_response_id": prev_response_id,
                  "finish_reason": finish_reason,
              }
++            if temperature_ignored:
++                metadata["temperature_ignored"] = True
++            return metadata
  
          attempts = 0
          max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)
@@ -374,852 +121,163 @@ index 68d9cecdb5581baa129b44008fba5da092bc23f5..5b4fe39b8aae4f3b7cab8e84bc96f3b0
          resume_from_response_id: Optional[str] = None
          content_started = False
          cap_retry_performed = False
-+        empty_retry_attempted = False
+         empty_retry_attempted = False
  
          def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
--            candidate = current
--            if step_index == 0:
--                candidate = max(current + 600, int(current * 1.5))
--            elif step_index == 1:
--                candidate = max(current + 600, int(current * 1.35))
--            else:
--                if cap is not None:
--                    candidate = cap
--                else:
--                    candidate = current + 600
--            if cap is not None:
--                candidate = min(candidate, cap)
--            return int(candidate)
-+            ladder: List[int] = []
-+            for value in (
-+                G5_MAX_OUTPUT_TOKENS_STEP1,
-+                G5_MAX_OUTPUT_TOKENS_STEP2,
-+                G5_MAX_OUTPUT_TOKENS_MAX,
-+            ):
-+                try:
-+                    normalized = int(value)
-+                except (TypeError, ValueError):
-+                    continue
-+                if normalized <= 0:
-+                    continue
-+                ladder.append(normalized)
-+            ladder = sorted(dict.fromkeys(ladder))
-+            for target in ladder:
-+                if target > current:
-+                    return target if cap is None else min(target, cap)
-+            if cap is not None and cap > current:
-+                return int(cap)
-+            return current + 200
- 
-         def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
-             poll_attempt = 0
-             while poll_attempt < MAX_RESPONSES_POLL_ATTEMPTS:
-                 poll_attempt += 1
-                 poll_url = f"{RESPONSES_API_URL}/{response_id}"
-                 LOGGER.info("responses poll attempt=%d id=%s", poll_attempt, response_id)
-                 if poll_attempt == 1:
-                     initial_sleep = schedule[0] if schedule else 0.5
-                     LOGGER.info("responses poll initial sleep=%.2f", initial_sleep)
-                     time.sleep(initial_sleep)
-                 try:
-                     poll_response = http_client.get(
-                         poll_url,
-                         headers=headers,
-                         timeout=timeout,
-                     )
-                     poll_response.raise_for_status()
-                 except httpx.HTTPStatusError as poll_error:
-                     _handle_responses_http_error(poll_error, {"poll_id": response_id})
-                     break
-                 except httpx.HTTPError as transport_error:  # pragma: no cover - defensive
-                     LOGGER.warning("responses poll transport error: %s", transport_error)
-                     break
-                 try:
-@@ -1921,50 +1935,60 @@ def generate(
-                             content_length = 0
-                             if isinstance(parse_flags, dict):
-                                 output_length = int(
-                                     parse_flags.get("output_text_len", 0) or 0
-                                 )
-                                 content_length = int(
-                                     parse_flags.get("content_text_len", 0) or 0
-                                 )
-                             LOGGER.warning(
-                                 "LLM_WARN cap_reached limit=%s output_len=%d content_len=%d status=%s reason=%s",
-                                 upper_cap,
-                                 output_length,
-                                 content_length,
-                                 status or "",
-                                 reason or "",
-                             )
-                             cap_retry_performed = True
-                             shrink_next_attempt = False
-                     last_error = RuntimeError("responses_incomplete")
-                     incomplete_retry_count += 1
-                     if incomplete_retry_count >= 2:
-                         break
-                     shrink_next_attempt = True
-                     continue
-                 if not text:
-+                    response_id_value = metadata.get("response_id") or ""
-+                    if response_id_value and not empty_retry_attempted:
-+                        empty_retry_attempted = True
-+                        resume_from_response_id = str(response_id_value)
-+                        LOGGER.warning(
-+                            "RESP_EMPTY retrying with previous_response_id=%s",
-+                            resume_from_response_id,
-+                        )
-+                        last_error = RuntimeError("responses_empty_retry")
-+                        continue
-                     last_error = EmptyCompletionError(
-                         "Модель вернула пустой ответ",
-                         raw_response=data,
-                         parse_flags=parse_flags,
-                     )
-                     LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
-                     continue
-                 _persist_raw_response(data)
-                 return text, parse_flags, data, schema_label
-             except EmptyCompletionError as exc:
-                 last_error = exc
-             except httpx.HTTPStatusError as exc:
-                 response_obj = exc.response
-                 status = response_obj.status_code if response_obj is not None else None
-                 if response_obj is not None and _needs_format_name_retry(response_obj):
-                     setattr(exc, "responses_no_fallback", True)
-                 if (
-                     status == 400
-                     and not format_retry_done
-                     and response_obj is not None
-                     and _has_text_format_migration_hint(response_obj)
-                 ):
-                     format_retry_done = True
-                     retry_used = True
-                     LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
-@@ -2043,91 +2067,52 @@ def generate(
-                 _raise_for_last_error(last_error)
-             if isinstance(last_error, (httpx.TimeoutException, httpx.TransportError)):
-                 _raise_for_last_error(last_error)
-             raise last_error
- 
-         raise RuntimeError("Модель не вернула ответ.")
- 
- 
-     lower_model = model_name.lower()
-     is_gpt5_model = lower_model.startswith("gpt-5")
- 
-     retry_used = False
-     fallback_used: Optional[str] = None
-     fallback_reason: Optional[str] = None
- 
-     try:
-         if is_gpt5_model:
-             available = _check_model_availability(
-                 http_client,
-                 provider=provider,
-                 headers=headers,
-                 model_name=model_name,
-             )
-             if not available:
-                 error_message = "Model GPT-5 not available for this key/plan"
--                LOGGER.warning("primary model %s unavailable — considering fallback", model_name)
--                if FORCE_MODEL:
--                    raise RuntimeError(error_message)
--                fallback_used = FALLBACK_MODEL
--                fallback_reason = "model_unavailable"
--                LOGGER.warning(
--                    "switching to fallback model %s (primary=%s, reason=%s: %s)",
--                    fallback_used,
--                    model_name,
--                    fallback_reason,
--                    error_message,
--                )
--                try:
--                    text, parse_flags_fallback, _, schema_fallback = _call_chat_model(
--                        fallback_used
--                    )
--                    schema_category = _categorize_schema(parse_flags_fallback)
--                    LOGGER.info(
--                        "completion schema category=%s (schema=%s, route=chat)",
--                        schema_category,
--                        schema_fallback,
--                    )
--                    metadata_block = None
--                    if isinstance(parse_flags_fallback, dict):
--                        meta_candidate = parse_flags_fallback.get("metadata")
--                        if isinstance(meta_candidate, dict):
--                            metadata_block = dict(meta_candidate)
--                    return GenerationResult(
--                        text=text,
--                        model_used=fallback_used,
--                        retry_used=False,
--                        fallback_used=fallback_used,
--                        fallback_reason=fallback_reason,
--                        api_route="chat",
--                        schema=schema_category,
--                        metadata=metadata_block,
--                    )
--                except EmptyCompletionError as fallback_error:
--                    _persist_raw_response(fallback_error.raw_response)
--                    _log_parse_chain(fallback_error.parse_flags, retry=0, fallback=fallback_used)
--                    raise
-+                LOGGER.error("primary model %s unavailable", model_name)
-+                raise RuntimeError(error_message)
- 
-             try:
-                 text, parse_flags_initial, _, schema_initial_call = _call_responses_model(
-                     model_name
-                 )
-                 schema_category = schema_initial_call
-                 LOGGER.info(
-                     "completion schema category=%s (schema=%s, route=responses)",
-                     schema_category,
-                     schema_initial_call,
-                 )
-                 metadata_block = None
-                 if isinstance(parse_flags_initial, dict):
-                     meta_candidate = parse_flags_initial.get("metadata")
-                     if isinstance(meta_candidate, dict):
-                         metadata_block = dict(meta_candidate)
-                 return GenerationResult(
-                     text=text,
-                     model_used=model_name,
-                     retry_used=retry_used,
-                     fallback_used=None,
-                     fallback_reason=None,
-                     api_route="responses",
-                     schema=schema_category,
-                     metadata=metadata_block,
-@@ -2165,55 +2150,54 @@ def generate(
-                     error_details: Dict[str, object] = {
-                         "reason": "api_error_gpt5_responses",
-                         "exception": str(responses_error),
-                     }
-                     if isinstance(responses_error, httpx.HTTPStatusError):
-                         status_code = (
-                             responses_error.response.status_code
-                             if responses_error.response is not None
-                             else None
-                         )
-                         error_details["status_code"] = status_code
-                         if responses_error.response is not None:
-                             try:
-                                 payload_json = responses_error.response.json()
-                             except ValueError:
-                                 payload_json = None
-                             if isinstance(payload_json, dict):
-                                 error_block = payload_json.get("error")
-                                 if isinstance(error_block, dict):
-                                     error_details["error_type"] = error_block.get("type")
-                                     error_details["error_message"] = error_block.get("message")
-                     raise _build_force_model_error("responses_error", error_details) from responses_error
-                 if not _is_responses_fallback_allowed(responses_error):
-                     raise
-                 fallback_reason = "api_error_gpt5_responses"
--            fallback_used = FALLBACK_MODEL
-+            fallback_used = model_name
-             LOGGER.warning(
--                "switching to fallback model %s (primary=%s, reason=%s)",
-+                "switching route to chat for model %s (reason=%s)",
-                 fallback_used,
--                model_name,
-                 fallback_reason,
-             )
-             text, parse_flags_fallback, _, schema_fallback = _call_chat_model(fallback_used)
-             schema_category = _categorize_schema(parse_flags_fallback)
-             LOGGER.info(
-                 "fallback completion schema category=%s (schema=%s, route=chat)",
-                 schema_category,
-                 schema_fallback,
-             )
-             metadata_block = None
-             if isinstance(parse_flags_fallback, dict):
-                 meta_candidate = parse_flags_fallback.get("metadata")
-                 if isinstance(meta_candidate, dict):
-                     metadata_block = dict(meta_candidate)
-             if fallback_reason == "empty_completion_gpt5_responses":
-                 retry_used = False
-             return GenerationResult(
-                 text=text,
-                 model_used=fallback_used,
-                 retry_used=retry_used,
-                 fallback_used=fallback_used,
-                 fallback_reason=fallback_reason,
-                 api_route="chat",
-                 schema=schema_category,
-                 metadata=metadata_block,
-diff --git a/orchestrate.py b/orchestrate.py
-index d43cdc8a5e3b6dbe42c492c4f2ae6b1cb996e6de..4fdcce30d7f19439e8a5dcd062b65e38734347c2 100644
---- a/orchestrate.py
-+++ b/orchestrate.py
-@@ -18,51 +18,51 @@ from assemble_messages import ContextBundle, assemble_messages, retrieve_context
- from artifacts_store import _atomic_write_text as store_atomic_write_text, register_artifact
- from config import (
-     DEFAULT_MAX_LENGTH,
-     DEFAULT_MIN_LENGTH,
-     MAX_CUSTOM_CONTEXT_CHARS,
-     OPENAI_API_KEY,
- )
- from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
- from llm_client import (
-     DEFAULT_MODEL,
-     RESPONSES_API_URL,
-     build_responses_payload,
-     is_min_tokens_error,
-     sanitize_payload_for_responses,
- )
- from keywords import parse_manual_keywords
- from length_limits import ResolvedLengthLimits, resolve_length_limits
- from validators import ValidationResult, length_no_spaces
- 
- BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
- TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
- LATEST_SCHEMA_VERSION = "2024-06"
- 
- HEALTH_MODEL = DEFAULT_MODEL
- HEALTH_PROMPT = "Ответь ровно словом: PONG"
--HEALTH_INITIAL_MAX_TOKENS = 24
-+HEALTH_INITIAL_MAX_TOKENS = 10
- HEALTH_MIN_BUMP_TOKENS = 24
- 
- 
- @dataclass
- class GenerationContext:
-     data: Dict[str, Any]
-     context_bundle: ContextBundle
-     messages: List[Dict[str, Any]]
-     clip_texts: List[str]
-     style_profile_applied: bool = False
-     style_profile_source: Optional[str] = None
-     style_profile_variant: Optional[str] = None
-     keywords_manual: List[str] = field(default_factory=list)
-     context_source: str = "index.json"
-     custom_context_text: Optional[str] = None
-     custom_context_len: int = 0
-     custom_context_filename: Optional[str] = None
-     custom_context_hash: Optional[str] = None
-     custom_context_truncated: bool = False
-     jsonld_requested: bool = False
-     length_limits: Optional[ResolvedLengthLimits] = None
-     faq_questions: int = 0
- 
- 
- def _local_now() -> datetime:
-@@ -512,50 +512,54 @@ def _generate_variant(
-         "metadata": metadata,
-         "duration": duration_seconds,
-         "artifact_files": outputs,
-     }
- 
- 
- def generate_article_from_payload(
-     *,
-     theme: str,
-     data: Dict[str, Any],
-     k: int,
-     model: Optional[str] = None,
-     temperature: float = 0.0,
-     max_tokens: int = 0,
-     timeout: Optional[int] = None,
-     mode: Optional[str] = None,
-     backoff_schedule: Optional[List[float]] = None,
-     outfile: Optional[str] = None,
-     append_style_profile: Optional[bool] = None,
-     context_source: Optional[str] = None,
-     context_text: Optional[str] = None,
-     context_filename: Optional[str] = None,
- ) -> Dict[str, Any]:
-     resolved_timeout = timeout if timeout is not None else 60
-     resolved_model = DEFAULT_MODEL
-+    health_probe = _run_health_ping()
-+    if not health_probe.get("ok"):
-+        message = str(health_probe.get("message") or "health gate failed")
-+        raise RuntimeError(f"health_gate_failed: {message}")
-     output_path = _make_output_path(theme, outfile)
-     result = _generate_variant(
-         theme=theme,
-         data=data,
-         data_path="<inline>",
-         k=k,
-         model_name=resolved_model,
-         temperature=temperature,
-         max_tokens=max_tokens,
-         timeout=resolved_timeout,
-         mode=mode or "final",
-         output_path=output_path,
-         backoff_schedule=backoff_schedule,
-         append_style_profile=append_style_profile,
-         context_source=context_source,
-         context_text=context_text,
-         context_filename=context_filename,
-     )
-     artifact_files = result.get("artifact_files")
-     artifact_paths = None
-     if artifact_files:
-         artifact_paths = {
-             "markdown": artifact_files["markdown"].as_posix(),
-             "metadata": artifact_files["metadata"].as_posix(),
-         }
-@@ -658,62 +662,80 @@ def _run_health_ping() -> Dict[str, object]:
-         prompt,
-         max_tokens,
-         text_format=text_format,
-     )
-     sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
-     sanitized_payload["text"] = {"format": deepcopy(text_format)}
-     sanitized_payload["max_output_tokens"] = max_tokens
-     sanitized_payload.pop("temperature", None)
- 
-     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
-     if not api_key:
-         return {
-             "ok": False,
-             "message": "Responses недоступен: ключ не задан",
-             "route": "responses",
-             "fallback_used": False,
-         }
- 
-     headers = {
-         "Authorization": f"Bearer {api_key}",
-         "Content-Type": "application/json",
-     }
- 
-     route = "responses"
-     fallback_used = False
-+    model_url = f"https://api.openai.com/v1/models/{model}"
- 
-     start = time.perf_counter()
-     attempts = 0
-     max_attempts = 2
-     min_bump_done = False
-     current_max_tokens = max_tokens
-     auto_bump_applied = False
-     data: Optional[Dict[str, object]] = None
-     response: Optional[httpx.Response] = None
- 
-     try:
-         with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
-+            model_probe = client.get(model_url, headers=headers)
-+            if model_probe.status_code != 200:
-+                detail = model_probe.text.strip()
-+                if len(detail) > 120:
-+                    detail = f"{detail[:117]}..."
-+                latency_ms = int((time.perf_counter() - start) * 1000)
-+                return {
-+                    "ok": False,
-+                    "message": (
-+                        f"Модель {model} недоступна: HTTP {model_probe.status_code}"
-+                        + (f" — {detail}" if detail else "")
-+                    ),
-+                    "route": "models",
-+                    "fallback_used": False,
-+                    "latency_ms": latency_ms,
-+                }
-+
-             while attempts < max_attempts:
-                 attempts += 1
-                 payload_snapshot = dict(sanitized_payload)
-                 payload_snapshot["text"] = {"format": deepcopy(text_format)}
-                 payload_snapshot["max_output_tokens"] = current_max_tokens
-                 response = client.post(
-                     RESPONSES_API_URL,
-                     json=payload_snapshot,
-                     headers=headers,
-                 )
-                 if (
-                     response.status_code == 400
-                     and not min_bump_done
-                     and is_min_tokens_error(response)
-                 ):
-                     current_max_tokens = max(current_max_tokens, HEALTH_MIN_BUMP_TOKENS)
-                     sanitized_payload["max_output_tokens"] = current_max_tokens
-                     min_bump_done = True
-                     auto_bump_applied = True
-                     continue
-                 break
-     except httpx.TimeoutException:
-         latency_ms = int((time.perf_counter() - start) * 1000)
-         return {
-             "ok": False,
-@@ -762,89 +784,91 @@ def _run_health_ping() -> Dict[str, object]:
-         return {
-             "ok": False,
-             "message": "Responses недоступен: некорректный JSON",
-             "route": route,
-             "fallback_used": fallback_used,
-             "latency_ms": latency_ms,
-         }
- 
-     status = str(data.get("status", "")).strip().lower()
-     incomplete_reason = ""
-     incomplete_details = data.get("incomplete_details")
-     if isinstance(incomplete_details, dict):
-         reason_value = incomplete_details.get("reason")
-         if isinstance(reason_value, str):
-             incomplete_reason = reason_value.strip().lower()
- 
-     got_output = False
-     output_text = data.get("output_text")
-     if isinstance(output_text, str) and output_text.strip():
-         got_output = True
-     elif isinstance(data.get("output"), list) or isinstance(data.get("outputs"), list):
-         got_output = True
- 
-     extras: List[str] = []
-     if auto_bump_applied:
--        extras.append("auto-bump до 24")
-+        extras.append(f"auto-bump до {current_max_tokens}")
- 
-     if status == "completed":
-         message = f"Responses OK (gpt-5, {current_max_tokens} токена"
-         ok = True
-     elif status == "incomplete" and incomplete_reason == "max_output_tokens":
-         extras.insert(0, "incomplete по лимиту — норм для health")
-         message = f"Responses OK (gpt-5, {current_max_tokens} токена"
-         ok = True
-     else:
-         if not status:
-             reason = "неизвестный статус"
-         else:
-             reason = status
-             if incomplete_reason:
-                 reason = f"{reason} ({incomplete_reason})"
-         return {
-             "ok": False,
-             "message": f"Responses недоступен: статус {reason}",
-             "route": route,
-             "fallback_used": fallback_used,
-             "latency_ms": latency_ms,
-             "status": status or "",
-         }
- 
-     if extras:
-         message = f"{message}; {'; '.join(extras)})"
-     else:
-         message = f"{message})"
- 
-     result: Dict[str, object] = {
-         "ok": ok,
-         "message": message,
-         "route": route,
-         "fallback_used": fallback_used,
-         "latency_ms": latency_ms,
--        "status": status or "ok",
-+        "tokens": current_max_tokens,
-+        "status": status,
-+        "incomplete_reason": incomplete_reason or None,
-+        "got_output": got_output,
-     }
--    result["got_output"] = bool(got_output)
-     return result
- 
- 
- def _parse_args() -> argparse.Namespace:
-     parser = argparse.ArgumentParser(description="Deterministic content pipeline")
-     parser.add_argument("--theme", required=True, help="Theme slug (profiles/<theme>)")
-     parser.add_argument("--data", required=True, help="Path to JSON brief")
-     parser.add_argument("--outfile", help="Override output path")
-     parser.add_argument("--k", type=int, default=0, help="Number of exemplar clips")
-     parser.add_argument("--model", help="Optional model label for metadata")
-     parser.add_argument("--temperature", type=float, default=0.0)
-     parser.add_argument("--max-tokens", type=int, default=0, dest="max_tokens")
-     parser.add_argument("--timeout", type=int, default=60)
-     parser.add_argument("--mode", default="final")
-     parser.add_argument("--retry-backoff", help="Retry schedule (unused)")
-     parser.add_argument("--append-style-profile", action="store_true")
-     parser.add_argument("--context-source")
-     parser.add_argument("--context-text")
-     parser.add_argument("--context-filename")
-     parser.add_argument("--check", action="store_true")
-     return parser.parse_args()
- 
- 
- def _load_input(path: str) -> Dict[str, Any]:
-     payload_path = Path(path)
-diff --git a/tests/test_health.py b/tests/test_health.py
-index d7c592d09033c9e6be7fed3d67ac4a5729939092..cf46a30c4913078e46ab5b0ee2be78113fe53534 100644
---- a/tests/test_health.py
-+++ b/tests/test_health.py
-@@ -1,111 +1,143 @@
- from pathlib import Path
- from typing import Iterable, List, Optional
- 
- import httpx
- import pytest
- 
- import sys
- 
- sys.path.append(str(Path(__file__).resolve().parents[1]))
- 
- import orchestrate
- 
- 
- class DummyHealthClient:
-     def __init__(self, responses: Iterable[httpx.Response]):
-         self._responses = list(responses)
-         self._index = 0
-         self.requests: List[dict] = []
- 
-     def __enter__(self):
-         return self
- 
-     def __exit__(self, exc_type, exc, tb):
-         return False
- 
--    def post(self, url, json=None, headers=None, **kwargs):
--        self.requests.append({"url": url, "json": json, "headers": headers})
-+    def _next(self) -> httpx.Response:
-         if self._index >= len(self._responses):
-             return self._responses[-1]
-         response = self._responses[self._index]
-         self._index += 1
-         return response
- 
-+    def get(self, url, headers=None, **kwargs):
-+        self.requests.append({"method": "GET", "url": url, "headers": headers})
-+        return self._next()
-+
-+    def post(self, url, json=None, headers=None, **kwargs):
-+        self.requests.append({"method": "POST", "url": url, "json": json, "headers": headers})
-+        return self._next()
-+
- 
- @pytest.fixture(autouse=True)
- def _force_api_key(monkeypatch):
-     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-     yield
-     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
- 
- 
--def _response(status_code: int, payload: Optional[dict] = None, text: str = "") -> httpx.Response:
--    request = httpx.Request("POST", orchestrate.RESPONSES_API_URL)
-+def _response(
-+    status_code: int,
-+    payload: Optional[dict] = None,
-+    text: str = "",
-+    *,
-+    method: str = "POST",
-+    url: str = orchestrate.RESPONSES_API_URL,
-+) -> httpx.Response:
-+    request = httpx.Request(method, url)
-     if payload is not None:
-         return httpx.Response(status_code, request=request, json=payload)
-     return httpx.Response(status_code, request=request, text=text)
- 
- 
- def test_health_ping_success(monkeypatch):
-     payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
--    client = DummyHealthClient([_response(200, payload)])
-+    responses = [
-+        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
-+        _response(200, payload),
-+    ]
-+    client = DummyHealthClient(responses)
-     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
- 
-     result = orchestrate._run_health_ping()
- 
-     assert result["ok"] is True
-     assert result["route"] == "responses"
-     assert result["fallback_used"] is False
--    assert "Responses OK (gpt-5, 24 токена)" in result["message"]
-+    expected_label = f"Responses OK (gpt-5, {orchestrate.HEALTH_INITIAL_MAX_TOKENS} токена)"
-+    assert expected_label in result["message"]
- 
--    request_payload = client.requests[0]["json"]
-+    assert client.requests[0]["method"] == "GET"
-+    request_payload = client.requests[1]["json"]
-     assert request_payload["max_output_tokens"] == orchestrate.HEALTH_INITIAL_MAX_TOKENS
-     assert request_payload["text"]["format"]["type"] == "text"
-     assert "temperature" not in request_payload
- 
- 
- def test_health_ping_incomplete_max_tokens(monkeypatch):
-     payload = {
-         "status": "incomplete",
-         "incomplete_details": {"reason": "max_output_tokens"},
-         "output": [],
-     }
--    client = DummyHealthClient([_response(200, payload)])
-+    responses = [
-+        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
-+        _response(200, payload),
-+    ]
-+    client = DummyHealthClient(responses)
-     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
- 
-     result = orchestrate._run_health_ping()
- 
-     assert result["ok"] is True
-     assert "incomplete по лимиту — норм для health" in result["message"]
- 
- 
- def test_health_ping_auto_bump(monkeypatch):
-     monkeypatch.setattr(orchestrate, "HEALTH_INITIAL_MAX_TOKENS", 12)
-     error_payload = {
-         "error": {
-             "type": "invalid_request_error",
-             "message": "Invalid 'max_output_tokens': Expected a value >= 16",
-         }
-     }
-     success_payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
--    responses = [_response(400, error_payload), _response(200, success_payload)]
-+    responses = [
-+        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
-+        _response(400, error_payload),
-+        _response(200, success_payload),
-+    ]
-     client = DummyHealthClient(responses)
-     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
- 
-     result = orchestrate._run_health_ping()
- 
-     assert result["ok"] is True
--    assert "auto-bump до 24" in result["message"]
--    assert len(client.requests) == 2
--    assert client.requests[0]["json"]["max_output_tokens"] == 12
--    assert client.requests[1]["json"]["max_output_tokens"] >= 24
-+    assert f"auto-bump до {orchestrate.HEALTH_MIN_BUMP_TOKENS}" in result["message"]
-+    assert len(client.requests) == 3
-+    assert client.requests[1]["json"]["max_output_tokens"] == 12
-+    assert client.requests[2]["json"]["max_output_tokens"] >= orchestrate.HEALTH_MIN_BUMP_TOKENS
- 
- 
- def test_health_ping_5xx_failure(monkeypatch):
--    client = DummyHealthClient([_response(502, None, text="Bad gateway")])
-+    responses = [
-+        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
-+        _response(502, None, text="Bad gateway"),
-+    ]
-+    client = DummyHealthClient(responses)
-     monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
- 
-     result = orchestrate._run_health_ping()
- 
-     assert result["ok"] is False
-     assert "HTTP 502" in result["message"]
+             ladder: List[int] = []
+             for value in (
+                 G5_MAX_OUTPUT_TOKENS_STEP1,
+                 G5_MAX_OUTPUT_TOKENS_STEP2,
 diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index 9e8b1b7bed80c856cde3733c3fa23c24d9970277..4435bebd4ffa91c8bcd7d5da56c778465c8577e1 100644
+index 4435bebd4ffa91c8bcd7d5da56c778465c8577e1..cefa754186215ef18e4c5c63d2a76d0bb1ad3165 100644
 --- a/tests/test_llm_client.py
 +++ b/tests/test_llm_client.py
-@@ -1,39 +1,41 @@
- # -*- coding: utf-8 -*-
- from pathlib import Path
- from unittest.mock import patch
- import httpx
- import pytest
- import sys
+@@ -99,136 +99,154 @@ class DummyClient:
+                 index = min(self.poll_count, len(self.poll_payloads) - 1)
+                 payload = self.poll_payloads[index]
+             self.poll_count += 1
+             return DummyResponse(payload)
  
- import json
+         self.last_probe = {
+             "url": url,
+             "headers": headers,
+         }
+         status_code = 200
+         text = ""
+         if self.availability:
+             entry = self.availability[min(self.probe_count, len(self.availability) - 1)]
+             if isinstance(entry, dict):
+                 status_code = entry.get("status", 200)
+                 text = entry.get("text", "")
+             else:
+                 status_code = int(entry)
+         self.probe_count += 1
+         return DummyResponse({"object": "model"}, status_code=status_code, text=text)
  
- sys.path.append(str(Path(__file__).resolve().parents[1]))
- 
- from llm_client import (
-     DEFAULT_RESPONSES_TEXT_FORMAT,
-     G5_MAX_OUTPUT_TOKENS_MAX,
-+    G5_MAX_OUTPUT_TOKENS_STEP1,
-+    G5_MAX_OUTPUT_TOKENS_STEP2,
-     GenerationResult,
-     generate,
- )
- 
- 
- @pytest.fixture(autouse=True)
- def _force_api_key(monkeypatch):
-     monkeypatch.setenv("OPENAI_API_KEY", "test")
-     yield
-     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+     def close(self):
+         return None
  
  
- class DummyResponse:
-     def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
-         if payload is None:
-             payload = {
-                 "choices": [
-                     {
-                         "message": {
-                             "content": "ok",
-                         }
-                     }
-                 ]
-             }
-         self._json = payload
-@@ -371,124 +373,138 @@ def test_generate_falls_back_to_gpt4_when_gpt5_empty():
+-def _run_and_capture_request(model_name: str, *, payloads=None, availability=None, poll_payloads=None):
++def _run_and_capture_request(
++    model_name: str,
++    *,
++    payloads=None,
++    availability=None,
++    poll_payloads=None,
++    temperature=None,
++):
+     dummy_client = DummyClient(
+         payloads=payloads,
+         availability=availability,
+         poll_payloads=poll_payloads,
+     )
+     with patch("llm_client.httpx.Client", return_value=dummy_client):
+-        result = generate(
+-            messages=[{"role": "user", "content": "ping"}],
+-            model=model_name,
+-            temperature=0,
+-            max_tokens=42,
+-        )
++        kwargs = {
++            "messages": [{"role": "user", "content": "ping"}],
++            "model": model_name,
++            "max_tokens": 42,
++        }
++        if temperature is not None:
++            kwargs["temperature"] = temperature
++        result = generate(**kwargs)
+     return result, dummy_client.last_request
+ 
+ 
+ def test_generate_uses_max_tokens_for_non_gpt5():
+     result, request_payload = _run_and_capture_request("gpt-4o")
+     assert isinstance(result, GenerationResult)
+     assert result.text == "ok"
+     assert result.api_route == "chat"
+     assert request_payload["json"]["max_tokens"] == 42
+     assert "max_completion_tokens" not in request_payload["json"]
+-    assert request_payload["json"]["temperature"] == 0
++    assert request_payload["json"]["temperature"] == 0.3
+     assert "tool_choice" not in request_payload["json"]
+     assert "modalities" not in request_payload["json"]
+     assert "response_format" not in request_payload["json"]
+     assert request_payload["url"].endswith("/chat/completions")
+ 
+ 
+ def test_generate_uses_responses_payload_for_gpt5():
+     responses_payload = {
+         "output": [
              {
                  "content": [
-                     {"type": "text", "text": "   "},
+                     {"type": "text", "text": "ok"},
                  ]
              }
          ]
      }
-     fallback_payload = {
-         "choices": [
+-    result, request_payload = _run_and_capture_request("gpt-5-preview", payloads=[responses_payload])
++    result, request_payload = _run_and_capture_request(
++        "gpt-5-preview",
++        payloads=[responses_payload],
++        temperature=0.7,
++    )
+     assert isinstance(result, GenerationResult)
+     assert result.api_route == "responses"
+     assert result.schema == "responses.output_text"
+     payload = request_payload["json"]
+     assert payload["max_output_tokens"] == 42
+     assert "modalities" not in payload
+     assert "messages" not in payload
+     assert payload["model"] == "gpt-5-preview"
+     assert payload["input"] == "ping"
+     assert "text" in payload
+     assert payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
+     assert "temperature" not in payload
+     assert set(payload.keys()) == {"input", "max_output_tokens", "model", "text"}
++    assert result.metadata is not None
++    assert result.metadata.get("temperature_ignored") is True
+     assert request_payload["url"].endswith("/responses")
+ 
+ 
+ def test_generate_logs_about_temperature_for_gpt5():
+     responses_payload = {
+         "output": [
              {
-                 "message": {
-                     "content": "from fallback",
-                 }
+                 "content": [
+                     {"type": "text", "text": "ok"},
+                 ]
              }
          ]
      }
-     client = DummyClient(payloads=[empty_payload, fallback_payload])
-     with patch("llm_client.httpx.Client", return_value=client):
-         result = generate(
+     dummy_client = DummyClient(payloads=[responses_payload])
+     with patch("llm_client.httpx.Client", return_value=dummy_client), patch("llm_client.LOGGER") as mock_logger:
+-        generate(
++        result = generate(
              messages=[{"role": "user", "content": "ping"}],
-             model="gpt-5-large",
-             temperature=0,
+             model="gpt-5-super",
+             temperature=0.7,
              max_tokens=42,
          )
  
--    assert result.model_used == "gpt-4o"
--    assert result.fallback_used == "gpt-4o"
-+    assert result.model_used == "gpt-5-large"
-+    assert result.fallback_used == "gpt-5-large"
-     assert result.retry_used is False
-     assert result.text == "from fallback"
-     assert result.fallback_reason == "empty_completion_gpt5_responses"
-     assert result.api_route == "chat"
+     mock_logger.info.assert_any_call(
+         "responses payload_keys=%s",
+         ["input", "max_output_tokens", "model", "text"],
+     )
+     mock_logger.info.assert_any_call("responses input_len=%d", 4)
+     mock_logger.info.assert_any_call("responses max_output_tokens=%s", 42)
+     mock_logger.info.assert_any_call(
+         "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
+         "gpt-5-super",
+     )
++    assert "temperature" not in dummy_client.last_request["json"]
++    assert result.metadata is not None
++    assert result.metadata.get("temperature_ignored") is True
  
  
- def test_generate_falls_back_when_gpt5_unavailable(monkeypatch):
-     monkeypatch.setattr("llm_client.FORCE_MODEL", False)
-     fallback_payload = {
-         "choices": [
-             {
-                 "message": {
-                     "content": "fallback ok",
-                 }
-             }
-         ]
-     }
-     client = DummyClient(payloads=[fallback_payload], availability=[403])
-     with patch("llm_client.httpx.Client", return_value=client):
--        result = generate(
--            messages=[{"role": "user", "content": "ping"}],
--            model="gpt-5",
--            temperature=0.2,
--            max_tokens=42,
--        )
-+        with pytest.raises(RuntimeError) as excinfo:
-+            generate(
-+                messages=[{"role": "user", "content": "ping"}],
-+                model="gpt-5",
-+                temperature=0.2,
-+                max_tokens=42,
-+            )
- 
--    assert result.model_used == "gpt-4o"
--    assert result.fallback_used == "gpt-4o"
--    assert result.retry_used is False
--    assert result.text == "fallback ok"
--    assert result.fallback_reason == "model_unavailable"
-+    assert "Model GPT-5 not available" in str(excinfo.value)
- 
- 
- def test_generate_escalates_max_tokens_when_truncated():
+ def test_generate_polls_for_incomplete_responses_status():
      initial_payload = {
-         "id": "resp-1",
-         "status": "incomplete",
-         "incomplete_details": {"reason": "max_output_tokens"},
+         "status": "in_progress",
+         "id": "resp-123",
          "output": [
              {
                  "content": [
@@ -1233,127 +291,10 @@ index 9e8b1b7bed80c856cde3733c3fa23c24d9970277..4435bebd4ffa91c8bcd7d5da56c77846
          "output": [
              {
                  "content": [
-                     {"type": "text", "text": "expanded"},
+                     {"type": "output_text", "text": "done"},
                  ]
              }
          ],
      }
-     client = DummyClient(payloads=[initial_payload, final_payload])
-     with patch("llm_client.httpx.Client", return_value=client):
-         result = generate(
-             messages=[{"role": "user", "content": "ping"}],
-             model="gpt-5",
-             temperature=0.1,
-         )
- 
-     assert isinstance(result, GenerationResult)
-     assert result.text == "expanded"
-     assert result.retry_used is True
-     assert client.call_count == 2
-     first_tokens = client.requests[0]["json"]["max_output_tokens"]
-     second_tokens = client.requests[1]["json"]["max_output_tokens"]
-     cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
--    expected_second = max(first_tokens + 600, int(first_tokens * 1.5))
-+    ladder = sorted(
-+        {
-+            value
-+            for value in (
-+                G5_MAX_OUTPUT_TOKENS_STEP1,
-+                G5_MAX_OUTPUT_TOKENS_STEP2,
-+                G5_MAX_OUTPUT_TOKENS_MAX,
-+            )
-+            if isinstance(value, int) and value > 0
-+        }
-+    )
-+    expected_second = None
-+    for value in ladder:
-+        if value > first_tokens:
-+            expected_second = value
-+            break
-+    if expected_second is None:
-+        expected_second = first_tokens + 200
-     if cap is not None:
-         expected_second = min(expected_second, cap)
-     assert second_tokens == expected_second
-     assert client.requests[1]["json"].get("previous_response_id") == "resp-1"
-     assert client.requests[0]["json"].get("previous_response_id") is None
- 
- 
- def test_generate_accepts_incomplete_with_valid_json():
-     skeleton_payload = {
-         "intro": "Вступление",
-         "main": ["Блок 1", "Блок 2", "Блок 3"],
-         "faq": [
-             {"q": f"Вопрос {idx}", "a": f"Ответ {idx}. Детали."}
-             for idx in range(1, 6)
-         ],
-         "conclusion": "Вывод",
-     }
-     skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
-     incomplete_payload = {
-         "id": "resp-accept",
-         "status": "incomplete",
-         "incomplete_details": {"reason": "max_output_tokens"},
-         "output": [
-             {
-                 "content": [
-diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
-index 64e675dbd8b66d6e7ef13e536f3e8ca7976559f4..9cedd89410720c82ea99db7cf2e5049bb2bb5fa8 100644
---- a/tests/test_orchestrate_utils.py
-+++ b/tests/test_orchestrate_utils.py
-@@ -280,50 +280,54 @@ def test_pipeline_resume_falls_back_to_available_checkpoint(monkeypatch):
-         messages=[{"role": "system", "content": "Системный промпт"}],
-         model="stub-model",
-         temperature=0.3,
-         max_tokens=1800,
-         timeout_s=60,
-     )
-     pipeline._run_skeleton()
-     state = pipeline.resume(PipelineStep.FAQ)
-     assert state.validation and state.validation.is_valid
-     faq_entries = [entry for entry in state.logs if entry.step == PipelineStep.FAQ]
-     assert faq_entries and faq_entries[-1].status == "ok"
- 
- 
- def test_generate_article_returns_metadata(monkeypatch, tmp_path):
-     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-     _stub_llm(monkeypatch)
-     unique_name = f"test_{uuid.uuid4().hex}.md"
-     outfile = Path("artifacts") / unique_name
-     data = {
-         "theme": "Долговая нагрузка семьи",
-         "structure": ["Введение", "Основная часть", "Вывод"],
-         "keywords": [f"ключ {idx}" for idx in range(1, 12)],
-         "include_jsonld": True,
-         "context_source": "off",
-     }
-+    monkeypatch.setattr(
-+        "orchestrate._run_health_ping",
-+        lambda: {"ok": True, "message": "stub", "route": "responses", "fallback_used": False},
-+    )
-     result = generate_article_from_payload(
-         theme="finance",
-         data=data,
-         k=0,
-         context_source="off",
-         outfile=str(outfile),
-     )
-     metadata = result["metadata"]
-     assert metadata["validation"]["passed"]
-     assert Path(outfile).exists()
-     assert metadata["pipeline_logs"]
-     # cleanup
-     Path(outfile).unlink(missing_ok=True)
-     Path(outfile.with_suffix(".json")).unlink(missing_ok=True)
- 
- 
- def test_gather_health_status_handles_missing_theme(monkeypatch):
-     monkeypatch.setenv("OPENAI_API_KEY", "")
-     status = gather_health_status(theme="")
-     assert not status["ok"]
-     assert not status["checks"]["theme_index"]["ok"]
-     llm_ping = status["checks"]["llm_ping"]
-     assert llm_ping["route"] == "responses"
-     assert llm_ping["fallback_used"] is False
-     assert not llm_ping["ok"]
+     dummy_client = DummyClient(payloads=[initial_payload], poll_payloads=[final_payload])
 

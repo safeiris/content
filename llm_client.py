@@ -1552,6 +1552,7 @@ def generate(
             upper_cap if upper_cap is not None else "-",
         )
 
+        temperature_ignored = False
         supports_temperature = _supports_temperature(target_model)
         if supports_temperature:
             raw_temperature = sanitized_payload.get("temperature", temperature)
@@ -1562,6 +1563,7 @@ def generate(
             except (TypeError, ValueError):
                 sanitized_payload["temperature"] = 0.3
         else:
+            temperature_ignored = True
             if "temperature" in sanitized_payload:
                 sanitized_payload.pop("temperature", None)
             LOGGER.info(
@@ -1635,7 +1637,7 @@ def generate(
             finish_block = payload.get("finish_reason")
             if isinstance(finish_block, str):
                 finish_reason = finish_block.strip().lower()
-            return {
+            metadata: Dict[str, object] = {
                 "status": status,
                 "incomplete_reason": incomplete_reason,
                 "usage_output_tokens": usage_output_tokens,
@@ -1643,6 +1645,9 @@ def generate(
                 "previous_response_id": prev_response_id,
                 "finish_reason": finish_reason,
             }
+            if temperature_ignored:
+                metadata["temperature_ignored"] = True
+            return metadata
 
         attempts = 0
         max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)

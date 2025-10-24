@@ -121,19 +121,28 @@ class DummyClient:
         return None
 
 
-def _run_and_capture_request(model_name: str, *, payloads=None, availability=None, poll_payloads=None):
+def _run_and_capture_request(
+    model_name: str,
+    *,
+    payloads=None,
+    availability=None,
+    poll_payloads=None,
+    temperature=None,
+):
     dummy_client = DummyClient(
         payloads=payloads,
         availability=availability,
         poll_payloads=poll_payloads,
     )
     with patch("llm_client.httpx.Client", return_value=dummy_client):
-        result = generate(
-            messages=[{"role": "user", "content": "ping"}],
-            model=model_name,
-            temperature=0,
-            max_tokens=42,
-        )
+        kwargs = {
+            "messages": [{"role": "user", "content": "ping"}],
+            "model": model_name,
+            "max_tokens": 42,
+        }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        result = generate(**kwargs)
     return result, dummy_client.last_request
 
 
@@ -144,7 +153,7 @@ def test_generate_uses_max_tokens_for_non_gpt5():
     assert result.api_route == "chat"
     assert request_payload["json"]["max_tokens"] == 42
     assert "max_completion_tokens" not in request_payload["json"]
-    assert request_payload["json"]["temperature"] == 0
+    assert request_payload["json"]["temperature"] == 0.3
     assert "tool_choice" not in request_payload["json"]
     assert "modalities" not in request_payload["json"]
     assert "response_format" not in request_payload["json"]
@@ -161,7 +170,11 @@ def test_generate_uses_responses_payload_for_gpt5():
             }
         ]
     }
-    result, request_payload = _run_and_capture_request("gpt-5-preview", payloads=[responses_payload])
+    result, request_payload = _run_and_capture_request(
+        "gpt-5-preview",
+        payloads=[responses_payload],
+        temperature=0.7,
+    )
     assert isinstance(result, GenerationResult)
     assert result.api_route == "responses"
     assert result.schema == "responses.output_text"
@@ -175,6 +188,8 @@ def test_generate_uses_responses_payload_for_gpt5():
     assert payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
     assert "temperature" not in payload
     assert set(payload.keys()) == {"input", "max_output_tokens", "model", "text"}
+    assert result.metadata is not None
+    assert result.metadata.get("temperature_ignored") is True
     assert request_payload["url"].endswith("/responses")
 
 
@@ -190,7 +205,7 @@ def test_generate_logs_about_temperature_for_gpt5():
     }
     dummy_client = DummyClient(payloads=[responses_payload])
     with patch("llm_client.httpx.Client", return_value=dummy_client), patch("llm_client.LOGGER") as mock_logger:
-        generate(
+        result = generate(
             messages=[{"role": "user", "content": "ping"}],
             model="gpt-5-super",
             temperature=0.7,
@@ -207,6 +222,9 @@ def test_generate_logs_about_temperature_for_gpt5():
         "LOG:RESPONSES_PARAM_OMITTED omitted=['temperature'] model=%s",
         "gpt-5-super",
     )
+    assert "temperature" not in dummy_client.last_request["json"]
+    assert result.metadata is not None
+    assert result.metadata.get("temperature_ignored") is True
 
 
 def test_generate_polls_for_incomplete_responses_status():
