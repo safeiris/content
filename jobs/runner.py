@@ -145,8 +145,17 @@ class JobRunner:
         ctx = PipelineContext(trace_id=job.trace_id)
         start_time = time.monotonic()
         deadline = start_time + self._soft_timeout_s
+        refine_extension = max(5.0, self._soft_timeout_s * 0.35)
+        refine_extension_applied = False
 
         for step in job.steps:
+            if step.name == "refine" and not refine_extension_applied:
+                deadline += refine_extension
+                refine_extension_applied = True
+                LOGGER.info(
+                    "job_soft_timeout_extend",
+                    extra={"step": step.name, "extra_seconds": round(refine_extension, 2)},
+                )
             if time.monotonic() >= deadline:
                 ctx.degradation_flags.append("soft_timeout")
                 step.mark_degraded("soft_timeout")

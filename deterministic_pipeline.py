@@ -888,6 +888,7 @@ class DeterministicPipeline:
                             "additionalProperties": False,
                         },
                         "minItems": min_items,
+                        "maxItems": min_items,
                     }
                 },
                 "required": ["faq"],
@@ -1257,6 +1258,9 @@ class DeterministicPipeline:
                 "Подготовь новые элементы FAQ с практичными ответами (минимум два предложения каждый)."
             )
             lines.append("Каждый ответ — максимум 2–3 предложения, избегай повторов.")
+            lines.append(
+                "Верни ровно 5 элементов FAQ, не больше и не меньше. Если запрашивается только часть списка, добавь столько пунктов, сколько нужно, чтобы итоговый FAQ оставался из пяти элементов."
+            )
             lines.append(
                 "Верни JSON {\"faq\": [{\"q\": str, \"a\": str}, ...]} в количестве, равном запросу."
             )

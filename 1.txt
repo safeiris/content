@@ -1,0 +1,697 @@
+diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
+index f01a5903442e84c8fac65956feae78594526b763..3fd80603a6a254a252d0d26b72bb471f016376ce 100644
+--- a/deterministic_pipeline.py
++++ b/deterministic_pipeline.py
+@@ -866,50 +866,51 @@ class DeterministicPipeline:
+                             "additionalProperties": False,
+                         },
+                         "minItems": min_items,
+                     }
+                 },
+                 "required": ["sections"],
+                 "additionalProperties": False,
+             }
+         elif batch.kind == SkeletonBatchKind.FAQ:
+             min_items = max(0, int(item_count))
+             schema = {
+                 "type": "object",
+                 "properties": {
+                     "faq": {
+                         "type": "array",
+                         "items": {
+                             "type": "object",
+                             "properties": {
+                                 "q": {"type": "string"},
+                                 "a": {"type": "string"},
+                             },
+                             "required": ["q", "a"],
+                             "additionalProperties": False,
+                         },
+                         "minItems": min_items,
++                        "maxItems": min_items,
+                     }
+                 },
+                 "required": ["faq"],
+                 "additionalProperties": False,
+             }
+         else:
+             schema = {
+                 "type": "object",
+                 "properties": {"conclusion": {"type": "string"}},
+                 "required": ["conclusion"],
+                 "additionalProperties": False,
+             }
+         name_map = {
+             SkeletonBatchKind.INTRO: "seo_article_intro_batch",
+             SkeletonBatchKind.MAIN: "seo_article_main_batch",
+             SkeletonBatchKind.FAQ: "seo_article_faq_batch",
+             SkeletonBatchKind.CONCLUSION: "seo_article_conclusion_batch",
+         }
+         format_block = {
+             "type": "json_schema",
+             "name": name_map.get(batch.kind, "seo_article_skeleton_batch"),
+             "schema": schema,
+             "strict": True,
+         }
+         return self._prepare_format_block(format_block, batch=batch)
+@@ -1235,50 +1236,53 @@ class DeterministicPipeline:
+                 + "."
+             )
+             if already_ready:
+                 lines.append(
+                     "Эти разделы уже готовы и переписывать их не нужно: "
+                     + "; ".join(already_ready)
+                     + "."
+                 )
+             lines.append(
+                 "Каждый раздел держи в рамках до четырёх абзацев по 3–4 предложения — без лишней воды."
+             )
+             lines.extend(
+                 [
+                     "Каждый раздел — 3–5 абзацев по 3–4 предложения, с примерами, рисками и расчётами.",
+                     "Верни JSON {\"sections\": [{\"title\": str, \"body\": str}, ...]} в порядке указанного списка.",
+                 ]
+             )
+             if tail_fill:
+                 lines.append("Верни только недостающие разделы без повтора уже написанных частей.")
+         elif batch.kind == SkeletonBatchKind.FAQ:
+             start_number = target_indices[0] + 1 if target_indices else 1
+             lines.append(
+                 "Подготовь новые элементы FAQ с практичными ответами (минимум два предложения каждый)."
+             )
+             lines.append("Каждый ответ — максимум 2–3 предложения, избегай повторов.")
++            lines.append(
++                "Верни ровно 5 элементов FAQ, не больше и не меньше. Если запрашивается только часть списка, добавь столько пунктов, сколько нужно, чтобы итоговый FAQ оставался из пяти элементов."
++            )
+             lines.append(
+                 "Верни JSON {\"faq\": [{\"q\": str, \"a\": str}, ...]} в количестве, равном запросу."
+             )
+             lines.append(
+                 "Продолжай нумерацию вопросов, начиная с пункта №%d." % start_number
+             )
+             if tail_fill:
+                 lines.append("Добавь только недостающие вопросы и ответы.")
+         else:
+             lines.append("Заключение ограничь объёмом до 180 слов.")
+             lines.extend(
+                 [
+                     "Сделай связный вывод и обозначь план действий, ссылаясь на ключевые идеи статьи.",
+                     "Верни JSON {\"conclusion\": str} с одним абзацем.",
+                 ]
+             )
+ 
+         lines.append("Ответ заверни в теги <response_json>...</response_json> без комментариев.")
+         user_payload = textwrap.dedent("\n".join(lines)).strip()
+         messages.append({"role": "user", "content": user_payload})
+         format_block = self._batch_schema(batch, outline=outline, item_count=len(target_indices))
+         return messages, format_block
+ 
+     def _parse_fallback_main(
+         self,
+diff --git a/domain/faq_seeds.py b/domain/faq_seeds.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..161758399e8e8614aab4de0c4007fd449e15a432
+--- /dev/null
++++ b/domain/faq_seeds.py
+@@ -0,0 +1,73 @@
++"""Predefined FAQ seed entries for FAQ normalization."""
++
++from __future__ import annotations
++
++from typing import Dict, List
++
++_FAQ_SEEDS: Dict[str, List[Dict[str, str]]] = {
++    "finance": [
++        {
++            "q": "Как рассчитать свою долговую нагрузку перед оформлением кредита?",
++            "a": (
++                "Сложите все ежемесячные платежи по кредитам и разделите их на совокупный доход."
++                " Если показатель превышает 40–45%, стоит сначала снизить задолженность или увеличить доход."
++            ),
++        },
++        {
++            "q": "Сколько времени банк рассматривает заявку и что ускоряет процесс?",
++            "a": (
++                "Решение по онлайн-заявке обычно занимает 1–2 рабочих дня, офлайн — до недели."
++                " Подготовьте документы заранее, проверьте кредитную историю и подтвердите официальный доход,"
++                " это сокращает время рассмотрения."
++            ),
++        },
++        {
++            "q": "Нужно ли страхование при получении потребительского кредита?",
++            "a": (
++                "Закон не требует полиса, но его могут включить в пакет и добавить к стоимости кредита."
++                " Проверьте условия договора: часто можно отказаться от страховки в течение 14 дней и тем самым снизить переплату."
++            ),
++        },
++        {
++            "q": "Как улучшить кредитную историю перед новой заявкой?",
++            "a": (
++                "Оплатите просрочки, закройте мелкие долги и несколько месяцев пользуйтесь кредитной картой в пределах лимита."
++                " Регулярные платежи без задержек повышают скоринговый балл в бюро кредитных историй."
++            ),
++        },
++        {
++            "q": "Чем отличается предварительное одобрение от окончательного решения банка?",
++            "a": (
++                "Предварительное одобрение подтверждает готовность банка выдать кредит при соблюдении условий,"
++                " но без проверки документов. Окончательное решение принимают после подтверждения доходов,"
++                " оценки залога и подписания договора."
++            ),
++        },
++        {
++            "q": "Можно ли погасить кредит досрочно без штрафов?",
++            "a": (
++                "Да, банки обязаны принимать досрочное погашение без комиссий — достаточно уведомить их за 30 дней или по регламенту банка."
++                " Уточните, уменьшится ли срок кредита или платеж, и подайте заявление через личный кабинет или отделение."
++            ),
++        },
++        {
++            "q": "Как выбрать оптимальный срок кредита, чтобы не переплатить?",
++            "a": (
++                "Чем короче срок, тем меньше переплата по процентам, но выше ежемесячный платёж."
++                " Рассчитайте бюджет так, чтобы платёж не превышал 30–35% чистого дохода, и сравните графики разных сроков."
++            ),
++        },
++    ]
++}
++
++
++def get_faq_seeds(theme: str) -> List[Dict[str, str]]:
++    """Return a list of FAQ seed entries for the requested theme."""
++
++    normalized = (theme or "").strip().lower()
++    if normalized in _FAQ_SEEDS:
++        return [dict(item) for item in _FAQ_SEEDS[normalized]]
++    return []
++
++
++__all__ = ["get_faq_seeds"]
+diff --git a/jobs/runner.py b/jobs/runner.py
+index 3b92ef016f8fa774757b5dc6de23152c4e9c3c19..591a3676b43a2d63a667c2eb56facc92d058fe80 100644
+--- a/jobs/runner.py
++++ b/jobs/runner.py
+@@ -123,52 +123,61 @@ class JobRunner:
+             if task.job_id == "__shutdown__":
+                 break
+             try:
+                 self._run_job(task)
+             except Exception as exc:  # noqa: BLE001
+                 LOGGER.exception("job_failed", extra={"job_id": task.job_id, "error": str(exc)})
+             finally:
+                 with self._events_lock:
+                     event = self._events.pop(task.job_id, None)
+                 if event:
+                     event.set()
+ 
+     def _run_job(self, task: RunnerTask) -> None:
+         job = self._store.get(task.job_id)
+         if not job:
+             LOGGER.warning("job_missing", extra={"job_id": task.job_id})
+             return
+ 
+         job.trace_id = job.trace_id or task.trace_id
+         job.mark_running()
+         self._store.touch(job.id)
+ 
+         ctx = PipelineContext(trace_id=job.trace_id)
+         start_time = time.monotonic()
+         deadline = start_time + self._soft_timeout_s
++        refine_extension = max(5.0, self._soft_timeout_s * 0.35)
++        refine_extension_applied = False
+ 
+         for step in job.steps:
++            if step.name == "refine" and not refine_extension_applied:
++                deadline += refine_extension
++                refine_extension_applied = True
++                LOGGER.info(
++                    "job_soft_timeout_extend",
++                    extra={"step": step.name, "extra_seconds": round(refine_extension, 2)},
++                )
+             if time.monotonic() >= deadline:
+                 ctx.degradation_flags.append("soft_timeout")
+                 step.mark_degraded("soft_timeout")
+                 log_step(
+                     LOGGER,
+                     job_id=job.id,
+                     step=step.name,
+                     status=step.status.value,
+                     reason="soft_timeout",
+                 )
+                 break
+ 
+             result = self._execute_step(step.name, task.payload, ctx)
+             if result.status == JobStepStatus.SUCCEEDED:
+                 step.mark_succeeded(**result.payload)
+             elif result.status == JobStepStatus.DEGRADED:
+                 step.mark_degraded(result.error, **result.payload)
+             else:
+                 step.mark_failed(result.error, **result.payload)
+             log_step(
+                 LOGGER,
+                 job_id=job.id,
+                 step=step.name,
+                 status=step.status.value,
+                 error=result.error,
+diff --git a/llm_client.py b/llm_client.py
+index 2c2d1341814fe3cded24ce485270b33650de9b61..64b0f4c22aec30b36220ba6a4d959c3654b5fa20 100644
+--- a/llm_client.py
++++ b/llm_client.py
+@@ -1674,50 +1674,51 @@ def generate(
+         attempts = 0
+         if max_attempts_override is not None:
+             try:
+                 parsed_attempts = int(max_attempts_override)
+             except (TypeError, ValueError):
+                 parsed_attempts = 1
+             max_attempts = max(1, parsed_attempts)
+         else:
+             max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)
+         current_max = max_tokens_value
+         last_error: Optional[BaseException] = None
+         format_retry_done = False
+         format_name_retry_done = False
+         min_tokens_bump_done = False
+         min_token_floor = 1
+         base_input_text = str(sanitized_payload.get("input", ""))
+         shrunken_input = _shrink_responses_input(base_input_text)
+         shrink_next_attempt = False
+         shrink_applied = False
+         incomplete_retry_count = 0
+         token_escalations = 0
+         resume_from_response_id: Optional[str] = None
+         content_started = False
+         cap_retry_performed = False
+         empty_retry_attempted = False
++        empty_direct_retry_attempted = False
+ 
+         def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
+             ladder: List[int] = []
+             for value in G5_ESCALATION_LADDER:
+                 try:
+                     normalized = int(value)
+                 except (TypeError, ValueError):
+                     continue
+                 if normalized <= 0:
+                     continue
+                 if normalized not in ladder:
+                     ladder.append(normalized)
+             for target in ladder:
+                 if target > current:
+                     return target if cap is None else min(target, cap)
+             if cap is not None and cap > current:
+                 return int(cap)
+             return current
+ 
+         def _poll_responses_payload(response_id: str) -> Optional[Dict[str, object]]:
+             poll_attempt = 0
+             while poll_attempt < MAX_RESPONSES_POLL_ATTEMPTS:
+                 poll_attempt += 1
+                 poll_url = f"{RESPONSES_API_URL}/{response_id}"
+                 LOGGER.info("responses poll attempt=%d id=%s", poll_attempt, response_id)
+@@ -1963,50 +1964,74 @@ def generate(
+                             content_length = 0
+                             if isinstance(parse_flags, dict):
+                                 output_length = int(
+                                     parse_flags.get("output_text_len", 0) or 0
+                                 )
+                                 content_length = int(
+                                     parse_flags.get("content_text_len", 0) or 0
+                                 )
+                             LOGGER.warning(
+                                 "LLM_WARN cap_reached limit=%s output_len=%d content_len=%d status=%s reason=%s",
+                                 upper_cap,
+                                 output_length,
+                                 content_length,
+                                 status or "",
+                                 reason or "",
+                             )
+                             cap_retry_performed = True
+                             shrink_next_attempt = False
+                     last_error = RuntimeError("responses_incomplete")
+                     incomplete_retry_count += 1
+                     if incomplete_retry_count >= 2:
+                         break
+                     shrink_next_attempt = True
+                     continue
+                 if not text:
++                    if (
++                        allow_empty_retry
++                        and status == "incomplete"
++                        and segments == 0
++                        and not empty_direct_retry_attempted
++                    ):
++                        empty_direct_retry_attempted = True
++                        resume_from_response_id = None
++                        shrink_next_attempt = False
++                        reduced = int(round(int(current_max) * 0.85)) if current_max else 0
++                        if reduced <= 0 or reduced >= int(current_max):
++                            reduced = int(current_max) - 1 if int(current_max) > 1 else 1
++                        if reduced < 1:
++                            reduced = 1
++                        current_max = reduced
++                        sanitized_payload["max_output_tokens"] = max(
++                            min_token_floor, int(current_max)
++                        )
++                        LOGGER.warning(
++                            "RESP_EMPTY direct retry without previous_response_id max_tokens=%s",
++                            sanitized_payload.get("max_output_tokens"),
++                        )
++                        last_error = RuntimeError("responses_empty_direct_retry")
++                        continue
+                     response_id_value = metadata.get("response_id") or ""
+                     if (
+                         allow_empty_retry
+                         and response_id_value
+                         and not empty_retry_attempted
+                     ):
+                         empty_retry_attempted = True
+                         resume_from_response_id = str(response_id_value)
+                         LOGGER.warning(
+                             "RESP_EMPTY retrying with previous_response_id=%s",
+                             resume_from_response_id,
+                         )
+                         last_error = RuntimeError("responses_empty_retry")
+                         continue
+                     last_error = EmptyCompletionError(
+                         "Модель вернула пустой ответ",
+                         raw_response=data,
+                         parse_flags=parse_flags,
+                     )
+                     LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
+                     if not allow_empty_retry:
+                         raise last_error
+                     continue
+                 _persist_raw_response(data)
+                 return text, parse_flags, data, schema_label
+diff --git a/skeleton_utils.py b/skeleton_utils.py
+index fc5cf34ea074b13aa25c1020fc6b82b7bea637c6..b9f79e311cd1f9fd728bbdee7f7fde4c72a92aa2 100644
+--- a/skeleton_utils.py
++++ b/skeleton_utils.py
+@@ -1,75 +1,221 @@
+ # -*- coding: utf-8 -*-
+ """Helpers for normalizing skeleton payloads returned by LLM."""
+ 
+ from __future__ import annotations
+ 
+ import logging
+-from typing import Any, Dict
++import re
++from typing import Any, Dict, Iterable, List
+ 
++from domain.faq_seeds import get_faq_seeds
+ 
+ LOGGER = logging.getLogger(__name__)
+ 
+ _CANONICAL_CONCLUSION_KEYS = ("conclusion", "outro", "ending", "final", "summary")
+ _DEFAULT_MAIN_PLACEHOLDER = (
+     "Этот раздел будет расширен детальными рекомендациями в финальной версии статьи."
+ )
++_FAQ_TARGET_COUNT = 5
++_WORD_RE = re.compile(r"[\w-]+", flags=re.UNICODE)
+ 
+ 
+ def _as_list(value: Any) -> list:
+     if isinstance(value, list):
+         return list(value)
+     if value is None:
+         return []
+     return [value]
+ 
+ 
++def _normalize_faq_item(item: Any) -> Dict[str, str] | None:
++    if isinstance(item, dict):
++        question = (
++            item.get("q")
++            or item.get("question")
++            or item.get("name")
++            or item.get("title")
++            or ""
++        )
++        answer_block = item.get("a") or item.get("answer") or item.get("text")
++        if isinstance(answer_block, dict):
++            answer = answer_block.get("text") or answer_block.get("content") or ""
++        else:
++            answer = answer_block or ""
++    elif isinstance(item, (list, tuple)) and len(item) >= 2:
++        question = item[0]
++        answer = item[1]
++    else:
++        question = ""
++        answer = ""
++    question_text = str(question or "").strip()
++    answer_text = str(answer or "").strip()
++    if not question_text or not answer_text:
++        return None
++    return {"q": question_text, "a": answer_text}
++
++
++def _deduplicate_entries(entries: Iterable[Dict[str, str]], *, seen: Iterable[str] | None = None) -> List[Dict[str, str]]:
++    seen_questions = {str(question).strip().lower() for question in (seen or []) if str(question).strip()}
++    unique_entries: List[Dict[str, str]] = []
++    for entry in entries:
++        question = str(entry.get("q", "")).strip()
++        answer = str(entry.get("a", "")).strip()
++        if not question or not answer:
++            continue
++        key = question.lower()
++        if key in seen_questions:
++            continue
++        seen_questions.add(key)
++        unique_entries.append({"q": question, "a": answer})
++    return unique_entries
++
++
++def _extract_keywords(payload: Dict[str, Any]) -> List[str]:
++    keyword_fields = (
++        "normalized_keywords",
++        "keywords",
++        "required_keywords",
++        "normalized_required_keywords",
++        "preferred_keywords",
++        "normalized_preferred_keywords",
++    )
++    collected: List[str] = []
++    seen: set[str] = set()
++    for field in keyword_fields:
++        values = payload.get(field)
++        if isinstance(values, (list, tuple, set)):
++            for value in values:
++                token = str(value or "").strip().lower()
++                if not token or token in seen:
++                    continue
++                seen.add(token)
++                collected.append(token)
++    return collected
++
++
++def _score_entry(entry: Dict[str, str], keywords: Iterable[str]) -> tuple[float, float, int]:
++    text = f"{entry.get('q', '')} {entry.get('a', '')}".lower()
++    coverage = 0
++    for keyword in keywords:
++        if keyword and keyword in text:
++            coverage += 1
++    words = _WORD_RE.findall(text)
++    diversity = 0.0
++    if words:
++        diversity = len(set(words)) / max(1, len(words))
++    length = len(entry.get("a", ""))
++    return float(coverage), diversity, length
++
++
++def _select_top_entries(entries: List[Dict[str, str]], keywords: List[str], limit: int) -> List[Dict[str, str]]:
++    scored: List[tuple[float, float, int, int, Dict[str, str]]] = []
++    for index, entry in enumerate(entries):
++        coverage, diversity, length = _score_entry(entry, keywords)
++        scored.append((coverage, diversity, length, index, entry))
++    scored.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
++    return [item[4] for item in scored[:limit]]
++
++
+ def _describe_keys(payload: Dict[str, Any]) -> str:
+     descriptors = []
+     if "intro" in payload:
+         descriptors.append("intro")
+     if "main" in payload:
+         descriptors.append("main[]")
+     if "faq" in payload:
+         descriptors.append("faq[]")
+     if "conclusion" in payload:
+         descriptors.append("conclusion")
+     return ",".join(descriptors)
+ 
+ 
+ def normalize_skeleton_payload(payload: Any) -> Any:
+     """Return a normalized skeleton payload with canonical keys."""
+ 
+     if not isinstance(payload, dict):
+         return payload
+ 
+     normalized: Dict[str, Any] = dict(payload)
+ 
+     conclusion_value = None
+     for key in _CANONICAL_CONCLUSION_KEYS:
+         if key in normalized:
+             value = normalized.get(key)
+             if value is not None and str(value).strip():
+                 conclusion_value = value
+                 break
+     if conclusion_value is not None:
+         normalized["conclusion"] = conclusion_value
+     for legacy_key in ("outro", "ending", "final", "summary"):
+         normalized.pop(legacy_key, None)
+ 
+     normalized_main = [
+         str(item or "").strip() for item in _as_list(normalized.get("main")) if str(item or "").strip()
+     ]
+     if len(normalized_main) > 6:
+         LOGGER.info("LOG:SKELETON_MAIN_TRIM normalize from=%d to=6", len(normalized_main))
+         normalized_main = normalized_main[:6]
+     while len(normalized_main) < 3:
+         normalized_main.append(_DEFAULT_MAIN_PLACEHOLDER)
+     normalized["main"] = normalized_main
+-    normalized["faq"] = _as_list(normalized.get("faq"))
++    raw_faq = _as_list(normalized.get("faq"))
++    faq_entries = _deduplicate_entries(filter(None, (_normalize_faq_item(item) for item in raw_faq)))
++
++    theme = str(normalized.get("theme") or normalized.get("topic") or "").strip().lower() or "finance"
++    keywords = _extract_keywords(normalized)
++    seeds = _deduplicate_entries(get_faq_seeds(theme), seen=(entry["q"] for entry in faq_entries))
++
++    combined = list(faq_entries)
++    needs_fill = len(faq_entries) < _FAQ_TARGET_COUNT
++    if needs_fill and seeds:
++        combined.extend(seeds)
++
++    if needs_fill and seeds:
++        missing = _FAQ_TARGET_COUNT - len(faq_entries)
++        LOGGER.info("LOG:SKELETON_FAQ_FILL missing=%d seed_pool=%d", missing, len(seeds))
++
++    if len(faq_entries) > _FAQ_TARGET_COUNT:
++        LOGGER.info("LOG:SKELETON_FAQ_TRIM from=%d to=%d", len(faq_entries), _FAQ_TARGET_COUNT)
++
++    if not combined:
++        combined = seeds[:]
++
++    selected = _select_top_entries(combined, keywords, _FAQ_TARGET_COUNT)
++    existing_lower = {entry.get("q", "").lower() for entry in selected if entry.get("q")}
++
++    if len(selected) < _FAQ_TARGET_COUNT:
++        supplemental = get_faq_seeds(theme)
++        for entry in supplemental:
++            if len(selected) >= _FAQ_TARGET_COUNT:
++                break
++            question = entry.get("q", "").strip()
++            answer = entry.get("a", "").strip()
++            if not question or not answer:
++                continue
++            q_lower = question.lower()
++            if q_lower in existing_lower:
++                continue
++            existing_lower.add(q_lower)
++            selected.append({"q": question, "a": answer})
++        if len(selected) < _FAQ_TARGET_COUNT and supplemental:
++            for entry in supplemental:
++                if len(selected) >= _FAQ_TARGET_COUNT:
++                    break
++                question = str(entry.get("q", "")).strip()
++                answer = str(entry.get("a", "")).strip()
++                if not question or not answer:
++                    continue
++                q_lower = question.lower()
++                if q_lower in existing_lower:
++                    continue
++                existing_lower.add(q_lower)
++                selected.append({"q": question, "a": answer})
++
++    normalized["faq"] = selected[:_FAQ_TARGET_COUNT]
+ 
+     keys_descriptor = _describe_keys(normalized)
+     LOGGER.info("LOG:SKELETON_NORMALIZED keys=%s", keys_descriptor)
+     return normalized
+ 
+ 
+ __all__ = ["normalize_skeleton_payload"]
+diff --git a/tests/test_skeleton_utils.py b/tests/test_skeleton_utils.py
+index 8f3705555779eaec3a14853a47697bb118baa54e..e47935480a971204cc2a8a05f49bcf236ad897a8 100644
+--- a/tests/test_skeleton_utils.py
++++ b/tests/test_skeleton_utils.py
+@@ -1,32 +1,76 @@
+ from skeleton_utils import normalize_skeleton_payload
+ 
+ 
+ def test_normalize_skeleton_payload_standardizes_keys():
+     raw_payload = {
+         "intro": "Intro",
+         "main": "Section",
+         "faq": {"q": "Q?", "a": "A!"},
+         "outro": "Bye",
+     }
+ 
+     normalized = normalize_skeleton_payload(raw_payload)
+ 
+     assert "outro" not in normalized
+     assert normalized["conclusion"] == "Bye"
+     assert len(normalized["main"]) == 3
+     assert normalized["main"][0] == "Section"
+-    assert normalized["faq"] == [{"q": "Q?", "a": "A!"}]
++    assert len(normalized["faq"]) == 5
++    assert normalized["faq"][0] == {"q": "Q?", "a": "A!"}
+ 
+ 
+ def test_normalize_skeleton_payload_enforces_main_range():
+     raw_payload = {
+         "intro": "Intro",
+         "main": [f"Block {idx}" for idx in range(10)],
+         "faq": [],
+         "conclusion": "Bye",
+     }
+ 
+     normalized = normalize_skeleton_payload(raw_payload)
+ 
+     assert len(normalized["main"]) == 6
+     assert normalized["main"][0] == "Block 0"
++
++
++def test_normalize_skeleton_payload_fills_faq_from_seeds():
++    raw_payload = {
++        "intro": "Intro",
++        "main": ["A", "B", "C"],
++        "faq": [
++            {"q": "Что такое кредитная нагрузка?", "a": "Это доля платежей от дохода."},
++            {"q": "Как выбрать банк?", "a": "Сравните ставки и комиссии."},
++        ],
++        "conclusion": "Bye",
++    }
++
++    normalized = normalize_skeleton_payload(raw_payload)
++
++    questions = [entry["q"] for entry in normalized["faq"]]
++    assert len(questions) == 5
++    assert any("долговую нагрузку" in question.lower() for question in questions)
++
++
++def test_normalize_skeleton_payload_trims_to_top_five():
++    raw_payload = {
++        "intro": "Intro",
++        "main": ["A", "B", "C"],
++        "faq": [
++            {"q": "Как считать процент по кредиту?", "a": "Рассчитывайте эффективную ставку."},
++            {"q": "Что такое скоринг?", "a": "Скоринг оценивает кредитоспособность."},
++            {"q": "Когда лучше подать заявку?", "a": "Когда доход стабилен и подтверждён."},
++            {"q": "Как снизить переплату?", "a": "Вносите досрочные платежи."},
++            {"q": "Зачем нужен поручитель?", "a": "Он повышает шанс одобрения."},
++            {"q": "Какие документы нужны?", "a": "Паспорт и подтверждение дохода."},
++        ],
++        "keywords": ["процент", "скоринг", "доход"],
++        "conclusion": "Bye",
++    }
++
++    normalized = normalize_skeleton_payload(raw_payload)
++
++    questions = [entry["q"] for entry in normalized["faq"]]
++    assert len(questions) == 5
++    assert "Как снизить переплату?" not in questions
++    assert any("процент" in q.lower() for q in questions)
++    assert any("скоринг" in q.lower() for q in questions)
+

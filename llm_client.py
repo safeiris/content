@@ -1696,6 +1696,7 @@ def generate(
         content_started = False
         cap_retry_performed = False
         empty_retry_attempted = False
+        empty_direct_retry_attempted = False
 
         def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
             ladder: List[int] = []
@@ -1985,6 +1986,30 @@ def generate(
                     shrink_next_attempt = True
                     continue
                 if not text:
+                    if (
+                        allow_empty_retry
+                        and status == "incomplete"
+                        and segments == 0
+                        and not empty_direct_retry_attempted
+                    ):
+                        empty_direct_retry_attempted = True
+                        resume_from_response_id = None
+                        shrink_next_attempt = False
+                        reduced = int(round(int(current_max) * 0.85)) if current_max else 0
+                        if reduced <= 0 or reduced >= int(current_max):
+                            reduced = int(current_max) - 1 if int(current_max) > 1 else 1
+                        if reduced < 1:
+                            reduced = 1
+                        current_max = reduced
+                        sanitized_payload["max_output_tokens"] = max(
+                            min_token_floor, int(current_max)
+                        )
+                        LOGGER.warning(
+                            "RESP_EMPTY direct retry without previous_response_id max_tokens=%s",
+                            sanitized_payload.get("max_output_tokens"),
+                        )
+                        last_error = RuntimeError("responses_empty_direct_retry")
+                        continue
                     response_id_value = metadata.get("response_id") or ""
                     if (
                         allow_empty_retry
