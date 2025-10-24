@@ -11,7 +11,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from config import (
     DEFAULT_MAX_LENGTH,
@@ -250,6 +250,7 @@ class DeterministicPipeline:
         provided_faq: Optional[List[Dict[str, str]]] = None,
         jsonld_requested: bool = True,
         faq_questions: Optional[int] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
     ) -> None:
         if not model or not str(model).strip():
             raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
@@ -309,12 +310,37 @@ class DeterministicPipeline:
         self._fallback_reason: Optional[str] = None
         self._api_route: Optional[str] = None
         self._token_usage: Optional[float] = None
+        self._progress_callback = progress_callback
 
         self.section_budgets: List[SectionBudget] = self._compute_section_budgets()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _emit_progress(
+        self,
+        stage: str,
+        progress: float,
+        *,
+        message: Optional[str] = None,
+        payload: Optional[Mapping[str, object]] = None,
+    ) -> None:
+        if not self._progress_callback:
+            return
+        event_payload = dict(payload) if payload else {}
+        try:
+            if event_payload:
+                self._progress_callback(
+                    stage=stage,
+                    progress=progress,
+                    message=message,
+                    payload=event_payload,
+                )
+            else:
+                self._progress_callback(stage=stage, progress=progress, message=message)
+        except Exception:  # pragma: no cover - defensive logging
+            LOGGER.debug("progress_callback_failed", exc_info=True)
+
     def _log(self, step: PipelineStep, status: str, **notes: object) -> None:
         entry = PipelineLogEntry(step=step, started_at=time.time(), status=status, notes=dict(notes))
         self.logs.append(entry)
@@ -2337,6 +2363,36 @@ class DeterministicPipeline:
         last_result: Optional[GenerationResult] = None
 
         pending_batches = deque(batches)
+        total_batches = len(pending_batches)
+        completed_batches = 0
+
+        def _schedule(plan: SkeletonBatchPlan, *, left: bool = False, count: bool = True) -> None:
+            nonlocal total_batches
+            if left:
+                pending_batches.appendleft(plan)
+            else:
+                pending_batches.append(plan)
+            if count:
+                total_batches += 1
+
+        def _notify_draft_progress(label: str = "", *, partial: bool = False) -> None:
+            if total_batches <= 0:
+                return
+            fraction = completed_batches / total_batches if total_batches else 0.0
+            payload: Dict[str, object] = {"total": total_batches, "completed": completed_batches}
+            if label:
+                payload["batch"] = label
+            if partial:
+                payload["partial"] = True
+            self._emit_progress("draft", max(0.0, min(1.0, fraction)), payload=payload)
+
+        if total_batches:
+            self._emit_progress(
+                "draft",
+                0.0,
+                payload={"total": total_batches, "completed": completed_batches},
+            )
+
         scheduled_main_indices: Set[int] = set()
         parse_none_streaks: Dict[str, int] = {}
         for plan in pending_batches:
@@ -2361,7 +2417,7 @@ class DeterministicPipeline:
                         "LOG:SCHEDULER_BLOCK main underflow=%d target_min=3 → continue_main",
                         filled_main,
                     )
-                    pending_batches.append(batch)
+                    _schedule(batch, count=False)
                     continue
             if not batch.label:
                 batch.label = self._format_batch_label(batch.kind, batch.indices)
@@ -2468,13 +2524,14 @@ class DeterministicPipeline:
                             remainder,
                             suffix=f"#split{split_serial}",
                         )
-                        pending_batches.appendleft(
+                        _schedule(
                             SkeletonBatchPlan(
                                 kind=batch.kind,
                                 indices=list(remainder),
                                 label=remainder_label,
                                 tail_fill=batch.tail_fill,
-                            )
+                            ),
+                            left=True,
                         )
                     LOGGER.info(
                         "BATCH_AUTOSPLIT kind=%s label=%s from=%d to=%d",
@@ -2658,7 +2715,7 @@ class DeterministicPipeline:
                         if not chunk:
                             break
                         chunk_label = self._format_batch_label(SkeletonBatchKind.MAIN, chunk)
-                        pending_batches.append(
+                        _schedule(
                             SkeletonBatchPlan(
                                 kind=SkeletonBatchKind.MAIN,
                                 indices=list(chunk),
@@ -2758,6 +2815,12 @@ class DeterministicPipeline:
                 batch.kind.value,
                 batch.label,
             )
+            completed_batches += 1
+            _notify_draft_progress(batch.label or "", partial=batch_partial)
+
+        if total_batches:
+            completed_batches = max(completed_batches, total_batches)
+            _notify_draft_progress()
 
         if not assembly.intro:
             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вводный блок скелета.")
@@ -3032,6 +3095,7 @@ class DeterministicPipeline:
 
     def _run_trim(self, text: str) -> TrimResult:
         self._log(PipelineStep.TRIM, "running")
+        self._emit_progress("trim", 0.0, payload={"chars": length_no_spaces(text)})
         reserve = self.jsonld_reserve if self.jsonld else 0
         hard_cap = ARTICLE_HARD_CHAR_CAP if ARTICLE_HARD_CHAR_CAP > 0 else None
         effective_upper = self.max_chars
@@ -3216,6 +3280,7 @@ class DeterministicPipeline:
             KEYWORDS_COVERAGE_OVERALL=self.keywords_coverage_percent,
         )
         self.checkpoints[PipelineStep.TRIM] = result.text
+        self._emit_progress("trim", 1.0, payload={"chars": current_length})
         return result
 
     # ------------------------------------------------------------------
@@ -3229,6 +3294,11 @@ class DeterministicPipeline:
         combined_text = trim_result.text
         if self.jsonld and self.jsonld_requested:
             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
+        self._emit_progress(
+            "validate",
+            0.0,
+            payload={"chars": length_no_spaces(combined_text), "faq": self.faq_target},
+        )
         try:
             validation = validate_article(
                 combined_text,
@@ -3247,6 +3317,11 @@ class DeterministicPipeline:
             "VALIDATION_OK length=%s keywords=%.0f%%",
             validation.stats.get("length_no_spaces"),
             float(validation.stats.get("keywords_coverage_percent") or 0.0),
+        )
+        self._emit_progress(
+            "validate",
+            1.0,
+            payload={"length": validation.stats.get("length_no_spaces"), "keywords": validation.stats.get("keywords_coverage_percent")},
         )
         return PipelineState(
             text=combined_text,

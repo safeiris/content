@@ -341,22 +341,43 @@ body {
   font-weight: 400;
 }
 
-.length-range {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 8px;
-  width: 100%;
+.length-mode-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
-.length-range input {
+.length-mode-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: #f3f4f6;
+  cursor: pointer;
+  font-size: 14px;
+  transition: background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.length-mode-option input {
+  margin: 0;
+  accent-color: #4f46e5;
+}
+
+.length-mode-option:focus-within {
+  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
+}
+
+.length-range-inputs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.length-range-inputs input,
+.length-target input {
   width: 100%;
   min-width: 0;
-}
-
-.range-separator {
-  color: #6b7280;
-  font-weight: 500;
-  text-align: center;
 }
 
 @media (min-width: 768px) {
@@ -1504,19 +1525,58 @@ button.loading {
   box-shadow: 0 20px 60px rgba(15, 23, 42, 0.2);
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 16px;
+  align-items: stretch;
+  gap: 12px;
   font-size: 16px;
+  min-width: min(420px, 90vw);
+}
+
+.progress-stage {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
   text-align: center;
 }
 
-.spinner {
-  width: 48px;
-  height: 48px;
-  border-radius: 50%;
-  border: 4px solid #e5e7eb;
-  border-top-color: #4f46e5;
-  animation: spin 1s linear infinite;
+.progress-bar {
+  position: relative;
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(79, 70, 229, 0.12);
+  overflow: hidden;
+}
+
+.progress-bar__fill {
+  position: absolute;
+  inset: 0;
+  width: 0%;
+  background: linear-gradient(90deg, #4f46e5, #6366f1);
+  border-radius: inherit;
+  transition: width 0.4s ease;
+}
+
+.progress-percent {
+  margin: 0;
+  font-size: 32px;
+  font-weight: 600;
+  text-align: center;
+  color: #111827;
+}
+
+.progress-message {
+  margin: 0;
+  font-size: 16px;
+  text-align: center;
+  color: #1f2937;
+}
+
+.progress-details {
+  margin: 0;
+  font-size: 14px;
+  text-align: center;
+  color: #4b5563;
+  min-height: 1.4em;
 }
 
 @keyframes spin {

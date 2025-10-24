@@ -483,6 +483,8 @@ def create_app() -> Flask:
                     snapshot.get("status"),
                     snapshot.get("step"),
                     snapshot.get("progress"),
+                    snapshot.get("progress_stage"),
+                    snapshot.get("progress_message"),
                     snapshot.get("last_event_at"),
                 )
                 if signature != last_signature:

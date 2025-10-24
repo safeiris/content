@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from zoneinfo import ZoneInfo
 
@@ -469,6 +469,7 @@ def _generate_variant(
     context_source: Optional[str] = None,
     context_text: Optional[str] = None,
     context_filename: Optional[str] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> Dict[str, Any]:
     start_time = time.time()
     payload = deepcopy(data)
@@ -511,6 +512,7 @@ def _generate_variant(
         provided_faq=prepared_data.get("faq_entries") if isinstance(prepared_data.get("faq_entries"), list) else None,
         jsonld_requested=generation_context.jsonld_requested,
         faq_questions=generation_context.faq_questions,
+        progress_callback=progress_callback,
     )
     state = pipeline.run()
     if not state.validation or not state.validation.is_valid:
@@ -557,6 +559,7 @@ def generate_article_from_payload(
     context_source: Optional[str] = None,
     context_text: Optional[str] = None,
     context_filename: Optional[str] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> Dict[str, Any]:
     resolved_timeout = timeout if timeout is not None else 60
     resolved_model = DEFAULT_MODEL
@@ -580,6 +583,7 @@ def generate_article_from_payload(
         context_source=context_source,
         context_text=context_text,
         context_filename=context_filename,
+        progress_callback=progress_callback,
     )
     artifact_files = result.get("artifact_files")
     artifact_paths = None

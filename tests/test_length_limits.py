@@ -43,3 +43,14 @@ def test_compute_soft_length_bounds_handles_inverted_values():
     soft_min, soft_max, _, _ = compute_soft_length_bounds(6800, 5200)
     assert soft_min == 5096
     assert soft_max == 6936
+
+
+def test_resolve_length_target_translates_to_soft_bounds():
+    payload = {"length_target": 6000}
+    result = resolve_length_limits("finance", payload)
+
+    assert result.min_chars == 5880
+    assert result.max_chars == 6120
+    assert result.min_source == "brief"
+    assert result.max_source == "brief"
+    assert payload.get("_length_limits_requested", {}).get("target") == 6000

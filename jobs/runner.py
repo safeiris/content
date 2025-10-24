@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from config import JOB_MAX_RETRIES_PER_STEP, JOB_SOFT_TIMEOUT_S
 from observability.logger import get_logger, log_step
@@ -22,6 +22,20 @@ LOGGER = get_logger("content_factory.jobs.runner")
 REGISTRY = get_registry()
 QUEUE_GAUGE = REGISTRY.gauge("jobs.queue_length")
 JOB_COUNTER = REGISTRY.counter("jobs.processed_total")
+
+PROGRESS_STAGE_WEIGHTS = {
+    "draft": (0.0, 0.82),
+    "trim": (0.82, 0.1),
+    "validate": (0.92, 0.06),
+    "done": (1.0, 0.0),
+}
+
+PROGRESS_STAGE_MESSAGES = {
+    "draft": "Генерируем черновик",
+    "trim": "Нормализуем объём",
+    "validate": "Проверяем результат",
+    "done": "Готово",
+}
 
 
 @dataclass
@@ -168,7 +182,9 @@ class JobRunner:
                 )
                 break
 
-            result = self._execute_step(step.name, task.payload, ctx)
+            step.mark_running()
+            self._store.touch(job.id)
+            result = self._execute_step(step.name, task.payload, ctx, job)
             if result.status == JobStepStatus.SUCCEEDED:
                 step.mark_succeeded(**result.payload)
             elif result.status == JobStepStatus.DEGRADED:
@@ -198,6 +214,7 @@ class JobRunner:
             "errors": ctx.errors or None,
         }
         job.mark_succeeded(result_payload, degradation_flags=ctx.degradation_flags)
+        self._record_progress(job, "done", 1.0, message=PROGRESS_STAGE_MESSAGES.get("done"))
         self._store.touch(job.id)
         JOB_COUNTER.inc()
 
@@ -206,24 +223,76 @@ class JobRunner:
         step_name: str,
         payload: Dict[str, Any],
         ctx: PipelineContext,
+        job: Optional[Job],
     ) -> StepResult:
         if step_name == "draft":
-            return self._run_draft_step(payload, ctx)
+            return self._run_draft_step(payload, ctx, job)
         if step_name == "refine":
-            return self._run_refine_step(ctx)
+            return self._run_refine_step(ctx, job)
         if step_name == "jsonld":
-            return self._run_jsonld_step(ctx)
+            return self._run_jsonld_step(ctx, job)
         if step_name == "post_analysis":
-            return self._run_post_analysis_step(ctx)
+            return self._run_post_analysis_step(ctx, job)
         return StepResult(JobStepStatus.SUCCEEDED, payload={"skipped": True})
 
-    def _run_draft_step(self, payload: Dict[str, Any], ctx: PipelineContext) -> StepResult:
+    def _record_progress(
+        self,
+        job: Optional[Job],
+        stage: str,
+        ratio: float,
+        *,
+        message: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if job is None:
+            return
+        stage_key = str(stage or "").strip().lower() or "draft"
+        base, span = PROGRESS_STAGE_WEIGHTS.get(stage_key, (0.0, 0.0))
+        try:
+            normalized = float(ratio)
+        except (TypeError, ValueError):
+            normalized = 0.0
+        normalized = max(0.0, min(1.0, normalized))
+        progress_value = base + normalized * span
+        if stage_key == "done":
+            progress_value = 1.0
+        if job.progress_value is not None:
+            progress_value = max(float(job.progress_value), progress_value)
+        effective_message = message or PROGRESS_STAGE_MESSAGES.get(stage_key) or "Обработка задания"
+        job.update_progress(
+            stage=stage_key,
+            progress=min(1.0, progress_value),
+            message=effective_message,
+            payload=payload,
+        )
+        self._store.touch(job.id)
+
+    def _run_draft_step(
+        self,
+        payload: Dict[str, Any],
+        ctx: PipelineContext,
+        job: Optional[Job],
+    ) -> StepResult:
+        self._record_progress(job, "draft", 0.0)
+
+        def _progress_event(
+            stage: str,
+            *,
+            progress: float = 0.0,
+            message: Optional[str] = None,
+            payload: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            self._record_progress(job, stage, progress, message=message, payload=payload)
+
         attempt = 0
         last_error: Optional[str] = None
         while attempt <= JOB_MAX_RETRIES_PER_STEP:
             attempt += 1
             try:
-                result = generate_article_from_payload(**payload)
+                result = generate_article_from_payload(
+                    **payload,
+                    progress_callback=_progress_event,
+                )
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
                 ctx.errors.append(last_error)
@@ -235,12 +304,14 @@ class JobRunner:
                 ctx.meta_json = metadata
             if markdown:
                 ctx.markdown = markdown
+                self._record_progress(job, "draft", 1.0)
                 return StepResult(JobStepStatus.SUCCEEDED, payload={"attempts": attempt})
             last_error = "empty_response"
             ctx.errors.append(last_error)
 
         ctx.ensure_markdown(_build_fallback_text(payload, error=last_error))
         flags = ["draft_failed"]
+        self._record_progress(job, "draft", 1.0, message="Черновик по запасному сценарию")
         return StepResult(
             JobStepStatus.DEGRADED,
             payload={"attempts": attempt, "error": last_error},
@@ -248,7 +319,7 @@ class JobRunner:
             error=last_error,
         )
 
-    def _run_refine_step(self, ctx: PipelineContext) -> StepResult:
+    def _run_refine_step(self, ctx: PipelineContext, job: Optional[Job]) -> StepResult:
         if not ctx.markdown.strip():
             ctx.ensure_markdown("Черновик пока пустой.")
             return StepResult(
@@ -257,6 +328,7 @@ class JobRunner:
                 degradation_flags=["refine_skipped"],
                 error="empty_markdown",
             )
+        self._record_progress(job, "trim", 0.0)
         refined = ctx.markdown.strip()
         passes = []
 
@@ -271,12 +343,13 @@ class JobRunner:
 
         final_text = polished.strip()
         ctx.markdown = final_text
+        self._record_progress(job, "trim", 1.0, payload={"chars": len(final_text)})
         return StepResult(
             JobStepStatus.SUCCEEDED,
             payload={"chars": len(final_text), "passes": passes},
         )
 
-    def _run_jsonld_step(self, ctx: PipelineContext) -> StepResult:
+    def _run_jsonld_step(self, ctx: PipelineContext, job: Optional[Job]) -> StepResult:
         raw_jsonld = None
         if isinstance(ctx.meta_json, dict):
             raw_jsonld = ctx.meta_json.get("jsonld")
@@ -287,6 +360,8 @@ class JobRunner:
         if guardrail_result.repaired_json is not None:
             ctx.meta_json["jsonld"] = guardrail_result.repaired_json
         status = JobStepStatus.SUCCEEDED if guardrail_result.ok else JobStepStatus.DEGRADED
+        if guardrail_result.ok:
+            self._record_progress(job, "validate", 0.6, payload={"faq_preview": guardrail_result.faq_entries})
         return StepResult(
             status,
             payload={
@@ -297,7 +372,7 @@ class JobRunner:
             error=guardrail_result.error,
         )
 
-    def _run_post_analysis_step(self, ctx: PipelineContext) -> StepResult:
+    def _run_post_analysis_step(self, ctx: PipelineContext, job: Optional[Job]) -> StepResult:
         if not ctx.markdown.strip():
             return StepResult(
                 JobStepStatus.DEGRADED,
@@ -307,6 +382,7 @@ class JobRunner:
             )
         length = len(ctx.markdown.replace(" ", ""))
         payload = {"chars_no_spaces": length, "faq_count": len(ctx.faq_entries)}
+        self._record_progress(job, "validate", 1.0, payload=payload)
         return StepResult(JobStepStatus.SUCCEEDED, payload=payload)
 
 

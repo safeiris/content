@@ -67,7 +67,19 @@ def compute_soft_length_bounds(min_chars: int, max_chars: int) -> Tuple[int, int
 def resolve_length_limits(theme: str, payload: Dict[str, Any]) -> ResolvedLengthLimits:
     """Determine min/max character limits using brief → profile → defaults."""
 
-    brief_min, brief_max = _extract_brief_limits(payload)
+    target_length = _safe_positive_int(payload.get("length_target"))
+    if target_length is not None and target_length > 0:
+        soft_min, soft_max, _tol_below, _tol_above = compute_soft_length_bounds(
+            target_length, target_length
+        )
+        brief_min = soft_min or target_length
+        brief_max = soft_max or target_length
+        requested = payload.setdefault("_length_limits_requested", {})
+        if isinstance(requested, dict):
+            requested["target"] = target_length
+    else:
+        brief_min, brief_max = _extract_brief_limits(payload)
+
     profile_min, profile_max, profile_source = _load_profile_limits(theme)
 
     min_value, min_source = _choose_limit(brief_min, profile_min, DEFAULT_MIN_LENGTH)

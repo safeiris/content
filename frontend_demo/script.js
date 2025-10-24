@@ -36,6 +36,14 @@ let reindexBtn = document.getElementById("reindex-btn");
 let healthBtn = document.getElementById("health-btn");
 const progressOverlay = document.getElementById("progress-overlay");
 const progressMessage = progressOverlay?.querySelector('[data-role="progress-message"]') || null;
+const progressStage = progressOverlay?.querySelector('[data-role="progress-stage"]') || null;
+const progressPercent = progressOverlay?.querySelector('[data-role="progress-percent"]') || null;
+const progressBar = progressOverlay?.querySelector('[data-role="progress-bar"]') || null;
+const progressBarFill = progressOverlay?.querySelector('[data-role="progress-bar-fill"]') || null;
+const progressDetails = progressOverlay?.querySelector('[data-role="progress-details"]') || null;
+if (progressStage && progressStage.textContent) {
+  progressStage.dataset.defaultLabel = progressStage.textContent.trim();
+}
 const toastRoot = document.getElementById("toast-root");
 const draftView = document.getElementById("draft-view");
 const reportView = document.getElementById("report-view");
@@ -48,6 +56,7 @@ const downloadReportBtn = document.getElementById("download-report");
 const clearLogBtn = document.getElementById("clear-log");
 const structurePreset = document.getElementById("structure-preset");
 const structureInput = document.getElementById("structure-input");
+const topicInput = document.getElementById("topic-input");
 const keywordsInput = document.getElementById("keywords-input");
 const titleInput = document.getElementById("title-input");
 const audienceInput = document.getElementById("audience-input");
@@ -57,8 +66,12 @@ const maxTokensInput = document.getElementById("max-tokens-input");
 const modelInput = document.getElementById("model-input");
 const includeFaq = document.getElementById("include-faq");
 const includeJsonld = document.getElementById("include-jsonld");
+const lengthTargetInput = document.getElementById("length-target-input");
 const minCharsInput = document.getElementById("min-chars-input");
 const maxCharsInput = document.getElementById("max-chars-input");
+const lengthModeRadios = document.querySelectorAll("input[name='length-mode']");
+const lengthTargetBlock = document.querySelector("[data-length-target]");
+const lengthRangeBlock = document.querySelector("[data-length-range]");
 const keywordModeInputs = document.querySelectorAll("input[name='keywords-mode']");
 const styleProfileSelect = document.getElementById("style-profile-select");
 const styleProfileHint = document.getElementById("style-profile-hint");
@@ -106,6 +119,22 @@ const STEP_LABELS = {
   post_analysis: "Пост-анализ",
 };
 
+const PROGRESS_STAGE_LABELS = {
+  draft: "Черновик",
+  trim: "Нормализация",
+  validate: "Проверка",
+  done: "Готово",
+  error: "Ошибка",
+};
+
+const PROGRESS_STAGE_MESSAGES = {
+  draft: "Генерируем черновик",
+  trim: "Нормализуем объём",
+  validate: "Проверяем результат",
+  done: "Готово",
+  error: "Завершено с ошибкой",
+};
+
 const DEGRADATION_LABELS = {
   draft_failed: "Черновик по запасному сценарию",
   refine_skipped: "Шаг уточнения пропущен",
@@ -115,7 +144,8 @@ const DEGRADATION_LABELS = {
   soft_timeout: "Сработал мягкий таймаут",
 };
 
-const DEFAULT_PROGRESS_MESSAGE = progressMessage?.textContent?.trim() || "Готовим данные…";
+const DEFAULT_PROGRESS_MESSAGE =
+  progressMessage?.textContent?.trim() || PROGRESS_STAGE_MESSAGES.draft;
 const MAX_TOASTS = 3;
 const MAX_CUSTOM_CONTEXT_CHARS = 20000;
 const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
@@ -177,6 +207,12 @@ const customContextState = {
   fileText: "",
   fileName: "",
   noticeShown: false,
+};
+
+const progressState = {
+  currentPercent: 0,
+  lastStage: "draft",
+  hideTimer: null,
 };
 
 function resolveApiPath(path) {
@@ -248,6 +284,9 @@ if (styleProfileSelect) {
 if (contextSourceSelect) {
   contextSourceSelect.addEventListener("change", handleContextSourceChange);
 }
+lengthModeRadios.forEach((radio) => {
+  radio.addEventListener("change", handleLengthModeChange);
+});
 if (customContextTextarea) {
   customContextTextarea.addEventListener("input", handleCustomContextInput);
 }
@@ -285,6 +324,7 @@ setupAdvancedSettings();
 handleStyleProfileChange();
 handleFaqToggle();
 handleContextSourceChange();
+handleLengthModeChange();
 updateCustomContextCounter();
 init();
 
@@ -310,6 +350,25 @@ function handleFaqToggle() {
   faqCountInput.disabled = !enabled;
   if (enabled && !faqCountInput.value) {
     faqCountInput.value = "5";
+  }
+}
+
+function handleLengthModeChange() {
+  const mode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
+  if (lengthTargetBlock) {
+    lengthTargetBlock.hidden = mode !== "target";
+  }
+  if (lengthTargetInput) {
+    lengthTargetInput.disabled = mode !== "target";
+  }
+  if (lengthRangeBlock) {
+    lengthRangeBlock.hidden = mode !== "range";
+  }
+  if (minCharsInput) {
+    minCharsInput.disabled = mode !== "range";
+  }
+  if (maxCharsInput) {
+    maxCharsInput.disabled = mode !== "range";
   }
 }
 
@@ -1386,9 +1445,6 @@ function applyPipeDefaults(pipeId) {
   if (structureInput && !structureInput.value && Array.isArray(pipe.default_structure)) {
     structureInput.value = pipe.default_structure.join("\n");
   }
-  if (goalInput && !goalInput.value) {
-    goalInput.value = "SEO-статья";
-  }
 }
 
 async function handlePromptPreview() {
@@ -1448,13 +1504,8 @@ async function handleGenerate(event) {
     if (Array.isArray(payload.data?.keywords)) {
       requestBody.keywords = payload.data.keywords;
     }
-    requestBody.length_range = {
-      min: DEFAULT_LENGTH_RANGE.min,
-      max: DEFAULT_LENGTH_RANGE.max,
-      mode: "no_spaces",
-    };
     requestBody.faq_required = true;
-    requestBody.faq_count = 5;
+    requestBody.faq_count = payload.data?.faq_questions || 5;
     if (payload.context_source === "custom") {
       requestBody.context_text = payload.context_text;
       if (payload.context_filename) {
@@ -1470,8 +1521,8 @@ async function handleGenerate(event) {
     if (snapshot.result && typeof snapshot.result === "object" && snapshot.result.artifact_paths) {
       artifactPathsHint = snapshot.result.artifact_paths;
     }
-    const initialChars = applyProgressiveResult(snapshot) || 0;
-    showProgress(true, describeJobProgress(snapshot, initialChars));
+    applyProgressiveResult(snapshot);
+    updateProgressFromSnapshot(snapshot);
     if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
       downloadsRequested = true;
       refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
@@ -1484,12 +1535,8 @@ async function handleGenerate(event) {
       }
       snapshot = await pollJobUntilDone(snapshot.job_id, {
         onUpdate: (update) => {
-          const liveChars = applyProgressiveResult(update) || 0;
-          if (update?.status === "succeeded" || update?.status === "failed") {
-            showProgress(false);
-          } else {
-            showProgress(true, describeJobProgress(update, liveChars));
-          }
+          applyProgressiveResult(update);
+          updateProgressFromSnapshot(update);
           if (!downloadsRequested && hasDraftStepSucceeded(update)) {
             downloadsRequested = true;
             activeJobId = update?.id || update?.job_id || activeJobId;
@@ -1507,6 +1554,7 @@ async function handleGenerate(event) {
     if (snapshot?.result && typeof snapshot.result === "object" && snapshot.result.artifact_paths) {
       artifactPathsHint = snapshot.result.artifact_paths;
     }
+    updateProgressFromSnapshot(snapshot);
     if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
       downloadsRequested = true;
       await refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
@@ -1528,10 +1576,11 @@ async function handleGenerate(event) {
     setButtonLoading(downloadMdBtn, false);
     setButtonLoading(downloadReportBtn, false);
     setActiveArtifactDownloads(null);
+    hideProgressOverlay({ immediate: true });
   } finally {
     setButtonLoading(generateBtn, false);
     setInteractiveBusy(false);
-    showProgress(false);
+    hideProgressOverlay();
     state.pendingArtifactFiles = null;
   }
 }
@@ -1551,6 +1600,14 @@ function normalizeJobResponse(response) {
       progress: typeof response.progress === "number" ? response.progress : null,
       step: typeof response.step === "string" ? response.step : null,
       last_event_at: response.last_event_at || null,
+      progress_stage:
+        typeof response.progress_stage === "string" ? response.progress_stage : null,
+      progress_message:
+        typeof response.progress_message === "string" ? response.progress_message : null,
+      progress_payload:
+        response.progress_payload && typeof response.progress_payload === "object"
+          ? response.progress_payload
+          : null,
       result: {
         markdown: typeof response.markdown === "string" ? response.markdown : "",
         meta_json: (response.meta_json && typeof response.meta_json === "object") ? response.meta_json : {},
@@ -1568,52 +1625,15 @@ function normalizeJobResponse(response) {
     progress: typeof response.progress === "number" ? response.progress : null,
     step: typeof response.step === "string" ? response.step : null,
     last_event_at: response.last_event_at || null,
+    progress_stage: typeof response.progress_stage === "string" ? response.progress_stage : null,
+    progress_message:
+      typeof response.progress_message === "string" ? response.progress_message : null,
+    progress_payload:
+      response.progress_payload && typeof response.progress_payload === "object"
+        ? response.progress_payload
+        : null,
     result: response.result && typeof response.result === "object" ? response.result : null,
   };
-}
-
-function describeJobProgress(snapshot, characters = 0) {
-  if (!snapshot || typeof snapshot !== "object") {
-    return DEFAULT_PROGRESS_MESSAGE;
-  }
-  const status = typeof snapshot.status === "string" ? snapshot.status : "queued";
-  let message = "";
-  if (typeof snapshot.message === "string" && snapshot.message.trim()) {
-    message = snapshot.message.trim();
-  } else if (Array.isArray(snapshot.steps) && snapshot.steps.length) {
-    const running = snapshot.steps.find((step) => step && step.status === "running");
-    if (running) {
-      message = `Шаг: ${STEP_LABELS[running.name] || running.name}`;
-    } else {
-      const pending = snapshot.steps.find((step) => step && step.status === "pending");
-      if (pending) {
-        message = `Шаг: ${STEP_LABELS[pending.name] || pending.name}`;
-      }
-    }
-  }
-  if (!message) {
-    if (status === "queued") {
-      message = "Задание в очереди";
-    } else if (status === "running") {
-      message = "Готовим материалы";
-    } else if (status === "succeeded") {
-      message = "Готово";
-    } else if (status === "failed") {
-      message = "Завершено с ошибкой";
-    }
-  }
-  const parts = [];
-  if (message) {
-    parts.push(message);
-  }
-  if (status === "running" && typeof snapshot.progress === "number") {
-    const percent = Math.max(0, Math.min(100, Math.round(snapshot.progress * 100)));
-    parts.push(`${percent}%`);
-  }
-  if (typeof characters === "number" && characters > 0 && status !== "queued") {
-    parts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
-  }
-  return parts.length ? parts.join(" · ") : DEFAULT_PROGRESS_MESSAGE;
 }
 
 function applyProgressiveResult(snapshot) {
@@ -1646,48 +1666,95 @@ async function pollJobUntilDone(jobId, { onUpdate } = {}) {
 
 function watchJobViaSse(jobId, { onUpdate } = {}) {
   return new Promise((resolve, reject) => {
-    const source = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream`);
     let settled = false;
-    const cleanup = () => {
-      if (!settled) {
-        settled = true;
-        source.close();
+    let retries = 0;
+    const maxRetries = 4;
+    let source = null;
+    let retryTimer = null;
+
+    const clearTimers = () => {
+      if (retryTimer) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
       }
     };
-    source.onmessage = (event) => {
-      let snapshot;
-      try {
-        snapshot = JSON.parse(event.data);
-      } catch (error) {
-        console.warn("Failed to parse SSE payload", error);
-        return;
+
+    const closeSource = () => {
+      if (source) {
+        try {
+          source.close();
+        } catch (error) {
+          console.debug("Failed to close SSE source", error);
+        }
+        source = null;
       }
+    };
+
+    const cleanup = () => {
+      clearTimers();
+      closeSource();
+    };
+
+    const handleSnapshot = (snapshot) => {
       if (typeof onUpdate === "function") {
-        onUpdate(snapshot);
+        try {
+          onUpdate(snapshot);
+        } catch (error) {
+          console.error("Progress handler failed", error);
+        }
       }
       if (snapshot?.status === "failed") {
+        settled = true;
         cleanup();
-        const message = snapshot?.error?.message || snapshot?.message || "Генерация завершилась с ошибкой.";
+        const message = extractErrorMessage(snapshot) || "Генерация завершилась с ошибкой.";
         const error = new Error(message);
         if (snapshot?.trace_id) {
           error.traceId = snapshot.trace_id;
         }
         reject(error);
-        return;
-      }
-      if (snapshot?.status === "succeeded" && snapshot.result) {
+      } else if (snapshot?.status === "succeeded" && snapshot.result) {
+        settled = true;
         cleanup();
         resolve(snapshot);
       }
     };
-    source.onerror = () => {
+
+    const connect = () => {
       if (settled) {
         return;
       }
-      settled = true;
-      source.close();
-      watchJobViaPolling(jobId, { onUpdate }).then(resolve).catch(reject);
+      clearTimers();
+      closeSource();
+      source = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream`);
+      source.onmessage = (event) => {
+        retries = 0;
+        let snapshot;
+        try {
+          snapshot = JSON.parse(event.data);
+        } catch (error) {
+          console.warn("Failed to parse SSE payload", error);
+          return;
+        }
+        handleSnapshot(snapshot);
+      };
+      source.onerror = () => {
+        if (settled) {
+          return;
+        }
+        retries += 1;
+        if (retries > maxRetries) {
+          settled = true;
+          cleanup();
+          watchJobViaPolling(jobId, { onUpdate }).then(resolve).catch(reject);
+          return;
+        }
+        closeSource();
+        clearTimers();
+        retryTimer = window.setTimeout(connect, Math.min(2000 * retries, 6000));
+      };
     };
+
+    connect();
   });
 }
 
@@ -1799,12 +1866,29 @@ function handleRetryClick(event) {
   }
 }
 
+function parsePositiveInt(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number.parseInt(trimmed, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
 function buildRequestPayload() {
   const theme = pipeSelect.value;
   if (!theme) {
     throw new Error("Выберите тематику");
   }
-  const topic = document.getElementById("topic-input").value.trim();
+  const topic = topicInput?.value?.trim() || "";
   if (!topic) {
     throw new Error("Укажите тему материала");
   }
@@ -1820,24 +1904,6 @@ function buildRequestPayload() {
         .filter(Boolean)
     : [];
 
-  let minChars = DEFAULT_LENGTH_RANGE.min;
-  let maxChars = DEFAULT_LENGTH_RANGE.max;
-  if (minCharsInput || maxCharsInput) {
-    const minCharsRaw = String(minCharsInput?.value ?? "").trim();
-    const maxCharsRaw = String(maxCharsInput?.value ?? "").trim();
-    minChars = minCharsRaw === "" ? DEFAULT_LENGTH_RANGE.min : Number.parseInt(minCharsRaw, 10);
-    maxChars = maxCharsRaw === "" ? DEFAULT_LENGTH_RANGE.max : Number.parseInt(maxCharsRaw, 10);
-    if (!Number.isInteger(minChars) || minChars <= 0) {
-      throw new Error("Минимальный объём должен быть положительным целым числом");
-    }
-    if (!Number.isInteger(maxChars) || maxChars <= 0) {
-      throw new Error("Максимальный объём должен быть положительным целым числом");
-    }
-    if (maxChars < minChars) {
-      throw new Error("Максимальный объём должен быть больше или равен минимальному");
-    }
-  }
-
   const keywordMode = Array.from(keywordModeInputs).find((input) => input.checked)?.value || "strict";
   const styleProfile = styleProfileSelect?.value || "sravni.ru";
   const contextSource = String(contextSourceSelect?.value || "index.json").toLowerCase();
@@ -1845,20 +1911,62 @@ function buildRequestPayload() {
 
   const data = {
     theme: topic,
-    goal: "SEO-статья",
-    tone: "экспертный",
     keywords,
-    keywords_mode: "strict",
-    structure: structure,
+    keywords_mode: keywordMode,
     include_faq: true,
     include_jsonld: true,
-    structure_preset: structurePreset ? structurePreset.value : "custom",
+    structure,
     pipe_id: theme,
-    length_limits: { min_chars: minChars, max_chars: maxChars },
     style_profile: styleProfile,
     context_source: contextSource,
-    faq_questions: 5,
   };
+
+  const titleValue = titleInput?.value?.trim();
+  if (titleValue) {
+    data.title = titleValue;
+  }
+
+  const goalValue = goalInput?.value?.trim();
+  if (goalValue) {
+    data.goal = goalValue;
+  }
+
+  const audienceValue = audienceInput?.value?.trim();
+  if (audienceValue) {
+    data.target_audience = audienceValue;
+  }
+
+  const selectedLengthMode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
+  if (selectedLengthMode === "range") {
+    const minValue = parsePositiveInt(minCharsInput?.value);
+    const maxValue = parsePositiveInt(maxCharsInput?.value);
+    if (minValue !== null && maxValue !== null && maxValue < minValue) {
+      throw new Error("Максимальный объём должен быть больше или равен минимальному");
+    }
+    if (minValue !== null || maxValue !== null) {
+      data.length_limits = {};
+      if (minValue !== null) {
+        data.length_limits.min_chars = minValue;
+      }
+      if (maxValue !== null) {
+        data.length_limits.max_chars = maxValue;
+      }
+    }
+  } else {
+    const targetValue = parsePositiveInt(lengthTargetInput?.value);
+    if (targetValue !== null) {
+      data.length_target = targetValue;
+    }
+  }
+
+  if (includeFaq) {
+    data.include_faq = true;
+    const faqValue = parsePositiveInt(faqCountInput?.value) || 5;
+    data.faq_questions = faqValue;
+  }
+  if (includeJsonld) {
+    data.include_jsonld = true;
+  }
 
   if (contextSource === "custom") {
     data.context_source = "custom";
@@ -2790,20 +2898,260 @@ function setupAdvancedSettings() {
   });
 }
 
+function resetProgressIndicator(message = DEFAULT_PROGRESS_MESSAGE) {
+  if (progressStage) {
+    const fallbackStage = progressStage.dataset.defaultLabel
+      || progressStage.textContent
+      || "Подготовка…";
+    progressStage.textContent = fallbackStage;
+  }
+  if (progressPercent) {
+    progressPercent.textContent = "0%";
+  }
+  if (progressBarFill) {
+    progressBarFill.style.width = "0%";
+  }
+  if (progressBar) {
+    progressBar.setAttribute("aria-valuenow", "0");
+  }
+  if (progressMessage) {
+    progressMessage.textContent = message;
+  }
+  if (progressDetails) {
+    progressDetails.textContent = "";
+  }
+  progressState.currentPercent = 0;
+  progressState.lastStage = "draft";
+}
+
 function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
   if (!progressOverlay) {
     return;
   }
   if (visible) {
-    if (progressMessage) {
-      progressMessage.textContent = message;
+    if (progressState.hideTimer) {
+      window.clearTimeout(progressState.hideTimer);
+      progressState.hideTimer = null;
     }
     progressOverlay.classList.remove("hidden");
+    resetProgressIndicator(message);
   } else {
-    progressOverlay.classList.add("hidden");
-    if (progressMessage) {
-      progressMessage.textContent = DEFAULT_PROGRESS_MESSAGE;
+    hideProgressOverlay({ immediate: true });
+  }
+}
+
+function hideProgressOverlay({ immediate = false } = {}) {
+  if (!progressOverlay) {
+    return;
+  }
+  if (!immediate && progressState.hideTimer) {
+    return;
+  }
+  if (progressState.hideTimer) {
+    window.clearTimeout(progressState.hideTimer);
+    progressState.hideTimer = null;
+  }
+  progressOverlay.classList.add("hidden");
+  resetProgressIndicator(DEFAULT_PROGRESS_MESSAGE);
+}
+
+function scheduleProgressHide(delay = 1200) {
+  if (!progressOverlay) {
+    return;
+  }
+  if (progressState.hideTimer) {
+    window.clearTimeout(progressState.hideTimer);
+  }
+  progressState.hideTimer = window.setTimeout(() => {
+    progressState.hideTimer = null;
+    hideProgressOverlay({ immediate: true });
+  }, Math.max(0, delay));
+}
+
+function clamp01(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return 0;
+  }
+  if (value <= 0) {
+    return 0;
+  }
+  if (value >= 1) {
+    return 1;
+  }
+  return value;
+}
+
+function toNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
     }
+  }
+  return null;
+}
+
+function formatProgressDetails(stage, payload) {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+  const parts = [];
+  if (stage === "draft") {
+    const completed = toNumber(payload.completed);
+    const total = toNumber(payload.total);
+    if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
+      const safeCompleted = Math.max(0, Math.min(total, completed));
+      parts.push(`Батчи: ${safeCompleted}/${total}`);
+    }
+    if (typeof payload.batch === "string" && payload.batch.trim()) {
+      parts.push(`Блок: ${payload.batch.trim()}`);
+    }
+    if (payload.partial) {
+      parts.push("частично");
+    }
+  } else if (stage === "trim") {
+    const chars = toNumber(payload.chars);
+    if (Number.isFinite(chars) && chars > 0) {
+      parts.push(`Символов: ${Math.round(chars).toLocaleString("ru-RU")}`);
+    }
+  } else if (stage === "validate") {
+    const length = toNumber(payload.length ?? payload.chars);
+    if (Number.isFinite(length) && length > 0) {
+      parts.push(`Символов: ${Math.round(length).toLocaleString("ru-RU")}`);
+    }
+    const faqCount = toNumber(payload.faq ?? payload.faq_count);
+    if (Number.isFinite(faqCount)) {
+      parts.push(`FAQ: ${Math.round(faqCount)}`);
+    }
+  }
+  return parts.join(" · ");
+}
+
+function extractErrorMessage(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return "";
+  }
+  const errorPayload = snapshot.error;
+  if (errorPayload && typeof errorPayload === "object") {
+    if (typeof errorPayload.message === "string" && errorPayload.message.trim()) {
+      return errorPayload.message.trim();
+    }
+    if (typeof errorPayload.error === "string" && errorPayload.error.trim()) {
+      return errorPayload.error.trim();
+    }
+  } else if (typeof errorPayload === "string" && errorPayload.trim()) {
+    return errorPayload.trim();
+  }
+  if (typeof snapshot.message === "string" && snapshot.message.trim()) {
+    return snapshot.message.trim();
+  }
+  return "";
+}
+
+function updateProgressFromSnapshot(snapshot) {
+  if (!progressOverlay || !snapshot || typeof snapshot !== "object") {
+    return;
+  }
+  if (progressState.hideTimer) {
+    window.clearTimeout(progressState.hideTimer);
+    progressState.hideTimer = null;
+  }
+
+  progressOverlay.classList.remove("hidden");
+
+  const status = typeof snapshot.status === "string" ? snapshot.status : "running";
+  let stage = typeof snapshot.progress_stage === "string" && snapshot.progress_stage.trim()
+    ? snapshot.progress_stage.trim().toLowerCase()
+    : "";
+  if (!stage && typeof snapshot.step === "string" && snapshot.step.trim()) {
+    stage = snapshot.step.trim().toLowerCase();
+  }
+  if (status === "succeeded") {
+    stage = "done";
+  } else if (status === "failed") {
+    stage = "error";
+  }
+  if (!PROGRESS_STAGE_LABELS[stage]) {
+    stage = progressState.lastStage || "draft";
+  }
+  progressState.lastStage = stage;
+
+  let percentValue = null;
+  if (typeof snapshot.progress === "number") {
+    percentValue = Math.round(clamp01(snapshot.progress) * 1000) / 10;
+  }
+  if (percentValue === null || Number.isNaN(percentValue)) {
+    percentValue = progressState.currentPercent || 0;
+  }
+  percentValue = Math.max(progressState.currentPercent || 0, percentValue);
+  percentValue = Math.min(100, percentValue);
+  progressState.currentPercent = percentValue;
+
+  if (progressBarFill) {
+    progressBarFill.style.width = `${percentValue}%`;
+  }
+  if (progressPercent) {
+    progressPercent.textContent = `${Math.round(percentValue)}%`;
+  }
+  if (progressBar) {
+    progressBar.setAttribute("aria-valuenow", String(Math.round(percentValue)));
+  }
+
+  let message = "";
+  if (typeof snapshot.progress_message === "string" && snapshot.progress_message.trim()) {
+    message = snapshot.progress_message.trim();
+  } else if (status === "succeeded") {
+    message = PROGRESS_STAGE_MESSAGES.done;
+  } else if (status === "failed") {
+    message = extractErrorMessage(snapshot) || PROGRESS_STAGE_MESSAGES.error;
+  } else if (typeof snapshot.message === "string" && snapshot.message.trim()) {
+    message = snapshot.message.trim();
+  } else {
+    message = PROGRESS_STAGE_MESSAGES[stage] || DEFAULT_PROGRESS_MESSAGE;
+  }
+  if (progressMessage) {
+    progressMessage.textContent = message;
+  }
+
+  if (progressStage) {
+    const label = PROGRESS_STAGE_LABELS[stage] || PROGRESS_STAGE_LABELS.draft;
+    progressStage.textContent = label;
+  }
+
+  const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
+    ? snapshot.progress_payload
+    : null;
+  if (progressDetails) {
+    progressDetails.textContent = formatProgressDetails(stage, payload);
+  }
+
+  if (status === "succeeded") {
+    progressState.currentPercent = 100;
+    if (progressPercent) {
+      progressPercent.textContent = "100%";
+    }
+    if (progressBarFill) {
+      progressBarFill.style.width = "100%";
+    }
+    if (progressBar) {
+      progressBar.setAttribute("aria-valuenow", "100");
+    }
+    scheduleProgressHide(1200);
+  } else if (status === "failed") {
+    progressState.currentPercent = 100;
+    if (progressPercent) {
+      progressPercent.textContent = "100%";
+    }
+    if (progressBarFill) {
+      progressBarFill.style.width = "100%";
+    }
+    if (progressBar) {
+      progressBar.setAttribute("aria-valuenow", "100");
+    }
+    scheduleProgressHide(2500);
   }
 }
 

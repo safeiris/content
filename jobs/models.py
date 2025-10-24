@@ -98,6 +98,10 @@ class Job:
     degradation_flags: List[str] = field(default_factory=list)
     trace_id: Optional[str] = None
     last_event_at: datetime = field(default_factory=utcnow)
+    progress_stage: Optional[str] = None
+    progress_value: Optional[float] = None
+    progress_message: Optional[str] = None
+    progress_payload: Dict[str, Any] = field(default_factory=dict)
 
     def mark_running(self) -> None:
         self.status = JobStatus.RUNNING
@@ -131,9 +135,37 @@ class Job:
             "error": self.error,
             "degradation_flags": list(self.degradation_flags) or None,
             "trace_id": self.trace_id,
+            "progress_stage": self.progress_stage,
+            "progress_message": self.progress_message,
+            "progress_payload": self.progress_payload or None,
         }
         payload.update(summarize_job(self))
         return payload
+
+    def update_progress(
+        self,
+        *,
+        stage: str,
+        progress: float,
+        message: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        normalized_stage = stage.strip().lower() if isinstance(stage, str) else ""
+        self.progress_stage = normalized_stage or self.progress_stage or "draft"
+        if progress is not None:
+            try:
+                value = float(progress)
+            except (TypeError, ValueError):
+                value = self.progress_value or 0.0
+            self.progress_value = max(0.0, min(1.0, value))
+        if message is not None:
+            self.progress_message = message
+        if payload is not None:
+            try:
+                self.progress_payload = dict(payload)
+            except Exception:  # pragma: no cover - defensive
+                self.progress_payload = {}
+        self.last_event_at = utcnow()
 
 
 def summarize_job(job: "Job") -> Dict[str, Any]:
@@ -187,17 +219,25 @@ def summarize_job(job: "Job") -> Dict[str, Any]:
         else:
             progress = 0.0
 
+    if job.progress_value is not None:
+        progress = max(0.0, min(1.0, float(job.progress_value)))
+    if job.progress_stage:
+        step_name = job.progress_stage
+
     if status == "queued":
         message = "Задание в очереди"
     elif status == "running":
-        message = f"Шаг: {step_labels.get(step_name, step_name)}"
+        message = job.progress_message or f"Шаг: {step_labels.get(step_name, step_name)}"
     elif status == "succeeded":
-        message = "Готово"
+        message = job.progress_message or "Готово"
     else:
         error_message = ""
         if isinstance(job.error, dict):
             error_message = str(job.error.get("message") or "").strip()
         message = error_message or "Завершено с ошибкой"
+
+    if job.progress_message and status in {"running", "succeeded"}:
+        message = job.progress_message
 
     timestamps = [job.created_at, job.started_at, job.finished_at, job.last_event_at]
     for step in job.steps:

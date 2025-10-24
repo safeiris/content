@@ -68,6 +68,57 @@
                   </div>
                 </div>
               </section>
+
+              <section class="form-card">
+                <header class="form-card__header">
+                  <h2 class="form-card__title">Расширенные параметры</h2>
+                </header>
+                <div class="form-card__body">
+                  <div class="form-row">
+                    <label for="title-input">Название текста</label>
+                    <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
+                    <p class="field-hint">Оставьте пустым, чтобы использовать название из профиля.</p>
+                  </div>
+                  <div class="form-row">
+                    <label>Объём</label>
+                    <div class="length-mode-toggle">
+                      <label class="length-mode-option">
+                        <input type="radio" name="length-mode" value="target" checked />
+                        Целевая длина
+                      </label>
+                      <label class="length-mode-option">
+                        <input type="radio" name="length-mode" value="range" />
+                        Диапазон
+                      </label>
+                    </div>
+                    <div class="length-target" data-length-target>
+                      <input id="length-target-input" type="number" min="500" step="50" placeholder="Например, 6000" />
+                      <p class="field-hint">Символов без пробелов. Пусто — используем профиль.</p>
+                    </div>
+                    <div class="length-range" data-length-range hidden>
+                      <div class="length-range-inputs">
+                        <input id="min-chars-input" type="number" min="500" step="50" placeholder="Минимум" />
+                        <input id="max-chars-input" type="number" min="500" step="50" placeholder="Максимум" />
+                      </div>
+                      <p class="field-hint">Можно заполнить одно или оба поля.</p>
+                    </div>
+                  </div>
+                  <div class="form-row">
+                    <label for="goal-input">Цель текста</label>
+                    <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
+                  </div>
+                  <div class="form-row">
+                    <label for="audience-input">Целевая аудитория</label>
+                    <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
+                  </div>
+                </div>
+              </section>
+
+              <section class="form-card">
+                <header class="form-card__header">
+                  <h2 class="form-card__title">Контекст</h2>
+                </header>
+                <div class="form-card__body">
                   <div class="form-row">
                     <label for="context-source-select">Контекст</label>
                     <select id="context-source-select">
@@ -80,7 +131,7 @@
                     </p>
                     <div class="custom-context-block" id="custom-context-block" hidden>
                       <p class="field-hint custom-context-hint">
-                        Можно вставить текст или загрузить .txt/.json. До 20 000 символов. При custom параметры подбираются автоматически.
+                        Можно вставить текст или загрузить .txt/.json. До 20 000 символов.
                       </p>
                       <label class="field-label" for="customContext">Пользовательский контекст</label>
                       <textarea id="customContext" placeholder="Вставьте сюда текст или JSON"></textarea>
@@ -204,8 +255,20 @@
 
     <div id="progress-overlay" class="progress-overlay hidden" role="alert" aria-live="polite">
       <div class="progress-card">
-        <div class="spinner"></div>
-        <p data-role="progress-message">Генерируем материалы…</p>
+        <p class="progress-stage" data-role="progress-stage">Подготовка…</p>
+        <div
+          class="progress-bar"
+          role="progressbar"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="0"
+          data-role="progress-bar"
+        >
+          <div class="progress-bar__fill" data-role="progress-bar-fill"></div>
+        </div>
+        <p class="progress-percent" data-role="progress-percent">0%</p>
+        <p class="progress-message" data-role="progress-message">Готовим данные…</p>
+        <p class="progress-details" data-role="progress-details"></p>
       </div>
     </div>
 
