@@ -866,15 +866,26 @@ class DeterministicPipeline:
                 candidate = candidate.split("<response_json>", 1)[1].split("</response_json>", 1)[0]
             except Exception:  # pragma: no cover - defensive
                 candidate = candidate
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    return None
+        candidate = candidate.strip()
+        decoder = json.JSONDecoder()
+        for start_index in (0, candidate.find("{"), candidate.find("[")):
+            if start_index is None or start_index < 0:
+                continue
+            snippet = candidate[start_index:].strip()
+            if not snippet:
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(snippet)
+                return parsed
+            except json.JSONDecodeError:
+                continue
+        match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+        if match:
+            balanced = match.group(0)
+            try:
+                return json.loads(balanced)
+            except json.JSONDecodeError:
+                pass
         return None
 
     def _normalize_intro_batch(
@@ -1653,6 +1664,9 @@ class DeterministicPipeline:
             continuation_id: Optional[str] = None
             batch_partial = False
             first_attempt_for_batch = True
+            best_payload_obj: Optional[object] = None
+            best_result: Optional[GenerationResult] = None
+            best_metadata_snapshot: Dict[str, object] = {}
 
             while True:
                 messages, format_block = self._build_batch_messages(
@@ -1694,6 +1708,10 @@ class DeterministicPipeline:
                 reason_lower = reason.strip().lower()
                 is_incomplete = status.lower() == "incomplete" or bool(reason)
                 has_payload = self._batch_has_payload(batch.kind, payload_obj)
+                if payload_obj is not None and has_payload:
+                    best_payload_obj = payload_obj
+                    best_result = result
+                    best_metadata_snapshot = dict(metadata_snapshot)
                 metadata_prev_id = str(
                     metadata_snapshot.get("previous_response_id")
                     or request_prev_id
@@ -1815,6 +1833,32 @@ class DeterministicPipeline:
 
             target_indices = list(active_indices)
 
+            if payload_obj is None and best_payload_obj is not None:
+                payload_obj = best_payload_obj
+                result = best_result
+                metadata_snapshot = dict(best_metadata_snapshot)
+                batch_partial = True
+                response_id_candidate = self._metadata_response_id(metadata_snapshot)
+                if response_id_candidate:
+                    parse_none_streaks.pop(response_id_candidate, None)
+            if payload_obj is None and batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ) and active_indices:
+                fallback_payload, fallback_result = self._run_fallback_batch(
+                    batch,
+                    outline=outline,
+                    assembly=assembly,
+                    target_indices=active_indices,
+                    max_tokens=last_max_tokens,
+                    previous_response_id=continuation_id,
+                )
+                if fallback_payload is not None and fallback_result is not None:
+                    payload_obj = fallback_payload
+                    result = fallback_result
+                    metadata_snapshot = fallback_result.metadata or {}
+                    response_id_candidate = self._metadata_response_id(metadata_snapshot)
+                    if response_id_candidate:
+                        continuation_id = response_id_candidate
+                        parse_none_streaks.pop(response_id_candidate, None)
+                    batch_partial = True
             if payload_obj is None:
                 raise PipelineStepError(
                     PipelineStep.SKELETON,
