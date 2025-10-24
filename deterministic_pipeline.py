@@ -79,6 +79,12 @@ class PipelineLogEntry:
 
 
 @dataclass
+class SectionBudget:
+    title: str
+    target_chars: int
+
+
+@dataclass
 class PipelineState:
     text: str
     jsonld: Optional[str]
@@ -304,6 +310,8 @@ class DeterministicPipeline:
         self._api_route: Optional[str] = None
         self._token_usage: Optional[float] = None
 
+        self.section_budgets: List[SectionBudget] = self._compute_section_budgets()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -335,6 +343,53 @@ class DeterministicPipeline:
             self._api_route = result.api_route
         if usage is not None:
             self._token_usage = usage
+
+    def _compute_section_budgets(self) -> List[SectionBudget]:
+        titles = [str(item or "").strip() for item in self.base_outline if str(item or "").strip()]
+        if len(titles) < 3:
+            titles = ["Введение", "Основная часть", "Вывод"]
+        intro = titles[0]
+        conclusion = titles[-1]
+        main_titles = titles[1:-1] or ["Основная часть"]
+
+        target_total = min(self.max_chars, max(self.min_chars, 6000))
+        intro_weight = 0.18
+        conclusion_weight = 0.16
+        remaining_weight = max(0.0, 1.0 - intro_weight - conclusion_weight)
+        if not main_titles:
+            intro_weight = 0.25
+            conclusion_weight = 0.25
+            remaining_weight = 0.5
+        main_weight = remaining_weight / len(main_titles) if main_titles else 0.0
+
+        weights: List[float] = [intro_weight]
+        weights.extend([main_weight] * len(main_titles))
+        weights.append(conclusion_weight)
+
+        sections = [intro, *main_titles, conclusion]
+        budgets: List[SectionBudget] = []
+        allocated = 0
+        for title, weight in zip(sections, weights):
+            portion = max(0, int(round(target_total * weight)))
+            budgets.append(SectionBudget(title=title, target_chars=portion))
+            allocated += portion
+
+        diff = target_total - allocated
+        idx = 0
+        while diff != 0 and budgets:
+            adjust = 1 if diff > 0 else -1
+            budgets[idx % len(budgets)].target_chars = max(0, budgets[idx % len(budgets)].target_chars + adjust)
+            diff -= adjust
+            idx += 1
+
+        return budgets
+
+    def _validate(self, text: str) -> ValidationResult:
+        return validate_article(
+            text,
+            required_keywords=self.required_keywords,
+            preferred_keywords=self.preferred_keywords,
+        )
 
     def _prompt_length(self, messages: Sequence[Dict[str, object]]) -> int:
         length = 0

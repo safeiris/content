@@ -192,12 +192,7 @@ if (!devActionsConfig.show && advancedSupportSection) {
   healthBtn = null;
 }
 
-const interactiveElements = [
-  generateBtn,
-  kInput,
-  maxTokensInput,
-  modelInput,
-];
+const interactiveElements = [generateBtn];
 
 if (reindexBtn) {
   interactiveElements.push(reindexBtn);
@@ -213,33 +208,16 @@ tabs.forEach((tab) => {
   tab.addEventListener("click", () => switchTab(tab.dataset.tab));
 });
 
-structurePreset.addEventListener("change", () => applyStructurePreset(structurePreset.value));
+if (structurePreset) {
+  structurePreset.addEventListener("change", () => applyStructurePreset(structurePreset.value));
+}
 pipeSelect.addEventListener("change", () => applyPipeDefaults(pipeSelect.value));
 briefForm.addEventListener("submit", handleGenerate);
 if (retryBtn) {
   retryBtn.addEventListener("click", handleRetryClick);
 }
-if (modelInput) {
-  modelInput.value = "gpt-5";
-}
 if (styleProfileSelect) {
   styleProfileSelect.addEventListener("change", handleStyleProfileChange);
-}
-if (useStyleCheckbox && styleSettings) {
-  const toggleStyleSettingsVisibility = () => {
-    styleSettings.style.display = useStyleCheckbox.checked ? "flex" : "none";
-  };
-  useStyleCheckbox.addEventListener("change", toggleStyleSettingsVisibility);
-  toggleStyleSettingsVisibility();
-}
-if (includeFaq) {
-  includeFaq.addEventListener("change", handleFaqToggle);
-}
-if (addSourceBtn) {
-  addSourceBtn.addEventListener("click", handleAddSource);
-}
-if (sourcesList) {
-  sourcesList.addEventListener("click", handleSourceListClick);
 }
 if (contextSourceSelect) {
   contextSourceSelect.addEventListener("change", handleContextSourceChange);
@@ -1013,6 +991,9 @@ function inlineFormat(text) {
 }
 
 function applyStructurePreset(presetKey) {
+  if (!structureInput) {
+    return;
+  }
   if (presetKey === "custom") {
     return;
   }
@@ -1027,14 +1008,11 @@ function applyPipeDefaults(pipeId) {
   if (!pipe) {
     return;
   }
-  if (!structureInput.value && Array.isArray(pipe.default_structure)) {
+  if (structureInput && !structureInput.value && Array.isArray(pipe.default_structure)) {
     structureInput.value = pipe.default_structure.join("\n");
   }
-  if (!goalInput.value) {
+  if (goalInput && !goalInput.value) {
     goalInput.value = "SEO-статья";
-  }
-  if (modelInput) {
-    modelInput.value = "gpt-5";
   }
 }
 
@@ -1081,19 +1059,22 @@ async function handleGenerate(event) {
     setButtonLoading(generateBtn, true);
     showProgress(true, DEFAULT_PROGRESS_MESSAGE);
     renderUsedKeywords(null);
-    const requestModel = payload.model || null;
     const requestBody = {
       theme: payload.theme,
       data: payload.data,
       k: payload.k,
-      model: requestModel,
-      max_tokens: payload.maxTokens,
       context_source: payload.context_source,
-      keywords: Array.isArray(payload.data?.keywords) ? payload.data.keywords : [],
-      length_range: { min: DEFAULT_LENGTH_RANGE.min, max: DEFAULT_LENGTH_RANGE.max, mode: "no_spaces" },
-      faq_required: true,
-      faq_count: 5,
     };
+    if (Array.isArray(payload.data?.keywords)) {
+      requestBody.keywords = payload.data.keywords;
+    }
+    requestBody.length_range = {
+      min: DEFAULT_LENGTH_RANGE.min,
+      max: DEFAULT_LENGTH_RANGE.max,
+      mode: "no_spaces",
+    };
+    requestBody.faq_required = true;
+    requestBody.faq_count = 5;
     if (payload.context_source === "custom") {
       requestBody.context_text = payload.context_text;
       if (payload.context_filename) {
@@ -1105,15 +1086,20 @@ async function handleGenerate(event) {
       body: JSON.stringify(requestBody),
     });
     let snapshot = normalizeJobResponse(initialResponse);
-    showProgress(true, describeJobProgress(snapshot));
+    const initialChars = applyProgressiveResult(snapshot) || 0;
+    showProgress(true, describeJobProgress(snapshot, initialChars));
     if (snapshot.status !== "succeeded" || !snapshot.result) {
       if (!snapshot.job_id) {
         throw new Error("Сервер вернул пустой ответ без идентификатора задания.");
       }
       snapshot = await pollJobUntilDone(snapshot.job_id, {
         onUpdate: (update) => {
-          showProgress(true, describeJobProgress(update));
-          applyProgressiveResult(update);
+          const liveChars = applyProgressiveResult(update) || 0;
+          if (update?.status === "succeeded" || update?.status === "failed") {
+            showProgress(false);
+          } else {
+            showProgress(true, describeJobProgress(update, liveChars));
+          }
         },
       });
     }
@@ -1147,6 +1133,10 @@ function normalizeJobResponse(response) {
       steps: Array.isArray(response.steps) ? response.steps : [],
       degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
       trace_id: response.trace_id || null,
+      message: typeof response.message === "string" ? response.message : null,
+      progress: typeof response.progress === "number" ? response.progress : null,
+      step: typeof response.step === "string" ? response.step : null,
+      last_event_at: response.last_event_at || null,
       result: {
         markdown: typeof response.markdown === "string" ? response.markdown : "",
         meta_json: (response.meta_json && typeof response.meta_json === "object") ? response.meta_json : {},
@@ -1160,37 +1150,62 @@ function normalizeJobResponse(response) {
     steps: Array.isArray(response.steps) ? response.steps : [],
     degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
     trace_id: response.trace_id || null,
+    message: typeof response.message === "string" ? response.message : null,
+    progress: typeof response.progress === "number" ? response.progress : null,
+    step: typeof response.step === "string" ? response.step : null,
+    last_event_at: response.last_event_at || null,
     result: response.result && typeof response.result === "object" ? response.result : null,
   };
 }
 
-function describeJobProgress(snapshot) {
-  if (!snapshot || !Array.isArray(snapshot.steps) || snapshot.steps.length === 0) {
+function describeJobProgress(snapshot, characters = 0) {
+  if (!snapshot || typeof snapshot !== "object") {
     return DEFAULT_PROGRESS_MESSAGE;
   }
-  const running = snapshot.steps.find((step) => step && step.status === "running");
-  if (running) {
-    return `Шаг: ${STEP_LABELS[running.name] || running.name}`;
+  const status = typeof snapshot.status === "string" ? snapshot.status : "queued";
+  let message = "";
+  if (typeof snapshot.message === "string" && snapshot.message.trim()) {
+    message = snapshot.message.trim();
+  } else if (Array.isArray(snapshot.steps) && snapshot.steps.length) {
+    const running = snapshot.steps.find((step) => step && step.status === "running");
+    if (running) {
+      message = `Шаг: ${STEP_LABELS[running.name] || running.name}`;
+    } else {
+      const pending = snapshot.steps.find((step) => step && step.status === "pending");
+      if (pending) {
+        message = `Шаг: ${STEP_LABELS[pending.name] || pending.name}`;
+      }
+    }
   }
-  const pending = snapshot.steps.find((step) => step && step.status === "pending");
-  if (pending) {
-    return `Шаг: ${STEP_LABELS[pending.name] || pending.name}`;
+  if (!message) {
+    if (status === "queued") {
+      message = "Задание в очереди";
+    } else if (status === "running") {
+      message = "Готовим материалы";
+    } else if (status === "succeeded") {
+      message = "Готово";
+    } else if (status === "failed") {
+      message = "Завершено с ошибкой";
+    }
   }
-  const degraded = [...snapshot.steps].reverse().find((step) => step && step.status === "degraded");
-  if (degraded) {
-    return `Завершено с деградацией: ${STEP_LABELS[degraded.name] || degraded.name}`;
+  const parts = [];
+  if (message) {
+    parts.push(message);
   }
-  const succeeded = [...snapshot.steps].reverse().find((step) => step && step.status === "succeeded");
-  if (succeeded) {
-    return `Шаг завершён: ${STEP_LABELS[succeeded.name] || succeeded.name}`;
+  if (status === "running" && typeof snapshot.progress === "number") {
+    const percent = Math.max(0, Math.min(100, Math.round(snapshot.progress * 100)));
+    parts.push(`${percent}%`);
   }
-  return DEFAULT_PROGRESS_MESSAGE;
+  if (typeof characters === "number" && characters > 0 && status !== "queued") {
+    parts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
+  }
+  return parts.length ? parts.join(" · ") : DEFAULT_PROGRESS_MESSAGE;
 }
 
 function applyProgressiveResult(snapshot) {
   const result = snapshot?.result;
   if (!result || typeof result !== "object") {
-    return;
+    return 0;
   }
   const markdown = typeof result.markdown === "string" ? result.markdown : "";
   if (markdown) {
@@ -1198,10 +1213,72 @@ function applyProgressiveResult(snapshot) {
   }
   const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
   updateResultBadges(meta, Array.isArray(snapshot?.degradation_flags) ? snapshot.degradation_flags : []);
+  const characters = typeof meta.characters === "number"
+    ? meta.characters
+    : markdown.replace(/\s+/g, "").length;
+  return characters;
 }
 
 async function pollJobUntilDone(jobId, { onUpdate } = {}) {
-  let delayMs = 600;
+  if (typeof EventSource === "function") {
+    try {
+      return await watchJobViaSse(jobId, { onUpdate });
+    } catch (error) {
+      console.warn("SSE unavailable, falling back to polling", error);
+    }
+  }
+  return watchJobViaPolling(jobId, { onUpdate });
+}
+
+function watchJobViaSse(jobId, { onUpdate } = {}) {
+  return new Promise((resolve, reject) => {
+    const source = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream`);
+    let settled = false;
+    const cleanup = () => {
+      if (!settled) {
+        settled = true;
+        source.close();
+      }
+    };
+    source.onmessage = (event) => {
+      let snapshot;
+      try {
+        snapshot = JSON.parse(event.data);
+      } catch (error) {
+        console.warn("Failed to parse SSE payload", error);
+        return;
+      }
+      if (typeof onUpdate === "function") {
+        onUpdate(snapshot);
+      }
+      if (snapshot?.status === "failed") {
+        cleanup();
+        const message = snapshot?.error?.message || snapshot?.message || "Генерация завершилась с ошибкой.";
+        const error = new Error(message);
+        if (snapshot?.trace_id) {
+          error.traceId = snapshot.trace_id;
+        }
+        reject(error);
+        return;
+      }
+      if (snapshot?.status === "succeeded" && snapshot.result) {
+        cleanup();
+        resolve(snapshot);
+      }
+    };
+    source.onerror = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      source.close();
+      watchJobViaPolling(jobId, { onUpdate }).then(resolve).catch(reject);
+    };
+  });
+}
+
+async function watchJobViaPolling(jobId, { onUpdate } = {}) {
+  let delayMs = 1000;
   while (true) {
     await delay(delayMs);
     const snapshot = await fetchJson(`/api/jobs/${encodeURIComponent(jobId)}`);
@@ -1209,7 +1286,7 @@ async function pollJobUntilDone(jobId, { onUpdate } = {}) {
       onUpdate(snapshot);
     }
     if (snapshot?.status === "failed") {
-      const message = snapshot?.error?.message || "Генерация завершилась с ошибкой.";
+      const message = snapshot?.error?.message || snapshot?.message || "Генерация завершилась с ошибкой.";
       const error = new Error(message);
       if (snapshot?.trace_id) {
         error.traceId = snapshot.trace_id;
@@ -1219,7 +1296,7 @@ async function pollJobUntilDone(jobId, { onUpdate } = {}) {
     if (snapshot?.status === "succeeded" && snapshot.result) {
       return snapshot;
     }
-    delayMs = Math.min(delayMs * 1.3, 4000);
+    delayMs = Math.min(delayMs + 200, 1500);
   }
 }
 
@@ -1314,113 +1391,68 @@ function buildRequestPayload() {
     .split(/\r?\n|,/)
     .map((item) => item.trim())
     .filter(Boolean);
-  const structure = structureInput.value
-    .split(/\r?\n/)
-    .map((item) => item.trim())
-    .filter(Boolean);
+  const structure = structureInput
+    ? structureInput.value
+        .split(/\r?\n/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : [];
 
-  const minCharsRaw = String(minCharsInput?.value ?? "").trim();
-  const maxCharsRaw = String(maxCharsInput?.value ?? "").trim();
-  const minChars = minCharsRaw === "" ? DEFAULT_LENGTH_RANGE.min : Number.parseInt(minCharsRaw, 10);
-  const maxChars = maxCharsRaw === "" ? DEFAULT_LENGTH_RANGE.max : Number.parseInt(maxCharsRaw, 10);
-  if (!Number.isInteger(minChars) || minChars <= 0) {
-    throw new Error("Минимальный объём должен быть положительным целым числом");
-  }
-  if (!Number.isInteger(maxChars) || maxChars <= 0) {
-    throw new Error("Максимальный объём должен быть положительным целым числом");
-  }
-  if (maxChars < minChars) {
-    throw new Error("Максимальный объём должен быть больше или равен минимальному");
+  let minChars = DEFAULT_LENGTH_RANGE.min;
+  let maxChars = DEFAULT_LENGTH_RANGE.max;
+  if (minCharsInput || maxCharsInput) {
+    const minCharsRaw = String(minCharsInput?.value ?? "").trim();
+    const maxCharsRaw = String(maxCharsInput?.value ?? "").trim();
+    minChars = minCharsRaw === "" ? DEFAULT_LENGTH_RANGE.min : Number.parseInt(minCharsRaw, 10);
+    maxChars = maxCharsRaw === "" ? DEFAULT_LENGTH_RANGE.max : Number.parseInt(maxCharsRaw, 10);
+    if (!Number.isInteger(minChars) || minChars <= 0) {
+      throw new Error("Минимальный объём должен быть положительным целым числом");
+    }
+    if (!Number.isInteger(maxChars) || maxChars <= 0) {
+      throw new Error("Максимальный объём должен быть положительным целым числом");
+    }
+    if (maxChars < minChars) {
+      throw new Error("Максимальный объём должен быть больше или равен минимальному");
+    }
   }
 
   const keywordMode = Array.from(keywordModeInputs).find((input) => input.checked)?.value || "strict";
-  const sources = collectSources();
   const styleProfile = styleProfileSelect?.value || "sravni.ru";
-  const title = titleInput?.value.trim();
-  const audience = audienceInput?.value.trim();
-  const toneSelect = document.getElementById("tone-select");
-  const tone = toneSelect ? toneSelect.value : "экспертный";
-
   const contextSource = String(contextSourceSelect?.value || "index.json").toLowerCase();
+  const contextPayload = resolveCustomContextPayload(contextSource);
 
   const data = {
     theme: topic,
-    goal: goalInput.value.trim() || "SEO-статья",
-    tone,
+    goal: "SEO-статья",
+    tone: "экспертный",
     keywords,
-    keywords_mode: keywordMode,
-    structure,
-    include_faq: includeFaq.checked,
-    include_jsonld: includeJsonld.checked,
-    structure_preset: structurePreset.value,
+    keywords_mode: "strict",
+    structure: structure,
+    include_faq: true,
+    include_jsonld: true,
+    structure_preset: structurePreset ? structurePreset.value : "custom",
     pipe_id: theme,
     length_limits: { min_chars: minChars, max_chars: maxChars },
     style_profile: styleProfile,
     context_source: contextSource,
+    faq_questions: 5,
   };
 
-  if (title) {
-    data.title = title;
-  }
-  if (audience) {
-    data.target_audience = audience;
-  }
-  if (sources.length) {
-    data.sources = sources;
-  }
-  if (includeFaq.checked) {
-    const faqValue = String(faqCountInput?.value ?? "").trim();
-    let faqCount = faqValue === "" ? 5 : Number.parseInt(faqValue, 10);
-    if (!Number.isInteger(faqCount) || faqCount <= 0) {
-      faqCount = 5;
-    }
-    data.faq_questions = faqCount;
-  }
-
-  const kValue = String(kInput?.value ?? "").trim();
-  let k = kValue === "" ? 0 : Number.parseInt(kValue, 10);
-  if (!Number.isInteger(k) || k < 0 || k > 6) {
-    throw new Error("Контекст (k) должен быть целым числом от 0 до 6");
-  }
-  if (contextSource === "off" || contextSource === "custom") {
-    k = 0;
-  }
-  if (kInput) {
-    kInput.value = String(k);
-  }
-
-  const contextPayload = resolveCustomContextPayload(contextSource);
   if (contextSource === "custom") {
     data.context_source = "custom";
     if (contextPayload.filename) {
       data.context_filename = contextPayload.filename;
-    } else {
-      delete data.context_filename;
     }
   } else {
     delete data.context_filename;
   }
 
-  const model = "gpt-5";
-  if (modelInput) {
-    modelInput.value = model;
-  }
-
-  const maxTokensValue = String(maxTokensInput?.value ?? "").trim();
-  let maxTokens = maxTokensValue === "" ? 1400 : Number.parseInt(maxTokensValue, 10);
-  if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
-    throw new Error("Max tokens должно быть положительным целым числом");
-  }
-  if (maxTokensInput) {
-    maxTokensInput.value = String(maxTokens);
-  }
-
   const payload = {
     theme,
     data,
-    k,
-    maxTokens,
-    model: model || undefined,
+    k: 0,
+    maxTokens: 0,
+    model: undefined,
     context_source: contextSource,
   };
 
@@ -1429,30 +1461,6 @@ function buildRequestPayload() {
     if (contextPayload.filename) {
       payload.context_filename = contextPayload.filename;
     }
-  }
-
-  let stylePayload;
-  if (useStyleCheckbox) {
-    if (useStyleCheckbox.checked) {
-      const selectedStyle = (styleSelect?.value || "sravni").trim() || "sravni";
-      const strengthRaw = String(styleStrengthInput?.value ?? "").trim();
-      let strength = Number.parseFloat(strengthRaw || "0.6");
-      if (Number.isNaN(strength)) {
-        strength = 0.6;
-      }
-      stylePayload = {
-        enabled: true,
-        style: selectedStyle,
-        strength,
-      };
-    } else {
-      stylePayload = { enabled: false };
-    }
-    data.style = stylePayload;
-  }
-
-  if (stylePayload) {
-    payload.style = stylePayload;
   }
 
   return payload;

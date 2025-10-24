@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,76 @@ MAX_RESPONSES_POLL_ATTEMPTS = (
 if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
+_PROMPT_CACHE: "OrderedDict[Tuple[Tuple[str, str], ...], List[Dict[str, str]]]" = OrderedDict()
+_PROMPT_CACHE_LIMIT = 16
+
+_HTTP_CLIENT_LIMITS = httpx.Limits(
+    max_connections=8,
+    max_keepalive_connections=8,
+    keepalive_expiry=60.0,
+)
+_HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
+
+
+def reset_http_client_cache() -> None:
+    """Close and clear pooled HTTP clients.
+
+    Intended for test code to avoid state leaking between invocations when
+    mocked clients keep internal counters (e.g. DummyClient instances)."""
+
+    while _HTTP_CLIENTS:
+        _, pooled_client = _HTTP_CLIENTS.popitem(last=False)
+        try:
+            pooled_client.close()
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
+
+
+def _cache_augmented_messages(messages: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    key = tuple((str(item.get("role", "")), str(item.get("content", ""))) for item in messages)
+    cached = _PROMPT_CACHE.get(key)
+    if cached is not None:
+        _PROMPT_CACHE.move_to_end(key)
+        return [dict(message) for message in cached]
+    augmented: List[Dict[str, object]] = []
+    appended_suffix = False
+    for message in messages:
+        cloned = dict(message)
+        if not appended_suffix and cloned.get("role") == "system":
+            content = str(cloned.get("content", ""))
+            if GPT5_TEXT_ONLY_SUFFIX not in content:
+                content = f"{content.rstrip()}\n\n{GPT5_TEXT_ONLY_SUFFIX}".strip()
+            cloned["content"] = content
+            appended_suffix = True
+        augmented.append(cloned)
+    _PROMPT_CACHE[key] = augmented
+    while len(_PROMPT_CACHE) > _PROMPT_CACHE_LIMIT:
+        _PROMPT_CACHE.popitem(last=False)
+    return [dict(message) for message in augmented]
+
+
+def _acquire_http_client(timeout_value: float) -> httpx.Client:
+    key = round(timeout_value, 1)
+    client = _HTTP_CLIENTS.get(key)
+    if client is not None:
+        _HTTP_CLIENTS.move_to_end(key)
+        return client
+
+    timeout = httpx.Timeout(
+        timeout=timeout_value,
+        connect=min(15.0, timeout_value),
+        read=timeout_value,
+        write=timeout_value,
+    )
+    client = httpx.Client(timeout=timeout, limits=_HTTP_CLIENT_LIMITS)
+    _HTTP_CLIENTS[key] = client
+    while len(_HTTP_CLIENTS) > 4:
+        _, old_client = _HTTP_CLIENTS.popitem(last=False)
+        try:
+            old_client.close()
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
+    return client
 def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
     """Detect the specific 400 error about max_output_tokens being too small."""
 
@@ -114,6 +185,26 @@ DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
         "additionalProperties": False,
     },
     "strict": True,
+}
+
+FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT: Dict[str, object] = {
+    "type": "json_schema",
+    "name": "seo_article_plain_outline",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "plain": {"type": "string"},
+            "outline": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 3,
+                "maxItems": 7,
+            },
+        },
+        "required": ["plain"],
+        "additionalProperties": False,
+    },
+    "strict": False,
 }
 
 
@@ -1320,14 +1411,7 @@ def generate(
     except (TypeError, ValueError):
         timeout_value = 60.0
     effective_timeout = min(max(timeout_value, 1.0), 90.0)
-    timeout = httpx.Timeout(
-        timeout=effective_timeout,
-        connect=min(15.0, effective_timeout),
-        read=effective_timeout,
-        write=effective_timeout,
-        pool=None,
-    )
-    http_client = httpx.Client(timeout=timeout)
+    http_client = _acquire_http_client(effective_timeout)
 
     schedule = _resolve_backoff_schedule(backoff_schedule)
     headers = {
@@ -1335,31 +1419,27 @@ def generate(
         "Content-Type": "application/json",
     }
 
-    def _augment_gpt5_messages(original: List[Dict[str, object]]) -> List[Dict[str, object]]:
-        augmented: List[Dict[str, object]] = []
-        appended_suffix = False
-        for message in original:
-            cloned = dict(message)
-            if not appended_suffix and cloned.get("role") == "system":
-                content = str(cloned.get("content", ""))
-                if GPT5_TEXT_ONLY_SUFFIX not in content:
-                    content = f"{content.rstrip()}\n\n{GPT5_TEXT_ONLY_SUFFIX}".strip()
-                cloned["content"] = content
-                appended_suffix = True
-            augmented.append(cloned)
-        return augmented
-
     gpt5_messages_cache: Optional[List[Dict[str, object]]] = None
 
     def _messages_for_model(target_model: str) -> List[Dict[str, object]]:
         nonlocal gpt5_messages_cache
         if target_model.lower().startswith("gpt-5"):
             if gpt5_messages_cache is None:
-                gpt5_messages_cache = _augment_gpt5_messages(messages)
-            return gpt5_messages_cache
-        return messages
+                gpt5_messages_cache = _cache_augmented_messages(messages)
+            return [dict(message) for message in gpt5_messages_cache]
+        return [dict(message) for message in messages]
 
-    def _call_responses_model(target_model: str) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
+    _PREVIOUS_ID_SENTINEL = object()
+
+    def _call_responses_model(
+        target_model: str,
+        *,
+        max_tokens_override: Optional[int] = None,
+        text_format_override: Optional[Dict[str, object]] = None,
+        previous_id_override: object = _PREVIOUS_ID_SENTINEL,
+        max_attempts_override: Optional[int] = None,
+        allow_empty_retry: bool = True,
+    ) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
         nonlocal retry_used
 
         payload_messages = _messages_for_model(target_model)
@@ -1380,17 +1460,27 @@ def generate(
         system_text = "\n\n".join(system_segments)
         user_text = "\n\n".join(user_segments)
 
+        effective_max_tokens = max_tokens_override if max_tokens_override is not None else max_tokens
+        effective_previous_id: Optional[str]
+        if previous_id_override is _PREVIOUS_ID_SENTINEL:
+            effective_previous_id = previous_response_id
+        else:
+            effective_previous_id = previous_id_override if isinstance(previous_id_override, str) else None
         base_payload = build_responses_payload(
             target_model,
             system_text,
             user_text,
-            max_tokens,
-            text_format=responses_text_format,
-            previous_response_id=previous_response_id,
+            effective_max_tokens,
+            text_format=text_format_override or responses_text_format,
+            previous_response_id=effective_previous_id,
         )
         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
 
-        raw_format_template = responses_text_format or DEFAULT_RESPONSES_TEXT_FORMAT
+        raw_format_template = (
+            text_format_override
+            or responses_text_format
+            or DEFAULT_RESPONSES_TEXT_FORMAT
+        )
         format_template, _, _ = _prepare_text_format_for_request(
             raw_format_template,
             context="template",
@@ -1411,7 +1501,13 @@ def generate(
         fmt_template_type = str(format_template.get("type", "")).strip().lower()
         if fmt_template_type == "json_schema":
             current_name = str(format_template.get("name", "")).strip()
-            if current_name != RESPONSES_FORMAT_DEFAULT_NAME:
+            allowed_names = {RESPONSES_FORMAT_DEFAULT_NAME}
+            fallback_name = str(
+                FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT.get("name", "")
+            ).strip()
+            if fallback_name:
+                allowed_names.add(fallback_name)
+            if current_name not in allowed_names:
                 format_template["name"] = RESPONSES_FORMAT_DEFAULT_NAME
 
         def _clone_text_format() -> Dict[str, object]:
@@ -1438,8 +1534,12 @@ def generate(
                 has_schema = isinstance(format_block.get("schema"), dict)
                 current_name = str(format_block.get("name", "")).strip()
                 if fmt_type.lower() == "json_schema":
+                    allowed_names = {
+                        RESPONSES_FORMAT_DEFAULT_NAME,
+                        FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT.get("name"),
+                    }
                     desired = RESPONSES_FORMAT_DEFAULT_NAME
-                    if current_name != desired:
+                    if current_name not in allowed_names:
                         format_block["name"] = desired
                         current_name = desired
                         fixed = True
@@ -1572,7 +1672,14 @@ def generate(
             return metadata
 
         attempts = 0
-        max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)
+        if max_attempts_override is not None:
+            try:
+                parsed_attempts = int(max_attempts_override)
+            except (TypeError, ValueError):
+                parsed_attempts = 1
+            max_attempts = max(1, parsed_attempts)
+        else:
+            max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)
         current_max = max_tokens_value
         last_error: Optional[BaseException] = None
         format_retry_done = False
@@ -1622,7 +1729,6 @@ def generate(
                     poll_response = http_client.get(
                         poll_url,
                         headers=headers,
-                        timeout=timeout,
                     )
                     poll_response.raise_for_status()
                 except httpx.HTTPStatusError as poll_error:
@@ -1711,7 +1817,6 @@ def generate(
                     RESPONSES_API_URL,
                     headers=headers,
                     json=current_payload,
-                    timeout=timeout,
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -1881,7 +1986,11 @@ def generate(
                     continue
                 if not text:
                     response_id_value = metadata.get("response_id") or ""
-                    if response_id_value and not empty_retry_attempted:
+                    if (
+                        allow_empty_retry
+                        and response_id_value
+                        and not empty_retry_attempted
+                    ):
                         empty_retry_attempted = True
                         resume_from_response_id = str(response_id_value)
                         LOGGER.warning(
@@ -1896,11 +2005,15 @@ def generate(
                         parse_flags=parse_flags,
                     )
                     LOGGER.info("RESP_STATUS=json_error|segments=%d", segments)
+                    if not allow_empty_retry:
+                        raise last_error
                     continue
                 _persist_raw_response(data)
                 return text, parse_flags, data, schema_label
             except EmptyCompletionError as exc:
                 last_error = exc
+                if not allow_empty_retry:
+                    raise
             except httpx.HTTPStatusError as exc:
                 response_obj = exc.response
                 status = response_obj.status_code if response_obj is not None else None
@@ -2000,81 +2113,131 @@ def generate(
 
     retry_used = False
 
-    try:
-        if is_gpt5_model:
-            available = _check_model_availability(
-                http_client,
-                provider=provider,
-                headers=headers,
-                model_name=model_name,
-            )
-            if not available:
-                error_message = "Model GPT-5 not available for this key/plan"
-                LOGGER.error("primary model %s unavailable", model_name)
-                raise RuntimeError(error_message)
+    if is_gpt5_model:
+        available = _check_model_availability(
+            http_client,
+            provider=provider,
+            headers=headers,
+            model_name=model_name,
+        )
+        if not available:
+            error_message = "Model GPT-5 not available for this key/plan"
+            LOGGER.error("primary model %s unavailable", model_name)
+            raise RuntimeError(error_message)
 
+        def _scale_tokens(base: int, factor: float) -> int:
+            if base <= 0:
+                return 1
+            scaled = int(round(base * factor))
+            if scaled < 1:
+                scaled = 1
+            if scaled >= base:
+                scaled = max(1, base - 1)
+            return scaled
+
+        try:
+            primary_tokens = int(max_tokens)
+        except (TypeError, ValueError):
+            primary_tokens = 1400
+        if primary_tokens <= 0:
+            primary_tokens = 1400
+
+        first_retry_tokens = _scale_tokens(primary_tokens, 0.85)
+        fallback_tokens = _scale_tokens(first_retry_tokens, 0.9)
+
+        attempt_plan = [
+            {
+                "label": "primary",
+                "max_tokens": primary_tokens,
+                "previous_id": _PREVIOUS_ID_SENTINEL,
+                "format": responses_text_format,
+                "fallback": None,
+                "reason": None,
+            },
+            {
+                "label": "retry_trimmed",
+                "max_tokens": first_retry_tokens,
+                "previous_id": None,
+                "format": responses_text_format,
+                "fallback": None,
+                "reason": "empty_completion_retry",
+            },
+            {
+                "label": "fallback_plain_outline",
+                "max_tokens": fallback_tokens,
+                "previous_id": None,
+                "format": FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT,
+                "fallback": "plain_outline",
+                "reason": "empty_completion_fallback",
+            },
+        ]
+
+        last_empty_error: Optional[EmptyCompletionError] = None
+        last_empty_plan: Optional[Dict[str, object]] = None
+
+        for attempt_index, attempt_cfg in enumerate(attempt_plan):
+            label = str(attempt_cfg["label"])
+            LOGGER.info(
+                "RESP_ATTEMPT label=%s max_tokens=%s fallback=%s",
+                label,
+                attempt_cfg["max_tokens"],
+                attempt_cfg["fallback"] or "-",
+            )
+            if attempt_index > 0:
+                retry_used = True
             try:
-                text, parse_flags_initial, _, schema_initial_call = _call_responses_model(
-                    model_name
+                text, parse_flags_current, _, schema_current = _call_responses_model(
+                    model_name,
+                    max_tokens_override=int(attempt_cfg["max_tokens"]),
+                    text_format_override=attempt_cfg["format"],
+                    previous_id_override=attempt_cfg["previous_id"],
+                    allow_empty_retry=False,
                 )
-                schema_category = schema_initial_call
+                schema_category = schema_current
                 LOGGER.info(
-                    "completion schema category=%s (schema=%s, route=responses)",
+                    "completion schema category=%s (schema=%s, route=responses, attempt=%s)",
                     schema_category,
-                    schema_initial_call,
+                    schema_current,
+                    label,
                 )
                 metadata_block = None
-                if isinstance(parse_flags_initial, dict):
-                    meta_candidate = parse_flags_initial.get("metadata")
+                if isinstance(parse_flags_current, dict):
+                    meta_candidate = parse_flags_current.get("metadata")
                     if isinstance(meta_candidate, dict):
                         metadata_block = dict(meta_candidate)
+                        metadata_block["max_output_tokens_applied"] = int(attempt_cfg["max_tokens"])
+                        if attempt_cfg["fallback"]:
+                            metadata_block["fallback_used"] = attempt_cfg["fallback"]
+                            metadata_block["fallback_reason"] = attempt_cfg["reason"]
                 return GenerationResult(
                     text=text,
                     model_used=model_name,
-                    retry_used=retry_used,
-                    fallback_used=None,
-                    fallback_reason=None,
+                    retry_used=retry_used or attempt_index > 0,
+                    fallback_used=attempt_cfg["fallback"],
+                    fallback_reason=attempt_cfg["reason"],
                     api_route=LLM_ROUTE,
                     schema=schema_category,
                     metadata=metadata_block,
                 )
             except EmptyCompletionError as responses_empty:
                 _persist_raw_response(responses_empty.raw_response)
-                _log_parse_chain(responses_empty.parse_flags, retry=0, fallback="responses")
+                _log_parse_chain(responses_empty.parse_flags, retry=attempt_index, fallback=label)
                 LOGGER.error(
-                    "empty completion from Responses API %s (schema=%s)",
+                    "empty completion attempt=%s model=%s max_tokens=%s",
+                    label,
                     model_name,
-                    responses_empty.parse_flags.get("schema", "unknown"),
+                    attempt_cfg["max_tokens"],
                 )
-                diagnostics: Dict[str, object] = {
-                    "reason": "empty_completion_gpt5_responses",
-                }
-                parse_flags = responses_empty.parse_flags or {}
-                diagnostics["schema"] = parse_flags.get("schema")
-                diagnostics["segments"] = parse_flags.get("segments")
-                metadata_block = parse_flags.get("metadata")
-                if isinstance(metadata_block, dict):
-                    diagnostics.update(
-                        {
-                            "status": metadata_block.get("status"),
-                            "incomplete_reason": metadata_block.get("incomplete_reason"),
-                            "usage_output_tokens": metadata_block.get("usage_output_tokens"),
-                            "finish_reason": metadata_block.get("finish_reason"),
-                            "previous_response_id": metadata_block.get("previous_response_id"),
-                        }
-                    )
-                response_id = responses_empty.raw_response.get("id")
-                if isinstance(response_id, str) and response_id.strip():
-                    diagnostics["response_id"] = response_id.strip()
-                if FORCE_MODEL:
-                    raise _build_force_model_error("responses_empty", diagnostics) from responses_empty
-                raise RuntimeError("GPT-5 вернул пустой ответ после эскалации") from responses_empty
+                last_empty_error = responses_empty
+                last_empty_plan = attempt_cfg
+                continue
             except Exception as responses_error:  # noqa: BLE001
-                LOGGER.warning("Responses API call failed: %s", responses_error)
+                LOGGER.warning("Responses API call failed on attempt=%s: %s", label, responses_error)
                 if FORCE_MODEL:
                     error_details: Dict[str, object] = {
                         "reason": "api_error_gpt5_responses",
                         "exception": str(responses_error),
+                        "attempt": label,
                     }
                     if isinstance(responses_error, httpx.HTTPStatusError):
                         status_code = (
@@ -2095,9 +2258,34 @@ def generate(
                                     error_details["error_message"] = error_block.get("message")
                     raise _build_force_model_error("responses_error", error_details) from responses_error
                 raise
-        raise RuntimeError(f"Поддерживается только модель {LLM_MODEL.upper()} для маршрута {LLM_ROUTE}")
-    finally:
-        http_client.close()
+
+        if last_empty_error is not None:
+            diagnostics: Dict[str, object] = {"reason": "empty_completion_gpt5_responses"}
+            parse_flags = last_empty_error.parse_flags or {}
+            diagnostics["schema"] = parse_flags.get("schema")
+            diagnostics["segments"] = parse_flags.get("segments")
+            metadata_block = parse_flags.get("metadata")
+            if isinstance(metadata_block, dict):
+                diagnostics.update(
+                    {
+                        "status": metadata_block.get("status"),
+                        "incomplete_reason": metadata_block.get("incomplete_reason"),
+                        "usage_output_tokens": metadata_block.get("usage_output_tokens"),
+                        "finish_reason": metadata_block.get("finish_reason"),
+                        "previous_response_id": metadata_block.get("previous_response_id"),
+                    }
+                )
+            if last_empty_plan:
+                diagnostics["attempt"] = last_empty_plan.get("label")
+                diagnostics["max_output_tokens"] = last_empty_plan.get("max_tokens")
+                diagnostics["fallback"] = last_empty_plan.get("fallback")
+            response_id = last_empty_error.raw_response.get("id")
+            if isinstance(response_id, str) and response_id.strip():
+                diagnostics["response_id"] = response_id.strip()
+            if FORCE_MODEL:
+                raise _build_force_model_error("responses_empty", diagnostics) from last_empty_error
+            raise RuntimeError("Модель вернула пустой ответ. Попробуйте повторить генерацию.") from last_empty_error
+    raise RuntimeError(f"Поддерживается только модель {LLM_MODEL.upper()} для маршрута {LLM_ROUTE}")
 
 
-__all__ = ["generate", "DEFAULT_MODEL", "GenerationResult"]
+__all__ = ["generate", "DEFAULT_MODEL", "GenerationResult", "reset_http_client_cache"]

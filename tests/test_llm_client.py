@@ -10,9 +10,11 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config import LLM_ALLOW_FALLBACK, LLM_MODEL, LLM_ROUTE
 from llm_client import (  # noqa: E402
     DEFAULT_RESPONSES_TEXT_FORMAT,
+    FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT,
     G5_ESCALATION_LADDER,
     GenerationResult,
     generate,
+    reset_http_client_cache,
 )
 
 
@@ -21,6 +23,13 @@ def _force_api_key(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test")
     yield
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_http_clients():
+    reset_http_client_cache()
+    yield
+    reset_http_client_cache()
 
 
 class DummyResponse:
@@ -136,6 +145,7 @@ def test_generate_uses_responses_payload_for_gpt5():
     assert metadata.get("allow_fallback") is LLM_ALLOW_FALLBACK
     assert metadata.get("temperature_applied") is False
     assert metadata.get("escalation_caps") == list(G5_ESCALATION_LADDER)
+    assert metadata.get("max_output_tokens_applied") == 64
 
 
 def test_generate_polls_until_completion():
@@ -179,5 +189,37 @@ def test_generate_retries_unknown_parameter():
 def test_generate_raises_when_responses_empty_after_escalation():
     empty_payload = {"output": [{"content": [{"type": "text", "text": "   "}]}]}
     with patch("llm_client.LOGGER"):
-        with pytest.raises(RuntimeError):
-            _generate_with_dummy(responses=[empty_payload])
+        with pytest.raises(RuntimeError) as excinfo:
+            _generate_with_dummy(responses=[empty_payload, empty_payload, empty_payload])
+    assert "Попробуйте повторить" in str(excinfo.value)
+
+
+def test_generate_retries_empty_completion_with_fallback():
+    empty_payload = {"output": [{"content": [{"type": "text", "text": "   "}]}]}
+    success_payload = {
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "Готовый текст"},
+                ]
+            }
+        ],
+    }
+    responses = [empty_payload, empty_payload, success_payload]
+    result, client = _generate_with_dummy(
+        responses=responses,
+        max_tokens=100,
+    )
+    assert isinstance(result, GenerationResult)
+    assert result.retry_used is True
+    assert result.fallback_used == "plain_outline"
+    assert result.fallback_reason == "empty_completion_fallback"
+    assert len(client.requests) == 3
+    primary_request = client.requests[0]["json"]
+    retry_request = client.requests[1]["json"]
+    fallback_request = client.requests[2]["json"]
+    assert primary_request["max_output_tokens"] == 100
+    assert retry_request["max_output_tokens"] == 85
+    assert fallback_request["max_output_tokens"] == 76
+    assert "previous_response_id" not in retry_request
+    assert fallback_request["text"]["format"] == FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT

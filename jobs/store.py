@@ -5,7 +5,7 @@ import threading
 import time
 from typing import Callable, Dict, Optional
 
-from .models import Job, JobStep
+from .models import Job, JobStep, utcnow
 
 
 class JobStore:
@@ -21,6 +21,7 @@ class JobStore:
         with self._lock:
             self._jobs[job.id] = job
             self._expiry[job.id] = time.time() + self._ttl_seconds
+            job.last_event_at = job.created_at
             self._purge_expired_locked()
             return job
 
@@ -39,6 +40,7 @@ class JobStore:
                     mutator(step)
                     break
             self._expiry[job_id] = time.time() + self._ttl_seconds
+            job.last_event_at = utcnow()
             return job
 
     def set_result(self, job_id: str, result: dict, *, degradation_flags: Optional[list[str]] = None) -> Optional[Job]:
@@ -48,6 +50,7 @@ class JobStore:
                 return None
             job.mark_succeeded(result, degradation_flags=degradation_flags)
             self._expiry[job_id] = time.time() + self._ttl_seconds
+            job.last_event_at = utcnow()
             return job
 
     def set_failed(
@@ -63,12 +66,15 @@ class JobStore:
                 return None
             job.mark_failed(error, degradation_flags=degradation_flags)
             self._expiry[job_id] = time.time() + self._ttl_seconds
+            job.last_event_at = utcnow()
             return job
 
     def touch(self, job_id: str) -> None:
         with self._lock:
-            if job_id in self._jobs:
+            job = self._jobs.get(job_id)
+            if job is not None:
                 self._expiry[job_id] = time.time() + self._ttl_seconds
+                job.last_event_at = utcnow()
 
     def delete(self, job_id: str) -> None:
         with self._lock:

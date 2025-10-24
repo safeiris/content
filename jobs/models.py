@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -96,10 +97,12 @@ class Job:
     error: Optional[Dict[str, Any]] = None
     degradation_flags: List[str] = field(default_factory=list)
     trace_id: Optional[str] = None
+    last_event_at: datetime = field(default_factory=utcnow)
 
     def mark_running(self) -> None:
         self.status = JobStatus.RUNNING
         self.started_at = self.started_at or utcnow()
+        self.last_event_at = utcnow()
 
     def mark_succeeded(self, result: Dict[str, Any], *, degradation_flags: Optional[List[str]] = None) -> None:
         self.status = JobStatus.SUCCEEDED
@@ -107,6 +110,7 @@ class Job:
         if degradation_flags:
             self.degradation_flags.extend(flag for flag in degradation_flags if flag)
         self.finished_at = utcnow()
+        self.last_event_at = utcnow()
 
     def mark_failed(self, error: str | Dict[str, Any], *, degradation_flags: Optional[List[str]] = None) -> None:
         self.status = JobStatus.FAILED
@@ -114,11 +118,11 @@ class Job:
         self.finished_at = utcnow()
         if degradation_flags:
             self.degradation_flags.extend(flag for flag in degradation_flags if flag)
+        self.last_event_at = utcnow()
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "id": self.id,
-            "status": self.status.value,
             "created_at": self.created_at.strftime(ISO_FORMAT),
             "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
             "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
@@ -128,3 +132,83 @@ class Job:
             "degradation_flags": list(self.degradation_flags) or None,
             "trace_id": self.trace_id,
         }
+        payload.update(summarize_job(self))
+        return payload
+
+
+def summarize_job(job: "Job") -> Dict[str, Any]:
+    status_map = {
+        JobStatus.PENDING: "queued",
+        JobStatus.RUNNING: "running",
+        JobStatus.SUCCEEDED: "succeeded",
+        JobStatus.FAILED: "failed",
+    }
+    step_alias = {
+        "jsonld": "finalize",
+        "post_analysis": "finalize",
+    }
+    step_labels = {
+        "draft": "Черновик",
+        "refine": "Полировка",
+        "finalize": "Финализация",
+        "jsonld": "JSON-LD",
+        "post_analysis": "Пост-анализ",
+        "done": "Готово",
+    }
+
+    status = status_map.get(job.status, job.status.value)
+
+    total_steps = len(job.steps)
+    completed = sum(
+        1
+        for step in job.steps
+        if step.status in {JobStepStatus.SUCCEEDED, JobStepStatus.DEGRADED, JobStepStatus.SKIPPED}
+    )
+    running_step = next((step for step in job.steps if step.status == JobStepStatus.RUNNING), None)
+    pending_step = next((step for step in job.steps if step.status == JobStepStatus.PENDING), None)
+
+    if status in {"succeeded", "failed"}:
+        step_name = "done"
+        progress = 1.0
+    else:
+        if running_step:
+            step_name = step_alias.get(running_step.name, running_step.name)
+        elif pending_step:
+            step_name = step_alias.get(pending_step.name, pending_step.name)
+        elif job.steps:
+            step_name = step_alias.get(job.steps[-1].name, job.steps[-1].name)
+        else:
+            step_name = "draft"
+        if total_steps:
+            progress = completed / total_steps
+            if running_step:
+                progress += 0.5 / total_steps
+            progress = min(1.0, max(0.0, progress))
+        else:
+            progress = 0.0
+
+    if status == "queued":
+        message = "Задание в очереди"
+    elif status == "running":
+        message = f"Шаг: {step_labels.get(step_name, step_name)}"
+    elif status == "succeeded":
+        message = "Готово"
+    else:
+        error_message = ""
+        if isinstance(job.error, dict):
+            error_message = str(job.error.get("message") or "").strip()
+        message = error_message or "Завершено с ошибкой"
+
+    timestamps = [job.created_at, job.started_at, job.finished_at, job.last_event_at]
+    for step in job.steps:
+        timestamps.extend([step.started_at, step.finished_at])
+    last_event_candidates = [ts for ts in timestamps if ts]
+    last_event = max(last_event_candidates) if last_event_candidates else utcnow()
+
+    return {
+        "status": status,
+        "step": step_name,
+        "progress": round(progress, 4),
+        "last_event_at": last_event.strftime(ISO_FORMAT),
+        "message": message,
+    }

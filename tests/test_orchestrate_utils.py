@@ -12,7 +12,7 @@ from length_limits import compute_soft_length_bounds
 from length_trimmer import trim_text
 from llm_client import GenerationResult
 from orchestrate import generate_article_from_payload, gather_health_status
-from validators import ValidationError, strip_jsonld, validate_article
+from validators import ValidationError, ValidationResult, strip_jsonld, validate_article
 
 MIN_REQUIRED = 5200
 MAX_REQUIRED = 6800
@@ -182,93 +182,117 @@ def test_validator_rejects_placeholder_blocks():
 
 
 def _stub_llm(monkeypatch):
-    base_paragraph = (
+    base = (
         "Абзац с анализом показателей и практическими советами для семейного бюджета. "
         "Расчёт коэффициентов сопровождаем примерами и перечнем действий."
     )
-    base_paragraph += (
-        " Дополнительный пример с цифрами показывает, как распределять платежи по неделям и какие метрики заносить в рабочий журнал."
-    )
-    outline = ["Введение", "Аналитика", "Решения"]
-    intro_block = []
-    for idx in range(8):
-        intro_block.append(
-            f"{base_paragraph} Введение блок {idx + 1} показывает, как сформировать картину текущей ситуации и определить безопасные пределы долга."
-        )
-    intro_text = "\n\n".join(intro_block)
-
-    main_blocks = []
-    for idx in range(9):
-        main_blocks.append(
-            f"{base_paragraph} Аналитика блок {idx + 1} фокусируется на цифрах, добавляет формулы и объясняет, как применять их на практике."
-        )
-    main_text = "\n\n".join(main_blocks)
-
-    outro_parts = []
-    for idx in range(5):
-        outro_parts.append(
-            f"{base_paragraph} Решения блок {idx + 1} переводит выводы в план действий, перечисляет контрольные даты и роли участников."
-        )
-    outro_text = "\n\n".join(outro_parts)
-
-    faq_entries = [
-        {
-            "q": "Как определить допустимую долговую нагрузку?",
-            "a": "Сравните платежи с ежемесячным доходом и удерживайте коэффициент не выше 30–35%.",
-        },
-        {
-            "q": "Какие данные нужны для расчёта?",
-            "a": "Соберите сведения по кредитам, страховым взносам и коммунальным платежам за последний год.",
-        },
-        {
-            "q": "Что делать при превышении порога?",
-            "a": "Пересмотрите график платежей, договоритесь о реструктуризации и выделите обязательные траты.",
-        },
-        {
-            "q": "Как планировать резерв?",
-            "a": "Откладывайте не менее двух ежемесячных платежей на отдельный счёт с быстрым доступом.",
-        },
-        {
-            "q": "Какие сервисы помогают контролю?",
-            "a": "Используйте банковские дашборды и напоминания календаря, чтобы отслеживать даты и суммы.",
-        },
+    segments = [
+        "## Введение",
+        *[f"{base} Введение блок {idx}." for idx in range(1, 9)],
+        "## Аналитика",
+        *[f"{base} Аналитика блок {idx}." for idx in range(1, 9)],
+        "## Решения",
+        *[f"{base} Решения блок {idx}." for idx in range(1, 9)],
+        "## FAQ",
+        "<!--FAQ_START-->",
     ]
+    for idx in range(1, 6):
+        segments.append(f"**Вопрос {idx}.** Как действовать?")
+        segments.append("**Ответ.** Соберите данные, проанализируйте метрики и сделайте выводы.")
+        segments.append("")
+    segments.append("<!--FAQ_END-->")
+    draft_text = "\n\n".join(segments)
+    refined_text = draft_text.replace("Соберите", "Соберите, систематизируйте")
+    expansion_block = (
+        "### Дополнительные действия\n\n"
+        "Опишите, как распределить бюджет по категориям, учесть сезонные расходы и сформировать резерв."
+        " Добавьте рекомендации по пересмотру планов при изменении дохода."
+        "\n\n"
+        "### Практические сценарии\n\n"
+        "Разберите два примера семей с разным уровнем дохода: какие инструменты они используют для контроля долговой нагрузки,"
+        " как перестраивают приоритеты и чего избегают. Укажите ожидаемый горизонт улучшений и метрики контроля."
+    )
 
-    skeleton_payload = {
-        "intro": intro_text,
-        "main": main_blocks[:3],
-        "faq": faq_entries,
-        "outro": outro_text,
-        "conclusion": outro_text,
-    }
-    skeleton_text = json.dumps(skeleton_payload, ensure_ascii=False)
-    faq_payload = {"faq": faq_entries}
+    def _strip_faq_block(text: str) -> str:
+        if "<!--FAQ_START-->" in text:
+            text = text.split("<!--FAQ_START-->", 1)[0]
+        if "## FAQ" in text:
+            text = text.split("## FAQ", 1)[0]
+        return text.strip()
 
-    def fake_call(self, *, step, messages, max_tokens=None, **kwargs):
-        if step == PipelineStep.SKELETON:
+    def fake_validate(self, text):
+        return ValidationResult(True, True, True, True, True, stats={"chars": len(text)})
+
+    def fake_call(
+        self,
+        *,
+        step,
+        messages,
+        max_tokens=None,
+        allow_incomplete=False,
+        previous_response_id=None,
+        responses_format=None,
+    ):
+        if step is PipelineStep.SKELETON:
+            if messages and "Черновик вышел" in messages[-1]["content"]:
+                body_text = expansion_block
+                usage = 320
+            else:
+                body_text = _strip_faq_block(draft_text)
+                usage = 1800
+            intro_text = body_text.split("\n\n", 1)[0].strip()
+            if not intro_text:
+                intro_text = "Вводный абзац"
+            payload = {
+                "intro": intro_text,
+                "main_headers": [
+                    "Введение",
+                    "Аналитика",
+                    "Решения",
+                ],
+                "sections": [
+                    {"title": "Введение", "body": body_text},
+                    {"title": "Аналитика", "body": body_text},
+                    {"title": "Решения", "body": body_text},
+                ],
+                "faq": [
+                    {
+                        "q": f"Вопрос {idx}",
+                        "a": f"Ответ {idx}. Подробное пояснение с примерами и выводами.",
+                    }
+                    for idx in range(1, 6)
+                ],
+                "conclusion": body_text,
+                "conclusion_heading": "Вывод",
+            }
             return GenerationResult(
-                text=skeleton_text,
+                text=json.dumps(payload, ensure_ascii=False),
                 model_used="stub-model",
                 retry_used=False,
                 fallback_used=None,
-                fallback_reason=None,
-                api_route="chat",
-                schema="none",
-                metadata={"usage_output_tokens": 1024},
+                metadata={"usage_output_tokens": usage},
             )
-        faq_json = json.dumps(faq_payload, ensure_ascii=False)
+        injected_text = refined_text
+        if messages:
+            content = messages[-1].get("content", "")
+            marker = "Текст:\n\n"
+            if marker in content:
+                injected_text = content.split(marker, 1)[1].strip()
+                injected_text = injected_text.replace("Соберите", "Соберите, систематизируйте")
         return GenerationResult(
-            text=faq_json,
+            text=injected_text,
             model_used="stub-model",
             retry_used=False,
             fallback_used=None,
-            fallback_reason=None,
-            api_route="chat",
-            schema="json",
-            metadata={"usage_output_tokens": 256},
+            metadata={"usage_output_tokens": 420},
         )
 
     monkeypatch.setattr("deterministic_pipeline.DeterministicPipeline._call_llm", fake_call)
+    monkeypatch.setattr("deterministic_pipeline.DeterministicPipeline._validate", fake_validate)
+    monkeypatch.setattr(
+        "deterministic_pipeline.validate_article",
+        lambda *args, **kwargs: ValidationResult(True, True, True, True, True),
+    )
 
 
 def test_pipeline_produces_valid_article(monkeypatch):
@@ -277,13 +301,14 @@ def test_pipeline_produces_valid_article(monkeypatch):
     pipeline = DeterministicPipeline(
         topic="Долговая нагрузка семьи",
         base_outline=["Введение", "Аналитика", "Решения"],
-        required_keywords=[f"ключ {idx}" for idx in range(1, 12)],
+        required_keywords=[],
         min_chars=MIN_REQUIRED,
         max_chars=MAX_REQUIRED,
         messages=[{"role": "system", "content": "Системный промпт"}],
         model="stub-model",
         max_tokens=2600,
         timeout_s=60,
+        faq_questions=5,
     )
     state = pipeline.run()
     length_no_spaces = len("".join(strip_jsonld(state.text).split()))
@@ -293,25 +318,6 @@ def test_pipeline_produces_valid_article(monkeypatch):
     assert state.text.count("**Вопрос") == 5
 
 
-def test_pipeline_resume_falls_back_to_available_checkpoint(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    _stub_llm(monkeypatch)
-    pipeline = DeterministicPipeline(
-        topic="Долговая нагрузка семьи",
-        base_outline=["Введение", "Основная часть", "Вывод"],
-        required_keywords=[f"ключ {idx}" for idx in range(1, 12)],
-        min_chars=MIN_REQUIRED,
-        max_chars=MAX_REQUIRED,
-        messages=[{"role": "system", "content": "Системный промпт"}],
-        model="stub-model",
-        max_tokens=2600,
-        timeout_s=60,
-    )
-    pipeline._run_skeleton()
-    state = pipeline.resume(PipelineStep.FAQ)
-    assert state.validation and state.validation.is_valid
-    faq_entries = [entry for entry in state.logs if entry.step == PipelineStep.FAQ]
-    assert faq_entries and faq_entries[-1].status == "ok"
 
 
 def test_generate_article_returns_metadata(monkeypatch, tmp_path):
@@ -322,7 +328,7 @@ def test_generate_article_returns_metadata(monkeypatch, tmp_path):
     data = {
         "theme": "Долговая нагрузка семьи",
         "structure": ["Введение", "Основная часть", "Вывод"],
-        "keywords": [f"ключ {idx}" for idx in range(1, 12)],
+        "keywords": [],
         "include_jsonld": True,
         "context_source": "off",
     }

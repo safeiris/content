@@ -16,6 +16,7 @@ from urllib.parse import urljoin, urlparse
 from dotenv import load_dotenv
 from flask import (
     Flask,
+    Response,
     abort,
     flash,
     jsonify,
@@ -26,6 +27,7 @@ from flask import (
     session,
     send_file,
     send_from_directory,
+    stream_with_context,
     url_for,
 )
 from flask_cors import CORS
@@ -459,6 +461,38 @@ def create_app() -> Flask:
                 404,
             )
         return jsonify(snapshot)
+
+    @app.get("/api/jobs/<job_id>/stream")
+    def job_stream(job_id: str):
+        def _event_stream():
+            last_signature = None
+            while True:
+                snapshot = JOB_RUNNER.get_job(job_id)
+                if not snapshot:
+                    payload = {
+                        "status": "failed",
+                        "message": "Задание не найдено",
+                        "job_id": job_id,
+                    }
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    break
+                signature = (
+                    snapshot.get("status"),
+                    snapshot.get("step"),
+                    snapshot.get("progress"),
+                    snapshot.get("last_event_at"),
+                )
+                if signature != last_signature:
+                    yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                    last_signature = signature
+                if snapshot.get("status") in {"succeeded", "failed"}:
+                    break
+                time.sleep(1.0)
+
+        response = Response(stream_with_context(_event_stream()), mimetype="text/event-stream")
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["X-Accel-Buffering"] = "no"
+        return response
 
     @app.post("/api/reindex")
     def reindex():

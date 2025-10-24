@@ -13,6 +13,7 @@ from llm_client import (
     build_responses_payload,
     generate,
     sanitize_payload_for_responses,
+    reset_http_client_cache,
 )
 
 
@@ -88,6 +89,13 @@ def _force_api_key(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     yield
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_http_clients():
+    reset_http_client_cache()
+    yield
+    reset_http_client_cache()
 
 
 def test_build_responses_payload_for_gpt5_includes_required_fields():

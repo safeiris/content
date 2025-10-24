@@ -1,10 +1,9 @@
-from deterministic_pipeline import (
-    DeterministicPipeline,
-    SkeletonBatchKind,
-    SkeletonBatchPlan,
-)
-from config import LLM_ROUTE
+import itertools
+import json
+
+from deterministic_pipeline import DeterministicPipeline, PipelineStep
 from llm_client import GenerationResult
+from validators import ValidationResult
 
 
 def make_pipeline() -> DeterministicPipeline:
@@ -12,41 +11,44 @@ def make_pipeline() -> DeterministicPipeline:
         topic="Тест",
         base_outline=["Введение", "Основная часть", "Вывод"],
         required_keywords=[],
-        min_chars=1000,
-        max_chars=2000,
-        messages=[{"role": "system", "content": "Ты модель"}],
+        min_chars=2800,
+        max_chars=3600,
+        messages=[{"role": "system", "content": "Системный промпт"}],
         model="stub-model",
-        max_tokens=500,
+        max_tokens=1800,
         timeout_s=30,
+        faq_questions=5,
     )
 
 
-def test_extract_response_json_tolerates_wrapped_payload():
+def test_section_budget_target_close_to_goal():
     pipeline = make_pipeline()
-    raw = "<response_json>{\"intro\": \"text\", \"main\": []}</response_json> trailing"
-    assert pipeline._extract_response_json(raw) == {"intro": "text", "main": []}
+    total_target = sum(item.target_chars for item in pipeline.section_budgets)
+    assert pipeline.min_chars <= total_target <= pipeline.max_chars
+    target_total = min(pipeline.max_chars, max(pipeline.min_chars, 6000))
+    assert abs(total_target - target_total) <= 400
+    assert pipeline.section_budgets[0].title == "Введение"
 
 
-def test_extract_response_json_with_leading_text():
+def test_pipeline_expands_short_draft(monkeypatch):
     pipeline = make_pipeline()
-    raw = "Ответ: {\"faq\": [{\"q\": \"Q?\", \"a\": \"A!\"}] }"
-    assert pipeline._extract_response_json(raw) == {"faq": [{"q": "Q?", "a": "A!"}]}
 
+    def fake_validate(self, text):
+        return ValidationResult(True, True, True, True, True, stats={"chars": len(text)})
 
-def test_build_batch_placeholder_provides_payload():
-    pipeline = make_pipeline()
-    outline = pipeline._prepare_outline()
-    batch = SkeletonBatchPlan(kind=SkeletonBatchKind.MAIN, indices=[0, 1], label="main[1-2]")
-    placeholder = pipeline._build_batch_placeholder(
-        batch,
-        outline=outline,
-        target_indices=[0, 1],
+    monkeypatch.setattr("deterministic_pipeline.DeterministicPipeline._validate", fake_validate)
+    monkeypatch.setattr(
+        "deterministic_pipeline.validate_article",
+        lambda *args, **kwargs: ValidationResult(True, True, True, True, True),
     )
-    assert pipeline._batch_has_payload(SkeletonBatchKind.MAIN, placeholder)
 
-
-def test_run_skeleton_uses_placeholder_when_cap(monkeypatch):
-    pipeline = make_pipeline()
+    responses = itertools.cycle(
+        [
+            "Короткий черновик без достаточной длины.",
+            "Дополнительный блок, который расширяет текст и добавляет детали.",
+            "Финальный вариант текста с достаточной длиной и структурой.",
+        ]
+    )
 
     def fake_call(
         self,
@@ -54,37 +56,45 @@ def test_run_skeleton_uses_placeholder_when_cap(monkeypatch):
         step,
         messages,
         max_tokens=None,
+        allow_incomplete=False,
         previous_response_id=None,
         responses_format=None,
-        allow_incomplete=False,
     ):
+        text = next(responses)
+        payload = {
+            "intro": text,
+            "main_headers": [
+                "Введение",
+                "Аналитика",
+                "Решения",
+            ],
+            "sections": [
+                {"title": "Введение", "body": text},
+                {"title": "Аналитика", "body": text},
+                {"title": "Решения", "body": text},
+            ],
+            "faq": [
+                {
+                    "q": f"Вопрос {idx}",
+                    "a": f"Ответ {idx}. Подробное пояснение с примерами и выводами.",
+                }
+                for idx in range(1, 6)
+            ],
+            "conclusion": text,
+            "conclusion_heading": "Вывод",
+        }
         return GenerationResult(
-            text="",
+            text=json.dumps(payload, ensure_ascii=False),
             model_used="stub-model",
             retry_used=False,
             fallback_used=None,
-            fallback_reason=None,
-            api_route=LLM_ROUTE,
-            schema="json",
-            metadata={"status": "incomplete", "incomplete_reason": "max_output_tokens"},
+            metadata={"usage_output_tokens": 512 if step is PipelineStep.SKELETON else 128},
         )
 
     monkeypatch.setattr("deterministic_pipeline.DeterministicPipeline._call_llm", fake_call)
-    monkeypatch.setattr(
-        "deterministic_pipeline.DeterministicPipeline._run_fallback_batch",
-        lambda *args, **kwargs: (None, None),
-    )
-    monkeypatch.setattr(
-        "deterministic_pipeline.DeterministicPipeline._run_cap_fallback_batch",
-        lambda *args, **kwargs: (None, None),
-    )
-    monkeypatch.setattr(
-        "deterministic_pipeline.DeterministicPipeline._render_skeleton_markdown",
-        lambda self, payload: ("", {"outline": []}),
-    )
 
-    pipeline._run_skeleton()
-    payload = pipeline.skeleton_payload
-    assert payload["intro"]
-    assert all(section for section in payload["main"])
-    assert payload["conclusion"]
+    state = pipeline.run()
+    assert pipeline.checkpoints[PipelineStep.SKELETON]
+    assert pipeline.checkpoints[PipelineStep.TRIM]
+    assert state.validation.is_valid
+    assert state.logs[-1].step is PipelineStep.TRIM
