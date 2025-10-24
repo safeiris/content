@@ -480,12 +480,12 @@ class DeterministicPipeline:
         start_max = max(600, start_max)
         requires_chunking = bool(cap is not None and predicted > cap)
         LOGGER.info(
-            "SKELETON_ESTIMATE predicted=%d start_max=%d cap=%s",
+            "SKELETON_ESTIMATE predicted=%d start_max=%d cap=%s → resolved max_output_tokens=%d",
             predicted,
             start_max,
             cap if cap is not None else "-",
+            start_max,
         )
-        LOGGER.info("resolved max_output_tokens=%d", start_max)
         return SkeletonVolumeEstimate(
             predicted_tokens=predicted,
             start_max_tokens=start_max,
@@ -701,6 +701,7 @@ class DeterministicPipeline:
         item_count: int,
     ) -> Dict[str, object]:
         if batch.kind == SkeletonBatchKind.INTRO:
+            main_count = max(0, len(outline.main_headings))
             schema = {
                 "type": "object",
                 "properties": {
@@ -708,7 +709,7 @@ class DeterministicPipeline:
                     "main_headers": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "minItems": len(outline.main_headings),
+                        "minItems": main_count,
                     },
                     "conclusion_heading": {"type": "string"},
                 },
@@ -716,7 +717,7 @@ class DeterministicPipeline:
                 "additionalProperties": False,
             }
         elif batch.kind == SkeletonBatchKind.MAIN:
-            min_items = 1 if item_count > 0 else 0
+            min_items = max(0, int(item_count))
             schema = {
                 "type": "object",
                 "properties": {
@@ -738,7 +739,7 @@ class DeterministicPipeline:
                 "additionalProperties": False,
             }
         elif batch.kind == SkeletonBatchKind.FAQ:
-            min_items = 1 if item_count > 0 else 0
+            min_items = max(0, int(item_count))
             schema = {
                 "type": "object",
                 "properties": {
@@ -772,12 +773,89 @@ class DeterministicPipeline:
             SkeletonBatchKind.FAQ: "seo_article_faq_batch",
             SkeletonBatchKind.CONCLUSION: "seo_article_conclusion_batch",
         }
-        return {
+        format_block = {
             "type": "json_schema",
             "name": name_map.get(batch.kind, "seo_article_skeleton_batch"),
             "schema": schema,
             "strict": True,
         }
+        return self._prepare_format_block(format_block, batch=batch)
+
+    def _prepare_format_block(
+        self,
+        format_block: Dict[str, object],
+        *,
+        batch: SkeletonBatchPlan,
+    ) -> Dict[str, object]:
+        fmt_type = str(format_block.get("type") or "").lower()
+        if fmt_type == "json_schema":
+            schema = format_block.get("schema")
+            if not isinstance(schema, dict):
+                raise PipelineStepError(
+                    PipelineStep.SKELETON,
+                    "Некорректная схема ответа для батча скелета.",
+                )
+            self._enforce_schema_defaults(schema)
+        format_name = str(format_block.get("name") or "")
+        if (
+            batch.kind != SkeletonBatchKind.INTRO
+            and format_name.strip() == "seo_article_skeleton"
+        ):
+            LOGGER.error(
+                "FORMAT_GUARD triggered kind=%s label=%s name=%s",
+                batch.kind.value,
+                batch.label or self._format_batch_label(batch.kind, batch.indices),
+                format_name,
+            )
+            raise PipelineStepError(
+                PipelineStep.SKELETON,
+                "Недопустимое имя формата для батча скелета.",
+            )
+        return format_block
+
+    def _enforce_schema_defaults(self, schema: Dict[str, object], path: str = "$") -> None:
+        if not isinstance(schema, dict):
+            raise PipelineStepError(
+                PipelineStep.SKELETON,
+                f"Невалидная структура схемы по пути {path}.",
+            )
+        node_type = str(schema.get("type") or "")
+        if node_type == "object":
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                if "additionalProperties" not in schema:
+                    schema["additionalProperties"] = False
+                required = schema.get("required")
+                if isinstance(required, list):
+                    missing = [
+                        str(field)
+                        for field in required
+                        if field not in properties
+                    ]
+                    if missing:
+                        missing_fields = ", ".join(sorted(missing))
+                        raise PipelineStepError(
+                            PipelineStep.SKELETON,
+                            f"Схема {path} содержит обязательные поля без описания: {missing_fields}",
+                        )
+                for key, value in properties.items():
+                    if isinstance(value, dict):
+                        self._enforce_schema_defaults(value, f"{path}.{key}")
+            else:
+                schema.setdefault("properties", {})
+                schema.setdefault("additionalProperties", False)
+        if node_type == "array":
+            items = schema.get("items")
+            if isinstance(items, dict):
+                self._enforce_schema_defaults(items, f"{path}[]")
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            collection = schema.get(keyword)
+            if isinstance(collection, list):
+                for index, value in enumerate(collection):
+                    if isinstance(value, dict):
+                        self._enforce_schema_defaults(
+                            value, f"{path}.{keyword}[{index}]"
+                        )
 
     def _extract_response_json(self, raw_text: str) -> Optional[object]:
         candidate = (raw_text or "").strip()
@@ -1221,99 +1299,110 @@ class DeterministicPipeline:
         previous_id = self._metadata_response_id(metadata)
         if not previous_id:
             return
-        tail_plan = SkeletonBatchPlan(
-            kind=batch.kind,
-            indices=list(pending),
-            label=batch.label + "#tail",
-            tail_fill=True,
-        )
-        messages, format_block = self._build_batch_messages(
-            tail_plan,
-            outline=outline,
-            assembly=assembly,
-            target_indices=list(pending),
-            tail_fill=True,
-        )
-        budget = self._batch_token_budget(batch, estimate, len(pending))
-        max_tokens = max(400, min(budget, TAIL_FILL_MAX_TOKENS, 800))
-        LOGGER.info(
-            "TAIL_FILL missing=%d items=%s max_tokens=%d",
-            len(pending),
-            ",".join(str(item + 1) for item in pending),
-            max_tokens,
-        )
-        attempts = 0
-        payload: Optional[object] = None
-        tail_metadata: Dict[str, object] = {}
-        current_limit = max_tokens
-        result: Optional[GenerationResult] = None
-        while attempts < 3:
-            attempts += 1
-            result = self._call_llm(
-                step=PipelineStep.SKELETON,
-                messages=messages,
-                max_tokens=current_limit,
-                previous_response_id=previous_id,
-                responses_format=format_block,
-                allow_incomplete=True,
-            )
-            tail_metadata = result.metadata or {}
-            payload = self._extract_response_json(result.text)
-            status = str(tail_metadata.get("status") or "")
-            reason = str(tail_metadata.get("incomplete_reason") or "")
-            is_incomplete = status.lower() == "incomplete" or bool(reason)
-            if not is_incomplete or self._batch_has_payload(batch.kind, payload):
-                break
-            current_limit = max(200, int(current_limit * 0.85))
-        if result is None:
-            raise PipelineStepError(PipelineStep.SKELETON, "Сбой tail-fill: модель не ответила.")
-        if batch.kind == SkeletonBatchKind.MAIN:
-            normalized, missing = self._normalize_main_batch(payload, list(pending), outline)
-            for index, heading, body in normalized:
-                assembly.apply_main(index, body, heading=heading)
-            if missing:
-                raise PipelineStepError(
-                    PipelineStep.SKELETON,
-                    "Не удалось достроить все разделы основной части.",
-                )
-        elif batch.kind == SkeletonBatchKind.FAQ:
-            normalized, missing = self._normalize_faq_batch(payload, list(pending))
-            for _, question, answer in normalized:
-                assembly.apply_faq(question, answer)
-            if missing:
-                raise PipelineStepError(
-                    PipelineStep.SKELETON,
-                    "Не удалось достроить все элементы FAQ.",
-                )
-        elif batch.kind == SkeletonBatchKind.INTRO:
-            normalized, missing_fields = self._normalize_intro_batch(payload, outline)
-            if normalized.get("intro"):
-                headers = normalized.get("main_headers") or []
-                if len(headers) < len(outline.main_headings):
-                    headers = headers + outline.main_headings[len(headers) :]
-                assembly.apply_intro(
-                    normalized.get("intro"),
-                    headers,
-                    normalized.get("conclusion_heading"),
-                )
-            if missing_fields:
-                raise PipelineStepError(
-                    PipelineStep.SKELETON,
-                    "Не удалось завершить вводный блок скелета.",
-                )
+        if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
+            groups = [[index] for index in pending]
         else:
-            conclusion_text, missing = self._normalize_conclusion_batch(payload)
-            if conclusion_text:
-                assembly.apply_conclusion(conclusion_text)
-            if missing:
+            groups = [list(pending)]
+
+        for group in groups:
+            if not group:
+                continue
+            tail_plan = SkeletonBatchPlan(
+                kind=batch.kind,
+                indices=list(group),
+                label=batch.label + "#tail",
+                tail_fill=True,
+            )
+            messages, format_block = self._build_batch_messages(
+                tail_plan,
+                outline=outline,
+                assembly=assembly,
+                target_indices=list(group),
+                tail_fill=True,
+            )
+            budget = self._batch_token_budget(batch, estimate, len(group))
+            max_tokens = max(400, min(budget, TAIL_FILL_MAX_TOKENS, 800))
+            LOGGER.info(
+                "TAIL_FILL missing=%d items=%s max_tokens=%d",
+                len(group),
+                ",".join(str(item + 1) for item in group),
+                max_tokens,
+            )
+            attempts = 0
+            payload: Optional[object] = None
+            tail_metadata: Dict[str, object] = {}
+            current_limit = max_tokens
+            result: Optional[GenerationResult] = None
+            while attempts < 3:
+                attempts += 1
+                result = self._call_llm(
+                    step=PipelineStep.SKELETON,
+                    messages=messages,
+                    max_tokens=current_limit,
+                    previous_response_id=previous_id,
+                    responses_format=format_block,
+                    allow_incomplete=True,
+                )
+                tail_metadata = result.metadata or {}
+                payload = self._extract_response_json(result.text)
+                status = str(tail_metadata.get("status") or "")
+                reason = str(tail_metadata.get("incomplete_reason") or "")
+                is_incomplete = status.lower() == "incomplete" or bool(reason)
+                if not is_incomplete or self._batch_has_payload(batch.kind, payload):
+                    break
+                current_limit = max(200, int(current_limit * 0.85))
+            if result is None:
                 raise PipelineStepError(
                     PipelineStep.SKELETON,
-                    "Не удалось завершить вывод скелета.",
+                    "Сбой tail-fill: модель не ответила.",
                 )
-        self._apply_inline_faq(payload, assembly)
-        for key, value in tail_metadata.items():
-            if value:
-                metadata[key] = value
+            if batch.kind == SkeletonBatchKind.MAIN:
+                normalized, missing = self._normalize_main_batch(payload, list(group), outline)
+                for index, heading, body in normalized:
+                    assembly.apply_main(index, body, heading=heading)
+                if missing:
+                    raise PipelineStepError(
+                        PipelineStep.SKELETON,
+                        "Не удалось достроить все разделы основной части.",
+                    )
+            elif batch.kind == SkeletonBatchKind.FAQ:
+                normalized, missing = self._normalize_faq_batch(payload, list(group))
+                for _, question, answer in normalized:
+                    assembly.apply_faq(question, answer)
+                if missing:
+                    raise PipelineStepError(
+                        PipelineStep.SKELETON,
+                        "Не удалось достроить все элементы FAQ.",
+                    )
+            elif batch.kind == SkeletonBatchKind.INTRO:
+                normalized, missing_fields = self._normalize_intro_batch(payload, outline)
+                if normalized.get("intro"):
+                    headers = normalized.get("main_headers") or []
+                    if len(headers) < len(outline.main_headings):
+                        headers = headers + outline.main_headings[len(headers) :]
+                    assembly.apply_intro(
+                        normalized.get("intro"),
+                        headers,
+                        normalized.get("conclusion_heading"),
+                    )
+                if missing_fields:
+                    raise PipelineStepError(
+                        PipelineStep.SKELETON,
+                        "Не удалось завершить вводный блок скелета.",
+                    )
+            else:
+                conclusion_text, missing = self._normalize_conclusion_batch(payload)
+                if conclusion_text:
+                    assembly.apply_conclusion(conclusion_text)
+                if missing:
+                    raise PipelineStepError(
+                        PipelineStep.SKELETON,
+                        "Не удалось завершить вывод скелета.",
+                    )
+            self._apply_inline_faq(payload, assembly)
+            for key, value in tail_metadata.items():
+                if value:
+                    metadata[key] = value
 
     def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
         if not isinstance(payload, dict):
@@ -1546,7 +1635,6 @@ class DeterministicPipeline:
         for plan in pending_batches:
             if plan.kind == SkeletonBatchKind.MAIN:
                 scheduled_main_indices.update(plan.indices)
-        first_request = True
         split_serial = 0
 
         while pending_batches:
@@ -1555,6 +1643,7 @@ class DeterministicPipeline:
                 batch.label = self._format_batch_label(batch.kind, batch.indices)
             active_indices = list(batch.indices)
             limit_override: Optional[int] = None
+            override_to_cap = False
             retries = 0
             consecutive_empty_incomplete = 0
             payload_obj: Optional[object] = None
@@ -1563,6 +1652,7 @@ class DeterministicPipeline:
             last_max_tokens = estimate.start_max_tokens
             continuation_id: Optional[str] = None
             batch_partial = False
+            first_attempt_for_batch = True
 
             while True:
                 messages, format_block = self._build_batch_messages(
@@ -1573,11 +1663,17 @@ class DeterministicPipeline:
                     tail_fill=batch.tail_fill,
                 )
                 base_budget = self._batch_token_budget(batch, estimate, len(active_indices) or 1)
-                max_tokens_to_use = estimate.start_max_tokens if first_request else base_budget
+                if first_attempt_for_batch:
+                    max_tokens_to_use = estimate.start_max_tokens
+                else:
+                    max_tokens_to_use = base_budget
                 if limit_override is not None:
-                    max_tokens_to_use = min(max_tokens_to_use, limit_override)
+                    if override_to_cap:
+                        max_tokens_to_use = max(max_tokens_to_use, limit_override)
+                    else:
+                        max_tokens_to_use = min(max_tokens_to_use, limit_override)
                 last_max_tokens = max_tokens_to_use
-                first_request = False
+                first_attempt_for_batch = False
                 request_prev_id = continuation_id or ""
                 result = self._call_llm(
                     step=PipelineStep.SKELETON,
@@ -1624,6 +1720,8 @@ class DeterministicPipeline:
                     self._can_split_batch(batch.kind, active_indices)
                     and len(active_indices) > 1
                     and consecutive_empty_incomplete >= 2
+                    and reason_lower == "max_output_tokens"
+                    and parse_none_count >= 2
                 )
                 if should_autosplit:
                     keep, remainder = self._split_batch_indices(active_indices)
@@ -1654,8 +1752,10 @@ class DeterministicPipeline:
                     batch.indices = list(keep)
                     batch.label = self._format_batch_label(batch.kind, keep)
                     limit_override = None
+                    override_to_cap = False
                     retries = 0
                     consecutive_empty_incomplete = 0
+                    first_attempt_for_batch = True
                     if metadata_prev_id:
                         parse_none_streaks.pop(metadata_prev_id, None)
                     continue
@@ -1702,7 +1802,16 @@ class DeterministicPipeline:
                         reason or "",
                     )
                     break
-                limit_override = max(200, int(last_max_tokens * 0.85))
+                if reason_lower == "max_output_tokens":
+                    cap_limit = estimate.cap_tokens or estimate.start_max_tokens
+                    if cap_limit and cap_limit > 0:
+                        limit_override = cap_limit
+                    else:
+                        limit_override = estimate.start_max_tokens
+                    override_to_cap = True
+                else:
+                    limit_override = max(200, int(last_max_tokens * 0.85))
+                    override_to_cap = False
 
             target_indices = list(active_indices)
 
