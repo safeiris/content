@@ -405,14 +405,40 @@ def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> 
     return {"markdown": markdown_path, "metadata": metadata_path}
 
 
-def _extract_keywords(data: Dict[str, Any]) -> List[str]:
+def _extract_keywords(data: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     raw_keywords = data.get("keywords") or []
-    keywords: List[str] = []
-    if isinstance(raw_keywords, list):
-        keywords = [str(item).strip() for item in raw_keywords if str(item).strip()]
+    required: List[str] = []
+    preferred: List[str] = []
+    if isinstance(raw_keywords, dict):
+        raw_required = raw_keywords.get("required", [])
+        raw_preferred = raw_keywords.get("preferred", [])
+        if isinstance(raw_required, (list, tuple, set)):
+            required = [str(item).strip() for item in raw_required if str(item).strip()]
+        elif isinstance(raw_required, str):
+            required = [item.strip() for item in raw_required.split(",") if item.strip()]
+        if isinstance(raw_preferred, (list, tuple, set)):
+            preferred = [str(item).strip() for item in raw_preferred if str(item).strip()]
+        elif isinstance(raw_preferred, str):
+            preferred = [item.strip() for item in raw_preferred.split(",") if item.strip()]
+    elif isinstance(raw_keywords, list):
+        required = [str(item).strip() for item in raw_keywords if str(item).strip()]
     elif isinstance(raw_keywords, str):
-        keywords = [item.strip() for item in raw_keywords.split(",") if item.strip()]
-    return keywords
+        required = [item.strip() for item in raw_keywords.split(",") if item.strip()]
+
+    normalized_required: List[str] = []
+    seen = set()
+    for term in required:
+        if term not in seen:
+            normalized_required.append(term)
+            seen.add(term)
+
+    normalized_preferred: List[str] = []
+    for term in preferred:
+        if term and term not in seen:
+            normalized_preferred.append(term)
+            seen.add(term)
+
+    return normalized_required, normalized_preferred
 
 
 def _prepare_outline(data: Dict[str, Any]) -> List[str]:
@@ -462,7 +488,7 @@ def _generate_variant(
     min_chars = length_limits.min_chars
     max_chars = length_limits.max_chars
 
-    keywords_required = _extract_keywords(prepared_data)
+    keywords_required, keywords_preferred = _extract_keywords(prepared_data)
     outline = _prepare_outline(prepared_data)
     topic = str(prepared_data.get("theme") or payload.get("theme") or theme).strip() or theme
 
@@ -473,7 +499,8 @@ def _generate_variant(
     pipeline = DeterministicPipeline(
         topic=topic,
         base_outline=outline,
-        keywords=keywords_required,
+        required_keywords=keywords_required,
+        preferred_keywords=keywords_preferred,
         min_chars=min_chars,
         max_chars=max_chars,
         messages=generation_context.messages,

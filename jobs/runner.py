@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 import uuid
@@ -248,9 +249,23 @@ class JobRunner:
                 error="empty_markdown",
             )
         refined = ctx.markdown.strip()
-        if refined != ctx.markdown:
-            ctx.markdown = refined
-        return StepResult(JobStepStatus.SUCCEEDED, payload={"chars": len(refined)})
+        passes = []
+
+        # Pass 1: stylistic cleanup
+        cleaned = "\n".join(line.rstrip() for line in refined.splitlines())
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        passes.append("style")
+
+        # Pass 2: light SEO polish (placeholder for future LLM call)
+        polished = re.sub(r"\s{2,}", " ", cleaned)
+        passes.append("seo")
+
+        final_text = polished.strip()
+        ctx.markdown = final_text
+        return StepResult(
+            JobStepStatus.SUCCEEDED,
+            payload={"chars": len(final_text), "passes": passes},
+        )
 
     def _run_jsonld_step(self, ctx: PipelineContext) -> StepResult:
         raw_jsonld = None

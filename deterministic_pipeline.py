@@ -23,10 +23,12 @@ from config import (
 from llm_client import GenerationResult, generate as llm_generate
 from faq_builder import _normalize_entry
 from keyword_injector import (
+    KeywordCoverage,
     KeywordInjectionResult,
     LOCK_END,
     LOCK_START_TEMPLATE,
     build_term_pattern,
+    evaluate_keyword_coverage,
     inject_keywords,
 )
 from length_controller import ensure_article_length
@@ -46,6 +48,8 @@ LOGGER = logging.getLogger("content_factory.pipeline")
 
 FAQ_START = "<!--FAQ_START-->"
 FAQ_END = "<!--FAQ_END-->"
+
+_JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">.*?</script>", re.DOTALL)
 
 _TEMPLATE_SNIPPETS = [
     "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
@@ -224,7 +228,8 @@ class DeterministicPipeline:
         *,
         topic: str,
         base_outline: Sequence[str],
-        keywords: Iterable[str],
+        required_keywords: Iterable[str],
+        preferred_keywords: Optional[Iterable[str]] = None,
         min_chars: int,
         max_chars: int,
         messages: Sequence[Dict[str, object]],
@@ -241,8 +246,27 @@ class DeterministicPipeline:
 
         self.topic = topic.strip() or "Тема"
         self.base_outline = list(base_outline) if base_outline else ["Введение", "Основная часть", "Вывод"]
-        self.keywords = [str(term).strip() for term in keywords if str(term).strip()]
-        self.normalized_keywords = [term for term in self.keywords if term]
+        required_clean = [str(term).strip() for term in required_keywords if str(term).strip()]
+        preferred_clean = [
+            str(term).strip()
+            for term in (preferred_keywords or [])
+            if str(term).strip()
+        ]
+        seen_terms: set[str] = set()
+        self.required_keywords: List[str] = []
+        for term in required_clean:
+            if term not in seen_terms:
+                self.required_keywords.append(term)
+                seen_terms.add(term)
+        self.preferred_keywords: List[str] = []
+        for term in preferred_clean:
+            if term not in seen_terms:
+                self.preferred_keywords.append(term)
+                seen_terms.add(term)
+        self.keywords = list(self.required_keywords + self.preferred_keywords)
+        self.normalized_keywords = list(self.keywords)
+        self.normalized_required_keywords = list(self.required_keywords)
+        self.normalized_preferred_keywords = list(self.preferred_keywords)
         self.min_chars = int(min_chars)
         self.max_chars = int(max_chars)
         self.messages = [dict(message) for message in messages]
@@ -268,6 +292,7 @@ class DeterministicPipeline:
         self.skeleton_payload: Optional[Dict[str, object]] = None
         self._skeleton_faq_entries: List[Dict[str, str]] = []
         self.keywords_coverage_percent: float = 0.0
+        self.keywords_required_coverage_percent: float = 0.0
 
         self._model_used: Optional[str] = None
         self._fallback_used: Optional[str] = None
@@ -1121,6 +1146,7 @@ class DeterministicPipeline:
 
         lines: List[str] = list(general_lines)
         if batch.kind == SkeletonBatchKind.INTRO:
+            lines.append("На вводный абзац выделен лимит до 450 слов — не превышай его.")
             lines.extend(
                 [
                     "Сформируй вводный абзац без приветствий и уточни заголовки основных разделов.",
@@ -1149,6 +1175,9 @@ class DeterministicPipeline:
                     + "; ".join(already_ready)
                     + "."
                 )
+            lines.append(
+                "Каждый раздел держи в рамках до четырёх абзацев по 3–4 предложения — без лишней воды."
+            )
             lines.extend(
                 [
                     "Каждый раздел — 3–5 абзацев по 3–4 предложения, с примерами, рисками и расчётами.",
@@ -1162,6 +1191,7 @@ class DeterministicPipeline:
             lines.append(
                 "Подготовь новые элементы FAQ с практичными ответами (минимум два предложения каждый)."
             )
+            lines.append("Каждый ответ — максимум 2–3 предложения, избегай повторов.")
             lines.append(
                 "Верни JSON {\"faq\": [{\"q\": str, \"a\": str}, ...]} в количестве, равном запросу."
             )
@@ -1171,6 +1201,7 @@ class DeterministicPipeline:
             if tail_fill:
                 lines.append("Добавь только недостающие вопросы и ответы.")
         else:
+            lines.append("Заключение ограничь объёмом до 180 слов.")
             lines.extend(
                 [
                     "Сделай связный вывод и обозначь план действий, ссылаясь на ключевые идеи статьи.",
@@ -2116,16 +2147,113 @@ class DeterministicPipeline:
 
     def _sync_locked_terms(self, text: str) -> None:
         pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
-        self.locked_terms = pattern.findall(text)
-        if self.normalized_keywords:
-            article = strip_jsonld(text)
-            found = 0
-            for term in self.normalized_keywords:
-                lock_token = LOCK_START_TEMPLATE.format(term=term)
-                lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-                if lock_pattern.search(text) and build_term_pattern(term).search(article):
-                    found += 1
-            self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
+        discovered = pattern.findall(text)
+        seen: set[str] = set()
+        self.locked_terms = []
+        for term in discovered:
+            if term and term not in seen:
+                self.locked_terms.append(term)
+                seen.add(term)
+        coverage: KeywordCoverage = evaluate_keyword_coverage(
+            text,
+            self.required_keywords,
+            preferred=self.preferred_keywords,
+        )
+        self.keywords_required_coverage_percent = coverage.required_percent
+        self.keywords_coverage_percent = coverage.overall_percent
+
+
+    @staticmethod
+    def _split_jsonld_block(text: str) -> Tuple[str, str]:
+        match = _JSONLD_PATTERN.search(text)
+        if not match:
+            return text, ""
+        jsonld = match.group(0).strip()
+        before = text[: match.start()].rstrip()
+        after = text[match.end() :].lstrip()
+        article = before
+        if after:
+            article = f"{article}\n\n{after}" if article else after
+        return article, jsonld
+
+    @staticmethod
+    def _is_intro_heading(title: str) -> bool:
+        normalized = title.strip().lower()
+        return normalized in {"введение", "вступление", "introduction", "intro"}
+
+    @staticmethod
+    def _is_conclusion_heading(title: str) -> bool:
+        normalized = title.strip().lower()
+        return normalized in {"заключение", "вывод", "итоги", "заключение и рекомендации"}
+
+    @staticmethod
+    def _inject_sentence_into_paragraph(body: str, sentence: str, *, tail: bool) -> str:
+        paragraphs = [segment for segment in re.split(r"\n\s*\n", body.strip()) if segment.strip()]
+        if not paragraphs:
+            return body
+        index = -1 if tail else 0
+        target = paragraphs[index].rstrip()
+        separator = " " if target.endswith(tuple(".!?")) else ". "
+        paragraphs[index] = target + separator + sentence.strip()
+        return "\n\n".join(paragraphs)
+
+    @staticmethod
+    def _compose_reinforcement_sentence(terms: Sequence[str], *, intro: bool) -> str:
+        if not terms:
+            return ""
+        if len(terms) == 1:
+            base = terms[0]
+            if intro:
+                return f"Отдельно подчёркиваем {base} — это помогает задать нужный контекст."
+            return f"Дополнительно фиксируем {base}, чтобы итоговый вывод оставался конкретным."
+        head = ", ".join(terms[:-1])
+        last = terms[-1]
+        joined = f"{head} и {last}" if head else last
+        if intro:
+            return (
+                f"Также отмечаем {joined} — эти акценты помогают читателю сразу увидеть ключевые ориентиры."
+            )
+        return f"В финале напоминаем про {joined}, чтобы сохранить целостность аргументации."
+
+    def _reinforce_keywords(self, text: str, missing_terms: Sequence[str]) -> str:
+        if not missing_terms:
+            return text
+        article, jsonld = self._split_jsonld_block(text)
+        if not article.strip():
+            return text
+        terms = [term for term in missing_terms if term]
+        if not terms:
+            return text
+        midpoint = (len(terms) + 1) // 2
+        intro_terms = terms[:midpoint]
+        conclusion_terms = terms[midpoint:]
+
+        pattern = re.compile(
+            r"(?P<header>##\s+(?P<title>[^\n]+))\n(?P<body>.*?)(?=\n##\s+|\Z)",
+            re.DOTALL,
+        )
+
+        def _replace(match: re.Match[str]) -> str:
+            header = match.group("header")
+            title = match.group("title")
+            body = match.group("body")
+            if self._is_intro_heading(title) and intro_terms:
+                sentence = self._compose_reinforcement_sentence(intro_terms, intro=True)
+                updated_body = self._inject_sentence_into_paragraph(body, sentence, tail=False)
+                return f"{header}\n{updated_body}"
+            if self._is_conclusion_heading(title) and conclusion_terms:
+                sentence = self._compose_reinforcement_sentence(conclusion_terms, intro=False)
+                updated_body = self._inject_sentence_into_paragraph(body, sentence, tail=True)
+                return f"{header}\n{updated_body}"
+            return match.group(0)
+
+        updated_article = pattern.sub(_replace, article)
+        if updated_article == article:
+            return text
+        updated_article = updated_article.rstrip() + "\n"
+        if jsonld:
+            return f"{updated_article}\n{jsonld}\n"
+        return updated_article
 
     # ------------------------------------------------------------------
     # Step implementations
@@ -2608,29 +2736,42 @@ class DeterministicPipeline:
 
     def _run_keywords(self, text: str) -> KeywordInjectionResult:
         self._log(PipelineStep.KEYWORDS, "running")
-        result = inject_keywords(text, self.keywords)
-        self.locked_terms = list(result.locked_terms)
-        self.keywords_coverage_percent = result.coverage_percent
-        total = result.total_terms
-        found = result.found_terms
-        missing = sorted(result.missing_terms)
-        LOGGER.info(
-            "KEYWORDS_COVERAGE=%.0f%% missing=%s",
-            result.coverage_percent,
-            ",".join(missing) if missing else "-",
+        result = inject_keywords(
+            text,
+            self.required_keywords,
+            preferred=self.preferred_keywords,
         )
-        if total and found < total:
+        self.locked_terms = list(result.locked_terms)
+        self.keywords_required_coverage_percent = result.coverage_percent
+        self.keywords_coverage_percent = result.overall_coverage_percent
+        missing_required = sorted(result.missing_terms)
+        missing_preferred = sorted(result.missing_preferred)
+        LOGGER.info(
+            "KEYWORDS_COVERAGE required=%.0f%% overall=%.0f%% missing_required=%s missing_preferred=%s",
+            result.coverage_percent,
+            result.overall_coverage_percent,
+            ",".join(missing_required) if missing_required else "-",
+            ",".join(missing_preferred) if missing_preferred else "-",
+        )
+        if missing_required:
             raise PipelineStepError(
                 PipelineStep.KEYWORDS,
-                "Не удалось обеспечить 100% покрытие ключей: " + ", ".join(missing),
+                "Не удалось обеспечить 100% покрытие обязательных ключей: "
+                + ", ".join(missing_required),
             )
-        LOGGER.info("KEYWORDS_OK coverage=%.2f%%", result.coverage_percent)
+        LOGGER.info(
+            "KEYWORDS_OK coverage_required=%.2f%% coverage_overall=%.2f%%",
+            result.coverage_percent,
+            result.overall_coverage_percent,
+        )
         self._update_log(
             PipelineStep.KEYWORDS,
             "ok",
             KEYWORDS_COVERAGE=result.coverage_report,
             KEYWORDS_COVERAGE_PERCENT=result.coverage_percent,
-            KEYWORDS_MISSING=missing,
+            KEYWORDS_COVERAGE_OVERALL=result.overall_coverage_percent,
+            KEYWORDS_MISSING=missing_required,
+            KEYWORDS_MISSING_PREFERRED=missing_preferred,
             inserted_section=result.inserted_section,
             **self._metrics(result.text),
         )
@@ -2793,6 +2934,8 @@ class DeterministicPipeline:
                 max_chars=target_max,
                 protected_blocks=self.locked_terms,
                 faq_expected=self.faq_target,
+                required_terms=self.required_keywords,
+                preferred_terms=self.preferred_keywords,
             )
         except TrimValidationError as exc:
             raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
@@ -2801,13 +2944,18 @@ class DeterministicPipeline:
         soft_min, soft_max, tolerance_below, tolerance_above = compute_soft_length_bounds(
             self.min_chars, self.max_chars
         )
-        strict_violation = current_length < self.min_chars or current_length > self.max_chars
+        effective_max = self.max_chars
         length_notes: Dict[str, object] = {}
+        if getattr(result, "length_relaxed", False):
+            effective_max = max(effective_max, int(result.relaxed_limit or self.max_chars))
+            length_notes["length_relaxed"] = True
+            length_notes["length_relaxed_limit"] = effective_max
+        strict_violation = current_length < self.min_chars or current_length > effective_max
         if strict_violation:
             controller = ensure_article_length(
                 result.text,
                 min_chars=self.min_chars,
-                max_chars=self.max_chars,
+                max_chars=effective_max,
                 protected_blocks=self.locked_terms,
                 faq_expected=self.faq_target,
                 exact_chars=self.min_chars if self.min_chars == self.max_chars else None,
@@ -2817,34 +2965,45 @@ class DeterministicPipeline:
                 length_notes["length_controller_iterations"] = controller.iterations
                 length_notes["length_controller_history"] = list(controller.history)
                 length_notes["length_controller_success"] = controller.success
-                result = TrimResult(text=controller.text, removed_paragraphs=result.removed_paragraphs)
+                result = TrimResult(
+                    text=controller.text,
+                    removed_paragraphs=result.removed_paragraphs,
+                    length_relaxed=getattr(result, "length_relaxed", False),
+                    relaxed_limit=getattr(result, "relaxed_limit", None),
+                )
                 current_length = controller.length
-                strict_violation = current_length < self.min_chars or current_length > self.max_chars
+                strict_violation = current_length < self.min_chars or current_length > effective_max
             if strict_violation:
                 LOGGER.warning(
                     "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
                     current_length,
                     self.min_chars,
-                    self.max_chars,
+                    effective_max,
                     soft_min,
                     soft_max,
                 )
-                length_notes["length_relaxed"] = True
+                length_notes.setdefault("length_relaxed", True)
                 length_notes["length_soft_min"] = soft_min
                 length_notes["length_soft_max"] = soft_max
                 length_notes["length_tolerance_below"] = tolerance_below
                 length_notes["length_tolerance_above"] = tolerance_above
                 if current_length < soft_min or current_length > soft_max:
-                    length_notes["length_controller_success"] = False
+                    controller_success = controller.success if controller.adjusted else False
+                    length_notes["length_controller_success"] = controller_success
                     length_notes["length_controller_reason"] = controller.failure_reason
                     fail_safe_article = self._build_fail_safe_article()
-                    result = TrimResult(text=fail_safe_article, removed_paragraphs=result.removed_paragraphs)
+                    result = TrimResult(
+                        text=fail_safe_article,
+                        removed_paragraphs=result.removed_paragraphs,
+                        length_relaxed=getattr(result, "length_relaxed", False),
+                        relaxed_limit=getattr(result, "relaxed_limit", None),
+                    )
                     current_length = length_no_spaces(result.text)
                     length_notes["length_controller_fallback"] = True
 
         missing_locks = [
             term
-            for term in self.normalized_keywords
+            for term in self.required_keywords
             if LOCK_START_TEMPLATE.format(term=term) not in result.text
         ]
         if missing_locks:
@@ -2852,6 +3011,71 @@ class DeterministicPipeline:
                 PipelineStep.TRIM,
                 "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing_locks)),
             )
+
+        coverage_post = evaluate_keyword_coverage(
+            result.text,
+            self.required_keywords,
+            preferred=self.preferred_keywords,
+        )
+        if coverage_post.missing_required:
+            raise PipelineStepError(
+                PipelineStep.TRIM,
+                "После тримминга отсутствуют обязательные ключевые слова: "
+                + ", ".join(sorted(coverage_post.missing_required)),
+            )
+
+        reinforcement_applied = False
+        if (
+            coverage_post.missing_preferred
+            and coverage_post.overall_percent < 100.0
+        ):
+            reinforced_text = self._reinforce_keywords(
+                result.text, coverage_post.missing_preferred
+            )
+            if reinforced_text != result.text:
+                reinforcement_applied = True
+                result = TrimResult(
+                    text=reinforced_text,
+                    removed_paragraphs=result.removed_paragraphs,
+                    length_relaxed=getattr(result, "length_relaxed", False),
+                    relaxed_limit=getattr(result, "relaxed_limit", None),
+                )
+                current_length = length_no_spaces(result.text)
+                coverage_post = evaluate_keyword_coverage(
+                    result.text,
+                    self.required_keywords,
+                    preferred=self.preferred_keywords,
+                )
+                if coverage_post.missing_required:
+                    raise PipelineStepError(
+                        PipelineStep.TRIM,
+                        "После дозаряда отсутствуют обязательные ключевые слова: "
+                        + ", ".join(sorted(coverage_post.missing_required)),
+                    )
+                if coverage_post.overall_percent < 100.0:
+                    raise PipelineStepError(
+                        PipelineStep.TRIM,
+                        "Не удалось восстановить покрытие ключевых слов до 100%.",
+                    )
+                missing_locks = [
+                    term
+                    for term in self.required_keywords
+                    if LOCK_START_TEMPLATE.format(term=term) not in result.text
+                ]
+                if missing_locks:
+                    raise PipelineStepError(
+                        PipelineStep.TRIM,
+                        "После дозаряда потеряны защищённые фразы: "
+                        + ", ".join(sorted(missing_locks)),
+                    )
+                if current_length > effective_max:
+                    length_notes.setdefault("length_relaxed", True)
+                    length_notes["length_relaxed_limit"] = effective_max
+
+        self.keywords_required_coverage_percent = coverage_post.required_percent
+        self.keywords_coverage_percent = coverage_post.overall_percent
+        if reinforcement_applied:
+            length_notes["keyword_reinforced"] = True
 
         faq_block = ""
         if self.faq_target > 0:
@@ -2874,6 +3098,8 @@ class DeterministicPipeline:
             removed=len(result.removed_paragraphs),
             **self._metrics(result.text),
             **length_notes,
+            KEYWORDS_COVERAGE_REQUIRED=self.keywords_required_coverage_percent,
+            KEYWORDS_COVERAGE_OVERALL=self.keywords_coverage_percent,
         )
         self.checkpoints[PipelineStep.TRIM] = result.text
         return result
@@ -2892,10 +3118,12 @@ class DeterministicPipeline:
         try:
             validation = validate_article(
                 combined_text,
-                keywords=self.keywords,
+                required_keywords=self.required_keywords,
+                preferred_keywords=self.preferred_keywords,
                 min_chars=self.min_chars,
                 max_chars=self.max_chars,
                 skeleton_payload=self.skeleton_payload,
+                keyword_required_coverage_percent=self.keywords_required_coverage_percent,
                 keyword_coverage_percent=self.keywords_coverage_percent,
                 faq_expected=self.faq_target,
             )
@@ -2953,10 +3181,12 @@ class DeterministicPipeline:
         try:
             validation = validate_article(
                 combined_text,
-                keywords=self.keywords,
+                required_keywords=self.required_keywords,
+                preferred_keywords=self.preferred_keywords,
                 min_chars=self.min_chars,
                 max_chars=self.max_chars,
                 skeleton_payload=self.skeleton_payload,
+                keyword_required_coverage_percent=self.keywords_required_coverage_percent,
                 keyword_coverage_percent=self.keywords_coverage_percent,
             )
         except ValidationError as exc:

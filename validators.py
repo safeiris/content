@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
 from length_limits import compute_soft_length_bounds
 from skeleton_utils import normalize_skeleton_payload
-from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
+from keyword_injector import LOCK_END, LOCK_START_TEMPLATE, evaluate_keyword_coverage
 
 _FAQ_START = "<!--FAQ_START-->"
 _FAQ_END = "<!--FAQ_END-->"
@@ -177,10 +177,12 @@ def _skeleton_status(
 def validate_article(
     text: str,
     *,
-    keywords: Iterable[str],
+    required_keywords: Iterable[str],
+    preferred_keywords: Optional[Iterable[str]] = None,
     min_chars: int,
     max_chars: int,
     skeleton_payload: Optional[Dict[str, object]] = None,
+    keyword_required_coverage_percent: Optional[float] = None,
     keyword_coverage_percent: Optional[float] = None,
     faq_expected: Optional[int] = None,
 ) -> ValidationResult:
@@ -198,10 +200,20 @@ def validate_article(
     )
     skeleton_ok, skeleton_message = _skeleton_status(normalized_skeleton, text)
 
-    normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
+    required_list = [str(term).strip() for term in required_keywords if str(term).strip()]
+    preferred_list = [
+        str(term).strip()
+        for term in (preferred_keywords or [])
+        if str(term).strip()
+    ]
+    coverage_info = evaluate_keyword_coverage(
+        text,
+        required_list,
+        preferred=preferred_list,
+    )
     missing: List[str] = []
     article = strip_jsonld(text)
-    for term in normalized_keywords:
+    for term in required_list:
         pattern = _keyword_regex(term)
         if not pattern.search(article):
             missing.append(term)
@@ -211,6 +223,12 @@ def validate_article(
         if not lock_pattern.search(text):
             missing.append(term)
     keywords_ok = len(missing) == 0
+
+    missing_preferred = [
+        term
+        for term in preferred_list
+        if not _keyword_regex(term).search(article)
+    ]
 
     target_faq = 5 if faq_expected is None else max(0, int(faq_expected))
     markdown_faq, markdown_error = _parse_markdown_faq(text, target_faq)
@@ -246,9 +264,10 @@ def validate_article(
     if not faq_ok and faq_error is None and target_faq > 0:
         faq_error = f"FAQ должен содержать ровно {target_faq} вопросов и ответов."
 
-    coverage_percent = 100.0 if not normalized_keywords else round(
-        (len(normalized_keywords) - len(missing)) / len(normalized_keywords) * 100,
-        2,
+    coverage_percent = (
+        100.0
+        if not required_list
+        else round((len(required_list) - len(missing)) / len(required_list) * 100, 2)
     )
 
     length_ok = default_soft_min <= length <= default_soft_max
@@ -256,11 +275,15 @@ def validate_article(
 
     stats: Dict[str, object] = {
         "length_no_spaces": length,
-        "keywords_total": len(normalized_keywords),
+        "keywords_total": len(required_list),
         "keywords_missing": missing,
-        "keywords_found": len(normalized_keywords) - len(missing),
-        "keywords_coverage": f"{len(normalized_keywords) - len(missing)}/{len(normalized_keywords) if normalized_keywords else 0}",
+        "keywords_found": len(required_list) - len(missing),
+        "keywords_coverage": f"{len(required_list) - len(missing)}/{len(required_list) if required_list else 0}",
         "keywords_coverage_percent": coverage_percent,
+        "keywords_overall_coverage_percent": coverage_info.overall_percent,
+        "keywords_preferred_total": len(preferred_list),
+        "keywords_preferred_missing": missing_preferred,
+        "keywords_preferred_found": len(preferred_list) - len(missing_preferred),
         "keyword_coverage_expected_percent": keyword_coverage_percent,
         "faq_count": faq_count,
         "faq_jsonld_count": len(jsonld_entries),
@@ -280,12 +303,12 @@ def validate_article(
         "length_requested_tolerance_above": req_tol_above,
     }
 
-    if keyword_coverage_percent is not None and keyword_coverage_percent < 100.0:
+    if keyword_required_coverage_percent is not None and keyword_required_coverage_percent < 100.0:
         raise ValidationError(
             "keywords",
             (
                 "Этап подстановки ключевых слов завершился с покрытием "
-                f"{keyword_coverage_percent:.0f}%, требуется 100%."
+                f"{keyword_required_coverage_percent:.0f}%, требуется 100%."
             ),
             details=stats,
         )

@@ -16,6 +16,19 @@ def build_term_pattern(term: str) -> re.Pattern[str]:
 
 
 @dataclass
+class KeywordCoverage:
+    """Aggregated coverage information for required and preferred terms."""
+
+    coverage: Dict[str, bool]
+    missing_required: List[str]
+    missing_preferred: List[str]
+    required_total: int
+    preferred_total: int
+    required_percent: float
+    overall_percent: float
+
+
+@dataclass
 class KeywordInjectionResult:
     """Result of the keyword injection step."""
 
@@ -26,8 +39,10 @@ class KeywordInjectionResult:
     total_terms: int = 0
     found_terms: int = 0
     missing_terms: List[str] = field(default_factory=list)
+    missing_preferred: List[str] = field(default_factory=list)
     coverage_report: str = "0/0"
     coverage_percent: float = 0.0
+    overall_coverage_percent: float = 0.0
 
 
 def _normalize_keywords(keywords: Iterable[str]) -> List[str]:
@@ -142,64 +157,181 @@ def _insert_term_into_main_section(text: str, term: str) -> Tuple[str, bool]:
     return text, False
 
 
-def inject_keywords(text: str, keywords: Iterable[str]) -> KeywordInjectionResult:
-    """Insert missing keywords and protect them with lock markers."""
-
-    normalized = _normalize_keywords(keywords)
-    if not normalized:
-        return KeywordInjectionResult(text=text, coverage={}, locked_terms=[])
-
+def _evaluate_keyword_coverage(
+    text: str,
+    *,
+    required: Sequence[str],
+    preferred: Sequence[str],
+) -> KeywordCoverage:
     coverage: Dict[str, bool] = {}
-    working = text
-    missing_terms: List[str] = []
+    missing_required: List[str] = []
+    missing_preferred: List[str] = []
+    for term in required:
+        present = _contains_term(text, term)
+        coverage[term] = present
+        if not present:
+            missing_required.append(term)
+    for term in preferred:
+        present = _contains_term(text, term)
+        coverage[term] = present
+        if not present:
+            missing_preferred.append(term)
 
-    for term in normalized:
+    required_total = len(required)
+    preferred_total = len(preferred)
+    required_found = required_total - len(missing_required)
+    preferred_found = preferred_total - len(missing_preferred)
+    required_percent = 100.0 if required_total == 0 else round(required_found / required_total * 100, 2)
+    total_terms = required_total + preferred_total
+    overall_percent = (
+        100.0
+        if total_terms == 0
+        else round((required_found + preferred_found) / total_terms * 100, 2)
+    )
+
+    return KeywordCoverage(
+        coverage=coverage,
+        missing_required=missing_required,
+        missing_preferred=missing_preferred,
+        required_total=required_total,
+        preferred_total=preferred_total,
+        required_percent=required_percent,
+        overall_percent=overall_percent,
+    )
+
+
+def evaluate_keyword_coverage(
+    text: str,
+    required: Iterable[str],
+    *,
+    preferred: Optional[Iterable[str]] = None,
+) -> KeywordCoverage:
+    required_normalized = _normalize_keywords(required)
+    preferred_normalized = _normalize_keywords(preferred or [])
+    preferred_deduped = [
+        term for term in preferred_normalized if term not in required_normalized
+    ]
+    return _evaluate_keyword_coverage(
+        text,
+        required=required_normalized,
+        preferred=preferred_deduped,
+    )
+
+
+def inject_keywords(
+    text: str,
+    required: Iterable[str],
+    *,
+    preferred: Optional[Iterable[str]] = None,
+) -> KeywordInjectionResult:
+    """Insert missing keywords and protect required ones with lock markers."""
+
+    normalized_required = _normalize_keywords(required)
+    normalized_preferred_all = _normalize_keywords(preferred or [])
+    normalized_preferred = [
+        term for term in normalized_preferred_all if term not in normalized_required
+    ]
+
+    if not normalized_required and not normalized_preferred:
+        return KeywordInjectionResult(
+            text=text,
+            coverage={},
+            locked_terms=[],
+            total_terms=0,
+            found_terms=0,
+            coverage_report="0/0",
+            coverage_percent=100.0,
+            overall_coverage_percent=100.0,
+        )
+
+    working = text
+    missing_required_candidates: List[str] = []
+
+    for term in normalized_required:
         if not term:
             continue
-
         if _contains_term(working, term):
             working = _ensure_lock(working, term)
             continue
-
         working, inserted = _insert_term_into_main_section(working, term)
         if inserted and _contains_term(working, term):
             working = _ensure_lock(working, term)
             continue
+        missing_required_candidates.append(term)
 
-        missing_terms.append(term)
+    for term in normalized_preferred:
+        if not term:
+            continue
+        if _contains_term(working, term):
+            continue
+        working, inserted = _insert_term_into_main_section(working, term)
+        if inserted and _contains_term(working, term):
+            continue
 
     inserted_section = False
-    if missing_terms:
-        working, inserted_section = _insert_terms_inset(working, missing_terms)
+    if missing_required_candidates:
+        working, inserted_section = _insert_terms_inset(working, missing_required_candidates)
 
-    for term in missing_terms:
+    for term in normalized_required:
         working = _ensure_lock(working, term)
 
-    locked_terms: List[str] = []
-    missing_report: List[str] = []
-    for term in normalized:
-        lock_token = LOCK_START_TEMPLATE.format(term=term)
-        lock_present = bool(re.search(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", working, re.DOTALL))
-        present = bool(build_term_pattern(term).search(working))
-        ok = present and lock_present
-        coverage[term] = ok
-        if ok:
-            locked_terms.append(term)
-        else:
-            missing_report.append(term)
+    coverage_info = _evaluate_keyword_coverage(
+        working,
+        required=normalized_required,
+        preferred=normalized_preferred,
+    )
 
-    total_terms = len(normalized)
-    found_terms = total_terms - len(missing_report)
-    coverage_report = f"{found_terms}/{total_terms}" if total_terms else "0/0"
-    coverage_percent = 100.0 if total_terms == 0 else round(found_terms / total_terms * 100, 2)
+    locked_terms: List[str] = []
+    for term in normalized_required:
+        lock_token = LOCK_START_TEMPLATE.format(term=term)
+        lock_present = bool(
+            re.search(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", working, re.DOTALL)
+        )
+        if coverage_info.coverage.get(term):
+            if not lock_present:
+                working = _ensure_lock(working, term)
+                lock_present = bool(
+                    re.search(
+                        rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}",
+                        working,
+                        re.DOTALL,
+                    )
+                )
+            if lock_present:
+                locked_terms.append(term)
+
+    total_terms = coverage_info.required_total + coverage_info.preferred_total
+    found_terms = total_terms - (
+        len(coverage_info.missing_required) + len(coverage_info.missing_preferred)
+    )
+    coverage_report = (
+        f"{coverage_info.required_total - len(coverage_info.missing_required)}/"
+        f"{coverage_info.required_total}"
+        if coverage_info.required_total
+        else "0/0"
+    )
+
     return KeywordInjectionResult(
         text=working,
-        coverage=coverage,
+        coverage=coverage_info.coverage,
         locked_terms=locked_terms,
         inserted_section=inserted_section,
         total_terms=total_terms,
         found_terms=found_terms,
-        missing_terms=missing_report,
+        missing_terms=coverage_info.missing_required,
+        missing_preferred=coverage_info.missing_preferred,
         coverage_report=coverage_report,
-        coverage_percent=coverage_percent,
+        coverage_percent=coverage_info.required_percent,
+        overall_coverage_percent=coverage_info.overall_percent,
     )
+
+
+__all__ = [
+    "KeywordCoverage",
+    "KeywordInjectionResult",
+    "build_term_pattern",
+    "evaluate_keyword_coverage",
+    "inject_keywords",
+    "LOCK_END",
+    "LOCK_START_TEMPLATE",
+]

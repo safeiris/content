@@ -92,7 +92,7 @@ def test_validator_detects_missing_keyword():
         "\n</script>"
     )
     with pytest.raises(ValidationError) as exc:
-        validate_article(text, keywords=["ключ"], min_chars=10, max_chars=1000)
+        validate_article(text, required_keywords=["ключ"], min_chars=10, max_chars=1000)
     assert exc.value.group == "keywords"
 
 
@@ -151,7 +151,7 @@ def test_validator_length_ignores_jsonld():
     assert MIN_REQUIRED <= base_length <= MAX_REQUIRED
     result = validate_article(
         article,
-        keywords=["ключ"],
+        required_keywords=["ключ"],
         min_chars=MIN_REQUIRED,
         max_chars=MAX_REQUIRED,
     )
@@ -252,7 +252,7 @@ def test_pipeline_produces_valid_article(monkeypatch):
     pipeline = DeterministicPipeline(
         topic="Долговая нагрузка семьи",
         base_outline=["Введение", "Аналитика", "Решения"],
-        keywords=[f"ключ {idx}" for idx in range(1, 12)],
+        required_keywords=[f"ключ {idx}" for idx in range(1, 12)],
         min_chars=3500,
         max_chars=6000,
         messages=[{"role": "system", "content": "Системный промпт"}],
@@ -274,7 +274,7 @@ def test_pipeline_resume_falls_back_to_available_checkpoint(monkeypatch):
     pipeline = DeterministicPipeline(
         topic="Долговая нагрузка семьи",
         base_outline=["Введение", "Основная часть", "Вывод"],
-        keywords=[f"ключ {idx}" for idx in range(1, 12)],
+        required_keywords=[f"ключ {idx}" for idx in range(1, 12)],
         min_chars=3500,
         max_chars=6000,
         messages=[{"role": "system", "content": "Системный промпт"}],

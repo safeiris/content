@@ -11,7 +11,7 @@ def make_pipeline() -> DeterministicPipeline:
     return DeterministicPipeline(
         topic="Тест",
         base_outline=["Введение", "Основная часть", "Вывод"],
-        keywords=[],
+        required_keywords=[],
         min_chars=1000,
         max_chars=2000,
         messages=[{"role": "system", "content": "Ты модель"}],
