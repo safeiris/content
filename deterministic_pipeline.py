@@ -7,9 +7,10 @@ import logging
 import re
 import textwrap
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from config import (
     G5_MAX_OUTPUT_TOKENS_MAX,
@@ -125,7 +126,12 @@ class SkeletonOutline:
         if current_len == 0:
             self.main_headings = cleaned
             return
-        adjusted = list(cleaned[:current_len])
+        adjusted = list(self.main_headings)
+        for idx, heading in enumerate(cleaned):
+            if idx < len(adjusted):
+                adjusted[idx] = heading
+            else:
+                adjusted.append(heading)
         if len(adjusted) < current_len:
             adjusted.extend(self.main_headings[len(adjusted) :])
         self.main_headings = adjusted
@@ -326,6 +332,7 @@ class DeterministicPipeline:
         override_model: Optional[str] = None,
         previous_response_id: Optional[str] = None,
         responses_format: Optional[Dict[str, object]] = None,
+        allow_incomplete: bool = False,
     ) -> GenerationResult:
         prompt_len = self._prompt_length(messages)
         limit = max_tokens if max_tokens and max_tokens > 0 else self.max_tokens
@@ -369,6 +376,16 @@ class DeterministicPipeline:
                 status,
             )
             if status.lower() != "incomplete" and not incomplete_reason:
+                self._register_llm_result(result, usage)
+                return result
+
+            if allow_incomplete:
+                LOGGER.warning(
+                    "LLM_INCOMPLETE_RETURN step=%s status=%s reason=%s",
+                    step.value,
+                    status or "incomplete",
+                    incomplete_reason or "",
+                )
                 self._register_llm_result(result, usage)
                 return result
 
@@ -539,6 +556,122 @@ class DeterministicPipeline:
         batches.append(SkeletonBatchPlan(kind=SkeletonBatchKind.CONCLUSION, label="conclusion"))
         return batches
 
+    def _format_batch_label(
+        self, kind: SkeletonBatchKind, indices: Sequence[int], *, suffix: str = ""
+    ) -> str:
+        base: str
+        if kind == SkeletonBatchKind.MAIN:
+            if not indices:
+                base = "main"
+            elif len(indices) == 1:
+                base = f"main[{indices[0] + 1}]"
+            else:
+                base = f"main[{indices[0] + 1}-{indices[-1] + 1}]"
+        elif kind == SkeletonBatchKind.FAQ:
+            if not indices:
+                base = "faq"
+            elif len(indices) == 1:
+                base = f"faq[{indices[0] + 1}]"
+            else:
+                base = f"faq[{indices[0] + 1}-{indices[-1] + 1}]"
+        else:
+            base = kind.value
+        return base + suffix
+
+    def _can_split_batch(self, kind: SkeletonBatchKind, indices: Sequence[int]) -> bool:
+        return kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ) and len(indices) > 1
+
+    def _split_batch_indices(self, indices: Sequence[int]) -> Tuple[List[int], List[int]]:
+        materialized = [int(idx) for idx in indices]
+        if len(materialized) <= 1:
+            return list(materialized), []
+        split_point = max(1, len(materialized) // 2)
+        keep = materialized[:split_point]
+        remainder = materialized[split_point:]
+        if not keep:
+            keep = [materialized[0]]
+            remainder = materialized[1:]
+        return keep, remainder
+
+    def _batch_has_payload(self, kind: SkeletonBatchKind, payload: object) -> bool:
+        if kind == SkeletonBatchKind.INTRO:
+            if not isinstance(payload, dict):
+                return False
+            intro = str(payload.get("intro") or "").strip()
+            headers = payload.get("main_headers")
+            has_headers = bool(
+                isinstance(headers, list)
+                and any(str(item or "").strip() for item in headers)
+            )
+            conclusion_heading = str(payload.get("conclusion_heading") or "").strip()
+            return bool(intro or has_headers or conclusion_heading)
+        if kind == SkeletonBatchKind.MAIN:
+            if not isinstance(payload, dict):
+                return False
+            sections = payload.get("sections")
+            if not isinstance(sections, list):
+                alt_main = payload.get("main")
+                if isinstance(alt_main, list):
+                    for entry in alt_main:
+                        if isinstance(entry, dict):
+                            body = str(entry.get("body") or entry.get("text") or "").strip()
+                            title = str(entry.get("title") or entry.get("heading") or "").strip()
+                            if body or title:
+                                return True
+                        else:
+                            if str(entry or "").strip():
+                                return True
+                return False
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                body = str(section.get("body") or "").strip()
+                title = str(section.get("title") or "").strip()
+                if body or title:
+                    return True
+            return False
+        if kind == SkeletonBatchKind.FAQ:
+            if not isinstance(payload, dict):
+                return False
+            faq_items = payload.get("faq")
+            if not isinstance(faq_items, list):
+                return False
+            for entry in faq_items:
+                if not isinstance(entry, dict):
+                    continue
+                question = str(entry.get("q") or "").strip()
+                answer = str(entry.get("a") or "").strip()
+                if question or answer:
+                    return True
+            return False
+        if kind == SkeletonBatchKind.CONCLUSION:
+            if not isinstance(payload, dict):
+                return False
+            conclusion = str(payload.get("conclusion") or "").strip()
+            return bool(conclusion)
+        return False
+
+    def _apply_inline_faq(self, payload: object, assembly: SkeletonAssembly) -> None:
+        if not isinstance(payload, dict):
+            return
+        faq_items = payload.get("faq")
+        if not isinstance(faq_items, list):
+            return
+        existing_questions = {entry.get("q") for entry in assembly.faq_entries}
+        for entry in faq_items:
+            if assembly.missing_faq_count(5) == 0:
+                break
+            if not isinstance(entry, dict):
+                continue
+            question = str(entry.get("q") or entry.get("question") or "").strip()
+            answer = str(entry.get("a") or entry.get("answer") or "").strip()
+            if not question or not answer:
+                continue
+            if question in existing_questions:
+                continue
+            assembly.apply_faq(question, answer)
+            existing_questions.add(question)
+
     def _batch_schema(
         self,
         batch: SkeletonBatchPlan,
@@ -615,9 +748,15 @@ class DeterministicPipeline:
                 "required": ["conclusion"],
                 "additionalProperties": False,
             }
+        name_map = {
+            SkeletonBatchKind.INTRO: "seo_article_intro_batch",
+            SkeletonBatchKind.MAIN: "seo_article_main_batch",
+            SkeletonBatchKind.FAQ: "seo_article_faq_batch",
+            SkeletonBatchKind.CONCLUSION: "seo_article_conclusion_batch",
+        }
         return {
             "type": "json_schema",
-            "name": f"seo_article_{batch.kind.value}",
+            "name": name_map.get(batch.kind, "seo_article_skeleton_batch"),
             "schema": schema,
             "strict": True,
         }
@@ -658,10 +797,38 @@ class DeterministicPipeline:
         conclusion_heading = str(payload.get("conclusion_heading") or "").strip()
         if not intro_text:
             missing.append("intro")
-        if len(headers) < len(outline.main_headings):
+        alt_main = payload.get("main")
+        needs_headers = False
+        if len(headers) < len(outline.main_headings) or (
+            isinstance(alt_main, list) and len(alt_main) > len(headers)
+        ):
+            derived: List[str] = []
+            if isinstance(alt_main, list):
+                for position, item in enumerate(alt_main):
+                    if isinstance(item, dict):
+                        candidate = str(item.get("title") or item.get("heading") or "").strip()
+                        if candidate:
+                            derived.append(candidate)
+                    elif isinstance(item, str):
+                        text_value = item.strip()
+                        if text_value:
+                            base_heading = outline.main_headings[0] if outline.main_headings else "Основная часть"
+                            derived.append(f"{base_heading} #{position + 1}")
+            if derived:
+                for idx, value in enumerate(derived):
+                    if idx < len(headers):
+                        if value:
+                            headers[idx] = value
+                    else:
+                        headers.append(value)
+            needs_headers = len(headers) < len(outline.main_headings) and not (
+                isinstance(alt_main, list)
+                and any(str(item or "").strip() for item in alt_main)
+            )
+        if needs_headers:
             missing.append("main_headers")
         normalized["intro"] = intro_text
-        normalized["main_headers"] = headers[: len(outline.main_headings)]
+        normalized["main_headers"] = headers
         normalized["conclusion_heading"] = conclusion_heading or outline.conclusion_heading
         return normalized, missing
 
@@ -677,7 +844,26 @@ class DeterministicPipeline:
             return normalized, list(target_indices)
         sections = payload.get("sections")
         if not isinstance(sections, list):
-            return normalized, list(target_indices)
+            alt_main = payload.get("main")
+            if isinstance(alt_main, list):
+                converted: List[Dict[str, str]] = []
+                for item in alt_main:
+                    if isinstance(item, dict):
+                        title = str(item.get("title") or item.get("heading") or "").strip()
+                        body = str(
+                            item.get("body") or item.get("text") or item.get("content") or ""
+                        ).strip()
+                        if not body and not title:
+                            continue
+                        converted.append({"title": title, "body": body or title})
+                    else:
+                        text_value = str(item or "").strip()
+                        if not text_value:
+                            continue
+                        converted.append({"title": "", "body": text_value})
+                sections = converted
+            else:
+                return normalized, list(target_indices)
         max_count = len(target_indices)
         for position, section in enumerate(sections[:max_count]):
             if not isinstance(section, dict):
@@ -880,15 +1066,31 @@ class DeterministicPipeline:
             ",".join(str(item + 1) for item in pending),
             max_tokens,
         )
-        result = self._call_llm(
-            step=PipelineStep.SKELETON,
-            messages=messages,
-            max_tokens=max_tokens,
-            previous_response_id=previous_id,
-            responses_format=format_block,
-        )
-        tail_metadata = result.metadata or {}
-        payload = self._extract_response_json(result.text)
+        attempts = 0
+        payload: Optional[object] = None
+        tail_metadata: Dict[str, object] = {}
+        current_limit = max_tokens
+        result: Optional[GenerationResult] = None
+        while attempts < 3:
+            attempts += 1
+            result = self._call_llm(
+                step=PipelineStep.SKELETON,
+                messages=messages,
+                max_tokens=current_limit,
+                previous_response_id=previous_id,
+                responses_format=format_block,
+                allow_incomplete=True,
+            )
+            tail_metadata = result.metadata or {}
+            payload = self._extract_response_json(result.text)
+            status = str(tail_metadata.get("status") or "")
+            reason = str(tail_metadata.get("incomplete_reason") or "")
+            is_incomplete = status.lower() == "incomplete" or bool(reason)
+            if not is_incomplete or self._batch_has_payload(batch.kind, payload):
+                break
+            current_limit = max(200, int(current_limit * 0.85))
+        if result is None:
+            raise PipelineStepError(PipelineStep.SKELETON, "Сбой tail-fill: модель не ответила.")
         if batch.kind == SkeletonBatchKind.MAIN:
             normalized, missing = self._normalize_main_batch(payload, list(pending), outline)
             for index, heading, body in normalized:
@@ -932,6 +1134,7 @@ class DeterministicPipeline:
                     PipelineStep.SKELETON,
                     "Не удалось завершить вывод скелета.",
                 )
+        self._apply_inline_faq(payload, assembly)
         for key, value in tail_metadata.items():
             if value:
                 metadata[key] = value
@@ -1161,29 +1364,95 @@ class DeterministicPipeline:
         metadata_snapshot: Dict[str, object] = {}
         last_result: Optional[GenerationResult] = None
 
-        for batch in batches:
-            target_indices = list(batch.indices)
-            messages, format_block = self._build_batch_messages(
-                batch,
-                outline=outline,
-                assembly=assembly,
-                target_indices=target_indices,
-                tail_fill=batch.tail_fill,
-            )
-            max_tokens = self._batch_token_budget(batch, estimate, len(target_indices))
-            try:
+        pending_batches = deque(batches)
+        scheduled_main_indices: Set[int] = set()
+        for plan in pending_batches:
+            if plan.kind == SkeletonBatchKind.MAIN:
+                scheduled_main_indices.update(plan.indices)
+        first_request = True
+        split_serial = 0
+
+        while pending_batches:
+            batch = pending_batches.popleft()
+            if not batch.label:
+                batch.label = self._format_batch_label(batch.kind, batch.indices)
+            active_indices = list(batch.indices)
+            limit_override: Optional[int] = None
+            retries = 0
+            consecutive_empty_incomplete = 0
+            payload_obj: Optional[object] = None
+            metadata_snapshot = {}
+            result: Optional[GenerationResult] = None
+            last_max_tokens = estimate.start_max_tokens
+
+            while True:
+                messages, format_block = self._build_batch_messages(
+                    batch,
+                    outline=outline,
+                    assembly=assembly,
+                    target_indices=active_indices,
+                    tail_fill=batch.tail_fill,
+                )
+                base_budget = self._batch_token_budget(batch, estimate, len(active_indices) or 1)
+                max_tokens_to_use = estimate.start_max_tokens if first_request else base_budget
+                if limit_override is not None:
+                    max_tokens_to_use = min(max_tokens_to_use, limit_override)
+                last_max_tokens = max_tokens_to_use
+                first_request = False
                 result = self._call_llm(
                     step=PipelineStep.SKELETON,
                     messages=messages,
-                    max_tokens=max_tokens,
+                    max_tokens=max_tokens_to_use,
                     responses_format=format_block,
+                    allow_incomplete=True,
                 )
-            except PipelineStepError:
-                raise
+                last_result = result
+                metadata_snapshot = result.metadata or {}
+                payload_obj = self._extract_response_json(result.text)
+                status = str(metadata_snapshot.get("status") or "")
+                reason = str(metadata_snapshot.get("incomplete_reason") or "")
+                is_incomplete = status.lower() == "incomplete" or bool(reason)
+                has_payload = self._batch_has_payload(batch.kind, payload_obj)
+                if not is_incomplete or has_payload:
+                    break
+                consecutive_empty_incomplete += 1
+                if self._can_split_batch(batch.kind, active_indices) and consecutive_empty_incomplete >= 2:
+                    keep, remainder = self._split_batch_indices(active_indices)
+                    if remainder:
+                        split_serial += 1
+                        remainder_label = self._format_batch_label(
+                            batch.kind,
+                            remainder,
+                            suffix=f"#split{split_serial}",
+                        )
+                        pending_batches.appendleft(
+                            SkeletonBatchPlan(
+                                kind=batch.kind,
+                                indices=list(remainder),
+                                label=remainder_label,
+                                tail_fill=batch.tail_fill,
+                            )
+                        )
+                    active_indices = keep
+                    batch.indices = list(keep)
+                    batch.label = self._format_batch_label(batch.kind, keep)
+                    limit_override = None
+                    retries = 0
+                    consecutive_empty_incomplete = 0
+                    continue
+                retries += 1
+                if retries >= 3:
+                    LOGGER.warning(
+                        "SKELETON_INCOMPLETE_WITHOUT_CONTENT kind=%s label=%s status=%s reason=%s",
+                        batch.kind.value,
+                        batch.label or self._format_batch_label(batch.kind, active_indices),
+                        status or "incomplete",
+                        reason or "",
+                    )
+                    break
+                limit_override = max(200, int(last_max_tokens * 0.85))
 
-            last_result = result
-            metadata_snapshot = result.metadata or {}
-            payload_obj = self._extract_response_json(result.text)
+            target_indices = list(active_indices)
 
             if batch.kind == SkeletonBatchKind.INTRO:
                 normalized, missing_fields = self._normalize_intro_batch(payload_obj, outline)
@@ -1192,6 +1461,27 @@ class DeterministicPipeline:
                 if len(headers) < len(outline.main_headings):
                     headers = headers + outline.main_headings[len(headers) :]
                 assembly.apply_intro(intro_text, headers, normalized.get("conclusion_heading"))
+                current_total = len(assembly.main_sections)
+                new_indices = [
+                    idx for idx in range(current_total) if idx not in scheduled_main_indices
+                ]
+                if new_indices:
+                    start_pos = 0
+                    batch_size = max(1, SKELETON_BATCH_SIZE_MAIN)
+                    while start_pos < len(new_indices):
+                        chunk = new_indices[start_pos : start_pos + batch_size]
+                        if not chunk:
+                            break
+                        chunk_label = self._format_batch_label(SkeletonBatchKind.MAIN, chunk)
+                        pending_batches.append(
+                            SkeletonBatchPlan(
+                                kind=SkeletonBatchKind.MAIN,
+                                indices=list(chunk),
+                                label=chunk_label,
+                            )
+                        )
+                        scheduled_main_indices.update(chunk)
+                        start_pos += batch_size
                 if missing_fields:
                     self._tail_fill_batch(
                         batch,
@@ -1242,6 +1532,7 @@ class DeterministicPipeline:
                         metadata=metadata_snapshot,
                     )
 
+            self._apply_inline_faq(payload_obj, assembly)
             LOGGER.info("SKELETON_BATCH_ACCEPT kind=%s label=%s", batch.kind.value, batch.label)
 
         if not assembly.intro:
