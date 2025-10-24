@@ -61,28 +61,14 @@ const keywordsInput = document.getElementById("keywords-input");
 const titleInput = document.getElementById("title-input");
 const audienceInput = document.getElementById("audience-input");
 const goalInput = document.getElementById("goal-input");
-const kInput = document.getElementById("k-input");
-const maxTokensInput = document.getElementById("max-tokens-input");
-const modelInput = document.getElementById("model-input");
-const includeFaq = document.getElementById("include-faq");
-const includeJsonld = document.getElementById("include-jsonld");
-const lengthTargetInput = document.getElementById("length-target-input");
+const toneSelect = document.getElementById("tone-select");
 const minCharsInput = document.getElementById("min-chars-input");
 const maxCharsInput = document.getElementById("max-chars-input");
-const lengthModeRadios = document.querySelectorAll("input[name='length-mode']");
-const lengthTargetBlock = document.querySelector("[data-length-target]");
-const lengthRangeBlock = document.querySelector("[data-length-range]");
 const keywordModeInputs = document.querySelectorAll("input[name='keywords-mode']");
 const styleProfileSelect = document.getElementById("style-profile-select");
 const styleProfileHint = document.getElementById("style-profile-hint");
-const useStyleCheckbox = document.getElementById("useStyleCheckbox");
-const styleSettings = document.getElementById("styleSettings");
-const styleSelect = document.getElementById("styleSelect");
-const styleStrengthInput = document.getElementById("styleStrength");
 const sourcesList = document.getElementById("sources-list");
 const addSourceBtn = document.getElementById("add-source-btn");
-const faqCountInput = document.getElementById("faq-count-input");
-const faqCountWrapper = document.getElementById("faq-count-wrapper");
 const contextSourceSelect = document.getElementById("context-source-select");
 const healthStatus = document.getElementById("health-status");
 const reindexLog = document.getElementById("reindex-log");
@@ -150,7 +136,7 @@ const MAX_TOASTS = 3;
 const MAX_CUSTOM_CONTEXT_CHARS = 20000;
 const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
 
-const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 5200, max: 6800, hard: 7200 });
+const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 3500, max: 6000, hard: 6500 });
 
 const HEALTH_STATUS_MESSAGES = {
   openai_key: {
@@ -284,9 +270,6 @@ if (styleProfileSelect) {
 if (contextSourceSelect) {
   contextSourceSelect.addEventListener("change", handleContextSourceChange);
 }
-lengthModeRadios.forEach((radio) => {
-  radio.addEventListener("change", handleLengthModeChange);
-});
 if (customContextTextarea) {
   customContextTextarea.addEventListener("input", handleCustomContextInput);
 }
@@ -295,6 +278,12 @@ if (customContextFileInput) {
 }
 if (customContextClearBtn) {
   customContextClearBtn.addEventListener("click", handleCustomContextClear);
+}
+if (addSourceBtn) {
+  addSourceBtn.addEventListener("click", handleAddSource);
+}
+if (sourcesList) {
+  sourcesList.addEventListener("click", handleSourceListClick);
 }
 if (reindexBtn) {
   reindexBtn.addEventListener("click", handleReindex);
@@ -322,9 +311,7 @@ if (clearLogBtn) {
 
 setupAdvancedSettings();
 handleStyleProfileChange();
-handleFaqToggle();
 handleContextSourceChange();
-handleLengthModeChange();
 updateCustomContextCounter();
 init();
 
@@ -339,37 +326,6 @@ function handleStyleProfileChange() {
   }
   const value = styleProfileSelect.value || "off";
   styleProfileHint.textContent = STYLE_PROFILE_HINTS[value] || STYLE_PROFILE_HINTS.off;
-}
-
-function handleFaqToggle() {
-  if (!faqCountWrapper || !faqCountInput || !includeFaq) {
-    return;
-  }
-  const enabled = includeFaq.checked;
-  faqCountWrapper.hidden = !enabled;
-  faqCountInput.disabled = !enabled;
-  if (enabled && !faqCountInput.value) {
-    faqCountInput.value = "5";
-  }
-}
-
-function handleLengthModeChange() {
-  const mode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
-  if (lengthTargetBlock) {
-    lengthTargetBlock.hidden = mode !== "target";
-  }
-  if (lengthTargetInput) {
-    lengthTargetInput.disabled = mode !== "target";
-  }
-  if (lengthRangeBlock) {
-    lengthRangeBlock.hidden = mode !== "range";
-  }
-  if (minCharsInput) {
-    minCharsInput.disabled = mode !== "range";
-  }
-  if (maxCharsInput) {
-    maxCharsInput.disabled = mode !== "range";
-  }
 }
 
 function handleAddSource(event) {
@@ -403,14 +359,6 @@ function handleContextSourceChange() {
       resetCustomContextState();
     } else {
       updateCustomContextCounter();
-    }
-  }
-  if (kInput) {
-    if (isCustom || isOff) {
-      kInput.value = "0";
-      kInput.disabled = true;
-    } else {
-      kInput.disabled = false;
     }
   }
 }
@@ -588,7 +536,7 @@ function resolveCustomContextPayload(contextSource) {
   return { text, filename: filename || null };
 }
 
-function addSourceRow(value = "") {
+function addSourceRow(source = { value: "", usage: "summary" }) {
   if (!sourcesList) {
     return;
   }
@@ -603,7 +551,13 @@ function addSourceRow(value = "") {
   }
   const input = row.querySelector(".source-input");
   if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
-    input.value = value;
+    input.value = source?.value || "";
+  }
+  const usageSelect = row.querySelector(".source-usage");
+  if (usageSelect instanceof HTMLSelectElement && source?.usage) {
+    const normalized = String(source.usage).trim().toLowerCase();
+    const option = Array.from(usageSelect.options).find((item) => item.value === normalized);
+    usageSelect.value = option ? option.value : usageSelect.value;
   }
   sourcesList.append(row);
 }
@@ -621,7 +575,10 @@ function collectSources() {
     if (!value) {
       continue;
     }
-    items.push(value);
+    const usageSelect = row.querySelector(".source-usage");
+    const usage =
+      usageSelect instanceof HTMLSelectElement ? String(usageSelect.value || "").trim().toLowerCase() : "";
+    items.push({ value, usage });
   }
   return items;
 }
@@ -1445,6 +1402,13 @@ function applyPipeDefaults(pipeId) {
   if (structureInput && !structureInput.value && Array.isArray(pipe.default_structure)) {
     structureInput.value = pipe.default_structure.join("\n");
   }
+  if (toneSelect && pipe.tone) {
+    const normalized = String(pipe.tone).trim().toLowerCase();
+    const option = Array.from(toneSelect.options || []).find((item) => item.value === normalized);
+    if (option) {
+      toneSelect.value = option.value;
+    }
+  }
 }
 
 async function handlePromptPreview() {
@@ -1914,6 +1878,7 @@ function buildRequestPayload() {
     keywords,
     keywords_mode: keywordMode,
     include_faq: true,
+    faq_questions: 5,
     include_jsonld: true,
     structure,
     pipe_id: theme,
@@ -1936,36 +1901,26 @@ function buildRequestPayload() {
     data.target_audience = audienceValue;
   }
 
-  const selectedLengthMode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
-  if (selectedLengthMode === "range") {
-    const minValue = parsePositiveInt(minCharsInput?.value);
-    const maxValue = parsePositiveInt(maxCharsInput?.value);
-    if (minValue !== null && maxValue !== null && maxValue < minValue) {
-      throw new Error("Максимальный объём должен быть больше или равен минимальному");
-    }
-    if (minValue !== null || maxValue !== null) {
-      data.length_limits = {};
-      if (minValue !== null) {
-        data.length_limits.min_chars = minValue;
-      }
-      if (maxValue !== null) {
-        data.length_limits.max_chars = maxValue;
-      }
-    }
-  } else {
-    const targetValue = parsePositiveInt(lengthTargetInput?.value);
-    if (targetValue !== null) {
-      data.length_target = targetValue;
-    }
+  const toneValue = toneSelect?.value?.trim();
+  if (toneValue) {
+    data.tone = toneValue;
   }
 
-  if (includeFaq) {
-    data.include_faq = true;
-    const faqValue = parsePositiveInt(faqCountInput?.value) || 5;
-    data.faq_questions = faqValue;
+  const minValue = parsePositiveInt(minCharsInput?.value);
+  const maxValue = parsePositiveInt(maxCharsInput?.value);
+  const effectiveMin = minValue ?? DEFAULT_LENGTH_RANGE.min;
+  const effectiveMax = maxValue ?? DEFAULT_LENGTH_RANGE.max;
+  if (effectiveMax < effectiveMin) {
+    throw new Error("Максимальный объём должен быть больше или равен минимальному");
   }
-  if (includeJsonld) {
-    data.include_jsonld = true;
+  data.length_limits = {
+    min_chars: effectiveMin,
+    max_chars: effectiveMax,
+  };
+
+  const sources = collectSources();
+  if (sources.length) {
+    data.sources = sources;
   }
 
   if (contextSource === "custom") {
@@ -1981,8 +1936,6 @@ function buildRequestPayload() {
     theme,
     data,
     k: 0,
-    maxTokens: 0,
-    model: undefined,
     context_source: contextSource,
   };
 
@@ -3228,26 +3181,17 @@ function toggleFeatureElements(elements, hidden) {
 
 function applyFeatureFlags() {
   const modelElements = [];
-  if (modelInput) {
-    modelElements.push(modelInput);
-  }
   document.querySelectorAll('[data-feature="model-selector"]').forEach((element) => {
     modelElements.push(element);
   });
   toggleFeatureElements(modelElements, featureState.hideModelSelector);
 
   const tokenElements = [];
-  if (maxTokensInput) {
-    tokenElements.push(maxTokensInput);
-  }
   if (minCharsInput) {
     tokenElements.push(minCharsInput);
   }
   if (maxCharsInput) {
     tokenElements.push(maxCharsInput);
-  }
-  if (kInput) {
-    tokenElements.push(kInput);
   }
   document.querySelectorAll('[data-feature="token-sliders"]').forEach((element) => {
     tokenElements.push(element);

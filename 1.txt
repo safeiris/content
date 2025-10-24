@@ -1,687 +1,216 @@
-diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 3fd80603a6a254a252d0d26b72bb471f016376ce..509740ce49ec9b42cfc62749a6a2626b1fd72e16 100644
---- a/deterministic_pipeline.py
-+++ b/deterministic_pipeline.py
-@@ -1,39 +1,39 @@
- """LLM-driven content pipeline with explicit step-level guarantees."""
- 
- from __future__ import annotations
- 
- import json
- import logging
- import math
- import re
- import textwrap
- import time
- from collections import deque
- from dataclasses import dataclass, field
- from enum import Enum
--from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
-+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
- 
- from config import (
-     DEFAULT_MAX_LENGTH,
-     DEFAULT_MIN_LENGTH,
-     G5_MAX_OUTPUT_TOKENS_MAX,
-     G5_MAX_OUTPUT_TOKENS_STEP1,
-     SKELETON_BATCH_SIZE_MAIN,
-     SKELETON_FAQ_BATCH,
-     TAIL_FILL_MAX_TOKENS,
- )
- from llm_client import GenerationResult, generate as llm_generate
- from faq_builder import _normalize_entry
- from keyword_injector import (
-     KeywordCoverage,
-     KeywordInjectionResult,
-     LOCK_END,
-     LOCK_START_TEMPLATE,
-     build_term_pattern,
-     evaluate_keyword_coverage,
-     inject_keywords,
- )
- from length_controller import ensure_article_length
- from length_limits import compute_soft_length_bounds
- from length_trimmer import TrimResult, TrimValidationError, trim_text
- from skeleton_utils import normalize_skeleton_payload
-@@ -228,50 +228,51 @@ class SkeletonAssembly:
-             "faq": list(self.faq_entries),
-             "conclusion": self.conclusion or "",
-         }
-         return payload
- 
- class DeterministicPipeline:
-     """Pipeline that orchestrates LLM calls and post-processing steps."""
- 
-     def __init__(
-         self,
-         *,
-         topic: str,
-         base_outline: Sequence[str],
-         required_keywords: Iterable[str],
-         preferred_keywords: Optional[Iterable[str]] = None,
-         min_chars: int,
-         max_chars: int,
-         messages: Sequence[Dict[str, object]],
-         model: str,
-         max_tokens: int,
-         timeout_s: int,
-         backoff_schedule: Optional[List[float]] = None,
-         provided_faq: Optional[List[Dict[str, str]]] = None,
-         jsonld_requested: bool = True,
-         faq_questions: Optional[int] = None,
-+        progress_callback: Optional[Callable[..., None]] = None,
-     ) -> None:
-         if not model or not str(model).strip():
-             raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
- 
-         self.topic = topic.strip() or "Тема"
-         self.base_outline = list(base_outline) if base_outline else ["Введение", "Основная часть", "Вывод"]
-         required_clean = [str(term).strip() for term in required_keywords if str(term).strip()]
-         preferred_clean = [
-             str(term).strip()
-             for term in (preferred_keywords or [])
-             if str(term).strip()
-         ]
-         seen_terms: set[str] = set()
-         self.required_keywords: List[str] = []
-         for term in required_clean:
-             if term not in seen_terms:
-                 self.required_keywords.append(term)
-                 seen_terms.add(term)
-         self.preferred_keywords: List[str] = []
-         for term in preferred_clean:
-             if term not in seen_terms:
-                 self.preferred_keywords.append(term)
-                 seen_terms.add(term)
-         self.keywords = list(self.required_keywords + self.preferred_keywords)
-         self.normalized_keywords = list(self.keywords)
-@@ -287,56 +288,81 @@ class DeterministicPipeline:
-         self.provided_faq = provided_faq or []
-         self.jsonld_requested = bool(jsonld_requested)
-         try:
-             faq_target = int(faq_questions) if faq_questions is not None else 5
-         except (TypeError, ValueError):
-             faq_target = 5
-         if faq_target < 0:
-             faq_target = 0
-         self.faq_target = faq_target
- 
-         self.logs: List[PipelineLogEntry] = []
-         self.checkpoints: Dict[PipelineStep, str] = {}
-         self.jsonld: Optional[str] = None
-         self.locked_terms: List[str] = []
-         self.jsonld_reserve: int = 0
-         self.skeleton_payload: Optional[Dict[str, object]] = None
-         self._skeleton_faq_entries: List[Dict[str, str]] = []
-         self.keywords_coverage_percent: float = 0.0
-         self.keywords_required_coverage_percent: float = 0.0
- 
-         self._model_used: Optional[str] = None
-         self._fallback_used: Optional[str] = None
-         self._fallback_reason: Optional[str] = None
-         self._api_route: Optional[str] = None
-         self._token_usage: Optional[float] = None
-+        self._progress_callback = progress_callback
- 
-         self.section_budgets: List[SectionBudget] = self._compute_section_budgets()
- 
-     # ------------------------------------------------------------------
-     # Internal helpers
-     # ------------------------------------------------------------------
-+    def _emit_progress(
-+        self,
-+        stage: str,
-+        progress: float,
-+        *,
-+        message: Optional[str] = None,
-+        payload: Optional[Mapping[str, object]] = None,
-+    ) -> None:
-+        if not self._progress_callback:
-+            return
-+        event_payload = dict(payload) if payload else {}
-+        try:
-+            if event_payload:
-+                self._progress_callback(
-+                    stage=stage,
-+                    progress=progress,
-+                    message=message,
-+                    payload=event_payload,
-+                )
-+            else:
-+                self._progress_callback(stage=stage, progress=progress, message=message)
-+        except Exception:  # pragma: no cover - defensive logging
-+            LOGGER.debug("progress_callback_failed", exc_info=True)
-+
-     def _log(self, step: PipelineStep, status: str, **notes: object) -> None:
-         entry = PipelineLogEntry(step=step, started_at=time.time(), status=status, notes=dict(notes))
-         self.logs.append(entry)
- 
-     def _update_log(self, step: PipelineStep, status: str, **notes: object) -> None:
-         for entry in reversed(self.logs):
-             if entry.step == step:
-                 entry.status = status
-                 entry.finished_at = time.time()
-                 entry.notes.update(notes)
-                 return
-         self.logs.append(
-             PipelineLogEntry(step=step, started_at=time.time(), finished_at=time.time(), status=status, notes=dict(notes))
-         )
- 
-     def _register_llm_result(self, result: GenerationResult, usage: Optional[float]) -> None:
-         if result.model_used:
-             self._model_used = result.model_used
-         elif self._model_used is None:
-             self._model_used = self.model
-         if result.fallback_used:
-             self._fallback_used = result.fallback_used
-         if result.fallback_reason:
-             self._fallback_reason = result.fallback_reason
-         if result.api_route:
-@@ -2315,75 +2341,105 @@ class DeterministicPipeline:
-                 updated_body = self._inject_sentence_into_paragraph(body, sentence, tail=True)
-                 return f"{header}\n{updated_body}"
-             return match.group(0)
- 
-         updated_article = pattern.sub(_replace, article)
-         if updated_article == article:
-             return text
-         updated_article = updated_article.rstrip() + "\n"
-         if jsonld:
-             return f"{updated_article}\n{jsonld}\n"
-         return updated_article
- 
-     # ------------------------------------------------------------------
-     # Step implementations
-     # ------------------------------------------------------------------
-     def _run_skeleton(self) -> str:
-         self._log(PipelineStep.SKELETON, "running")
-         outline = self._prepare_outline()
-         estimate = self._predict_skeleton_volume(outline)
-         batches = self._build_skeleton_batches(outline, estimate)
-         assembly = SkeletonAssembly(outline=outline)
-         metadata_snapshot: Dict[str, object] = {}
-         last_result: Optional[GenerationResult] = None
- 
-         pending_batches = deque(batches)
-+        total_batches = len(pending_batches)
-+        completed_batches = 0
-+
-+        def _schedule(plan: SkeletonBatchPlan, *, left: bool = False, count: bool = True) -> None:
-+            nonlocal total_batches
-+            if left:
-+                pending_batches.appendleft(plan)
-+            else:
-+                pending_batches.append(plan)
-+            if count:
-+                total_batches += 1
-+
-+        def _notify_draft_progress(label: str = "", *, partial: bool = False) -> None:
-+            if total_batches <= 0:
-+                return
-+            fraction = completed_batches / total_batches if total_batches else 0.0
-+            payload: Dict[str, object] = {"total": total_batches, "completed": completed_batches}
-+            if label:
-+                payload["batch"] = label
-+            if partial:
-+                payload["partial"] = True
-+            self._emit_progress("draft", max(0.0, min(1.0, fraction)), payload=payload)
-+
-+        if total_batches:
-+            self._emit_progress(
-+                "draft",
-+                0.0,
-+                payload={"total": total_batches, "completed": completed_batches},
-+            )
-+
-         scheduled_main_indices: Set[int] = set()
-         parse_none_streaks: Dict[str, int] = {}
-         for plan in pending_batches:
-             if plan.kind == SkeletonBatchKind.MAIN:
-                 scheduled_main_indices.update(plan.indices)
-         split_serial = 0
-         tail_fill_allowed = False
- 
-         while pending_batches:
-             batch = pending_batches.popleft()
-             if batch.kind in (SkeletonBatchKind.FAQ, SkeletonBatchKind.CONCLUSION):
-                 filled_main = sum(
-                     1
-                     for body in assembly.main_sections
-                     if isinstance(body, str) and body.strip()
-                 )
-                 has_pending_main = any(
-                     plan.kind == SkeletonBatchKind.MAIN for plan in pending_batches
-                 )
-                 if filled_main < 3 and has_pending_main:
-                     LOGGER.info(
-                         "LOG:SCHEDULER_BLOCK main underflow=%d target_min=3 → continue_main",
-                         filled_main,
-                     )
--                    pending_batches.append(batch)
-+                    _schedule(batch, count=False)
-                     continue
-             if not batch.label:
-                 batch.label = self._format_batch_label(batch.kind, batch.indices)
-             active_indices = list(batch.indices)
-             limit_override: Optional[int] = None
-             override_to_cap = False
-             retries = 0
-             consecutive_empty_incomplete = 0
-             payload_obj: Optional[object] = None
-             metadata_snapshot = {}
-             result: Optional[GenerationResult] = None
-             last_max_tokens = estimate.start_max_tokens
-             continuation_id: Optional[str] = None
-             batch_partial = False
-             first_attempt_for_batch = True
-             best_payload_obj: Optional[object] = None
-             best_result: Optional[GenerationResult] = None
-             best_metadata_snapshot: Dict[str, object] = {}
-             last_reason_lower = ""
-             forced_tail_indices: List[int] = []
- 
-             while True:
-                 messages, format_block = self._build_batch_messages(
-                     batch,
-                     outline=outline,
-@@ -2446,57 +2502,58 @@ class DeterministicPipeline:
-                         parse_none_streaks.pop(metadata_prev_id, None)
-                 if not is_incomplete or has_payload:
-                     batch_partial = bool(is_incomplete and has_payload)
-                     if metadata_prev_id:
-                         parse_none_streaks.pop(metadata_prev_id, None)
-                     if request_prev_id and request_prev_id != metadata_prev_id:
-                         parse_none_streaks.pop(request_prev_id, None)
-                     break
-                 consecutive_empty_incomplete += 1
-                 should_autosplit = False
-                 if self._can_split_batch(batch.kind, active_indices) and len(active_indices) > 1:
-                     if reason_lower == "max_output_tokens" and consecutive_empty_incomplete >= 1:
-                         should_autosplit = True
-                     elif consecutive_empty_incomplete >= 2 and parse_none_count >= 2:
-                         should_autosplit = True
-                 if should_autosplit:
-                     keep, remainder = self._split_batch_indices(active_indices)
-                     original_size = len(active_indices)
-                     if remainder:
-                         split_serial += 1
-                         remainder_label = self._format_batch_label(
-                             batch.kind,
-                             remainder,
-                             suffix=f"#split{split_serial}",
-                         )
--                        pending_batches.appendleft(
-+                        _schedule(
-                             SkeletonBatchPlan(
-                                 kind=batch.kind,
-                                 indices=list(remainder),
-                                 label=remainder_label,
-                                 tail_fill=batch.tail_fill,
--                            )
-+                            ),
-+                            left=True,
-                         )
-                     LOGGER.info(
-                         "BATCH_AUTOSPLIT kind=%s label=%s from=%d to=%d",
-                         batch.kind.value,
-                         batch.label or self._format_batch_label(batch.kind, active_indices),
-                         original_size,
-                         len(keep) or 0,
-                     )
-                     active_indices = keep
-                     batch.indices = list(keep)
-                     batch.label = self._format_batch_label(batch.kind, keep)
-                     limit_override = None
-                     override_to_cap = False
-                     retries = 0
-                     consecutive_empty_incomplete = 0
-                     first_attempt_for_batch = True
-                     if metadata_prev_id:
-                         parse_none_streaks.pop(metadata_prev_id, None)
-                     continue
-                 should_trigger_fallback = (
-                     len(active_indices) == 1
-                     and consecutive_empty_incomplete >= 2
-                     and (
-                         reason_lower == "max_output_tokens"
-                         or (metadata_prev_id and parse_none_count >= 2)
-@@ -2636,51 +2693,51 @@ class DeterministicPipeline:
-                     "Скелет не содержит данных после генерации.",
-                 )
- 
-             if batch.kind == SkeletonBatchKind.INTRO:
-                 normalized, missing_fields = self._normalize_intro_batch(payload_obj, outline)
-                 intro_text = normalized.get("intro", "")
-                 headers = normalized.get("main_headers") or []
-                 if len(headers) < len(outline.main_headings):
-                     headers = headers + outline.main_headings[len(headers) :]
-                 assembly.apply_intro(intro_text, headers, normalized.get("conclusion_heading"))
-                 current_total = len(assembly.main_sections)
-                 new_indices = [
-                     idx for idx in range(current_total) if idx not in scheduled_main_indices
-                 ]
-                 if new_indices:
-                     start_pos = 0
-                     if self._should_force_single_main_batches(outline, estimate):
-                         batch_size = 1
-                     else:
-                         batch_size = max(1, SKELETON_BATCH_SIZE_MAIN)
-                     while start_pos < len(new_indices):
-                         chunk = new_indices[start_pos : start_pos + batch_size]
-                         if not chunk:
-                             break
-                         chunk_label = self._format_batch_label(SkeletonBatchKind.MAIN, chunk)
--                        pending_batches.append(
-+                        _schedule(
-                             SkeletonBatchPlan(
-                                 kind=SkeletonBatchKind.MAIN,
-                                 indices=list(chunk),
-                                 label=chunk_label,
-                             )
-                         )
-                         scheduled_main_indices.update(chunk)
-                         start_pos += batch_size
-                 if missing_fields:
-                     if tail_fill_allowed:
-                         self._tail_fill_batch(
-                             batch,
-                             outline=outline,
-                             assembly=assembly,
-                             estimate=estimate,
-                             missing_items=[0],
-                             metadata=metadata_snapshot,
-                         )
-                     else:
-                         LOGGER.info(
-                             "LOG:TAIL_FILL_SKIPPED reason=max_tokens_not_hit kind=%s items=%s",
-                             batch.kind.value,
-                             "0",
-                         )
-             elif batch.kind == SkeletonBatchKind.MAIN:
-@@ -2736,50 +2793,56 @@ class DeterministicPipeline:
-                 assembly.apply_conclusion(conclusion_text)
-                 if missing_flag:
-                     if tail_fill_allowed:
-                         self._tail_fill_batch(
-                             batch,
-                             outline=outline,
-                             assembly=assembly,
-                             estimate=estimate,
-                             missing_items=[0],
-                             metadata=metadata_snapshot,
-                         )
-                     else:
-                         LOGGER.info(
-                             "LOG:TAIL_FILL_SKIPPED reason=max_tokens_not_hit kind=%s items=%s",
-                             batch.kind.value,
-                             "0",
-                         )
- 
-             self._apply_inline_faq(payload_obj, assembly)
-             LOGGER.info(
-                 "BATCH_ACCEPT state=%s kind=%s label=%s",
-                 "partial" if batch_partial else "complete",
-                 batch.kind.value,
-                 batch.label,
-             )
-+            completed_batches += 1
-+            _notify_draft_progress(batch.label or "", partial=batch_partial)
-+
-+        if total_batches:
-+            completed_batches = max(completed_batches, total_batches)
-+            _notify_draft_progress()
- 
-         if not assembly.intro:
-             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вводный блок скелета.")
-         if not assembly.conclusion:
-             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вывод скелета.")
-         missing_main = assembly.missing_main_indices()
-         if missing_main:
-             LOGGER.warning(
-                 "LOG:SKELETON_MAIN_GAPS missing=%s",
-                 ",".join(str(idx + 1) for idx in missing_main),
-             )
-             if tail_fill_allowed:
-                 self._tail_fill_main_sections(
-                     indices=missing_main,
-                     outline=outline,
-                     assembly=assembly,
-                     estimate=estimate,
-                 )
-                 missing_main = assembly.missing_main_indices()
-             else:
-                 LOGGER.info(
-                     "LOG:TAIL_FILL_SKIPPED reason=max_tokens_not_hit kind=%s items=%s",
-                     "main",
-                     ",".join(str(idx) for idx in missing_main),
-                 )
-@@ -3010,50 +3073,51 @@ class DeterministicPipeline:
-         for heading, paragraph in main_sections:
-             lines.extend([f"## {heading}", paragraph, ""])
-         if faq_entries:
-             lines.extend(["## FAQ", "<!--FAQ_START-->"])
-             for index, (question, answer) in enumerate(faq_entries, start=1):
-                 lines.append(f"**Вопрос {index}.** {question}")
-                 lines.append(f"**Ответ.** {answer}")
-                 lines.append("")
-             if lines and lines[-1] == "":
-                 lines.pop()
-             lines.extend(["<!--FAQ_END-->", ""])
-         lines.extend(["## Заключение", conclusion, ""])
-         article = "\n".join(lines).strip() + "\n"
-         controller = ensure_article_length(
-             article,
-             min_chars=self.min_chars,
-             max_chars=self.max_chars,
-             protected_blocks=self.locked_terms,
-             faq_expected=self.faq_target,
-             exact_chars=self.min_chars if self.min_chars == self.max_chars else None,
-         )
-         return controller.text if controller.text else article
- 
-     def _run_trim(self, text: str) -> TrimResult:
-         self._log(PipelineStep.TRIM, "running")
-+        self._emit_progress("trim", 0.0, payload={"chars": length_no_spaces(text)})
-         reserve = self.jsonld_reserve if self.jsonld else 0
-         hard_cap = ARTICLE_HARD_CHAR_CAP if ARTICLE_HARD_CHAR_CAP > 0 else None
-         effective_upper = self.max_chars
-         if hard_cap is not None:
-             effective_upper = min(effective_upper, hard_cap)
-         target_max = max(self.min_chars, effective_upper - reserve)
-         try:
-             result = trim_text(
-                 text,
-                 min_chars=self.min_chars,
-                 max_chars=target_max,
-                 protected_blocks=self.locked_terms,
-                 faq_expected=self.faq_target,
-                 required_terms=self.required_keywords,
-                 preferred_terms=self.preferred_keywords,
-             )
-         except TrimValidationError as exc:
-             raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
-         current_length = length_no_spaces(result.text)
- 
-         soft_min, soft_max, tolerance_below, tolerance_above = compute_soft_length_bounds(
-             self.min_chars, self.max_chars
-         )
-         effective_max = self.max_chars
-         length_notes: Dict[str, object] = {}
-@@ -3194,82 +3258,93 @@ class DeterministicPipeline:
-         faq_block = ""
-         if self.faq_target > 0:
-             if FAQ_START in result.text and FAQ_END in result.text:
-                 faq_block = result.text.split(FAQ_START, 1)[1].split(FAQ_END, 1)[0]
-             faq_pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", faq_block)
-             if len(faq_pairs) != self.faq_target:
-                 raise PipelineStepError(
-                     PipelineStep.TRIM,
-                     f"FAQ должен содержать ровно {self.faq_target} вопросов после тримминга.",
-                 )
-         LOGGER.info(
-             "TRIM_OK chars_no_spaces=%d removed_paragraphs=%d",
-             current_length,
-             len(result.removed_paragraphs),
-         )
-         self._update_log(
-             PipelineStep.TRIM,
-             "ok",
-             removed=len(result.removed_paragraphs),
-             **self._metrics(result.text),
-             **length_notes,
-             KEYWORDS_COVERAGE_REQUIRED=self.keywords_required_coverage_percent,
-             KEYWORDS_COVERAGE_OVERALL=self.keywords_coverage_percent,
-         )
-         self.checkpoints[PipelineStep.TRIM] = result.text
-+        self._emit_progress("trim", 1.0, payload={"chars": current_length})
-         return result
- 
-     # ------------------------------------------------------------------
-     # Public API
-     # ------------------------------------------------------------------
-     def run(self) -> PipelineState:
-         text = self._run_skeleton()
-         keyword_result = self._run_keywords(text)
-         faq_text = self._run_faq(keyword_result.text)
-         trim_result = self._run_trim(faq_text)
-         combined_text = trim_result.text
-         if self.jsonld and self.jsonld_requested:
-             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
-+        self._emit_progress(
-+            "validate",
-+            0.0,
-+            payload={"chars": length_no_spaces(combined_text), "faq": self.faq_target},
-+        )
-         try:
-             validation = validate_article(
-                 combined_text,
-                 required_keywords=self.required_keywords,
-                 preferred_keywords=self.preferred_keywords,
-                 min_chars=self.min_chars,
-                 max_chars=self.max_chars,
-                 skeleton_payload=self.skeleton_payload,
-                 keyword_required_coverage_percent=self.keywords_required_coverage_percent,
-                 keyword_coverage_percent=self.keywords_coverage_percent,
-                 faq_expected=self.faq_target,
-             )
-         except ValidationError as exc:
-             raise PipelineStepError(PipelineStep.TRIM, str(exc), status_code=400) from exc
-         LOGGER.info(
-             "VALIDATION_OK length=%s keywords=%.0f%%",
-             validation.stats.get("length_no_spaces"),
-             float(validation.stats.get("keywords_coverage_percent") or 0.0),
-         )
-+        self._emit_progress(
-+            "validate",
-+            1.0,
-+            payload={"length": validation.stats.get("length_no_spaces"), "keywords": validation.stats.get("keywords_coverage_percent")},
-+        )
-         return PipelineState(
-             text=combined_text,
-             jsonld=self.jsonld,
-             validation=validation,
-             logs=self.logs,
-             checkpoints=self.checkpoints,
-             model_used=self._model_used or self.model,
-             fallback_used=self._fallback_used,
-             fallback_reason=self._fallback_reason,
-             api_route=self._api_route,
-             token_usage=self._token_usage,
-             skeleton_payload=self.skeleton_payload,
-         )
- 
-     def resume(self, from_step: PipelineStep) -> PipelineState:
-         order = [PipelineStep.SKELETON, PipelineStep.KEYWORDS, PipelineStep.FAQ, PipelineStep.TRIM]
-         if from_step == PipelineStep.SKELETON:
-             return self.run()
- 
-         requested_index = order.index(from_step)
-         base_index = requested_index - 1
-         fallback_index = base_index
-         while fallback_index >= 0 and order[fallback_index] not in self.checkpoints:
-             fallback_index -= 1
- 
 diff --git a/frontend_demo/index.html b/frontend_demo/index.html
-index 2484d5a9c610348a62e137b5270e1883806c339b..72b144db067771fcfdfff692cb7a3e85df2eb6c7 100644
+index 72b144db067771fcfdfff692cb7a3e85df2eb6c7..39a602afe0b0ad81aa932e48adf07ef69052e693 100644
 --- a/frontend_demo/index.html
 +++ b/frontend_demo/index.html
-@@ -46,63 +46,114 @@
+@@ -6,176 +6,202 @@
+     <title>Фабрика контента — демо</title>
+     <link rel="stylesheet" href="styles.css" />
+   </head>
+   <body>
+     <header class="app-header">
+       <div class="app-shell header-inner">
+         <div>
+           <h1>Фабрика контента</h1>
+           <p class="subtitle">Платформа генерации текстов на базе AI</p>
+         </div>
+       </div>
+     </header>
+ 
+     <main class="app app-shell">
+       <nav class="tabs" role="tablist">
+         <button class="tab active" data-tab="new-request" role="tab">Новый запрос</button>
+         <button class="tab" data-tab="materials" role="tab">Сгенерированные материалы</button>
+         <button class="tab" data-tab="pipes" role="tab">Тематики</button>
+         <button class="tab" data-tab="result" role="tab">Результат</button>
+       </nav>
+ 
+       <section class="tab-panel active" id="new-request" role="tabpanel">
+         <div class="request-shell">
+           <div class="request-grid">
+             <form id="brief-form" class="brief-form">
+-              <section class="form-card">
+-                <header class="form-card__header">
+-                  <h2 class="form-card__title">Основные параметры</h2>
++              <section class="parameters-card">
++                <header class="parameters-card__header">
++                  <h2 class="parameters-card__title">Параметры текста</h2>
+                 </header>
+-                <div class="form-card__body">
++                <div class="parameters-card__body">
+                   <div class="form-row">
+                     <label for="pipe-select">Тематика</label>
+                     <select id="pipe-select" required></select>
+                   </div>
+                   <div class="form-row">
+                     <label for="topic-input">Тема</label>
+-                    <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
++                    <input id="topic-input" type="text" placeholder="Например, «Как выбрать дебетовую карту»" required />
+                   </div>
+                   <div class="form-row">
+-                    <label for="style-profile-select">Стиль</label>
++                    <label for="title-input">Название</label>
++                    <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
++                    <p class="field-hint">Оставьте пустым, чтобы взять название из профиля.</p>
++                  </div>
++                  <div class="form-row">
++                    <label for="goal-input">Цель</label>
++                    <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
++                  </div>
++                  <div class="form-row">
++                    <label for="audience-input">Аудитория</label>
++                    <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
++                  </div>
++                  <div class="form-row">
++                    <label for="tone-select">Тон</label>
++                    <select id="tone-select">
++                      <option value="экспертный" selected>Экспертный</option>
++                      <option value="дружелюбный">Дружелюбный</option>
++                      <option value="строгий">Строгий</option>
++                    </select>
++                  </div>
++                  <div class="form-row">
++                    <label for="style-profile-select">Стиль бренда</label>
                      <select id="style-profile-select">
                        <option value="sravni.ru" selected>sravni.ru — экспертно, структурировано</option>
                        <option value="tinkoff.ru">tinkoff.ru — дружелюбно и с примерами</option>
                        <option value="banki.ru">banki.ru — аналитично и по делу</option>
-                       <option value="off">off — без стилевого профиля</option>
+-                      <option value="off">off — без стилевого профиля</option>
++                      <option value="off">Без привязки к бренду</option>
                      </select>
                      <p class="field-hint" id="style-profile-hint">
                        Определяет тон и подачу текста, близкие к стилю выбранного бренда.
                      </p>
                    </div>
-                 </div>
-               </section>
- 
-               <section class="form-card">
-                 <header class="form-card__header">
-                   <h2 class="form-card__title">Ключевые слова</h2>
-                 </header>
-                 <div class="form-card__body">
+-                </div>
+-              </section>
+-
+-              <section class="form-card">
+-                <header class="form-card__header">
+-                  <h2 class="form-card__title">Ключевые слова</h2>
+-                </header>
+-                <div class="form-card__body">
                    <div class="form-row">
-                     <label for="keywords-input">Ключевые слова</label>
-                     <textarea id="keywords-input" rows="4" placeholder="Каждое слово с новой строки"></textarea>
-                     <p class="field-hint">Можно оставить пустым — ключевые слова не будут добавлены.</p>
+-                    <label for="keywords-input">Ключевые слова</label>
+-                    <textarea id="keywords-input" rows="4" placeholder="Каждое слово с новой строки"></textarea>
+-                    <p class="field-hint">Можно оставить пустым — ключевые слова не будут добавлены.</p>
++                    <label for="min-chars-input">Объём текста</label>
++                    <div class="length-range-inline">
++                      <input
++                        id="min-chars-input"
++                        type="number"
++                        min="500"
++                        step="50"
++                        value="3500"
++                        aria-label="Минимум символов"
++                      />
++                      <span aria-hidden="true" class="range-separator">—</span>
++                      <input
++                        id="max-chars-input"
++                        type="number"
++                        min="500"
++                        step="50"
++                        value="6000"
++                        aria-label="Максимум символов"
++                      />
++                    </div>
++                    <p class="field-hint">Символов без пробелов. Можно изменить диапазон под задачу.</p>
                    </div>
-                 </div>
-               </section>
-+
-+              <section class="form-card">
-+                <header class="form-card__header">
-+                  <h2 class="form-card__title">Расширенные параметры</h2>
-+                </header>
-+                <div class="form-card__body">
-+                  <div class="form-row">
-+                    <label for="title-input">Название текста</label>
-+                    <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
-+                    <p class="field-hint">Оставьте пустым, чтобы использовать название из профиля.</p>
-+                  </div>
-+                  <div class="form-row">
-+                    <label>Объём</label>
-+                    <div class="length-mode-toggle">
-+                      <label class="length-mode-option">
-+                        <input type="radio" name="length-mode" value="target" checked />
-+                        Целевая длина
-+                      </label>
-+                      <label class="length-mode-option">
-+                        <input type="radio" name="length-mode" value="range" />
-+                        Диапазон
-+                      </label>
-+                    </div>
-+                    <div class="length-target" data-length-target>
-+                      <input id="length-target-input" type="number" min="500" step="50" placeholder="Например, 6000" />
-+                      <p class="field-hint">Символов без пробелов. Пусто — используем профиль.</p>
-+                    </div>
-+                    <div class="length-range" data-length-range hidden>
-+                      <div class="length-range-inputs">
-+                        <input id="min-chars-input" type="number" min="500" step="50" placeholder="Минимум" />
-+                        <input id="max-chars-input" type="number" min="500" step="50" placeholder="Максимум" />
+-                </div>
+-              </section>
+-
+-              <section class="form-card">
+-                <header class="form-card__header">
+-                  <h2 class="form-card__title">Расширенные параметры</h2>
+-                </header>
+-                <div class="form-card__body">
+                   <div class="form-row">
+-                    <label for="title-input">Название текста</label>
+-                    <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
+-                    <p class="field-hint">Оставьте пустым, чтобы использовать название из профиля.</p>
++                    <label for="structure-preset">Пресет структуры</label>
++                    <select id="structure-preset">
++                      <option value="seo" selected>SEO-статья</option>
++                      <option value="faq">FAQ и поддержка</option>
++                      <option value="overview">Обзор продукта</option>
++                    </select>
++                    <p class="field-hint">Выберите заготовку или отредактируйте структуру вручную ниже.</p>
+                   </div>
+                   <div class="form-row">
+-                    <label>Объём</label>
+-                    <div class="length-mode-toggle">
+-                      <label class="length-mode-option">
+-                        <input type="radio" name="length-mode" value="target" checked />
+-                        Целевая длина
+-                      </label>
+-                      <label class="length-mode-option">
+-                        <input type="radio" name="length-mode" value="range" />
+-                        Диапазон
+-                      </label>
+-                    </div>
+-                    <div class="length-target" data-length-target>
+-                      <input id="length-target-input" type="number" min="500" step="50" placeholder="Например, 6000" />
+-                      <p class="field-hint">Символов без пробелов. Пусто — используем профиль.</p>
+-                    </div>
+-                    <div class="length-range" data-length-range hidden>
+-                      <div class="length-range-inputs">
+-                        <input id="min-chars-input" type="number" min="500" step="50" placeholder="Минимум" />
+-                        <input id="max-chars-input" type="number" min="500" step="50" placeholder="Максимум" />
+-                      </div>
+-                      <p class="field-hint">Можно заполнить одно или оба поля.</p>
+-                    </div>
++                    <label for="structure-input">Структура материала</label>
++                    <textarea
++                      id="structure-input"
++                      rows="4"
++                      placeholder="Каждый пункт с новой строки: вводная, блок преимуществ, FAQ, заключение"
++                    ></textarea>
+                   </div>
+                   <div class="form-row">
+-                    <label for="goal-input">Цель текста</label>
+-                    <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
++                    <label for="keywords-input">Ключевые слова</label>
++                    <textarea
++                      id="keywords-input"
++                      rows="4"
++                      placeholder="Каждое ключевое слово или фраза с новой строки"
++                    ></textarea>
++                    <div class="keyword-mode">
++                      <span class="field-label">Режим вхождений</span>
++                      <div class="keyword-mode__options">
++                        <label class="radio-option">
++                          <input type="radio" name="keywords-mode" value="strict" checked />
++                          <span>Строгое — точные вхождения</span>
++                        </label>
++                        <label class="radio-option">
++                          <input type="radio" name="keywords-mode" value="soft" />
++                          <span>Мягкое — допускает формы и синонимы</span>
++                        </label>
++                        <label class="radio-option">
++                          <input type="radio" name="keywords-mode" value="anti_spam" />
++                          <span>Антипереспам — следим за частотой</span>
++                        </label>
 +                      </div>
-+                      <p class="field-hint">Можно заполнить одно или оба поля.</p>
 +                    </div>
-+                  </div>
-+                  <div class="form-row">
-+                    <label for="goal-input">Цель текста</label>
-+                    <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
-+                  </div>
-+                  <div class="form-row">
-+                    <label for="audience-input">Целевая аудитория</label>
-+                    <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
-+                  </div>
-+                </div>
-+              </section>
-+
-+              <section class="form-card">
-+                <header class="form-card__header">
-+                  <h2 class="form-card__title">Контекст</h2>
-+                </header>
-+                <div class="form-card__body">
++                    <p class="field-hint">Можно оставить пустым — ключевые слова не будут добавлены.</p>
+                   </div>
+                   <div class="form-row">
+-                    <label for="audience-input">Целевая аудитория</label>
+-                    <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
++                    <label>Источники (референсы)</label>
++                    <div id="sources-list" class="sources-list"></div>
++                    <div class="sources-actions">
++                      <button type="button" class="ghost small" id="add-source-btn">Добавить источник</button>
++                    </div>
++                    <p class="field-hint">Добавьте ссылки и тип использования, если нужно опираться на конкретные материалы.</p>
+                   </div>
+-                </div>
+-              </section>
+-
+-              <section class="form-card">
+-                <header class="form-card__header">
+-                  <h2 class="form-card__title">Контекст</h2>
+-                </header>
+-                <div class="form-card__body">
                    <div class="form-row">
                      <label for="context-source-select">Контекст</label>
                      <select id="context-source-select">
@@ -694,8 +223,7 @@ index 2484d5a9c610348a62e137b5270e1883806c339b..72b144db067771fcfdfff692cb7a3e85
                      </p>
                      <div class="custom-context-block" id="custom-context-block" hidden>
                        <p class="field-hint custom-context-hint">
--                        Можно вставить текст или загрузить .txt/.json. До 20 000 символов. При custom параметры подбираются автоматически.
-+                        Можно вставить текст или загрузить .txt/.json. До 20 000 символов.
+                         Можно вставить текст или загрузить .txt/.json. До 20 000 символов.
                        </p>
                        <label class="field-label" for="customContext">Пользовательский контекст</label>
                        <textarea id="customContext" placeholder="Вставьте сюда текст или JSON"></textarea>
@@ -709,66 +237,74 @@ index 2484d5a9c610348a62e137b5270e1883806c339b..72b144db067771fcfdfff692cb7a3e85
                      </div>
                    </div>
                  </div>
-               </section>
- 
-               <footer class="form-card form-card--actions">
+-              </section>
+-
+-              <footer class="form-card form-card--actions">
                  <div class="form-actions">
                    <button type="submit" class="primary">
                      <span class="btn-label">Сгенерировать</span>
                    </button>
                  </div>
-               </footer>
+-              </footer>
++              </section>
              </form>
              <aside class="status-panel">
                <section class="status-card">
-@@ -182,52 +233,64 @@
-                 id="download-md"
-                 class="secondary"
-                 role="button"
-                 aria-disabled="true"
-                 data-fallback-name="draft.md"
-               >
-                 <span class="btn-label">Скачать .md</span>
-               </a>
-               <a
-                 id="download-report"
-                 class="secondary"
-                 role="button"
-                 aria-disabled="true"
-                 data-fallback-name="report.json"
-               >
-                 <span class="btn-label">Скачать отчёт .json</span>
-               </a>
-             </div>
-           </aside>
+                 <h3>Health</h3>
+                 <div id="health-status" class="status-grid"></div>
+               </section>
+               <section class="status-card">
+                 <div class="section-header">
+                   <h3>Reindex log</h3>
+                   <button type="button" class="ghost small" id="clear-log">Очистить</button>
+                 </div>
+                 <div id="reindex-log" class="console-log">
+                   <div class="log-empty">Пока без запусков.</div>
+                 </div>
+               </section>
+             </aside>
+           </div>
+         </div>
+       </section>
+       <section class="tab-panel" id="materials" role="tabpanel">
+         <div class="materials-toolbar">
+           <div class="materials-toolbar__spacer"></div>
+           <button type="button" class="ghost small" id="cleanup-artifacts">Очистить список</button>
+         </div>
+         <div id="artifacts-list" class="cards-grid"></div>
+@@ -252,51 +278,56 @@
          </div>
        </section>
      </main>
  
      <div id="progress-overlay" class="progress-overlay hidden" role="alert" aria-live="polite">
        <div class="progress-card">
--        <div class="spinner"></div>
--        <p data-role="progress-message">Генерируем материалы…</p>
-+        <p class="progress-stage" data-role="progress-stage">Подготовка…</p>
-+        <div
-+          class="progress-bar"
-+          role="progressbar"
-+          aria-valuemin="0"
-+          aria-valuemax="100"
-+          aria-valuenow="0"
-+          data-role="progress-bar"
-+        >
-+          <div class="progress-bar__fill" data-role="progress-bar-fill"></div>
-+        </div>
-+        <p class="progress-percent" data-role="progress-percent">0%</p>
-+        <p class="progress-message" data-role="progress-message">Готовим данные…</p>
-+        <p class="progress-details" data-role="progress-details"></p>
+         <p class="progress-stage" data-role="progress-stage">Подготовка…</p>
+         <div
+           class="progress-bar"
+           role="progressbar"
+           aria-valuemin="0"
+           aria-valuemax="100"
+           aria-valuenow="0"
+           data-role="progress-bar"
+         >
+           <div class="progress-bar__fill" data-role="progress-bar-fill"></div>
+         </div>
+         <p class="progress-percent" data-role="progress-percent">0%</p>
+         <p class="progress-message" data-role="progress-message">Готовим данные…</p>
+         <p class="progress-details" data-role="progress-details"></p>
        </div>
      </div>
  
      <template id="source-row-template">
        <div class="source-row">
-         <textarea class="source-input" rows="2" placeholder="https://example.com"></textarea>
+-        <textarea class="source-input" rows="2" placeholder="https://example.com"></textarea>
++        <input class="source-input" type="text" placeholder="https://example.com" />
++        <select class="source-usage" aria-label="Тип использования источника">
++          <option value="summary" selected>Пересказ</option>
++          <option value="quote">Цитата</option>
++          <option value="inspiration">Вдохновение</option>
++        </select>
          <button type="button" class="icon-button remove-source" aria-label="Удалить источник">✕</button>
        </div>
      </template>
@@ -788,44 +324,25 @@ index 2484d5a9c610348a62e137b5270e1883806c339b..72b144db067771fcfdfff692cb7a3e85
            <button type="button" class="secondary subtle download-btn">
              <span class="btn-label">Скачать</span>
            </button>
+           <button type="button" class="secondary danger delete-btn">
+             <span class="btn-label">Удалить</span>
+           </button>
+         </div>
+       </article>
+     </template>
 diff --git a/frontend_demo/script.js b/frontend_demo/script.js
-index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0a95f2451 100644
+index 90f6bfe2cf05d8be6858501fe7354bf0a95f2451..ad76927dec4b975ddac02929895344eac165acb0 100644
 --- a/frontend_demo/script.js
 +++ b/frontend_demo/script.js
-@@ -14,130 +14,160 @@ const STRUCTURE_PRESETS = {
-     "Сложные кейсы",
-     "Дополнительные ресурсы",
-     "Вывод",
-   ],
-   overview: [
-     "Краткое резюме",
-     "Описание продукта",
-     "Преимущества и ограничения",
-     "Сравнение",
-     "Рекомендации",
-   ],
- };
- 
- const tabs = document.querySelectorAll(".tab");
- const panels = document.querySelectorAll(".tab-panel");
- const pipeSelect = document.getElementById("pipe-select");
- const pipesList = document.getElementById("pipes-list");
- const artifactsList = document.getElementById("artifacts-list");
- const cleanupArtifactsBtn = document.getElementById("cleanup-artifacts");
- const briefForm = document.getElementById("brief-form");
- const previewBtn = document.getElementById("preview-btn");
- let reindexBtn = document.getElementById("reindex-btn");
- let healthBtn = document.getElementById("health-btn");
- const progressOverlay = document.getElementById("progress-overlay");
- const progressMessage = progressOverlay?.querySelector('[data-role="progress-message"]') || null;
-+const progressStage = progressOverlay?.querySelector('[data-role="progress-stage"]') || null;
-+const progressPercent = progressOverlay?.querySelector('[data-role="progress-percent"]') || null;
-+const progressBar = progressOverlay?.querySelector('[data-role="progress-bar"]') || null;
-+const progressBarFill = progressOverlay?.querySelector('[data-role="progress-bar-fill"]') || null;
-+const progressDetails = progressOverlay?.querySelector('[data-role="progress-details"]') || null;
-+if (progressStage && progressStage.textContent) {
-+  progressStage.dataset.defaultLabel = progressStage.textContent.trim();
-+}
+@@ -39,72 +39,58 @@ const progressMessage = progressOverlay?.querySelector('[data-role="progress-mes
+ const progressStage = progressOverlay?.querySelector('[data-role="progress-stage"]') || null;
+ const progressPercent = progressOverlay?.querySelector('[data-role="progress-percent"]') || null;
+ const progressBar = progressOverlay?.querySelector('[data-role="progress-bar"]') || null;
+ const progressBarFill = progressOverlay?.querySelector('[data-role="progress-bar-fill"]') || null;
+ const progressDetails = progressOverlay?.querySelector('[data-role="progress-details"]') || null;
+ if (progressStage && progressStage.textContent) {
+   progressStage.dataset.defaultLabel = progressStage.textContent.trim();
+ }
  const toastRoot = document.getElementById("toast-root");
  const draftView = document.getElementById("draft-view");
  const reportView = document.getElementById("report-view");
@@ -838,33 +355,34 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
  const clearLogBtn = document.getElementById("clear-log");
  const structurePreset = document.getElementById("structure-preset");
  const structureInput = document.getElementById("structure-input");
-+const topicInput = document.getElementById("topic-input");
+ const topicInput = document.getElementById("topic-input");
  const keywordsInput = document.getElementById("keywords-input");
  const titleInput = document.getElementById("title-input");
  const audienceInput = document.getElementById("audience-input");
  const goalInput = document.getElementById("goal-input");
- const kInput = document.getElementById("k-input");
- const maxTokensInput = document.getElementById("max-tokens-input");
- const modelInput = document.getElementById("model-input");
- const includeFaq = document.getElementById("include-faq");
- const includeJsonld = document.getElementById("include-jsonld");
-+const lengthTargetInput = document.getElementById("length-target-input");
+-const kInput = document.getElementById("k-input");
+-const maxTokensInput = document.getElementById("max-tokens-input");
+-const modelInput = document.getElementById("model-input");
+-const includeFaq = document.getElementById("include-faq");
+-const includeJsonld = document.getElementById("include-jsonld");
+-const lengthTargetInput = document.getElementById("length-target-input");
++const toneSelect = document.getElementById("tone-select");
  const minCharsInput = document.getElementById("min-chars-input");
  const maxCharsInput = document.getElementById("max-chars-input");
-+const lengthModeRadios = document.querySelectorAll("input[name='length-mode']");
-+const lengthTargetBlock = document.querySelector("[data-length-target]");
-+const lengthRangeBlock = document.querySelector("[data-length-range]");
+-const lengthModeRadios = document.querySelectorAll("input[name='length-mode']");
+-const lengthTargetBlock = document.querySelector("[data-length-target]");
+-const lengthRangeBlock = document.querySelector("[data-length-range]");
  const keywordModeInputs = document.querySelectorAll("input[name='keywords-mode']");
  const styleProfileSelect = document.getElementById("style-profile-select");
  const styleProfileHint = document.getElementById("style-profile-hint");
- const useStyleCheckbox = document.getElementById("useStyleCheckbox");
- const styleSettings = document.getElementById("styleSettings");
- const styleSelect = document.getElementById("styleSelect");
- const styleStrengthInput = document.getElementById("styleStrength");
+-const useStyleCheckbox = document.getElementById("useStyleCheckbox");
+-const styleSettings = document.getElementById("styleSettings");
+-const styleSelect = document.getElementById("styleSelect");
+-const styleStrengthInput = document.getElementById("styleStrength");
  const sourcesList = document.getElementById("sources-list");
  const addSourceBtn = document.getElementById("add-source-btn");
- const faqCountInput = document.getElementById("faq-count-input");
- const faqCountWrapper = document.getElementById("faq-count-wrapper");
+-const faqCountInput = document.getElementById("faq-count-input");
+-const faqCountWrapper = document.getElementById("faq-count-wrapper");
  const contextSourceSelect = document.getElementById("context-source-select");
  const healthStatus = document.getElementById("health-status");
  const reindexLog = document.getElementById("reindex-log");
@@ -890,33 +408,17 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
  const LOG_STATUS_LABELS = {
    info: "INFO",
    success: "SUCCESS",
-   warn: "WARN",
-   error: "ERROR",
+@@ -128,51 +114,51 @@ const PROGRESS_STAGE_LABELS = {
  };
  
- const STEP_LABELS = {
-   draft: "Черновик",
-   refine: "Уточнение",
-   jsonld: "JSON-LD",
-   post_analysis: "Пост-анализ",
+ const PROGRESS_STAGE_MESSAGES = {
+   draft: "Генерируем черновик",
+   trim: "Нормализуем объём",
+   validate: "Проверяем результат",
+   done: "Готово",
+   error: "Завершено с ошибкой",
  };
  
-+const PROGRESS_STAGE_LABELS = {
-+  draft: "Черновик",
-+  trim: "Нормализация",
-+  validate: "Проверка",
-+  done: "Готово",
-+  error: "Ошибка",
-+};
-+
-+const PROGRESS_STAGE_MESSAGES = {
-+  draft: "Генерируем черновик",
-+  trim: "Нормализуем объём",
-+  validate: "Проверяем результат",
-+  done: "Готово",
-+  error: "Завершено с ошибкой",
-+};
-+
  const DEGRADATION_LABELS = {
    draft_failed: "Черновик по запасному сценарию",
    refine_skipped: "Шаг уточнения пропущен",
@@ -926,14 +428,14 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
    soft_timeout: "Сработал мягкий таймаут",
  };
  
--const DEFAULT_PROGRESS_MESSAGE = progressMessage?.textContent?.trim() || "Готовим данные…";
-+const DEFAULT_PROGRESS_MESSAGE =
-+  progressMessage?.textContent?.trim() || PROGRESS_STAGE_MESSAGES.draft;
+ const DEFAULT_PROGRESS_MESSAGE =
+   progressMessage?.textContent?.trim() || PROGRESS_STAGE_MESSAGES.draft;
  const MAX_TOASTS = 3;
  const MAX_CUSTOM_CONTEXT_CHARS = 20000;
  const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
  
- const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 5200, max: 6800, hard: 7200 });
+-const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 5200, max: 6800, hard: 7200 });
++const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 3500, max: 6000, hard: 6500 });
  
  const HEALTH_STATUS_MESSAGES = {
    openai_key: {
@@ -954,64 +456,12 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
    artifacts_writable: {
      label: "Каталог артефактов",
      ok: "доступен",
-@@ -157,50 +187,56 @@ const STYLE_PROFILE_HINTS = {
-   off: "Нейтральный деловой стиль без привязки к порталу.",
- };
- 
- const state = {
-   pipes: new Map(),
-   artifacts: [],
-   artifactFiles: [],
-   pendingArtifactFiles: null,
-   hasMissingArtifacts: false,
-   currentResult: null,
-   currentDownloads: { markdown: null, report: null },
- };
- 
- const featureState = {
-   hideModelSelector: true,
-   hideTokenSliders: true,
- };
- 
- const customContextState = {
-   textareaText: "",
-   fileText: "",
-   fileName: "",
-   noticeShown: false,
- };
- 
-+const progressState = {
-+  currentPercent: 0,
-+  lastStage: "draft",
-+  hideTimer: null,
-+};
-+
- function resolveApiPath(path) {
-   if (typeof path !== "string" || !path) {
-     return API_BASE || "";
-   }
-   if (/^https?:\/\//i.test(path)) {
-     return path;
-   }
-   const base = API_BASE || "";
-   const normalizedBase = base.endsWith("/") ? base.slice(0, -1) : base;
-   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-   if (/^https?:\/\//i.test(normalizedBase)) {
-     return `${normalizedBase}${normalizedPath}`;
-   }
-   return `${normalizedBase}${normalizedPath}`;
- }
- 
- function escapeHtml(value) {
-   if (typeof value !== "string") {
-     return "";
-   }
-   const map = {
-     "&": "&amp;",
-     "<": "&lt;",
-     ">": "&gt;",
-     '"': "&quot;",
-@@ -226,115 +262,138 @@ if (reindexBtn) {
+     fail: "недоступен",
+   },
+   theme_index: {
+     label: "Индекс темы",
+     ok: "найден",
+@@ -262,179 +248,141 @@ if (reindexBtn) {
  if (healthBtn) {
    interactiveElements.push(healthBtn);
  }
@@ -1037,9 +487,9 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
  if (contextSourceSelect) {
    contextSourceSelect.addEventListener("change", handleContextSourceChange);
  }
-+lengthModeRadios.forEach((radio) => {
-+  radio.addEventListener("change", handleLengthModeChange);
-+});
+-lengthModeRadios.forEach((radio) => {
+-  radio.addEventListener("change", handleLengthModeChange);
+-});
  if (customContextTextarea) {
    customContextTextarea.addEventListener("input", handleCustomContextInput);
  }
@@ -1049,6 +499,12 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
  if (customContextClearBtn) {
    customContextClearBtn.addEventListener("click", handleCustomContextClear);
  }
++if (addSourceBtn) {
++  addSourceBtn.addEventListener("click", handleAddSource);
++}
++if (sourcesList) {
++  sourcesList.addEventListener("click", handleSourceListClick);
++}
  if (reindexBtn) {
    reindexBtn.addEventListener("click", handleReindex);
  }
@@ -1075,9 +531,9 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
  
  setupAdvancedSettings();
  handleStyleProfileChange();
- handleFaqToggle();
+-handleFaqToggle();
  handleContextSourceChange();
-+handleLengthModeChange();
+-handleLengthModeChange();
  updateCustomContextCounter();
  init();
  
@@ -1094,37 +550,37 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
    styleProfileHint.textContent = STYLE_PROFILE_HINTS[value] || STYLE_PROFILE_HINTS.off;
  }
  
- function handleFaqToggle() {
-   if (!faqCountWrapper || !faqCountInput || !includeFaq) {
-     return;
-   }
-   const enabled = includeFaq.checked;
-   faqCountWrapper.hidden = !enabled;
-   faqCountInput.disabled = !enabled;
-   if (enabled && !faqCountInput.value) {
-     faqCountInput.value = "5";
-   }
- }
- 
-+function handleLengthModeChange() {
-+  const mode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
-+  if (lengthTargetBlock) {
-+    lengthTargetBlock.hidden = mode !== "target";
-+  }
-+  if (lengthTargetInput) {
-+    lengthTargetInput.disabled = mode !== "target";
-+  }
-+  if (lengthRangeBlock) {
-+    lengthRangeBlock.hidden = mode !== "range";
-+  }
-+  if (minCharsInput) {
-+    minCharsInput.disabled = mode !== "range";
-+  }
-+  if (maxCharsInput) {
-+    maxCharsInput.disabled = mode !== "range";
-+  }
-+}
-+
+-function handleFaqToggle() {
+-  if (!faqCountWrapper || !faqCountInput || !includeFaq) {
+-    return;
+-  }
+-  const enabled = includeFaq.checked;
+-  faqCountWrapper.hidden = !enabled;
+-  faqCountInput.disabled = !enabled;
+-  if (enabled && !faqCountInput.value) {
+-    faqCountInput.value = "5";
+-  }
+-}
+-
+-function handleLengthModeChange() {
+-  const mode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
+-  if (lengthTargetBlock) {
+-    lengthTargetBlock.hidden = mode !== "target";
+-  }
+-  if (lengthTargetInput) {
+-    lengthTargetInput.disabled = mode !== "target";
+-  }
+-  if (lengthRangeBlock) {
+-    lengthRangeBlock.hidden = mode !== "range";
+-  }
+-  if (minCharsInput) {
+-    minCharsInput.disabled = mode !== "range";
+-  }
+-  if (maxCharsInput) {
+-    maxCharsInput.disabled = mode !== "range";
+-  }
+-}
+-
  function handleAddSource(event) {
    event.preventDefault();
    addSourceRow();
@@ -1150,7 +606,145 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
    const value = String(contextSourceSelect.value || "index.json").toLowerCase();
    const isCustom = value === "custom";
    const isOff = value === "off";
-@@ -1364,53 +1423,50 @@ function inlineFormat(text) {
+   if (customContextBlock) {
+     customContextBlock.hidden = !isCustom;
+     if (!isCustom) {
+       resetCustomContextState();
+     } else {
+       updateCustomContextCounter();
+     }
+   }
+-  if (kInput) {
+-    if (isCustom || isOff) {
+-      kInput.value = "0";
+-      kInput.disabled = true;
+-    } else {
+-      kInput.disabled = false;
+-    }
+-  }
+ }
+ 
+ function resetCustomContextState() {
+   customContextState.textareaText = "";
+   customContextState.fileText = "";
+   customContextState.fileName = "";
+   customContextState.noticeShown = false;
+   if (customContextTextarea) {
+     customContextTextarea.value = "";
+   }
+   if (customContextFileInput) {
+     customContextFileInput.value = "";
+   }
+   updateCustomContextCounter();
+ }
+ 
+ function updateCustomContextCounter() {
+   if (!customContextCounter) {
+     return;
+   }
+   const activeText = customContextState.fileText || customContextState.textareaText;
+   const current = activeText.length;
+   customContextCounter.textContent = `${current.toLocaleString("ru-RU")} / ${MAX_CUSTOM_CONTEXT_LABEL} символов`;
+ }
+ 
+@@ -566,84 +514,93 @@ function resolveCustomContextPayload(contextSource) {
+   const sourceText = customContextState.fileText || customContextState.textareaText;
+   const { text, truncated } = normalizeCustomContext(sourceText);
+   if (!text) {
+     throw new Error("Добавьте текст для пользовательского контекста");
+   }
+   const shouldNotify = truncated && !customContextState.noticeShown;
+   customContextState.noticeShown = truncated;
+   if (shouldNotify) {
+     showToast({ message: "Слишком длинный контекст: сокращён до 20 000 символов", type: "warn" });
+   }
+   if (text !== sourceText) {
+     if (customContextState.fileText) {
+       customContextState.fileText = text;
+     } else {
+       customContextState.textareaText = text;
+     }
+     if (customContextTextarea) {
+       customContextTextarea.value = text;
+     }
+     updateCustomContextCounter();
+   }
+   const filename = customContextState.fileText ? customContextState.fileName : "";
+   return { text, filename: filename || null };
+ }
+ 
+-function addSourceRow(value = "") {
++function addSourceRow(source = { value: "", usage: "summary" }) {
+   if (!sourcesList) {
+     return;
+   }
+   const template = document.getElementById("source-row-template");
+   if (!(template instanceof HTMLTemplateElement)) {
+     return;
+   }
+   const fragment = template.content.cloneNode(true);
+   const row = fragment.querySelector(".source-row");
+   if (!row) {
+     return;
+   }
+   const input = row.querySelector(".source-input");
+   if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
+-    input.value = value;
++    input.value = source?.value || "";
++  }
++  const usageSelect = row.querySelector(".source-usage");
++  if (usageSelect instanceof HTMLSelectElement && source?.usage) {
++    const normalized = String(source.usage).trim().toLowerCase();
++    const option = Array.from(usageSelect.options).find((item) => item.value === normalized);
++    usageSelect.value = option ? option.value : usageSelect.value;
+   }
+   sourcesList.append(row);
+ }
+ 
+ function collectSources() {
+   if (!sourcesList) {
+     return [];
+   }
+   const rows = Array.from(sourcesList.querySelectorAll(".source-row"));
+   const items = [];
+   for (const row of rows) {
+     const input = row.querySelector(".source-input");
+     const value =
+       input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement ? input.value.trim() : "";
+     if (!value) {
+       continue;
+     }
+-    items.push(value);
++    const usageSelect = row.querySelector(".source-usage");
++    const usage =
++      usageSelect instanceof HTMLSelectElement ? String(usageSelect.value || "").trim().toLowerCase() : "";
++    items.push({ value, usage });
+   }
+   return items;
+ }
+ 
+ async function init() {
+   let pipesLoaded = false;
+   try {
+     await loadPipes();
+     pipesLoaded = true;
+   } catch (error) {
+     console.error(error);
+     showToast({ message: `Не удалось загрузить тематики: ${getErrorMessage(error)}`, type: "error" });
+   }
+ 
+   try {
+     await loadArtifacts();
+   } catch (error) {
+     console.error(error);
+     showToast({ message: `Не удалось загрузить материалы: ${getErrorMessage(error)}`, type: "error" });
+   }
+ 
+   if (pipesLoaded) {
+     applyStructurePreset(structurePreset.value);
+   }
+ 
+@@ -1423,50 +1380,57 @@ function inlineFormat(text) {
      .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
      .replace(/`([^`]+)`/g, "<code>$1</code>");
  }
@@ -1176,9 +770,13 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
    if (structureInput && !structureInput.value && Array.isArray(pipe.default_structure)) {
      structureInput.value = pipe.default_structure.join("\n");
    }
--  if (goalInput && !goalInput.value) {
--    goalInput.value = "SEO-статья";
--  }
++  if (toneSelect && pipe.tone) {
++    const normalized = String(pipe.tone).trim().toLowerCase();
++    const option = Array.from(toneSelect.options || []).find((item) => item.value === normalized);
++    if (option) {
++      toneSelect.value = option.value;
++    }
++  }
  }
  
  async function handlePromptPreview() {
@@ -1204,438 +802,7 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
        body: JSON.stringify(previewRequest),
      });
      updatePromptPreview(preview);
-@@ -1426,290 +1482,301 @@ async function handlePromptPreview() {
- }
- 
- async function handleGenerate(event) {
-   event.preventDefault();
-   try {
-     const payload = buildRequestPayload();
-     resetDownloadButtonsForNewJob();
-     state.pendingArtifactFiles = null;
-     let downloadsRequested = false;
-     let activeJobId = null;
-     let artifactPathsHint = null;
-     toggleRetryButton(false);
-     setInteractiveBusy(true);
-     setButtonLoading(generateBtn, true);
-     showProgress(true, DEFAULT_PROGRESS_MESSAGE);
-     renderUsedKeywords(null);
-     const requestBody = {
-       theme: payload.theme,
-       data: payload.data,
-       k: payload.k,
-       context_source: payload.context_source,
-     };
-     if (Array.isArray(payload.data?.keywords)) {
-       requestBody.keywords = payload.data.keywords;
-     }
--    requestBody.length_range = {
--      min: DEFAULT_LENGTH_RANGE.min,
--      max: DEFAULT_LENGTH_RANGE.max,
--      mode: "no_spaces",
--    };
-     requestBody.faq_required = true;
--    requestBody.faq_count = 5;
-+    requestBody.faq_count = payload.data?.faq_questions || 5;
-     if (payload.context_source === "custom") {
-       requestBody.context_text = payload.context_text;
-       if (payload.context_filename) {
-         requestBody.context_filename = payload.context_filename;
-       }
-     }
-     const initialResponse = await fetchJson("/api/generate", {
-       method: "POST",
-       body: JSON.stringify(requestBody),
-     });
-     let snapshot = normalizeJobResponse(initialResponse);
-     activeJobId = snapshot.job_id || snapshot.id || activeJobId;
-     if (snapshot.result && typeof snapshot.result === "object" && snapshot.result.artifact_paths) {
-       artifactPathsHint = snapshot.result.artifact_paths;
-     }
--    const initialChars = applyProgressiveResult(snapshot) || 0;
--    showProgress(true, describeJobProgress(snapshot, initialChars));
-+    applyProgressiveResult(snapshot);
-+    updateProgressFromSnapshot(snapshot);
-     if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
-       downloadsRequested = true;
-       refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
-         console.warn("Не удалось заранее получить ссылки на артефакты", error);
-       });
-     }
-     if (snapshot.status !== "succeeded" || !snapshot.result) {
-       if (!snapshot.job_id) {
-         throw new Error("Сервер вернул пустой ответ без идентификатора задания.");
-       }
-       snapshot = await pollJobUntilDone(snapshot.job_id, {
-         onUpdate: (update) => {
--          const liveChars = applyProgressiveResult(update) || 0;
--          if (update?.status === "succeeded" || update?.status === "failed") {
--            showProgress(false);
--          } else {
--            showProgress(true, describeJobProgress(update, liveChars));
--          }
-+          applyProgressiveResult(update);
-+          updateProgressFromSnapshot(update);
-           if (!downloadsRequested && hasDraftStepSucceeded(update)) {
-             downloadsRequested = true;
-             activeJobId = update?.id || update?.job_id || activeJobId;
-             if (update?.result && typeof update.result === "object" && update.result.artifact_paths) {
-               artifactPathsHint = update.result.artifact_paths;
-             }
-             refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
-               console.warn("Не удалось заранее получить ссылки на артефакты", error);
-             });
-           }
-         },
-       });
-     }
-     activeJobId = snapshot?.id || snapshot?.job_id || activeJobId;
-     if (snapshot?.result && typeof snapshot.result === "object" && snapshot.result.artifact_paths) {
-       artifactPathsHint = snapshot.result.artifact_paths;
-     }
-+    updateProgressFromSnapshot(snapshot);
-     if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
-       downloadsRequested = true;
-       await refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
-     }
-     renderGenerationResult(snapshot, { payload });
-     try {
-       const pendingFiles = state.pendingArtifactFiles;
-       await loadArtifacts(pendingFiles);
-     } catch (refreshError) {
-       console.error(refreshError);
-       showToast({ message: `Не удалось обновить список материалов: ${getErrorMessage(refreshError)}`, type: "warn" });
-     }
-     state.pendingArtifactFiles = null;
-     switchTab("result");
-     showToast({ message: "Готово", type: "success" });
-   } catch (error) {
-     console.error(error);
-     showToast({ message: `Не удалось выполнить генерацию: ${getErrorMessage(error)}`, type: "error" });
-     setButtonLoading(downloadMdBtn, false);
-     setButtonLoading(downloadReportBtn, false);
-     setActiveArtifactDownloads(null);
-+    hideProgressOverlay({ immediate: true });
-   } finally {
-     setButtonLoading(generateBtn, false);
-     setInteractiveBusy(false);
--    showProgress(false);
-+    hideProgressOverlay();
-     state.pendingArtifactFiles = null;
-   }
- }
- 
- function normalizeJobResponse(response) {
-   if (!response || typeof response !== "object") {
-     return { status: "pending", result: null, steps: [], degradation_flags: [], job_id: null };
-   }
-   if (typeof response.markdown === "string" || typeof response.meta_json === "object") {
-     return {
-       status: "succeeded",
-       job_id: response.job_id || null,
-       steps: Array.isArray(response.steps) ? response.steps : [],
-       degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
-       trace_id: response.trace_id || null,
-       message: typeof response.message === "string" ? response.message : null,
-       progress: typeof response.progress === "number" ? response.progress : null,
-       step: typeof response.step === "string" ? response.step : null,
-       last_event_at: response.last_event_at || null,
-+      progress_stage:
-+        typeof response.progress_stage === "string" ? response.progress_stage : null,
-+      progress_message:
-+        typeof response.progress_message === "string" ? response.progress_message : null,
-+      progress_payload:
-+        response.progress_payload && typeof response.progress_payload === "object"
-+          ? response.progress_payload
-+          : null,
-       result: {
-         markdown: typeof response.markdown === "string" ? response.markdown : "",
-         meta_json: (response.meta_json && typeof response.meta_json === "object") ? response.meta_json : {},
-         faq_entries: Array.isArray(response.faq_entries) ? response.faq_entries : [],
-       },
-     };
-   }
-   return {
-     status: typeof response.status === "string" ? response.status : "pending",
-     job_id: response.job_id || null,
-     steps: Array.isArray(response.steps) ? response.steps : [],
-     degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
-     trace_id: response.trace_id || null,
-     message: typeof response.message === "string" ? response.message : null,
-     progress: typeof response.progress === "number" ? response.progress : null,
-     step: typeof response.step === "string" ? response.step : null,
-     last_event_at: response.last_event_at || null,
-+    progress_stage: typeof response.progress_stage === "string" ? response.progress_stage : null,
-+    progress_message:
-+      typeof response.progress_message === "string" ? response.progress_message : null,
-+    progress_payload:
-+      response.progress_payload && typeof response.progress_payload === "object"
-+        ? response.progress_payload
-+        : null,
-     result: response.result && typeof response.result === "object" ? response.result : null,
-   };
- }
- 
--function describeJobProgress(snapshot, characters = 0) {
--  if (!snapshot || typeof snapshot !== "object") {
--    return DEFAULT_PROGRESS_MESSAGE;
--  }
--  const status = typeof snapshot.status === "string" ? snapshot.status : "queued";
--  let message = "";
--  if (typeof snapshot.message === "string" && snapshot.message.trim()) {
--    message = snapshot.message.trim();
--  } else if (Array.isArray(snapshot.steps) && snapshot.steps.length) {
--    const running = snapshot.steps.find((step) => step && step.status === "running");
--    if (running) {
--      message = `Шаг: ${STEP_LABELS[running.name] || running.name}`;
--    } else {
--      const pending = snapshot.steps.find((step) => step && step.status === "pending");
--      if (pending) {
--        message = `Шаг: ${STEP_LABELS[pending.name] || pending.name}`;
--      }
--    }
--  }
--  if (!message) {
--    if (status === "queued") {
--      message = "Задание в очереди";
--    } else if (status === "running") {
--      message = "Готовим материалы";
--    } else if (status === "succeeded") {
--      message = "Готово";
--    } else if (status === "failed") {
--      message = "Завершено с ошибкой";
--    }
--  }
--  const parts = [];
--  if (message) {
--    parts.push(message);
--  }
--  if (status === "running" && typeof snapshot.progress === "number") {
--    const percent = Math.max(0, Math.min(100, Math.round(snapshot.progress * 100)));
--    parts.push(`${percent}%`);
--  }
--  if (typeof characters === "number" && characters > 0 && status !== "queued") {
--    parts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
--  }
--  return parts.length ? parts.join(" · ") : DEFAULT_PROGRESS_MESSAGE;
--}
--
- function applyProgressiveResult(snapshot) {
-   const result = snapshot?.result;
-   if (!result || typeof result !== "object") {
-     return 0;
-   }
-   const markdown = typeof result.markdown === "string" ? result.markdown : "";
-   if (markdown) {
-     draftView.innerHTML = markdownToHtml(markdown);
-   }
-   const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
-   updateResultBadges(meta, Array.isArray(snapshot?.degradation_flags) ? snapshot.degradation_flags : []);
-   const characters = typeof meta.characters === "number"
-     ? meta.characters
-     : markdown.replace(/\s+/g, "").length;
-   return characters;
- }
- 
- async function pollJobUntilDone(jobId, { onUpdate } = {}) {
-   if (typeof EventSource === "function") {
-     try {
-       return await watchJobViaSse(jobId, { onUpdate });
-     } catch (error) {
-       console.warn("SSE unavailable, falling back to polling", error);
-     }
-   }
-   return watchJobViaPolling(jobId, { onUpdate });
- }
- 
- function watchJobViaSse(jobId, { onUpdate } = {}) {
-   return new Promise((resolve, reject) => {
--    const source = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream`);
-     let settled = false;
--    const cleanup = () => {
--      if (!settled) {
--        settled = true;
--        source.close();
-+    let retries = 0;
-+    const maxRetries = 4;
-+    let source = null;
-+    let retryTimer = null;
-+
-+    const clearTimers = () => {
-+      if (retryTimer) {
-+        window.clearTimeout(retryTimer);
-+        retryTimer = null;
-       }
-     };
--    source.onmessage = (event) => {
--      let snapshot;
--      try {
--        snapshot = JSON.parse(event.data);
--      } catch (error) {
--        console.warn("Failed to parse SSE payload", error);
--        return;
-+
-+    const closeSource = () => {
-+      if (source) {
-+        try {
-+          source.close();
-+        } catch (error) {
-+          console.debug("Failed to close SSE source", error);
-+        }
-+        source = null;
-       }
-+    };
-+
-+    const cleanup = () => {
-+      clearTimers();
-+      closeSource();
-+    };
-+
-+    const handleSnapshot = (snapshot) => {
-       if (typeof onUpdate === "function") {
--        onUpdate(snapshot);
-+        try {
-+          onUpdate(snapshot);
-+        } catch (error) {
-+          console.error("Progress handler failed", error);
-+        }
-       }
-       if (snapshot?.status === "failed") {
-+        settled = true;
-         cleanup();
--        const message = snapshot?.error?.message || snapshot?.message || "Генерация завершилась с ошибкой.";
-+        const message = extractErrorMessage(snapshot) || "Генерация завершилась с ошибкой.";
-         const error = new Error(message);
-         if (snapshot?.trace_id) {
-           error.traceId = snapshot.trace_id;
-         }
-         reject(error);
--        return;
--      }
--      if (snapshot?.status === "succeeded" && snapshot.result) {
-+      } else if (snapshot?.status === "succeeded" && snapshot.result) {
-+        settled = true;
-         cleanup();
-         resolve(snapshot);
-       }
-     };
--    source.onerror = () => {
-+
-+    const connect = () => {
-       if (settled) {
-         return;
-       }
--      settled = true;
--      source.close();
--      watchJobViaPolling(jobId, { onUpdate }).then(resolve).catch(reject);
-+      clearTimers();
-+      closeSource();
-+      source = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream`);
-+      source.onmessage = (event) => {
-+        retries = 0;
-+        let snapshot;
-+        try {
-+          snapshot = JSON.parse(event.data);
-+        } catch (error) {
-+          console.warn("Failed to parse SSE payload", error);
-+          return;
-+        }
-+        handleSnapshot(snapshot);
-+      };
-+      source.onerror = () => {
-+        if (settled) {
-+          return;
-+        }
-+        retries += 1;
-+        if (retries > maxRetries) {
-+          settled = true;
-+          cleanup();
-+          watchJobViaPolling(jobId, { onUpdate }).then(resolve).catch(reject);
-+          return;
-+        }
-+        closeSource();
-+        clearTimers();
-+        retryTimer = window.setTimeout(connect, Math.min(2000 * retries, 6000));
-+      };
-     };
-+
-+    connect();
-   });
- }
- 
- async function watchJobViaPolling(jobId, { onUpdate } = {}) {
-   let delayMs = 1000;
-   while (true) {
-     await delay(delayMs);
-     const snapshot = await fetchJson(`/api/jobs/${encodeURIComponent(jobId)}`);
-     if (typeof onUpdate === "function") {
-       onUpdate(snapshot);
-     }
-     if (snapshot?.status === "failed") {
-       const message = snapshot?.error?.message || snapshot?.message || "Генерация завершилась с ошибкой.";
-       const error = new Error(message);
-       if (snapshot?.trace_id) {
-         error.traceId = snapshot.trace_id;
-       }
-       throw error;
-     }
-     if (snapshot?.status === "succeeded" && snapshot.result) {
-       return snapshot;
-     }
-     delayMs = Math.min(delayMs + 200, 1500);
-   }
- }
-@@ -1777,111 +1844,152 @@ function renderGenerationResult(snapshot, { payload }) {
-   }
- }
- 
- function describeDegradationFlag(flag) {
-   if (!flag) {
-     return "unknown";
-   }
-   return DEGRADATION_LABELS[flag] || flag;
- }
- 
- const delay = (ms) => new Promise((resolve) => {
-   setTimeout(resolve, ms);
- });
- 
- function handleRetryClick(event) {
-   event.preventDefault();
-   if (briefForm && typeof briefForm.requestSubmit === "function") {
-     briefForm.requestSubmit(generateBtn);
-     return;
-   }
-   if (generateBtn) {
-     generateBtn.click();
-   }
- }
- 
-+function parsePositiveInt(value) {
-+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-+    return Math.floor(value);
-+  }
-+  if (typeof value === "string") {
-+    const trimmed = value.trim();
-+    if (!trimmed) {
-+      return null;
-+    }
-+    const parsed = Number.parseInt(trimmed, 10);
-+    if (Number.isFinite(parsed) && parsed > 0) {
-+      return parsed;
-+    }
-+  }
-+  return null;
-+}
-+
- function buildRequestPayload() {
-   const theme = pipeSelect.value;
-   if (!theme) {
-     throw new Error("Выберите тематику");
-   }
--  const topic = document.getElementById("topic-input").value.trim();
-+  const topic = topicInput?.value?.trim() || "";
+@@ -1892,119 +1856,108 @@ function buildRequestPayload() {
    if (!topic) {
      throw new Error("Укажите тему материала");
    }
@@ -1651,24 +818,6 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
          .filter(Boolean)
      : [];
  
--  let minChars = DEFAULT_LENGTH_RANGE.min;
--  let maxChars = DEFAULT_LENGTH_RANGE.max;
--  if (minCharsInput || maxCharsInput) {
--    const minCharsRaw = String(minCharsInput?.value ?? "").trim();
--    const maxCharsRaw = String(maxCharsInput?.value ?? "").trim();
--    minChars = minCharsRaw === "" ? DEFAULT_LENGTH_RANGE.min : Number.parseInt(minCharsRaw, 10);
--    maxChars = maxCharsRaw === "" ? DEFAULT_LENGTH_RANGE.max : Number.parseInt(maxCharsRaw, 10);
--    if (!Number.isInteger(minChars) || minChars <= 0) {
--      throw new Error("Минимальный объём должен быть положительным целым числом");
--    }
--    if (!Number.isInteger(maxChars) || maxChars <= 0) {
--      throw new Error("Максимальный объём должен быть положительным целым числом");
--    }
--    if (maxChars < minChars) {
--      throw new Error("Максимальный объём должен быть больше или равен минимальному");
--    }
--  }
--
    const keywordMode = Array.from(keywordModeInputs).find((input) => input.checked)?.value || "strict";
    const styleProfile = styleProfileSelect?.value || "sravni.ru";
    const contextSource = String(contextSourceSelect?.value || "index.json").toLowerCase();
@@ -1676,70 +825,81 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
  
    const data = {
      theme: topic,
--    goal: "SEO-статья",
--    tone: "экспертный",
      keywords,
--    keywords_mode: "strict",
--    structure: structure,
-+    keywords_mode: keywordMode,
+     keywords_mode: keywordMode,
      include_faq: true,
++    faq_questions: 5,
      include_jsonld: true,
--    structure_preset: structurePreset ? structurePreset.value : "custom",
-+    structure,
+     structure,
      pipe_id: theme,
--    length_limits: { min_chars: minChars, max_chars: maxChars },
      style_profile: styleProfile,
      context_source: contextSource,
--    faq_questions: 5,
    };
  
-+  const titleValue = titleInput?.value?.trim();
-+  if (titleValue) {
-+    data.title = titleValue;
-+  }
+   const titleValue = titleInput?.value?.trim();
+   if (titleValue) {
+     data.title = titleValue;
+   }
+ 
+   const goalValue = goalInput?.value?.trim();
+   if (goalValue) {
+     data.goal = goalValue;
+   }
+ 
+   const audienceValue = audienceInput?.value?.trim();
+   if (audienceValue) {
+     data.target_audience = audienceValue;
+   }
+ 
+-  const selectedLengthMode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
+-  if (selectedLengthMode === "range") {
+-    const minValue = parsePositiveInt(minCharsInput?.value);
+-    const maxValue = parsePositiveInt(maxCharsInput?.value);
+-    if (minValue !== null && maxValue !== null && maxValue < minValue) {
+-      throw new Error("Максимальный объём должен быть больше или равен минимальному");
+-    }
+-    if (minValue !== null || maxValue !== null) {
+-      data.length_limits = {};
+-      if (minValue !== null) {
+-        data.length_limits.min_chars = minValue;
+-      }
+-      if (maxValue !== null) {
+-        data.length_limits.max_chars = maxValue;
+-      }
+-    }
+-  } else {
+-    const targetValue = parsePositiveInt(lengthTargetInput?.value);
+-    if (targetValue !== null) {
+-      data.length_target = targetValue;
+-    }
++  const toneValue = toneSelect?.value?.trim();
++  if (toneValue) {
++    data.tone = toneValue;
+   }
+ 
+-  if (includeFaq) {
+-    data.include_faq = true;
+-    const faqValue = parsePositiveInt(faqCountInput?.value) || 5;
+-    data.faq_questions = faqValue;
++  const minValue = parsePositiveInt(minCharsInput?.value);
++  const maxValue = parsePositiveInt(maxCharsInput?.value);
++  const effectiveMin = minValue ?? DEFAULT_LENGTH_RANGE.min;
++  const effectiveMax = maxValue ?? DEFAULT_LENGTH_RANGE.max;
++  if (effectiveMax < effectiveMin) {
++    throw new Error("Максимальный объём должен быть больше или равен минимальному");
+   }
+-  if (includeJsonld) {
+-    data.include_jsonld = true;
++  data.length_limits = {
++    min_chars: effectiveMin,
++    max_chars: effectiveMax,
++  };
 +
-+  const goalValue = goalInput?.value?.trim();
-+  if (goalValue) {
-+    data.goal = goalValue;
-+  }
-+
-+  const audienceValue = audienceInput?.value?.trim();
-+  if (audienceValue) {
-+    data.target_audience = audienceValue;
-+  }
-+
-+  const selectedLengthMode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
-+  if (selectedLengthMode === "range") {
-+    const minValue = parsePositiveInt(minCharsInput?.value);
-+    const maxValue = parsePositiveInt(maxCharsInput?.value);
-+    if (minValue !== null && maxValue !== null && maxValue < minValue) {
-+      throw new Error("Максимальный объём должен быть больше или равен минимальному");
-+    }
-+    if (minValue !== null || maxValue !== null) {
-+      data.length_limits = {};
-+      if (minValue !== null) {
-+        data.length_limits.min_chars = minValue;
-+      }
-+      if (maxValue !== null) {
-+        data.length_limits.max_chars = maxValue;
-+      }
-+    }
-+  } else {
-+    const targetValue = parsePositiveInt(lengthTargetInput?.value);
-+    if (targetValue !== null) {
-+      data.length_target = targetValue;
-+    }
-+  }
-+
-+  if (includeFaq) {
-+    data.include_faq = true;
-+    const faqValue = parsePositiveInt(faqCountInput?.value) || 5;
-+    data.faq_questions = faqValue;
-+  }
-+  if (includeJsonld) {
-+    data.include_jsonld = true;
-+  }
-+
++  const sources = collectSources();
++  if (sources.length) {
++    data.sources = sources;
+   }
+ 
    if (contextSource === "custom") {
      data.context_source = "custom";
      if (contextPayload.filename) {
@@ -1753,8 +913,8 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
      theme,
      data,
      k: 0,
-     maxTokens: 0,
-     model: undefined,
+-    maxTokens: 0,
+-    model: undefined,
      context_source: contextSource,
    };
  
@@ -1765,321 +925,223 @@ index be69d338d7148f62ef752d07639cdb0f9eb0efc1..90f6bfe2cf05d8be6858501fe7354bf0
      }
    }
  
-@@ -2768,64 +2876,304 @@ function setupAdvancedSettings() {
-   }
+   return payload;
+ }
  
+ function renderMetadata(meta) {
+   reportView.innerHTML = "";
+   const lengthWarnings = [];
+   if (Array.isArray(meta?.length_limits_warnings)) {
+     meta.length_limits_warnings.forEach((note) => {
+       if (typeof note === "string" && note.trim()) {
+         lengthWarnings.push(note.trim());
+       }
+     });
+   }
+   if (typeof meta?.length_limits_warning === "string" && meta.length_limits_warning.trim()) {
+     lengthWarnings.push(meta.length_limits_warning.trim());
+@@ -3206,71 +3159,62 @@ function setButtonLoading(button, isLoading) {
+     }
+     delete button.dataset.originalDisabled;
+   }
+ }
+ 
+ function toggleFeatureElements(elements, hidden) {
+   elements
+     .filter(Boolean)
+     .forEach((element) => {
+       const target = element.closest?.("[data-feature-root]")
+         || element.closest?.(".form-row")
+         || element;
+       if (!target) {
+         return;
+       }
+       if (hidden) {
+         target.classList.add("feature-hidden");
+       } else {
+         target.classList.remove("feature-hidden");
+       }
+     });
+ }
+ 
+ function applyFeatureFlags() {
+   const modelElements = [];
+-  if (modelInput) {
+-    modelElements.push(modelInput);
+-  }
+   document.querySelectorAll('[data-feature="model-selector"]').forEach((element) => {
+     modelElements.push(element);
+   });
+   toggleFeatureElements(modelElements, featureState.hideModelSelector);
+ 
+   const tokenElements = [];
+-  if (maxTokensInput) {
+-    tokenElements.push(maxTokensInput);
+-  }
+   if (minCharsInput) {
+     tokenElements.push(minCharsInput);
+   }
+   if (maxCharsInput) {
+     tokenElements.push(maxCharsInput);
+   }
+-  if (kInput) {
+-    tokenElements.push(kInput);
+-  }
+   document.querySelectorAll('[data-feature="token-sliders"]').forEach((element) => {
+     tokenElements.push(element);
+   });
+   toggleFeatureElements(tokenElements, featureState.hideTokenSliders);
+ }
+ 
+ async function initFeatureFlags() {
+   applyFeatureFlags();
    try {
-     const saved = window.localStorage.getItem(ADVANCED_SETTINGS_STORAGE_KEY);
-     if (saved === "open") {
-       advancedSettings.setAttribute("open", "");
-     } else if (saved === "closed") {
-       advancedSettings.removeAttribute("open");
+     const config = await fetchJson("/api/features");
+     if (config && typeof config === "object") {
+       if (typeof config.hide_model_selector === "boolean") {
+         featureState.hideModelSelector = config.hide_model_selector;
+       }
+       if (typeof config.hide_token_sliders === "boolean") {
+         featureState.hideTokenSliders = config.hide_token_sliders;
+       }
      }
    } catch (error) {
-     console.debug("Не удалось восстановить состояние расширенных настроек", error);
-   }
- 
-   advancedSettings.addEventListener("toggle", () => {
-     try {
-       window.localStorage.setItem(
-         ADVANCED_SETTINGS_STORAGE_KEY,
-         advancedSettings.open ? "open" : "closed"
-       );
-     } catch (error) {
-       console.debug("Не удалось сохранить состояние расширенных настроек", error);
-     }
-   });
- }
- 
-+function resetProgressIndicator(message = DEFAULT_PROGRESS_MESSAGE) {
-+  if (progressStage) {
-+    const fallbackStage = progressStage.dataset.defaultLabel
-+      || progressStage.textContent
-+      || "Подготовка…";
-+    progressStage.textContent = fallbackStage;
-+  }
-+  if (progressPercent) {
-+    progressPercent.textContent = "0%";
-+  }
-+  if (progressBarFill) {
-+    progressBarFill.style.width = "0%";
-+  }
-+  if (progressBar) {
-+    progressBar.setAttribute("aria-valuenow", "0");
-+  }
-+  if (progressMessage) {
-+    progressMessage.textContent = message;
-+  }
-+  if (progressDetails) {
-+    progressDetails.textContent = "";
-+  }
-+  progressState.currentPercent = 0;
-+  progressState.lastStage = "draft";
-+}
-+
- function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
-   if (!progressOverlay) {
-     return;
-   }
-   if (visible) {
--    if (progressMessage) {
--      progressMessage.textContent = message;
-+    if (progressState.hideTimer) {
-+      window.clearTimeout(progressState.hideTimer);
-+      progressState.hideTimer = null;
-     }
-     progressOverlay.classList.remove("hidden");
-+    resetProgressIndicator(message);
-+  } else {
-+    hideProgressOverlay({ immediate: true });
-+  }
-+}
-+
-+function hideProgressOverlay({ immediate = false } = {}) {
-+  if (!progressOverlay) {
-+    return;
-+  }
-+  if (!immediate && progressState.hideTimer) {
-+    return;
-+  }
-+  if (progressState.hideTimer) {
-+    window.clearTimeout(progressState.hideTimer);
-+    progressState.hideTimer = null;
-+  }
-+  progressOverlay.classList.add("hidden");
-+  resetProgressIndicator(DEFAULT_PROGRESS_MESSAGE);
-+}
-+
-+function scheduleProgressHide(delay = 1200) {
-+  if (!progressOverlay) {
-+    return;
-+  }
-+  if (progressState.hideTimer) {
-+    window.clearTimeout(progressState.hideTimer);
-+  }
-+  progressState.hideTimer = window.setTimeout(() => {
-+    progressState.hideTimer = null;
-+    hideProgressOverlay({ immediate: true });
-+  }, Math.max(0, delay));
-+}
-+
-+function clamp01(value) {
-+  if (typeof value !== "number" || Number.isNaN(value)) {
-+    return 0;
-+  }
-+  if (value <= 0) {
-+    return 0;
-+  }
-+  if (value >= 1) {
-+    return 1;
-+  }
-+  return value;
-+}
-+
-+function toNumber(value) {
-+  if (typeof value === "number" && Number.isFinite(value)) {
-+    return value;
-+  }
-+  if (typeof value === "string" && value.trim()) {
-+    const parsed = Number(value);
-+    if (Number.isFinite(parsed)) {
-+      return parsed;
-+    }
-+  }
-+  return null;
-+}
-+
-+function formatProgressDetails(stage, payload) {
-+  if (!payload || typeof payload !== "object") {
-+    return "";
-+  }
-+  const parts = [];
-+  if (stage === "draft") {
-+    const completed = toNumber(payload.completed);
-+    const total = toNumber(payload.total);
-+    if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
-+      const safeCompleted = Math.max(0, Math.min(total, completed));
-+      parts.push(`Батчи: ${safeCompleted}/${total}`);
-+    }
-+    if (typeof payload.batch === "string" && payload.batch.trim()) {
-+      parts.push(`Блок: ${payload.batch.trim()}`);
-+    }
-+    if (payload.partial) {
-+      parts.push("частично");
-+    }
-+  } else if (stage === "trim") {
-+    const chars = toNumber(payload.chars);
-+    if (Number.isFinite(chars) && chars > 0) {
-+      parts.push(`Символов: ${Math.round(chars).toLocaleString("ru-RU")}`);
-+    }
-+  } else if (stage === "validate") {
-+    const length = toNumber(payload.length ?? payload.chars);
-+    if (Number.isFinite(length) && length > 0) {
-+      parts.push(`Символов: ${Math.round(length).toLocaleString("ru-RU")}`);
-+    }
-+    const faqCount = toNumber(payload.faq ?? payload.faq_count);
-+    if (Number.isFinite(faqCount)) {
-+      parts.push(`FAQ: ${Math.round(faqCount)}`);
-+    }
-+  }
-+  return parts.join(" · ");
-+}
-+
-+function extractErrorMessage(snapshot) {
-+  if (!snapshot || typeof snapshot !== "object") {
-+    return "";
-+  }
-+  const errorPayload = snapshot.error;
-+  if (errorPayload && typeof errorPayload === "object") {
-+    if (typeof errorPayload.message === "string" && errorPayload.message.trim()) {
-+      return errorPayload.message.trim();
-+    }
-+    if (typeof errorPayload.error === "string" && errorPayload.error.trim()) {
-+      return errorPayload.error.trim();
-+    }
-+  } else if (typeof errorPayload === "string" && errorPayload.trim()) {
-+    return errorPayload.trim();
-+  }
-+  if (typeof snapshot.message === "string" && snapshot.message.trim()) {
-+    return snapshot.message.trim();
-+  }
-+  return "";
-+}
-+
-+function updateProgressFromSnapshot(snapshot) {
-+  if (!progressOverlay || !snapshot || typeof snapshot !== "object") {
-+    return;
-+  }
-+  if (progressState.hideTimer) {
-+    window.clearTimeout(progressState.hideTimer);
-+    progressState.hideTimer = null;
-+  }
-+
-+  progressOverlay.classList.remove("hidden");
-+
-+  const status = typeof snapshot.status === "string" ? snapshot.status : "running";
-+  let stage = typeof snapshot.progress_stage === "string" && snapshot.progress_stage.trim()
-+    ? snapshot.progress_stage.trim().toLowerCase()
-+    : "";
-+  if (!stage && typeof snapshot.step === "string" && snapshot.step.trim()) {
-+    stage = snapshot.step.trim().toLowerCase();
-+  }
-+  if (status === "succeeded") {
-+    stage = "done";
-+  } else if (status === "failed") {
-+    stage = "error";
-+  }
-+  if (!PROGRESS_STAGE_LABELS[stage]) {
-+    stage = progressState.lastStage || "draft";
-+  }
-+  progressState.lastStage = stage;
-+
-+  let percentValue = null;
-+  if (typeof snapshot.progress === "number") {
-+    percentValue = Math.round(clamp01(snapshot.progress) * 1000) / 10;
-+  }
-+  if (percentValue === null || Number.isNaN(percentValue)) {
-+    percentValue = progressState.currentPercent || 0;
-+  }
-+  percentValue = Math.max(progressState.currentPercent || 0, percentValue);
-+  percentValue = Math.min(100, percentValue);
-+  progressState.currentPercent = percentValue;
-+
-+  if (progressBarFill) {
-+    progressBarFill.style.width = `${percentValue}%`;
-+  }
-+  if (progressPercent) {
-+    progressPercent.textContent = `${Math.round(percentValue)}%`;
-+  }
-+  if (progressBar) {
-+    progressBar.setAttribute("aria-valuenow", String(Math.round(percentValue)));
-+  }
-+
-+  let message = "";
-+  if (typeof snapshot.progress_message === "string" && snapshot.progress_message.trim()) {
-+    message = snapshot.progress_message.trim();
-+  } else if (status === "succeeded") {
-+    message = PROGRESS_STAGE_MESSAGES.done;
-+  } else if (status === "failed") {
-+    message = extractErrorMessage(snapshot) || PROGRESS_STAGE_MESSAGES.error;
-+  } else if (typeof snapshot.message === "string" && snapshot.message.trim()) {
-+    message = snapshot.message.trim();
-   } else {
--    progressOverlay.classList.add("hidden");
--    if (progressMessage) {
--      progressMessage.textContent = DEFAULT_PROGRESS_MESSAGE;
-+    message = PROGRESS_STAGE_MESSAGES[stage] || DEFAULT_PROGRESS_MESSAGE;
-+  }
-+  if (progressMessage) {
-+    progressMessage.textContent = message;
-+  }
-+
-+  if (progressStage) {
-+    const label = PROGRESS_STAGE_LABELS[stage] || PROGRESS_STAGE_LABELS.draft;
-+    progressStage.textContent = label;
-+  }
-+
-+  const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
-+    ? snapshot.progress_payload
-+    : null;
-+  if (progressDetails) {
-+    progressDetails.textContent = formatProgressDetails(stage, payload);
-+  }
-+
-+  if (status === "succeeded") {
-+    progressState.currentPercent = 100;
-+    if (progressPercent) {
-+      progressPercent.textContent = "100%";
-+    }
-+    if (progressBarFill) {
-+      progressBarFill.style.width = "100%";
-+    }
-+    if (progressBar) {
-+      progressBar.setAttribute("aria-valuenow", "100");
-+    }
-+    scheduleProgressHide(1200);
-+  } else if (status === "failed") {
-+    progressState.currentPercent = 100;
-+    if (progressPercent) {
-+      progressPercent.textContent = "100%";
-+    }
-+    if (progressBarFill) {
-+      progressBarFill.style.width = "100%";
-+    }
-+    if (progressBar) {
-+      progressBar.setAttribute("aria-valuenow", "100");
-     }
-+    scheduleProgressHide(2500);
+     console.debug("Не удалось загрузить настройки фич", error);
+   } finally {
+     applyFeatureFlags();
    }
  }
  
- function setInteractiveBusy(isBusy) {
-   interactiveElements.forEach((element) => {
-     if (!element) {
-       return;
-     }
-     if (isBusy) {
-       if (typeof element.dataset.interactiveLocked === "undefined") {
-         element.dataset.interactiveLocked = element.disabled ? "true" : "false";
-       }
-       element.disabled = true;
-     } else if (typeof element.dataset.interactiveLocked !== "undefined") {
-       const shouldRemainDisabled = element.dataset.interactiveLocked === "true";
-       if (!shouldRemainDisabled) {
-         element.disabled = false;
-       }
-       delete element.dataset.interactiveLocked;
-     }
-   });
- 
-   if (advancedSettings) {
-     advancedSettings.classList.toggle("is-disabled", isBusy);
-   }
 diff --git a/frontend_demo/styles.css b/frontend_demo/styles.css
-index b13a696b02cdb349ccc68d515ac0c9ced0540018..565bf35662624c4dd860eb5c295253877246e6db 100644
+index 565bf35662624c4dd860eb5c295253877246e6db..6f905d6f7ed61bf8cef04c646d1b6fe6cc93bc17 100644
 --- a/frontend_demo/styles.css
 +++ b/frontend_demo/styles.css
-@@ -319,66 +319,87 @@ body {
+@@ -139,101 +139,94 @@ body {
+ 
+ @media (min-width: 992px) and (max-width: 1199px) {
+   .request-grid {
+     grid-template-columns: 320px 1fr;
+   }
+ }
+ 
+ @media (min-width: 1600px) {
+   .request-grid {
+     grid-template-columns: 400px 1fr;
+   }
+ }
+ 
+ .brief-form {
+   display: flex;
+   flex-direction: column;
+   gap: 24px;
+ }
+ 
+ @media (max-width: 991px) {
+   .brief-form {
+     gap: 20px;
+   }
+ }
+ 
+-.form-card {
++.parameters-card {
+   background: #ffffff;
+-  border-radius: 16px;
+-  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
+-  padding: 24px;
++  border-radius: 18px;
++  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.08);
++  padding: 28px;
+   display: flex;
+   flex-direction: column;
+-  gap: 16px;
++  gap: 24px;
+   min-width: 0;
+ }
+ 
+-.form-card__header {
++.parameters-card__header {
+   display: flex;
+-  align-items: center;
++  align-items: baseline;
+   justify-content: space-between;
+   gap: 12px;
+ }
+ 
+-.form-card__title {
++.parameters-card__title {
+   margin: 0;
+-  font-size: 18px;
++  font-size: 22px;
+   font-weight: 600;
++  color: #111827;
+ }
+ 
+-.form-card__body {
+-  display: flex;
+-  flex-direction: column;
+-  gap: 16px;
+-}
+-
+-.form-card--actions {
+-  padding: 20px 24px;
+-}
+-
+-.style-toggle-block {
++.parameters-card__body {
+   display: flex;
+   flex-direction: column;
+-  gap: 8px;
+-  margin-bottom: 16px;
++  gap: 20px;
+ }
+ 
+-#styleSettings {
+-  display: none;
+-  flex-direction: column;
+-  gap: 12px;
++.parameters-card .form-actions {
++  justify-content: flex-end;
++  padding-top: 8px;
+ }
+ 
+-#styleSettings label {
+-  display: flex;
+-  flex-direction: column;
+-  gap: 6px;
++@media (max-width: 599px) {
++  .parameters-card {
++    padding: 22px;
++    gap: 20px;
++  }
++  .parameters-card__title {
++    font-size: 20px;
++  }
+ }
+ 
+ .brief-form * {
+   box-sizing: border-box;
+ }
+ 
+ .form-row {
+   display: flex;
+   flex-direction: column;
+   gap: 8px;
+ }
+ 
+ .form-row label,
+ .field-label,
+ .field-label-inline,
+ .radio-option,
+ .checkbox-with-hint,
+ .checkbox-with-hint span {
+   white-space: normal;
+   word-break: break-word;
+   overflow-wrap: anywhere;
+ }
+ 
+ .field-label {
+   display: flex;
+@@ -319,173 +312,168 @@ body {
  .form-row textarea {
    padding: 12px 14px;
    border-radius: 10px;
@@ -2105,71 +1167,86 @@ index b13a696b02cdb349ccc68d515ac0c9ced0540018..565bf35662624c4dd860eb5c29525387
    font-weight: 400;
  }
  
--.length-range {
--  display: grid;
--  grid-template-columns: 1fr;
-+.length-mode-toggle {
-+  display: flex;
+-.length-mode-toggle {
+-  display: flex;
+-  flex-wrap: wrap;
+-  gap: 12px;
+-}
+-
+-.length-mode-option {
++.length-range-inline {
+   display: inline-flex;
+   align-items: center;
+-  gap: 8px;
+-  padding: 6px 14px;
+-  border-radius: 999px;
+-  background: #f3f4f6;
+-  cursor: pointer;
+-  font-size: 14px;
+-  transition: background-color 0.2s ease, box-shadow 0.2s ease;
+-}
+-
+-.length-mode-option input {
+-  margin: 0;
+-  accent-color: #4f46e5;
++  gap: 10px;
 +  flex-wrap: wrap;
-+  gap: 12px;
-+}
-+
-+.length-mode-option {
-+  display: inline-flex;
-+  align-items: center;
-   gap: 8px;
--  width: 100%;
-+  padding: 6px 14px;
-+  border-radius: 999px;
-+  background: #f3f4f6;
-+  cursor: pointer;
-+  font-size: 14px;
-+  transition: background-color 0.2s ease, box-shadow 0.2s ease;
  }
  
--.length-range input {
+-.length-mode-option:focus-within {
+-  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
++.length-range-inline input {
++  width: 140px;
++  flex: 0 0 140px;
+ }
+ 
+-.length-range-inputs {
+-  display: grid;
+-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+-  gap: 12px;
++.range-separator {
++  font-size: 18px;
++  color: #9ca3af;
+ }
+ 
+-.length-range-inputs input,
+-.length-target input {
 -  width: 100%;
 -  min-width: 0;
-+.length-mode-option input {
-+  margin: 0;
-+  accent-color: #4f46e5;
++@media (max-width: 599px) {
++  .length-range-inline input {
++    width: 100%;
++    flex: 1 1 120px;
++  }
  }
  
--.range-separator {
--  color: #6b7280;
--  font-weight: 500;
--  text-align: center;
-+.length-mode-option:focus-within {
-+  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
-+}
-+
-+.length-range-inputs {
-+  display: grid;
-+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-+  gap: 12px;
-+}
-+
-+.length-range-inputs input,
-+.length-target input {
-+  width: 100%;
-+  min-width: 0;
+-@media (min-width: 768px) {
+-  .length-range {
+-    grid-template-columns: 1fr auto 1fr;
+-    align-items: center;
+-  }
++.keyword-mode {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
  }
  
- @media (min-width: 768px) {
-   .length-range {
-     grid-template-columns: 1fr auto 1fr;
-     align-items: center;
-   }
- }
- 
- .keyword-mode-group {
+-.keyword-mode-group {
++.keyword-mode__options {
    display: grid;
-   gap: 12px;
+-  gap: 12px;
++  gap: 10px;
    background: #f5f6fb;
    border: 1px solid #e4e7ec;
    border-radius: 12px;
    padding: 12px 16px;
-   overflow-wrap: anywhere;
+-  overflow-wrap: anywhere;
++}
++
++@media (min-width: 768px) {
++  .keyword-mode__options {
++    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
++  }
  }
  
  .field-label-inline {
@@ -2178,1000 +1255,109 @@ index b13a696b02cdb349ccc68d515ac0c9ced0540018..565bf35662624c4dd860eb5c29525387
    color: #1f2937;
  }
  
-@@ -1482,63 +1503,102 @@ button.loading {
-   display: flex;
+ .radio-option {
+   display: grid;
+   grid-template-columns: auto 1fr;
+   align-items: start;
+   column-gap: 8px;
+   row-gap: 4px;
+   font-size: 14px;
+   color: #374151;
+ }
+ 
+ .radio-option span {
+   min-width: 0;
+ }
+ 
+ .radio-option input {
+   margin-top: 2px;
+ }
+ 
+ .sources-control {
+   display: grid;
    gap: 12px;
+   white-space: normal;
+   word-break: break-word;
+   overflow-wrap: anywhere;
  }
  
- .progress-overlay {
-   position: fixed;
-   inset: 0;
-   background: rgba(15, 23, 42, 0.25);
-   display: flex;
-   align-items: center;
-   justify-content: center;
-   z-index: 100;
- }
- 
- .progress-overlay.hidden {
-   display: none;
- }
- 
- .progress-card {
-   background: #ffffff;
-   padding: 32px 40px;
-   border-radius: 16px;
-   box-shadow: 0 20px 60px rgba(15, 23, 42, 0.2);
-   display: flex;
-   flex-direction: column;
--  align-items: center;
--  gap: 16px;
-+  align-items: stretch;
+ .sources-list {
+-  display: grid;
+-  gap: 10px;
++  display: flex;
++  flex-direction: column;
 +  gap: 12px;
-   font-size: 16px;
-+  min-width: min(420px, 90vw);
-+}
-+
-+.progress-stage {
-+  margin: 0;
-+  font-size: 18px;
-+  font-weight: 600;
-   text-align: center;
  }
  
--.spinner {
--  width: 48px;
--  height: 48px;
--  border-radius: 50%;
--  border: 4px solid #e5e7eb;
--  border-top-color: #4f46e5;
--  animation: spin 1s linear infinite;
-+.progress-bar {
-+  position: relative;
-+  width: 100%;
-+  height: 12px;
-+  border-radius: 999px;
-+  background: rgba(79, 70, 229, 0.12);
-+  overflow: hidden;
-+}
-+
-+.progress-bar__fill {
-+  position: absolute;
-+  inset: 0;
-+  width: 0%;
-+  background: linear-gradient(90deg, #4f46e5, #6366f1);
-+  border-radius: inherit;
-+  transition: width 0.4s ease;
-+}
-+
-+.progress-percent {
-+  margin: 0;
-+  font-size: 32px;
-+  font-weight: 600;
-+  text-align: center;
-+  color: #111827;
-+}
-+
-+.progress-message {
-+  margin: 0;
-+  font-size: 16px;
-+  text-align: center;
-+  color: #1f2937;
-+}
-+
-+.progress-details {
-+  margin: 0;
-+  font-size: 14px;
-+  text-align: center;
-+  color: #4b5563;
-+  min-height: 1.4em;
+ .source-row {
+   display: grid;
+   gap: 12px;
+-  grid-template-columns: minmax(0, 1fr);
+-  align-items: start;
++  grid-template-columns: minmax(0, 1fr) minmax(140px, 180px) auto;
++  align-items: center;
  }
  
- @keyframes spin {
-   to {
-     transform: rotate(360deg);
+-.source-row .source-input {
++.source-row .source-input,
++.source-row .source-usage {
+   width: 100%;
+   min-width: 0;
+-  overflow-wrap: anywhere;
+-  word-break: break-word;
+-  resize: vertical;
+-  min-height: 48px;
++  min-height: 44px;
+ }
+ 
+ .source-row .icon-button {
+-  justify-self: flex-start;
++  justify-self: flex-end;
+ }
+ 
+-@media (min-width: 600px) {
++@media (max-width: 599px) {
+   .source-row {
+-    grid-template-columns: minmax(0, 1fr) auto;
++    grid-template-columns: minmax(0, 1fr);
+   }
+ 
++  .source-row .source-usage,
+   .source-row .icon-button {
+-    justify-self: flex-end;
++    justify-self: flex-start;
    }
  }
  
- .empty-state {
-   text-align: center;
-   color: #9ca3af;
-   padding: 40px;
-   border: 1px dashed #e2e8f0;
-   border-radius: 16px;
-   background: #ffffff;
- }
- 
- .btn-spinner {
-   width: 16px;
-   height: 16px;
-   border-radius: 50%;
-   border: 2px solid currentColor;
-   border-top-color: transparent;
-   animation: spin 0.9s linear infinite;
- }
-diff --git a/jobs/models.py b/jobs/models.py
-index c5f97af8d21e42db63288673af8fdf152641bfcf..11b237dd3844379e88d200ff1a3eb2436639f673 100644
---- a/jobs/models.py
-+++ b/jobs/models.py
-@@ -76,87 +76,119 @@ class JobStep:
-         return {
-             "name": self.name,
-             "status": self.status.value,
-             "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
-             "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
-             "payload": self.payload or None,
-             "error": self.error,
-         }
- 
- 
- @dataclass
- class Job:
-     """Representation of a long-running generation request."""
- 
-     id: str
-     status: JobStatus = JobStatus.PENDING
-     created_at: datetime = field(default_factory=utcnow)
-     started_at: Optional[datetime] = None
-     finished_at: Optional[datetime] = None
-     steps: List[JobStep] = field(default_factory=list)
-     result: Optional[Dict[str, Any]] = None
-     error: Optional[Dict[str, Any]] = None
-     degradation_flags: List[str] = field(default_factory=list)
-     trace_id: Optional[str] = None
-     last_event_at: datetime = field(default_factory=utcnow)
-+    progress_stage: Optional[str] = None
-+    progress_value: Optional[float] = None
-+    progress_message: Optional[str] = None
-+    progress_payload: Dict[str, Any] = field(default_factory=dict)
- 
-     def mark_running(self) -> None:
-         self.status = JobStatus.RUNNING
-         self.started_at = self.started_at or utcnow()
-         self.last_event_at = utcnow()
- 
-     def mark_succeeded(self, result: Dict[str, Any], *, degradation_flags: Optional[List[str]] = None) -> None:
-         self.status = JobStatus.SUCCEEDED
-         self.result = result
-         if degradation_flags:
-             self.degradation_flags.extend(flag for flag in degradation_flags if flag)
-         self.finished_at = utcnow()
-         self.last_event_at = utcnow()
- 
-     def mark_failed(self, error: str | Dict[str, Any], *, degradation_flags: Optional[List[str]] = None) -> None:
-         self.status = JobStatus.FAILED
-         self.error = {"message": error} if isinstance(error, str) else error
-         self.finished_at = utcnow()
-         if degradation_flags:
-             self.degradation_flags.extend(flag for flag in degradation_flags if flag)
-         self.last_event_at = utcnow()
- 
-     def to_dict(self) -> Dict[str, Any]:
-         payload: Dict[str, Any] = {
-             "id": self.id,
-             "created_at": self.created_at.strftime(ISO_FORMAT),
-             "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
-             "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
-             "steps": [step.to_dict() for step in self.steps],
-             "result": self.result,
-             "error": self.error,
-             "degradation_flags": list(self.degradation_flags) or None,
-             "trace_id": self.trace_id,
-+            "progress_stage": self.progress_stage,
-+            "progress_message": self.progress_message,
-+            "progress_payload": self.progress_payload or None,
-         }
-         payload.update(summarize_job(self))
-         return payload
- 
-+    def update_progress(
-+        self,
-+        *,
-+        stage: str,
-+        progress: float,
-+        message: Optional[str] = None,
-+        payload: Optional[Dict[str, Any]] = None,
-+    ) -> None:
-+        normalized_stage = stage.strip().lower() if isinstance(stage, str) else ""
-+        self.progress_stage = normalized_stage or self.progress_stage or "draft"
-+        if progress is not None:
-+            try:
-+                value = float(progress)
-+            except (TypeError, ValueError):
-+                value = self.progress_value or 0.0
-+            self.progress_value = max(0.0, min(1.0, value))
-+        if message is not None:
-+            self.progress_message = message
-+        if payload is not None:
-+            try:
-+                self.progress_payload = dict(payload)
-+            except Exception:  # pragma: no cover - defensive
-+                self.progress_payload = {}
-+        self.last_event_at = utcnow()
-+
- 
- def summarize_job(job: "Job") -> Dict[str, Any]:
-     status_map = {
-         JobStatus.PENDING: "queued",
-         JobStatus.RUNNING: "running",
-         JobStatus.SUCCEEDED: "succeeded",
-         JobStatus.FAILED: "failed",
-     }
-     step_alias = {
-         "jsonld": "finalize",
-         "post_analysis": "finalize",
-     }
-     step_labels = {
-         "draft": "Черновик",
-         "refine": "Полировка",
-         "finalize": "Финализация",
-         "jsonld": "JSON-LD",
-         "post_analysis": "Пост-анализ",
-         "done": "Готово",
-     }
- 
-     status = status_map.get(job.status, job.status.value)
- 
-     total_steps = len(job.steps)
-     completed = sum(
-@@ -165,50 +197,58 @@ def summarize_job(job: "Job") -> Dict[str, Any]:
-         if step.status in {JobStepStatus.SUCCEEDED, JobStepStatus.DEGRADED, JobStepStatus.SKIPPED}
-     )
-     running_step = next((step for step in job.steps if step.status == JobStepStatus.RUNNING), None)
-     pending_step = next((step for step in job.steps if step.status == JobStepStatus.PENDING), None)
- 
-     if status in {"succeeded", "failed"}:
-         step_name = "done"
-         progress = 1.0
-     else:
-         if running_step:
-             step_name = step_alias.get(running_step.name, running_step.name)
-         elif pending_step:
-             step_name = step_alias.get(pending_step.name, pending_step.name)
-         elif job.steps:
-             step_name = step_alias.get(job.steps[-1].name, job.steps[-1].name)
-         else:
-             step_name = "draft"
-         if total_steps:
-             progress = completed / total_steps
-             if running_step:
-                 progress += 0.5 / total_steps
-             progress = min(1.0, max(0.0, progress))
-         else:
-             progress = 0.0
- 
-+    if job.progress_value is not None:
-+        progress = max(0.0, min(1.0, float(job.progress_value)))
-+    if job.progress_stage:
-+        step_name = job.progress_stage
-+
-     if status == "queued":
-         message = "Задание в очереди"
-     elif status == "running":
--        message = f"Шаг: {step_labels.get(step_name, step_name)}"
-+        message = job.progress_message or f"Шаг: {step_labels.get(step_name, step_name)}"
-     elif status == "succeeded":
--        message = "Готово"
-+        message = job.progress_message or "Готово"
-     else:
-         error_message = ""
-         if isinstance(job.error, dict):
-             error_message = str(job.error.get("message") or "").strip()
-         message = error_message or "Завершено с ошибкой"
- 
-+    if job.progress_message and status in {"running", "succeeded"}:
-+        message = job.progress_message
-+
-     timestamps = [job.created_at, job.started_at, job.finished_at, job.last_event_at]
-     for step in job.steps:
-         timestamps.extend([step.started_at, step.finished_at])
-     last_event_candidates = [ts for ts in timestamps if ts]
-     last_event = max(last_event_candidates) if last_event_candidates else utcnow()
- 
-     return {
-         "status": status,
-         "step": step_name,
-         "progress": round(progress, 4),
-         "last_event_at": last_event.strftime(ISO_FORMAT),
-         "message": message,
-     }
-diff --git a/jobs/runner.py b/jobs/runner.py
-index 591a3676b43a2d63a667c2eb56facc92d058fe80..397a02db7233e384572a5c3427821f38acea1be1 100644
---- a/jobs/runner.py
-+++ b/jobs/runner.py
-@@ -1,50 +1,64 @@
- """Background execution engine for generation jobs with soft degradation."""
- from __future__ import annotations
- 
- import queue
- import re
- import threading
- import time
- import uuid
- from dataclasses import dataclass, field
--from typing import Any, Dict, List, Optional
-+from typing import Any, Callable, Dict, List, Optional
- 
- from config import JOB_MAX_RETRIES_PER_STEP, JOB_SOFT_TIMEOUT_S
- from observability.logger import get_logger, log_step
- from observability.metrics import get_registry
- from orchestrate import generate_article_from_payload
- from services.guardrails import GuardrailResult, parse_and_repair_jsonld
- 
- from .models import Job, JobStep, JobStepStatus
- from .store import JobStore
- 
- LOGGER = get_logger("content_factory.jobs.runner")
- REGISTRY = get_registry()
- QUEUE_GAUGE = REGISTRY.gauge("jobs.queue_length")
- JOB_COUNTER = REGISTRY.counter("jobs.processed_total")
- 
-+PROGRESS_STAGE_WEIGHTS = {
-+    "draft": (0.0, 0.82),
-+    "trim": (0.82, 0.1),
-+    "validate": (0.92, 0.06),
-+    "done": (1.0, 0.0),
++.sources-actions {
++  display: flex;
++  gap: 12px;
++  flex-wrap: wrap;
 +}
 +
-+PROGRESS_STAGE_MESSAGES = {
-+    "draft": "Генерируем черновик",
-+    "trim": "Нормализуем объём",
-+    "validate": "Проверяем результат",
-+    "done": "Готово",
-+}
-+
+ .icon-button {
+   border: none;
+   background: transparent;
+   color: #6b7280;
+   cursor: pointer;
+   padding: 6px 8px;
+   border-radius: 8px;
+   font-size: 15px;
+   line-height: 1;
+   transition: color 0.2s ease, background-color 0.2s ease;
+ }
  
- @dataclass
- class RunnerTask:
-     job_id: str
-     payload: Dict[str, Any]
-     trace_id: Optional[str] = None
+ .icon-button:hover {
+   color: #ef4444;
+   background-color: rgba(239, 68, 68, 0.1);
+ }
  
+ .inline-field {
+   display: grid;
+   grid-template-columns: 1fr;
+   gap: 8px;
+   align-items: center;
+ }
  
- @dataclass
- class PipelineContext:
-     markdown: str = ""
-     meta_json: Dict[str, Any] = field(default_factory=dict)
-     faq_entries: List[Dict[str, str]] = field(default_factory=list)
-     degradation_flags: List[str] = field(default_factory=list)
-     errors: List[str] = field(default_factory=list)
-     trace_id: Optional[str] = None
- 
-     def ensure_markdown(self, fallback: str) -> None:
-         if not self.markdown.strip():
-             self.markdown = fallback
- 
- 
- @dataclass
- class StepResult:
-     status: JobStepStatus
-@@ -146,179 +160,241 @@ class JobRunner:
-         start_time = time.monotonic()
-         deadline = start_time + self._soft_timeout_s
-         refine_extension = max(5.0, self._soft_timeout_s * 0.35)
-         refine_extension_applied = False
- 
-         for step in job.steps:
-             if step.name == "refine" and not refine_extension_applied:
-                 deadline += refine_extension
-                 refine_extension_applied = True
-                 LOGGER.info(
-                     "job_soft_timeout_extend",
-                     extra={"step": step.name, "extra_seconds": round(refine_extension, 2)},
-                 )
-             if time.monotonic() >= deadline:
-                 ctx.degradation_flags.append("soft_timeout")
-                 step.mark_degraded("soft_timeout")
-                 log_step(
-                     LOGGER,
-                     job_id=job.id,
-                     step=step.name,
-                     status=step.status.value,
-                     reason="soft_timeout",
-                 )
-                 break
- 
--            result = self._execute_step(step.name, task.payload, ctx)
-+            step.mark_running()
-+            self._store.touch(job.id)
-+            result = self._execute_step(step.name, task.payload, ctx, job)
-             if result.status == JobStepStatus.SUCCEEDED:
-                 step.mark_succeeded(**result.payload)
-             elif result.status == JobStepStatus.DEGRADED:
-                 step.mark_degraded(result.error, **result.payload)
-             else:
-                 step.mark_failed(result.error, **result.payload)
-             log_step(
-                 LOGGER,
-                 job_id=job.id,
-                 step=step.name,
-                 status=step.status.value,
-                 error=result.error,
-                 payload=result.payload or None,
-             )
-             ctx.degradation_flags.extend(result.degradation_flags)
-             self._store.touch(job.id)
-             if not result.continue_pipeline:
-                 break
- 
-         ctx.ensure_markdown(_build_fallback_text(task.payload))
-         if ctx.degradation_flags:
-             ctx.degradation_flags = list(dict.fromkeys(ctx.degradation_flags))
-         result_payload = {
-             "markdown": ctx.markdown,
-             "meta_json": ctx.meta_json,
-             "faq_entries": ctx.faq_entries,
-             "errors": ctx.errors or None,
-         }
-         job.mark_succeeded(result_payload, degradation_flags=ctx.degradation_flags)
-+        self._record_progress(job, "done", 1.0, message=PROGRESS_STAGE_MESSAGES.get("done"))
-         self._store.touch(job.id)
-         JOB_COUNTER.inc()
- 
-     def _execute_step(
-         self,
-         step_name: str,
-         payload: Dict[str, Any],
-         ctx: PipelineContext,
-+        job: Optional[Job],
-     ) -> StepResult:
-         if step_name == "draft":
--            return self._run_draft_step(payload, ctx)
-+            return self._run_draft_step(payload, ctx, job)
-         if step_name == "refine":
--            return self._run_refine_step(ctx)
-+            return self._run_refine_step(ctx, job)
-         if step_name == "jsonld":
--            return self._run_jsonld_step(ctx)
-+            return self._run_jsonld_step(ctx, job)
-         if step_name == "post_analysis":
--            return self._run_post_analysis_step(ctx)
-+            return self._run_post_analysis_step(ctx, job)
-         return StepResult(JobStepStatus.SUCCEEDED, payload={"skipped": True})
- 
--    def _run_draft_step(self, payload: Dict[str, Any], ctx: PipelineContext) -> StepResult:
-+    def _record_progress(
-+        self,
-+        job: Optional[Job],
-+        stage: str,
-+        ratio: float,
-+        *,
-+        message: Optional[str] = None,
-+        payload: Optional[Dict[str, Any]] = None,
-+    ) -> None:
-+        if job is None:
-+            return
-+        stage_key = str(stage or "").strip().lower() or "draft"
-+        base, span = PROGRESS_STAGE_WEIGHTS.get(stage_key, (0.0, 0.0))
-+        try:
-+            normalized = float(ratio)
-+        except (TypeError, ValueError):
-+            normalized = 0.0
-+        normalized = max(0.0, min(1.0, normalized))
-+        progress_value = base + normalized * span
-+        if stage_key == "done":
-+            progress_value = 1.0
-+        if job.progress_value is not None:
-+            progress_value = max(float(job.progress_value), progress_value)
-+        effective_message = message or PROGRESS_STAGE_MESSAGES.get(stage_key) or "Обработка задания"
-+        job.update_progress(
-+            stage=stage_key,
-+            progress=min(1.0, progress_value),
-+            message=effective_message,
-+            payload=payload,
-+        )
-+        self._store.touch(job.id)
-+
-+    def _run_draft_step(
-+        self,
-+        payload: Dict[str, Any],
-+        ctx: PipelineContext,
-+        job: Optional[Job],
-+    ) -> StepResult:
-+        self._record_progress(job, "draft", 0.0)
-+
-+        def _progress_event(
-+            stage: str,
-+            *,
-+            progress: float = 0.0,
-+            message: Optional[str] = None,
-+            payload: Optional[Dict[str, Any]] = None,
-+        ) -> None:
-+            self._record_progress(job, stage, progress, message=message, payload=payload)
-+
-         attempt = 0
-         last_error: Optional[str] = None
-         while attempt <= JOB_MAX_RETRIES_PER_STEP:
-             attempt += 1
-             try:
--                result = generate_article_from_payload(**payload)
-+                result = generate_article_from_payload(
-+                    **payload,
-+                    progress_callback=_progress_event,
-+                )
-             except Exception as exc:  # noqa: BLE001
-                 last_error = str(exc)
-                 ctx.errors.append(last_error)
-                 continue
- 
-             markdown = str(result.get("text") or result.get("markdown") or "").strip()
-             metadata = result.get("metadata")
-             if isinstance(metadata, dict):
-                 ctx.meta_json = metadata
-             if markdown:
-                 ctx.markdown = markdown
-+                self._record_progress(job, "draft", 1.0)
-                 return StepResult(JobStepStatus.SUCCEEDED, payload={"attempts": attempt})
-             last_error = "empty_response"
-             ctx.errors.append(last_error)
- 
-         ctx.ensure_markdown(_build_fallback_text(payload, error=last_error))
-         flags = ["draft_failed"]
-+        self._record_progress(job, "draft", 1.0, message="Черновик по запасному сценарию")
-         return StepResult(
-             JobStepStatus.DEGRADED,
-             payload={"attempts": attempt, "error": last_error},
-             degradation_flags=flags,
-             error=last_error,
-         )
- 
--    def _run_refine_step(self, ctx: PipelineContext) -> StepResult:
-+    def _run_refine_step(self, ctx: PipelineContext, job: Optional[Job]) -> StepResult:
-         if not ctx.markdown.strip():
-             ctx.ensure_markdown("Черновик пока пустой.")
-             return StepResult(
-                 JobStepStatus.DEGRADED,
-                 payload={"action": "fallback_text"},
-                 degradation_flags=["refine_skipped"],
-                 error="empty_markdown",
-             )
-+        self._record_progress(job, "trim", 0.0)
-         refined = ctx.markdown.strip()
-         passes = []
- 
-         # Pass 1: stylistic cleanup
-         cleaned = "\n".join(line.rstrip() for line in refined.splitlines())
-         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-         passes.append("style")
- 
-         # Pass 2: light SEO polish (placeholder for future LLM call)
-         polished = re.sub(r"\s{2,}", " ", cleaned)
-         passes.append("seo")
- 
-         final_text = polished.strip()
-         ctx.markdown = final_text
-+        self._record_progress(job, "trim", 1.0, payload={"chars": len(final_text)})
-         return StepResult(
-             JobStepStatus.SUCCEEDED,
-             payload={"chars": len(final_text), "passes": passes},
-         )
- 
--    def _run_jsonld_step(self, ctx: PipelineContext) -> StepResult:
-+    def _run_jsonld_step(self, ctx: PipelineContext, job: Optional[Job]) -> StepResult:
-         raw_jsonld = None
-         if isinstance(ctx.meta_json, dict):
-             raw_jsonld = ctx.meta_json.get("jsonld")
-         guardrail_result: GuardrailResult = parse_and_repair_jsonld(raw_jsonld, trace_id=ctx.trace_id)
-         ctx.degradation_flags.extend(guardrail_result.degradation_flags)
-         if guardrail_result.faq_entries:
-             ctx.faq_entries = guardrail_result.faq_entries
-         if guardrail_result.repaired_json is not None:
-             ctx.meta_json["jsonld"] = guardrail_result.repaired_json
-         status = JobStepStatus.SUCCEEDED if guardrail_result.ok else JobStepStatus.DEGRADED
-+        if guardrail_result.ok:
-+            self._record_progress(job, "validate", 0.6, payload={"faq_preview": guardrail_result.faq_entries})
-         return StepResult(
-             status,
-             payload={
-                 "attempts": guardrail_result.attempts,
-                 "faq_preview": guardrail_result.faq_entries[:2] if guardrail_result.faq_entries else None,
-             },
-             degradation_flags=guardrail_result.degradation_flags,
-             error=guardrail_result.error,
-         )
- 
--    def _run_post_analysis_step(self, ctx: PipelineContext) -> StepResult:
-+    def _run_post_analysis_step(self, ctx: PipelineContext, job: Optional[Job]) -> StepResult:
-         if not ctx.markdown.strip():
-             return StepResult(
-                 JobStepStatus.DEGRADED,
-                 payload={"reason": "empty_markdown"},
-                 degradation_flags=["post_analysis_skipped"],
-                 error="no_markdown",
-             )
-         length = len(ctx.markdown.replace(" ", ""))
-         payload = {"chars_no_spaces": length, "faq_count": len(ctx.faq_entries)}
-+        self._record_progress(job, "validate", 1.0, payload=payload)
-         return StepResult(JobStepStatus.SUCCEEDED, payload=payload)
- 
- 
- def _build_fallback_text(payload: Dict[str, Any], *, error: Optional[str] = None) -> str:
-     theme = str(payload.get("theme") or payload.get("title") or "Материал").strip()
-     if not theme:
-         theme = "Материал"
-     message = [f"Предварительный черновик для темы: {theme}."]
-     if error:
-         message.append(f"Ошибка: {error}")
-     message.append("Контент недоступен, используйте черновик для доработки.")
-     return "\n\n".join(message)
- 
- 
- __all__ = ["JobRunner", "RunnerTask", "PipelineContext", "StepResult"]
-diff --git a/length_limits.py b/length_limits.py
-index af8ade7a584c859ecd3db049532ec1229519893f..88e5d5df89094ba7c96c8f9d6760d25f980fdf98 100644
---- a/length_limits.py
-+++ b/length_limits.py
-@@ -45,51 +45,63 @@ def compute_soft_length_bounds(min_chars: int, max_chars: int) -> Tuple[int, int
-         max_value = 0
- 
-     if max_value < min_value:
-         min_value, max_value = max_value, min_value
- 
-     min_value = max(0, min_value)
-     max_value = max(0, max_value)
- 
-     lower_tolerance = 0
-     if min_value > 0:
-         lower_tolerance = min(
-             min_value,
-             max(SOFT_RANGE_MIN_BELOW, int(round(min_value * SOFT_RANGE_PERCENT))),
-         )
-     upper_tolerance = max(SOFT_RANGE_MIN_ABOVE, int(round(max_value * SOFT_RANGE_PERCENT)))
- 
-     soft_min = max(0, min_value - lower_tolerance)
-     soft_max = max_value + upper_tolerance
- 
-     return soft_min, soft_max, lower_tolerance, upper_tolerance
- 
- 
- def resolve_length_limits(theme: str, payload: Dict[str, Any]) -> ResolvedLengthLimits:
-     """Determine min/max character limits using brief → profile → defaults."""
- 
--    brief_min, brief_max = _extract_brief_limits(payload)
-+    target_length = _safe_positive_int(payload.get("length_target"))
-+    if target_length is not None and target_length > 0:
-+        soft_min, soft_max, _tol_below, _tol_above = compute_soft_length_bounds(
-+            target_length, target_length
-+        )
-+        brief_min = soft_min or target_length
-+        brief_max = soft_max or target_length
-+        requested = payload.setdefault("_length_limits_requested", {})
-+        if isinstance(requested, dict):
-+            requested["target"] = target_length
-+    else:
-+        brief_min, brief_max = _extract_brief_limits(payload)
-+
-     profile_min, profile_max, profile_source = _load_profile_limits(theme)
- 
-     min_value, min_source = _choose_limit(brief_min, profile_min, DEFAULT_MIN_LENGTH)
-     max_value, max_source = _choose_limit(brief_max, profile_max, DEFAULT_MAX_LENGTH)
- 
-     swapped = False
-     warnings: Tuple[str, ...] = ()
- 
-     if max_value < min_value:
-         swapped = True
-         min_value, max_value, min_source, max_source = (
-             max_value,
-             min_value,
-             max_source,
-             min_source,
-         )
-         warnings = (
-             "Минимальный объём в брифе был больше максимального; значения переставлены местами.",
-         )
- 
-     return ResolvedLengthLimits(
-         min_chars=min_value,
-         max_chars=max_value,
-         min_source=min_source,
-         max_source=max_source,
-diff --git a/orchestrate.py b/orchestrate.py
-index 477bf8aeb88ee10025059070168a2a37410a5394..64d4f78c09582ad65448809556fef5ee5e1f033c 100644
---- a/orchestrate.py
-+++ b/orchestrate.py
-@@ -1,38 +1,38 @@
- from __future__ import annotations
- 
- import argparse
- import json
- import httpx
- import os
- import sys
- import time
- from copy import deepcopy
- from dataclasses import dataclass, field
- from datetime import datetime
- from pathlib import Path
--from typing import Any, Dict, Iterable, List, Optional, Tuple
-+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
- 
- from zoneinfo import ZoneInfo
- 
- from assemble_messages import ContextBundle, assemble_messages, retrieve_context
- from artifacts_store import _atomic_write_text as store_atomic_write_text, register_artifact
- from config import (
-     DEFAULT_MAX_LENGTH,
-     DEFAULT_MIN_LENGTH,
-     LLM_ALLOW_FALLBACK,
-     LLM_ROUTE,
-     MAX_CUSTOM_CONTEXT_CHARS,
-     OPENAI_API_KEY,
- )
- from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
- from llm_client import (
-     DEFAULT_MODEL,
-     RESPONSES_API_URL,
-     build_responses_payload,
-     is_min_tokens_error,
-     sanitize_payload_for_responses,
- )
- from keywords import parse_manual_keywords
- from length_limits import ResolvedLengthLimits, resolve_length_limits
- from validators import ValidationResult, length_no_spaces
- 
-@@ -447,161 +447,165 @@ def _prepare_outline(data: Dict[str, Any]) -> List[str]:
-     if isinstance(raw_structure, list):
-         for item in raw_structure:
-             text = str(item).strip()
-             if text:
-                 outline.append(text)
-     return outline
- 
- 
- def _generate_variant(
-     *,
-     theme: str,
-     data: Dict[str, Any],
-     data_path: str,
-     k: int,
-     model_name: str,
-     max_tokens: int,
-     timeout: int,
-     mode: str,
-     output_path: Path,
-     variant_label: Optional[str] = None,
-     backoff_schedule: Optional[List[float]] = None,
-     append_style_profile: Optional[bool] = None,
-     context_source: Optional[str] = None,
-     context_text: Optional[str] = None,
-     context_filename: Optional[str] = None,
-+    progress_callback: Optional[Callable[..., None]] = None,
- ) -> Dict[str, Any]:
-     start_time = time.time()
-     payload = deepcopy(data)
- 
-     generation_context = make_generation_context(
-         theme=theme,
-         data=payload,
-         k=k,
-         append_style_profile=append_style_profile,
-         context_source=context_source,
-         custom_context_text=context_text,
-         context_filename=context_filename,
-     )
- 
-     prepared_data = generation_context.data
-     length_limits = generation_context.length_limits or resolve_length_limits(theme, prepared_data)
-     min_chars = length_limits.min_chars
-     max_chars = length_limits.max_chars
- 
-     keywords_required, keywords_preferred = _extract_keywords(prepared_data)
-     outline = _prepare_outline(prepared_data)
-     topic = str(prepared_data.get("theme") or payload.get("theme") or theme).strip() or theme
- 
-     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
-     if not api_key:
-         raise PipelineStepError(PipelineStep.SKELETON, "OPENAI_API_KEY не найден. Укажите действительный ключ.")
- 
-     pipeline = DeterministicPipeline(
-         topic=topic,
-         base_outline=outline,
-         required_keywords=keywords_required,
-         preferred_keywords=keywords_preferred,
-         min_chars=min_chars,
-         max_chars=max_chars,
-         messages=generation_context.messages,
-         model=model_name,
-         max_tokens=max_tokens,
-         timeout_s=timeout,
-         backoff_schedule=backoff_schedule,
-         provided_faq=prepared_data.get("faq_entries") if isinstance(prepared_data.get("faq_entries"), list) else None,
-         jsonld_requested=generation_context.jsonld_requested,
-         faq_questions=generation_context.faq_questions,
-+        progress_callback=progress_callback,
-     )
-     state = pipeline.run()
-     if not state.validation or not state.validation.is_valid:
-         raise RuntimeError("Pipeline validation failed; artifact not recorded.")
- 
-     final_text = state.text
-     duration_seconds = time.time() - start_time
-     metadata = _build_metadata(
-         theme=theme,
-         generation_context=generation_context,
-         pipeline_state_text=final_text,
-         validation=state.validation,
-         pipeline_logs=state.logs,
-         checkpoints=state.checkpoints,
-         duration_seconds=duration_seconds,
-         model_used=state.model_used,
-         fallback_used=state.fallback_used,
-         fallback_reason=state.fallback_reason,
-         api_route=state.api_route,
-         token_usage=state.token_usage,
-     )
- 
-     outputs = _write_outputs(output_path, final_text, metadata)
-     return {
-         "text": final_text,
-         "metadata": metadata,
-         "duration": duration_seconds,
-         "artifact_files": outputs,
-     }
- 
- 
- def generate_article_from_payload(
-     *,
-     theme: str,
-     data: Dict[str, Any],
-     k: int,
-     model: Optional[str] = None,
-     max_tokens: int = 0,
-     timeout: Optional[int] = None,
-     mode: Optional[str] = None,
-     backoff_schedule: Optional[List[float]] = None,
-     outfile: Optional[str] = None,
-     append_style_profile: Optional[bool] = None,
-     context_source: Optional[str] = None,
-     context_text: Optional[str] = None,
-     context_filename: Optional[str] = None,
-+    progress_callback: Optional[Callable[..., None]] = None,
- ) -> Dict[str, Any]:
-     resolved_timeout = timeout if timeout is not None else 60
-     resolved_model = DEFAULT_MODEL
-     health_probe = _run_health_ping()
-     if not health_probe.get("ok"):
-         message = str(health_probe.get("message") or "health gate failed")
-         raise RuntimeError(f"health_gate_failed: {message}")
-     output_path = _make_output_path(theme, outfile)
-     result = _generate_variant(
-         theme=theme,
-         data=data,
-         data_path="<inline>",
-         k=k,
-         model_name=resolved_model,
-         max_tokens=max_tokens,
-         timeout=resolved_timeout,
-         mode=mode or "final",
-         output_path=output_path,
-         backoff_schedule=backoff_schedule,
-         append_style_profile=append_style_profile,
-         context_source=context_source,
-         context_text=context_text,
-         context_filename=context_filename,
-+        progress_callback=progress_callback,
-     )
-     artifact_files = result.get("artifact_files")
-     artifact_paths = None
-     if artifact_files:
-         artifact_paths = {
-             "markdown": artifact_files["markdown"].as_posix(),
-             "metadata": artifact_files["metadata"].as_posix(),
-         }
-     return {
-         "text": result["text"],
-         "metadata": result["metadata"],
-         "artifact_paths": artifact_paths,
-     }
- 
- 
- def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
-     checks: Dict[str, Dict[str, object]] = {}
- 
-     artifacts_dir = Path("artifacts").resolve()
-     try:
-         artifacts_dir.mkdir(parents=True, exist_ok=True)
-         probe = artifacts_dir / ".write_check"
-         probe.write_text("ok", encoding="utf-8")
-         probe.unlink()
-         checks["artifacts_writable"] = {
-diff --git a/server/__init__.py b/server/__init__.py
-index 21cb03b0dcc6d0dfaaedd4820b066dab364af4dd..5ebf8db6cba261e1f907b2eebebeac58163973cc 100644
---- a/server/__init__.py
-+++ b/server/__init__.py
-@@ -461,50 +461,52 @@ def create_app() -> Flask:
-                         }
-                     }
-                 ),
-                 404,
-             )
-         return jsonify(snapshot)
- 
-     @app.get("/api/jobs/<job_id>/stream")
-     def job_stream(job_id: str):
-         def _event_stream():
-             last_signature = None
-             while True:
-                 snapshot = JOB_RUNNER.get_job(job_id)
-                 if not snapshot:
-                     payload = {
-                         "status": "failed",
-                         "message": "Задание не найдено",
-                         "job_id": job_id,
-                     }
-                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                     break
-                 signature = (
-                     snapshot.get("status"),
-                     snapshot.get("step"),
-                     snapshot.get("progress"),
-+                    snapshot.get("progress_stage"),
-+                    snapshot.get("progress_message"),
-                     snapshot.get("last_event_at"),
-                 )
-                 if signature != last_signature:
-                     yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
-                     last_signature = signature
-                 if snapshot.get("status") in {"succeeded", "failed"}:
-                     break
-                 time.sleep(1.0)
- 
-         response = Response(stream_with_context(_event_stream()), mimetype="text/event-stream")
-         response.headers["Cache-Control"] = "no-cache"
-         response.headers["X-Accel-Buffering"] = "no"
-         return response
- 
-     @app.post("/api/reindex")
-     def reindex():
-         payload = _require_json(request)
-         theme = str(payload.get("theme", "")).strip()
-         if not theme:
-             raise ApiError("Не указана тема (theme)")
- 
-         try:
-             stats = build_index(theme)
-         except FileNotFoundError as exc:
-             raise ApiError(str(exc), status_code=404) from exc
-diff --git a/tests/test_length_limits.py b/tests/test_length_limits.py
-index 5dbe1ad925f3088b75a782ef59e1021f50669aca..ae5f6c3a1c00b5e8762f821cd984ba7fdf569b00 100644
---- a/tests/test_length_limits.py
-+++ b/tests/test_length_limits.py
-@@ -21,25 +21,36 @@ def test_resolve_uses_profile_defaults_when_missing():
- 
- 
- def test_resolve_swaps_when_min_greater_than_max():
-     payload = {"length_limits": {"min_chars": 6800, "max_chars": 5200}}
-     result = resolve_length_limits("finance", payload)
-     assert result.min_chars == 5200
-     assert result.max_chars == 6800
-     assert result.swapped
-     assert result.min_source == "brief"
-     assert result.max_source == "brief"
-     assert any("поменяли" in warning.lower() or "перестав" in warning.lower() for warning in result.warnings)
- 
- 
- def test_compute_soft_length_bounds_adds_reasonable_tolerance():
-     soft_min, soft_max, tol_below, tol_above = compute_soft_length_bounds(5200, 6800)
-     assert soft_min == 5096
-     assert soft_max == 6936
-     assert tol_below == 104
-     assert tol_above == 136
- 
- 
- def test_compute_soft_length_bounds_handles_inverted_values():
-     soft_min, soft_max, _, _ = compute_soft_length_bounds(6800, 5200)
-     assert soft_min == 5096
-     assert soft_max == 6936
-+
-+
-+def test_resolve_length_target_translates_to_soft_bounds():
-+    payload = {"length_target": 6000}
-+    result = resolve_length_limits("finance", payload)
-+
-+    assert result.min_chars == 5880
-+    assert result.max_chars == 6120
-+    assert result.min_source == "brief"
-+    assert result.max_source == "brief"
-+    assert payload.get("_length_limits_requested", {}).get("target") == 6000
+ @media (min-width: 768px) {
 

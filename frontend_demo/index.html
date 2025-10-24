@@ -28,97 +28,126 @@
         <div class="request-shell">
           <div class="request-grid">
             <form id="brief-form" class="brief-form">
-              <section class="form-card">
-                <header class="form-card__header">
-                  <h2 class="form-card__title">Основные параметры</h2>
+              <section class="parameters-card">
+                <header class="parameters-card__header">
+                  <h2 class="parameters-card__title">Параметры текста</h2>
                 </header>
-                <div class="form-card__body">
+                <div class="parameters-card__body">
                   <div class="form-row">
                     <label for="pipe-select">Тематика</label>
                     <select id="pipe-select" required></select>
                   </div>
                   <div class="form-row">
                     <label for="topic-input">Тема</label>
-                    <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
+                    <input id="topic-input" type="text" placeholder="Например, «Как выбрать дебетовую карту»" required />
                   </div>
                   <div class="form-row">
-                    <label for="style-profile-select">Стиль</label>
+                    <label for="title-input">Название</label>
+                    <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
+                    <p class="field-hint">Оставьте пустым, чтобы взять название из профиля.</p>
+                  </div>
+                  <div class="form-row">
+                    <label for="goal-input">Цель</label>
+                    <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
+                  </div>
+                  <div class="form-row">
+                    <label for="audience-input">Аудитория</label>
+                    <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
+                  </div>
+                  <div class="form-row">
+                    <label for="tone-select">Тон</label>
+                    <select id="tone-select">
+                      <option value="экспертный" selected>Экспертный</option>
+                      <option value="дружелюбный">Дружелюбный</option>
+                      <option value="строгий">Строгий</option>
+                    </select>
+                  </div>
+                  <div class="form-row">
+                    <label for="style-profile-select">Стиль бренда</label>
                     <select id="style-profile-select">
                       <option value="sravni.ru" selected>sravni.ru — экспертно, структурировано</option>
                       <option value="tinkoff.ru">tinkoff.ru — дружелюбно и с примерами</option>
                       <option value="banki.ru">banki.ru — аналитично и по делу</option>
-                      <option value="off">off — без стилевого профиля</option>
+                      <option value="off">Без привязки к бренду</option>
                     </select>
                     <p class="field-hint" id="style-profile-hint">
                       Определяет тон и подачу текста, близкие к стилю выбранного бренда.
                     </p>
                   </div>
-                </div>
-              </section>
-
-              <section class="form-card">
-                <header class="form-card__header">
-                  <h2 class="form-card__title">Ключевые слова</h2>
-                </header>
-                <div class="form-card__body">
+                  <div class="form-row">
+                    <label for="min-chars-input">Объём текста</label>
+                    <div class="length-range-inline">
+                      <input
+                        id="min-chars-input"
+                        type="number"
+                        min="500"
+                        step="50"
+                        value="3500"
+                        aria-label="Минимум символов"
+                      />
+                      <span aria-hidden="true" class="range-separator">—</span>
+                      <input
+                        id="max-chars-input"
+                        type="number"
+                        min="500"
+                        step="50"
+                        value="6000"
+                        aria-label="Максимум символов"
+                      />
+                    </div>
+                    <p class="field-hint">Символов без пробелов. Можно изменить диапазон под задачу.</p>
+                  </div>
+                  <div class="form-row">
+                    <label for="structure-preset">Пресет структуры</label>
+                    <select id="structure-preset">
+                      <option value="seo" selected>SEO-статья</option>
+                      <option value="faq">FAQ и поддержка</option>
+                      <option value="overview">Обзор продукта</option>
+                    </select>
+                    <p class="field-hint">Выберите заготовку или отредактируйте структуру вручную ниже.</p>
+                  </div>
+                  <div class="form-row">
+                    <label for="structure-input">Структура материала</label>
+                    <textarea
+                      id="structure-input"
+                      rows="4"
+                      placeholder="Каждый пункт с новой строки: вводная, блок преимуществ, FAQ, заключение"
+                    ></textarea>
+                  </div>
                   <div class="form-row">
                     <label for="keywords-input">Ключевые слова</label>
-                    <textarea id="keywords-input" rows="4" placeholder="Каждое слово с новой строки"></textarea>
+                    <textarea
+                      id="keywords-input"
+                      rows="4"
+                      placeholder="Каждое ключевое слово или фраза с новой строки"
+                    ></textarea>
+                    <div class="keyword-mode">
+                      <span class="field-label">Режим вхождений</span>
+                      <div class="keyword-mode__options">
+                        <label class="radio-option">
+                          <input type="radio" name="keywords-mode" value="strict" checked />
+                          <span>Строгое — точные вхождения</span>
+                        </label>
+                        <label class="radio-option">
+                          <input type="radio" name="keywords-mode" value="soft" />
+                          <span>Мягкое — допускает формы и синонимы</span>
+                        </label>
+                        <label class="radio-option">
+                          <input type="radio" name="keywords-mode" value="anti_spam" />
+                          <span>Антипереспам — следим за частотой</span>
+                        </label>
+                      </div>
+                    </div>
                     <p class="field-hint">Можно оставить пустым — ключевые слова не будут добавлены.</p>
                   </div>
-                </div>
-              </section>
-
-              <section class="form-card">
-                <header class="form-card__header">
-                  <h2 class="form-card__title">Расширенные параметры</h2>
-                </header>
-                <div class="form-card__body">
                   <div class="form-row">
-                    <label for="title-input">Название текста</label>
-                    <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
-                    <p class="field-hint">Оставьте пустым, чтобы использовать название из профиля.</p>
-                  </div>
-                  <div class="form-row">
-                    <label>Объём</label>
-                    <div class="length-mode-toggle">
-                      <label class="length-mode-option">
-                        <input type="radio" name="length-mode" value="target" checked />
-                        Целевая длина
-                      </label>
-                      <label class="length-mode-option">
-                        <input type="radio" name="length-mode" value="range" />
-                        Диапазон
-                      </label>
+                    <label>Источники (референсы)</label>
+                    <div id="sources-list" class="sources-list"></div>
+                    <div class="sources-actions">
+                      <button type="button" class="ghost small" id="add-source-btn">Добавить источник</button>
                     </div>
-                    <div class="length-target" data-length-target>
-                      <input id="length-target-input" type="number" min="500" step="50" placeholder="Например, 6000" />
-                      <p class="field-hint">Символов без пробелов. Пусто — используем профиль.</p>
-                    </div>
-                    <div class="length-range" data-length-range hidden>
-                      <div class="length-range-inputs">
-                        <input id="min-chars-input" type="number" min="500" step="50" placeholder="Минимум" />
-                        <input id="max-chars-input" type="number" min="500" step="50" placeholder="Максимум" />
-                      </div>
-                      <p class="field-hint">Можно заполнить одно или оба поля.</p>
-                    </div>
+                    <p class="field-hint">Добавьте ссылки и тип использования, если нужно опираться на конкретные материалы.</p>
                   </div>
-                  <div class="form-row">
-                    <label for="goal-input">Цель текста</label>
-                    <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
-                  </div>
-                  <div class="form-row">
-                    <label for="audience-input">Целевая аудитория</label>
-                    <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
-                  </div>
-                </div>
-              </section>
-
-              <section class="form-card">
-                <header class="form-card__header">
-                  <h2 class="form-card__title">Контекст</h2>
-                </header>
-                <div class="form-card__body">
                   <div class="form-row">
                     <label for="context-source-select">Контекст</label>
                     <select id="context-source-select">
@@ -145,15 +174,12 @@
                     </div>
                   </div>
                 </div>
-              </section>
-
-              <footer class="form-card form-card--actions">
                 <div class="form-actions">
                   <button type="submit" class="primary">
                     <span class="btn-label">Сгенерировать</span>
                   </button>
                 </div>
-              </footer>
+              </section>
             </form>
             <aside class="status-panel">
               <section class="status-card">
@@ -274,7 +300,12 @@
 
     <template id="source-row-template">
       <div class="source-row">
-        <textarea class="source-input" rows="2" placeholder="https://example.com"></textarea>
+        <input class="source-input" type="text" placeholder="https://example.com" />
+        <select class="source-usage" aria-label="Тип использования источника">
+          <option value="summary" selected>Пересказ</option>
+          <option value="quote">Цитата</option>
+          <option value="inspiration">Вдохновение</option>
+        </select>
         <button type="button" class="icon-button remove-source" aria-label="Удалить источник">✕</button>
       </div>
     </template>
