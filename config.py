@@ -107,3 +107,7 @@ APPEND_STYLE_PROFILE_DEFAULT = (
 
 # Ключевые слова
 KEYWORDS_ALLOW_AUTO = _env_bool("KEYWORDS_ALLOW_AUTO", False)
+
+# Feature flags controlling visibility of advanced UI controls
+FEATURE_HIDE_MODEL_SELECTOR = _env_bool("FEATURE_HIDE_MODEL_SELECTOR", True)
+FEATURE_HIDE_TOKEN_SLIDERS = _env_bool("FEATURE_HIDE_TOKEN_SLIDERS", True)

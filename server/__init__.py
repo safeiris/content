@@ -7,7 +7,7 @@ import os
 import secrets
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,17 +25,19 @@ from flask import (
     render_template,
     request,
     session,
-    send_file,
     send_from_directory,
     stream_with_context,
     url_for,
 )
 from flask_cors import CORS
 from werkzeug.security import check_password_hash
+from werkzeug.utils import safe_join
 
 from assemble_messages import invalidate_style_profile_cache
 from config import (
     DEFAULT_STRUCTURE,
+    FEATURE_HIDE_MODEL_SELECTOR,
+    FEATURE_HIDE_TOKEN_SLIDERS,
     JOB_STORE_TTL_S,
     OPENAI_RPM,
     OPENAI_RPS,
@@ -45,6 +47,7 @@ from orchestrate import gather_health_status, make_generation_context
 from llm_client import DEFAULT_MODEL
 from retrieval import build_index
 from artifacts_store import (
+    ARTIFACTS_DIR,
     cleanup_index as cleanup_artifact_index,
     delete_artifact as delete_artifact_entry,
     list_artifacts as list_artifact_cards,
@@ -511,11 +514,120 @@ def create_app() -> Flask:
         invalidate_style_profile_cache()
         return jsonify(stats)
 
+    def _normalize_iso8601(candidate: Optional[str], fallback_ts: Optional[float]) -> Optional[str]:
+        if isinstance(candidate, str) and candidate.strip():
+            value = candidate.strip()
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return value
+            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        if fallback_ts is None:
+            return None
+        return (
+            datetime.fromtimestamp(fallback_ts, timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def _send_artifact_file(relative_path: str):
+        safe_path = safe_join(str(ARTIFACTS_DIR), relative_path)
+        if safe_path is None:
+            raise ApiError("Недопустимый путь к артефакту", status_code=400)
+
+        file_path = Path(safe_path)
+        if not file_path.exists() or not file_path.is_file():
+            return jsonify({"error": "file_not_found"}), 404
+
+        try:
+            relative = file_path.relative_to(ARTIFACTS_DIR)
+        except ValueError as exc:
+            raise ApiError("Недопустимый путь к артефакту", status_code=400) from exc
+
+        suffix = file_path.suffix.lower()
+        if suffix == ".md":
+            mimetype = "text/markdown"
+        elif suffix == ".json":
+            mimetype = "application/json"
+        else:
+            guessed, _ = mimetypes.guess_type(file_path.name)
+            mimetype = guessed or "application/octet-stream"
+
+        return send_from_directory(
+            str(ARTIFACTS_DIR),
+            relative.as_posix(),
+            as_attachment=True,
+            download_name=file_path.name,
+            mimetype=mimetype,
+        )
+
     @app.get("/api/artifacts")
     def list_artifacts():
         theme = request.args.get("theme")
-        items = list_artifact_cards(theme, auto_cleanup=True)
-        return jsonify(items)
+        records = list_artifact_cards(theme, auto_cleanup=True)
+        files: List[Dict[str, Any]] = []
+
+        for record in records:
+            record_id = str(record.get("id") or "").strip() or None
+            metadata = record.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            status = record.get("status") or metadata.get("status") or "Ready"
+            job_id = metadata.get("job_id")
+
+            def _make_entry(path_value: Optional[str], file_type: str) -> Optional[Dict[str, Any]]:
+                if not path_value or not isinstance(path_value, str):
+                    return None
+                try:
+                    file_path = resolve_artifact_path(path_value)
+                except ValueError:
+                    return None
+                if not file_path.exists() or not file_path.is_file():
+                    return None
+                stat = file_path.stat()
+                try:
+                    relative = file_path.relative_to(ARTIFACTS_DIR).as_posix()
+                except ValueError:
+                    relative = file_path.name
+
+                created_at = _normalize_iso8601(
+                    metadata.get("generated_at") or record.get("modified_at"),
+                    stat.st_mtime,
+                )
+                entry: Dict[str, Any] = {
+                    "id": f"{record_id or file_path.stem}:{file_type}",
+                    "artifact_id": record_id or file_path.stem,
+                    "name": file_path.name,
+                    "type": file_type,
+                    "size": stat.st_size,
+                    "created_at": created_at,
+                    "url": url_for("download_artifact_file", filename=relative),
+                    "job_id": job_id,
+                    "path": relative,
+                    "status": status,
+                    "metadata": dict(metadata),
+                }
+                if file_type == "json":
+                    entry["metadata_path"] = relative
+                    entry["artifact_path"] = record.get("path")
+                else:
+                    entry["metadata_path"] = record.get("metadata_path")
+                    entry["artifact_path"] = relative
+                entry["_created_ts"] = stat.st_mtime
+                return entry
+
+            markdown_entry = _make_entry(record.get("path"), "md")
+            if markdown_entry:
+                files.append(markdown_entry)
+
+            metadata_entry = _make_entry(record.get("metadata_path"), "json")
+            if metadata_entry:
+                files.append(metadata_entry)
+
+        files.sort(key=lambda item: item.get("_created_ts") or 0, reverse=True)
+        for item in files:
+            item.pop("_created_ts", None)
+        return jsonify(files)
 
     @app.delete("/api/artifacts")
     def delete_artifact():
@@ -557,15 +669,23 @@ def create_app() -> Flask:
             artifact_path = resolve_artifact_path(raw_path)
         except ValueError as exc:
             raise ApiError(str(exc), status_code=400) from exc
-        if not artifact_path.exists() or not artifact_path.is_file():
-            return jsonify({"error": "file_not_found"}), 404
+        try:
+            relative = artifact_path.relative_to(ARTIFACTS_DIR).as_posix()
+        except ValueError as exc:
+            raise ApiError("Недопустимый путь к артефакту", status_code=400) from exc
+        return _send_artifact_file(relative)
 
-        mime_type, _ = mimetypes.guess_type(artifact_path.name)
-        return send_file(
-            artifact_path,
-            mimetype=mime_type or "application/octet-stream",
-            as_attachment=True,
-            download_name=artifact_path.name,
+    @app.get("/api/artifacts/<path:filename>")
+    def download_artifact_file(filename: str):
+        return _send_artifact_file(filename)
+
+    @app.get("/api/features")
+    def get_feature_flags():
+        return jsonify(
+            {
+                "hide_model_selector": FEATURE_HIDE_MODEL_SELECTOR,
+                "hide_token_sliders": FEATURE_HIDE_TOKEN_SLIDERS,
+            }
         )
 
     @app.get("/api/health")

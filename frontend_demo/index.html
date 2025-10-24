@@ -178,8 +178,24 @@
             <h3>Отчет о качестве</h3>
             <div id="report-view" class="report-view"></div>
             <div class="download-buttons">
-              <button id="download-md" class="secondary" disabled>Скачать .md</button>
-              <button id="download-report" class="secondary" disabled>Скачать отчёт .json</button>
+              <a
+                id="download-md"
+                class="secondary"
+                role="button"
+                aria-disabled="true"
+                data-fallback-name="draft.md"
+              >
+                <span class="btn-label">Скачать .md</span>
+              </a>
+              <a
+                id="download-report"
+                class="secondary"
+                role="button"
+                aria-disabled="true"
+                data-fallback-name="report.json"
+              >
+                <span class="btn-label">Скачать отчёт .json</span>
+              </a>
             </div>
           </aside>
         </div>

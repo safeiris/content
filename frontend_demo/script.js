@@ -160,8 +160,16 @@ const STYLE_PROFILE_HINTS = {
 const state = {
   pipes: new Map(),
   artifacts: [],
+  artifactFiles: [],
+  pendingArtifactFiles: null,
   hasMissingArtifacts: false,
   currentResult: null,
+  currentDownloads: { markdown: null, report: null },
+};
+
+const featureState = {
+  hideModelSelector: true,
+  hideTokenSliders: true,
 };
 
 const customContextState = {
@@ -170,6 +178,22 @@ const customContextState = {
   fileName: "",
   noticeShown: false,
 };
+
+function resolveApiPath(path) {
+  if (typeof path !== "string" || !path) {
+    return API_BASE || "";
+  }
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+  const base = API_BASE || "";
+  const normalizedBase = base.endsWith("/") ? base.slice(0, -1) : base;
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  if (/^https?:\/\//i.test(normalizedBase)) {
+    return `${normalizedBase}${normalizedPath}`;
+  }
+  return `${normalizedBase}${normalizedPath}`;
+}
 
 function escapeHtml(value) {
   if (typeof value !== "string") {
@@ -191,6 +215,8 @@ if (!devActionsConfig.show && advancedSupportSection) {
   reindexBtn = null;
   healthBtn = null;
 }
+
+initFeatureFlags();
 
 const interactiveElements = [generateBtn];
 
@@ -240,8 +266,14 @@ if (healthBtn) {
 if (cleanupArtifactsBtn) {
   cleanupArtifactsBtn.addEventListener("click", handleArtifactsCleanup);
 }
-downloadMdBtn.addEventListener("click", () => handleDownload("markdown"));
-downloadReportBtn.addEventListener("click", () => handleDownload("metadata"));
+if (downloadMdBtn) {
+  setDownloadLinkAvailability(downloadMdBtn, null);
+  downloadMdBtn.addEventListener("click", (event) => handleDownloadClick(event, "markdown"));
+}
+if (downloadReportBtn) {
+  setDownloadLinkAvailability(downloadReportBtn, null);
+  downloadReportBtn.addEventListener("click", (event) => handleDownloadClick(event, "report"));
+}
 if (clearLogBtn) {
   clearLogBtn.addEventListener("click", () => {
     clearReindexLog();
@@ -639,30 +671,41 @@ function renderPipeCards(pipes) {
   });
 }
 
-async function loadArtifacts() {
-  let artifacts;
-  try {
-    artifacts = await fetchJson("/api/artifacts");
-  } catch (error) {
-    artifactsList.innerHTML = '<div class="empty-state">Не удалось загрузить материалы.</div>';
-    state.artifacts = [];
-    state.hasMissingArtifacts = false;
-    updateArtifactsToolbar();
-    throw error;
+async function fetchArtifactFiles() {
+  const artifacts = await fetchJson("/api/artifacts");
+  if (Array.isArray(artifacts)) {
+    return artifacts;
   }
-  const items = Array.isArray(artifacts)
-    ? artifacts
-    : artifacts && Array.isArray(artifacts.items)
-      ? artifacts.items
-      : null;
-  if (!items) {
+  if (artifacts && Array.isArray(artifacts.items)) {
+    return artifacts.items;
+  }
+  throw new Error("Некорректный ответ сервера");
+}
+
+async function loadArtifacts(prefetched = null) {
+  let files = prefetched;
+  if (!Array.isArray(files)) {
+    try {
+      files = await fetchArtifactFiles();
+    } catch (error) {
+      artifactsList.innerHTML = '<div class="empty-state">Не удалось загрузить материалы.</div>';
+      state.artifacts = [];
+      state.artifactFiles = [];
+      state.hasMissingArtifacts = false;
+      updateArtifactsToolbar();
+      throw error;
+    }
+  }
+  if (!Array.isArray(files)) {
     artifactsList.innerHTML = '<div class="empty-state">Некорректный ответ сервера.</div>';
     state.artifacts = [];
+    state.artifactFiles = [];
     state.hasMissingArtifacts = false;
     updateArtifactsToolbar();
     throw new Error("Некорректный ответ сервера");
   }
-  state.artifacts = normalizeArtifactList(items);
+  state.artifactFiles = files;
+  state.artifacts = normalizeArtifactList(files);
   state.hasMissingArtifacts = state.artifacts.some((artifact) => artifact.missing);
   renderArtifacts();
   updateArtifactsToolbar();
@@ -703,15 +746,16 @@ function renderArtifacts() {
     const openBtn = card.querySelector(".open-btn");
     const downloadBtn = card.querySelector(".download-btn");
     const deleteBtn = card.querySelector(".delete-btn");
+    const hasMarkdown = Boolean(artifact.downloads?.markdown);
     if (openBtn) {
-      openBtn.disabled = !artifact.path;
+      openBtn.disabled = !hasMarkdown;
       openBtn.addEventListener("click", (event) => {
         event.stopPropagation();
         showArtifact(artifact);
       });
     }
     if (downloadBtn) {
-      downloadBtn.disabled = !artifact.path;
+      downloadBtn.disabled = !hasMarkdown;
       downloadBtn.addEventListener("click", async (event) => {
         event.stopPropagation();
         await handleArtifactDownload(artifact);
@@ -751,38 +795,367 @@ function resolveArtifactStatus(artifact) {
 }
 
 function normalizeArtifactList(items) {
-  return items.map((item) => {
-    const metadata = item && typeof item.metadata === "object" && !Array.isArray(item.metadata) ? item.metadata : {};
+  const groups = new Map();
+
+  items.forEach((item) => {
+    if (!item || typeof item !== "object") {
+      return;
+    }
+    const metadata = item.metadata && typeof item.metadata === "object" && !Array.isArray(item.metadata)
+      ? item.metadata
+      : {};
     const fallbackId =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `artifact-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const id = typeof item.id === "string" && item.id.trim()
-      ? item.id.trim()
-      : typeof item.path === "string" && item.path.trim()
-        ? item.path.trim()
-        : metadata.id || metadata.artifact_id || fallbackId;
-    const path = typeof item.path === "string" && item.path.trim() ? item.path.trim() : null;
-    const metadataPath = typeof item.metadata_path === "string" && item.metadata_path.trim()
-      ? item.metadata_path.trim()
-      : null;
-    const name = typeof item.name === "string" && item.name.trim()
-      ? item.name.trim()
-      : typeof metadata.name === "string" && metadata.name.trim()
-        ? metadata.name.trim()
-        : id;
+      typeof item.artifact_id === "string" && item.artifact_id.trim()
+        ? item.artifact_id.trim()
+        : typeof item.id === "string" && item.id.trim()
+          ? item.id.trim()
+          : typeof item.path === "string" && item.path.trim()
+            ? item.path.trim()
+            : metadata.id || metadata.artifact_id || null;
+    const groupId = fallbackId || (typeof item.name === "string" ? item.name.replace(/\.[^.]+$/, "").trim() : null);
+    if (!groupId) {
+      return;
+    }
+    if (!groups.has(groupId)) {
+      groups.set(groupId, {
+        id: groupId,
+        name: null,
+        metadata: {},
+        status: null,
+        path: null,
+        metadata_path: null,
+        downloads: { markdown: null, report: null },
+        modified_at: null,
+        modified_ts: null,
+        size: null,
+        job_id: null,
+      });
+    }
+    const group = groups.get(groupId);
+    if (!group) {
+      return;
+    }
+
+    const downloadInfo = createDownloadInfoFromFile(item);
+    const type = (item.type || "").toString().toLowerCase();
+    const isMarkdown = type === "md" || (typeof item.name === "string" && item.name.toLowerCase().endsWith?.(".md"));
+    const isJson = type === "json" || (typeof item.name === "string" && item.name.toLowerCase().endsWith?.(".json"));
+
+    if (isMarkdown && downloadInfo) {
+      group.downloads.markdown = downloadInfo;
+      group.path = downloadInfo.path || item.artifact_path || downloadInfo.url || group.path;
+      if (!group.name) {
+        group.name = typeof item.name === "string" && item.name.trim()
+          ? item.name.trim()
+          : metadata.title || metadata.name || null;
+      }
+    }
+    if (isJson && downloadInfo) {
+      group.downloads.report = downloadInfo;
+      group.metadata_path = downloadInfo.path || item.metadata_path || downloadInfo.url || group.metadata_path;
+    }
+
+    if (Object.keys(metadata).length) {
+      group.metadata = metadata;
+      if (!group.name) {
+        const metaName = metadata.input_data?.theme || metadata.theme || metadata.name;
+        if (metaName) {
+          group.name = metaName;
+        }
+      }
+      if (!group.status && typeof metadata.status === "string") {
+        group.status = metadata.status;
+      }
+      if (!group.job_id && typeof metadata.job_id === "string") {
+        group.job_id = metadata.job_id;
+      }
+    }
+
+    if (!group.status && typeof item.status === "string") {
+      group.status = item.status;
+    }
+    if (!group.job_id && typeof item.job_id === "string") {
+      group.job_id = item.job_id;
+    }
+    if (typeof item.size === "number") {
+      group.size = item.size;
+    }
+
+    const createdAt = typeof item.created_at === "string" && item.created_at.trim()
+      ? item.created_at.trim()
+      : downloadInfo?.created_at || null;
+    const createdTs = parseTimestamp(createdAt);
+    if (createdTs !== null && (group.modified_ts === null || createdTs > group.modified_ts)) {
+      group.modified_ts = createdTs;
+      group.modified_at = createdAt;
+    }
+  });
+
+  return Array.from(groups.values()).map((group) => {
+    const name = group.name || group.metadata?.name || group.metadata?.input_data?.theme || group.id;
     return {
-      id,
+      id: group.id,
       name,
-      path,
-      metadata_path: metadataPath,
-      metadata,
-      size: typeof item.size === "number" ? item.size : null,
-      modified_at: item.modified_at || null,
-      status: item.status || metadata.status || null,
-      missing: Boolean(item.missing),
+      path: group.path,
+      metadata_path: group.metadata_path,
+      metadata: group.metadata || {},
+      size: typeof group.size === "number" ? group.size : null,
+      modified_at: group.modified_at,
+      status: group.status || null,
+      job_id: group.job_id || null,
+      downloads: group.downloads,
+      missing: !group.downloads.markdown,
     };
   });
+}
+
+function parseTimestamp(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  const direct = Date.parse(value);
+  if (!Number.isNaN(direct)) {
+    return direct;
+  }
+  const normalized = Date.parse(value.replace(/\s+/, "T"));
+  return Number.isNaN(normalized) ? null : normalized;
+}
+
+function createDownloadInfoFromFile(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  const url = typeof item.url === "string" && item.url.trim() ? item.url.trim() : null;
+  const path = typeof item.path === "string" && item.path.trim() ? item.path.trim() : null;
+  const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : null;
+  const size = typeof item.size === "number" ? item.size : null;
+  const createdAt = typeof item.created_at === "string" && item.created_at.trim() ? item.created_at.trim() : null;
+  if (!url && !path) {
+    return null;
+  }
+  const info = {
+    url,
+    path,
+    name,
+    size,
+    created_at: createdAt,
+    job_id: item.job_id || null,
+  };
+  if (!info.url && info.path) {
+    info.url = `/api/artifacts/download?path=${encodeURIComponent(info.path)}`;
+  }
+  return info;
+}
+
+function setDownloadLinkAvailability(link, downloadInfo) {
+  if (!link) {
+    return;
+  }
+  const fallbackName = link.dataset.fallbackName || (link.id === "download-md" ? "draft.md" : "report.json");
+  if (downloadInfo && (downloadInfo.url || downloadInfo.path)) {
+    const targetUrl = downloadInfo.url || `/api/artifacts/download?path=${encodeURIComponent(downloadInfo.path)}`;
+    const resolvedUrl = resolveApiPath(targetUrl);
+    link.href = resolvedUrl;
+    link.dataset.downloadUrl = resolvedUrl;
+    link.setAttribute("download", downloadInfo.name || fallbackName);
+    link.classList.remove("is-disabled");
+    link.removeAttribute("aria-disabled");
+    return;
+  }
+  link.removeAttribute("href");
+  link.removeAttribute("download");
+  link.classList.add("is-disabled");
+  link.setAttribute("aria-disabled", "true");
+  delete link.dataset.downloadUrl;
+}
+
+function setActiveArtifactDownloads(downloads) {
+  const normalized = downloads && typeof downloads === "object" ? downloads : {};
+  state.currentDownloads = {
+    markdown: normalized.markdown || normalized.article || null,
+    report: normalized.report || normalized.json || normalized.metadata || null,
+  };
+  setDownloadLinkAvailability(downloadMdBtn, state.currentDownloads.markdown);
+  setDownloadLinkAvailability(downloadReportBtn, state.currentDownloads.report);
+}
+
+function resetDownloadButtonsForNewJob() {
+  state.currentDownloads = { markdown: null, report: null };
+  setDownloadLinkAvailability(downloadMdBtn, null);
+  setDownloadLinkAvailability(downloadReportBtn, null);
+  setButtonLoading(downloadMdBtn, true);
+  setButtonLoading(downloadReportBtn, true);
+}
+
+function handleDownloadClick(event, type) {
+  const link = type === "markdown" ? downloadMdBtn : downloadReportBtn;
+  if (!link) {
+    return;
+  }
+  if (link.classList.contains("loading") || link.getAttribute("aria-disabled") === "true") {
+    event.preventDefault();
+    if (!link.classList.contains("loading")) {
+      showToast({ message: "Файл недоступен для скачивания", type: "warn" });
+    }
+    return;
+  }
+  const downloadInfo = type === "markdown" ? state.currentDownloads.markdown : state.currentDownloads.report;
+  if (!downloadInfo) {
+    event.preventDefault();
+    showToast({ message: "Файл недоступен для скачивания", type: "warn" });
+    return;
+  }
+  event.preventDefault();
+  const fallbackName = link.dataset.fallbackName || (type === "markdown" ? "draft.md" : "report.json");
+  downloadArtifactFile(downloadInfo, fallbackName);
+}
+
+function extractArtifactPathHints(artifactPaths) {
+  const hints = new Set();
+  if (!artifactPaths || typeof artifactPaths !== "object") {
+    return hints;
+  }
+  ["markdown", "metadata", "json"].forEach((key) => {
+    const raw = artifactPaths[key];
+    if (typeof raw === "string" && raw.trim()) {
+      const name = raw.split("/").pop() || raw;
+      hints.add(name.replace(/\.[^.]+$/, ""));
+    }
+  });
+  return hints;
+}
+
+function findLatestArtifactPair(files, { jobId = null, artifactPaths = null } = {}) {
+  if (!Array.isArray(files) || !files.length) {
+    return null;
+  }
+
+  const groups = new Map();
+  const hints = extractArtifactPathHints(artifactPaths);
+
+  const isMarkdownFile = (file) => {
+    const type = (file?.type || "").toString().toLowerCase();
+    if (type === "md") {
+      return true;
+    }
+    const name = typeof file?.name === "string" ? file.name.toLowerCase() : "";
+    return name.endsWith(".md");
+  };
+
+  const isJsonFile = (file) => {
+    const type = (file?.type || "").toString().toLowerCase();
+    if (type === "json") {
+      return true;
+    }
+    const name = typeof file?.name === "string" ? file.name.toLowerCase() : "";
+    return name.endsWith(".json");
+  };
+
+  files.forEach((file) => {
+    if (!file || typeof file !== "object") {
+      return;
+    }
+    const artifactId = typeof file.artifact_id === "string" && file.artifact_id.trim()
+      ? file.artifact_id.trim()
+      : null;
+    const name = typeof file.name === "string" ? file.name : "";
+    const baseName = name ? name.replace(/\.[^.]+$/, "") : null;
+    const key = artifactId || baseName;
+    if (!key) {
+      return;
+    }
+    if (!groups.has(key)) {
+      groups.set(key, {
+        files: [],
+        jobIds: new Set(),
+        createdTs: null,
+        baseName: baseName || key,
+      });
+    }
+    const group = groups.get(key);
+    if (!group) {
+      return;
+    }
+    group.files.push(file);
+    if (file.job_id) {
+      group.jobIds.add(file.job_id);
+    }
+    const createdTs = parseTimestamp(typeof file.created_at === "string" ? file.created_at : null);
+    if (createdTs !== null && (group.createdTs === null || createdTs > group.createdTs)) {
+      group.createdTs = createdTs;
+    }
+  });
+
+  const availableGroups = Array.from(groups.entries()).filter(([_, group]) => group.files.some(isMarkdownFile));
+  if (!availableGroups.length) {
+    return null;
+  }
+
+  const selectByJob = jobId
+    ? availableGroups.find(([_, group]) => group.jobIds.has(jobId))
+    : null;
+  if (selectByJob) {
+    const group = selectByJob[1];
+    const markdown = group.files.find(isMarkdownFile) || null;
+    const report = group.files.find(isJsonFile) || null;
+    return { markdown, report };
+  }
+
+  const selectByHint = hints.size
+    ? availableGroups.find(([key, group]) => hints.has(group.baseName) || hints.has(key))
+    : null;
+  if (selectByHint) {
+    const group = selectByHint[1];
+    const markdown = group.files.find(isMarkdownFile) || null;
+    const report = group.files.find(isJsonFile) || null;
+    return { markdown, report };
+  }
+
+  availableGroups.sort((a, b) => (b[1].createdTs || 0) - (a[1].createdTs || 0));
+  const latest = availableGroups[0]?.[1];
+  if (!latest) {
+    return null;
+  }
+  const markdown = latest.files.find(isMarkdownFile) || null;
+  const report = latest.files.find(isJsonFile) || null;
+  return { markdown, report };
+}
+
+function hasDraftStepSucceeded(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.steps)) {
+    return false;
+  }
+  return snapshot.steps.some((step) => step && step.name === "draft" && step.status === "succeeded");
+}
+
+async function refreshDownloadLinksForJob({ jobId = null, artifactPaths = null } = {}) {
+  if (!downloadMdBtn || !downloadReportBtn) {
+    return null;
+  }
+  try {
+    const files = await fetchArtifactFiles();
+    state.pendingArtifactFiles = files;
+    const pair = findLatestArtifactPair(files, { jobId, artifactPaths });
+    const downloads = pair
+      ? {
+          markdown: pair.markdown ? createDownloadInfoFromFile(pair.markdown) : null,
+          report: pair.report ? createDownloadInfoFromFile(pair.report) : null,
+        }
+      : { markdown: null, report: null };
+    setButtonLoading(downloadMdBtn, false);
+    setButtonLoading(downloadReportBtn, false);
+    setActiveArtifactDownloads(downloads);
+    if (state.currentResult && typeof state.currentResult === "object") {
+      state.currentResult.downloads = downloads;
+    }
+    return downloads;
+  } catch (error) {
+    console.warn("Не удалось обновить ссылки на артефакты", error);
+    setButtonLoading(downloadMdBtn, false);
+    setButtonLoading(downloadReportBtn, false);
+    setActiveArtifactDownloads({ markdown: null, report: null });
+    return null;
+  }
 }
 
 function resolveArtifactIdentifier(artifact) {
@@ -817,11 +1190,13 @@ function removeArtifactFromState(artifact) {
 }
 
 async function handleArtifactDownload(artifact) {
-  if (!artifact?.path) {
+  const downloadInfo = artifact?.downloads?.markdown || null;
+  if (!downloadInfo) {
     showToast({ message: "Файл недоступен для скачивания", type: "warn" });
     return false;
   }
-  const result = await downloadArtifactFile(artifact.path, artifact.name || "artifact.txt", artifact);
+  const fallbackName = artifact?.name || downloadInfo.name || "artifact.txt";
+  const result = await downloadArtifactFile(downloadInfo, fallbackName, artifact);
   return result === "ok";
 }
 
@@ -1054,6 +1429,11 @@ async function handleGenerate(event) {
   event.preventDefault();
   try {
     const payload = buildRequestPayload();
+    resetDownloadButtonsForNewJob();
+    state.pendingArtifactFiles = null;
+    let downloadsRequested = false;
+    let activeJobId = null;
+    let artifactPathsHint = null;
     toggleRetryButton(false);
     setInteractiveBusy(true);
     setButtonLoading(generateBtn, true);
@@ -1086,8 +1466,18 @@ async function handleGenerate(event) {
       body: JSON.stringify(requestBody),
     });
     let snapshot = normalizeJobResponse(initialResponse);
+    activeJobId = snapshot.job_id || snapshot.id || activeJobId;
+    if (snapshot.result && typeof snapshot.result === "object" && snapshot.result.artifact_paths) {
+      artifactPathsHint = snapshot.result.artifact_paths;
+    }
     const initialChars = applyProgressiveResult(snapshot) || 0;
     showProgress(true, describeJobProgress(snapshot, initialChars));
+    if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
+      downloadsRequested = true;
+      refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
+        console.warn("Не удалось заранее получить ссылки на артефакты", error);
+      });
+    }
     if (snapshot.status !== "succeeded" || !snapshot.result) {
       if (!snapshot.job_id) {
         throw new Error("Сервер вернул пустой ответ без идентификатора задания.");
@@ -1100,25 +1490,49 @@ async function handleGenerate(event) {
           } else {
             showProgress(true, describeJobProgress(update, liveChars));
           }
+          if (!downloadsRequested && hasDraftStepSucceeded(update)) {
+            downloadsRequested = true;
+            activeJobId = update?.id || update?.job_id || activeJobId;
+            if (update?.result && typeof update.result === "object" && update.result.artifact_paths) {
+              artifactPathsHint = update.result.artifact_paths;
+            }
+            refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
+              console.warn("Не удалось заранее получить ссылки на артефакты", error);
+            });
+          }
         },
       });
     }
+    activeJobId = snapshot?.id || snapshot?.job_id || activeJobId;
+    if (snapshot?.result && typeof snapshot.result === "object" && snapshot.result.artifact_paths) {
+      artifactPathsHint = snapshot.result.artifact_paths;
+    }
+    if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
+      downloadsRequested = true;
+      await refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
+    }
     renderGenerationResult(snapshot, { payload });
     try {
-      await loadArtifacts();
+      const pendingFiles = state.pendingArtifactFiles;
+      await loadArtifacts(pendingFiles);
     } catch (refreshError) {
       console.error(refreshError);
       showToast({ message: `Не удалось обновить список материалов: ${getErrorMessage(refreshError)}`, type: "warn" });
     }
+    state.pendingArtifactFiles = null;
     switchTab("result");
     showToast({ message: "Готово", type: "success" });
   } catch (error) {
     console.error(error);
     showToast({ message: `Не удалось выполнить генерацию: ${getErrorMessage(error)}`, type: "error" });
+    setButtonLoading(downloadMdBtn, false);
+    setButtonLoading(downloadReportBtn, false);
+    setActiveArtifactDownloads(null);
   } finally {
     setButtonLoading(generateBtn, false);
     setInteractiveBusy(false);
     showProgress(false);
+    state.pendingArtifactFiles = null;
   }
 }
 
@@ -1315,6 +1729,10 @@ function renderGenerationResult(snapshot, { payload }) {
     characters,
     hasContent,
     degradationFlags,
+    downloads:
+      state.currentDownloads && (state.currentDownloads.markdown || state.currentDownloads.report)
+        ? { ...state.currentDownloads }
+        : null,
   };
   draftView.innerHTML = markdownToHtml(markdown);
   resultTitle.textContent = payload?.data?.theme || "Результат генерации";
@@ -1348,7 +1766,11 @@ function renderGenerationResult(snapshot, { payload }) {
     context_budget_tokens_limit: meta.context_budget_tokens_limit,
     k: payload?.k,
   });
-  enableDownloadButtons(result.artifact_paths ?? null);
+  if (state.currentResult.downloads) {
+    setButtonLoading(downloadMdBtn, false);
+    setButtonLoading(downloadReportBtn, false);
+    setActiveArtifactDownloads(state.currentResult.downloads);
+  }
   if (degradationFlags.length) {
     const label = degradationFlags.map(describeDegradationFlag).join(", ");
     showToast({ message: `Частичная деградация: ${label}`, type: "warn", duration: 6000 });
@@ -1971,61 +2393,25 @@ function toggleRetryButton(show) {
   retryBtn.disabled = !show;
 }
 
-function enableDownloadButtons(paths) {
-  const normalizePath = (value) =>
-    typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
-
-  const markdownPath = normalizePath(paths?.markdown);
-  const metadataPath = normalizePath(paths?.metadata);
-
-  if (markdownPath) {
-    downloadMdBtn.dataset.path = markdownPath;
-    downloadMdBtn.disabled = false;
-  } else {
-    downloadMdBtn.disabled = true;
-    delete downloadMdBtn.dataset.path;
-  }
-
-  if (metadataPath) {
-    downloadReportBtn.dataset.path = metadataPath;
-    downloadReportBtn.disabled = false;
-  } else {
-    downloadReportBtn.disabled = true;
-    delete downloadReportBtn.dataset.path;
-  }
-}
-
-async function handleDownload(type) {
-  const button = type === "markdown" ? downloadMdBtn : downloadReportBtn;
-  const path = button.dataset.path;
-  if (!path) {
-    showToast({ message: "Файл недоступен для скачивания", type: "warn" });
-    return;
-  }
-  const result = await downloadArtifactFile(
-    path,
-    type === "markdown" ? "draft.md" : "report.json"
-  );
-  if (result === "not_found") {
-    button.disabled = true;
-    delete button.dataset.path;
-  }
-}
-
 async function showArtifact(artifact) {
   try {
     showProgress(true, "Загружаем артефакт…");
-    const markdownPath = artifact.path;
-    if (!markdownPath) {
+    const markdownDownload = artifact?.downloads?.markdown || null;
+    const markdownUrl = markdownDownload?.url
+      || (artifact.path ? `/api/artifacts/download?path=${encodeURIComponent(artifact.path)}` : null);
+    if (!markdownUrl) {
       handleMissingArtifact(artifact);
       return;
     }
-    const markdown = await fetchText(`/api/artifacts/download?path=${encodeURIComponent(markdownPath)}`);
+    const markdown = await fetchText(markdownUrl);
     const metadataPath = artifact.metadata_path;
+    const metadataDownload = artifact?.downloads?.report || null;
     let metadata = artifact.metadata || {};
-    if (!Object.keys(metadata).length && metadataPath) {
+    if (!Object.keys(metadata).length && (metadataDownload?.url || metadataPath)) {
       try {
-        const jsonText = await fetchText(`/api/artifacts/download?path=${encodeURIComponent(metadataPath)}`);
+        const metadataUrl = metadataDownload?.url
+          || (metadataPath ? `/api/artifacts/download?path=${encodeURIComponent(metadataPath)}` : null);
+        const jsonText = metadataUrl ? await fetchText(metadataUrl) : "";
         metadata = JSON.parse(jsonText);
       } catch (parseError) {
         console.warn("Не удалось разобрать метаданные", parseError);
@@ -2038,7 +2424,12 @@ async function showArtifact(artifact) {
     resultMeta.textContent = `Символов: ${characters.toLocaleString("ru-RU")} · Модель: ${metadata.model_used ?? "—"}`;
     renderMetadata(metadata);
     updateResultBadges(metadata, Array.isArray(metadata?.degradation_flags) ? metadata.degradation_flags : []);
-    enableDownloadButtons({ markdown: artifact.path, metadata: metadataPath });
+    setButtonLoading(downloadMdBtn, false);
+    setButtonLoading(downloadReportBtn, false);
+    setActiveArtifactDownloads(artifact.downloads || {
+      markdown: markdownDownload,
+      report: metadataDownload,
+    });
     updatePromptPreview({
       system: metadata.system_prompt_preview,
       context: metadata.clips || [],
@@ -2053,6 +2444,18 @@ async function showArtifact(artifact) {
       context_len: metadata.context_len,
       context_filename: metadata.context_filename,
     });
+    state.currentResult = {
+      markdown,
+      meta: metadata,
+      artifactPaths: { markdown: artifact.path || null, metadata: metadataPath || null },
+      characters,
+      hasContent: true,
+      degradationFlags: Array.isArray(metadata?.degradation_flags) ? metadata.degradation_flags : [],
+      downloads: artifact.downloads || {
+        markdown: markdownDownload,
+        report: metadataDownload,
+      },
+    };
     switchTab("result");
   } catch (error) {
     console.error(error);
@@ -2283,9 +2686,10 @@ async function fetchJson(path, options = {}) {
     headers["Content-Type"] = "application/json";
   }
 
+  const url = resolveApiPath(path);
   let response;
   try {
-    response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+    response = await fetch(url, { ...options, headers });
   } catch (error) {
     throw new Error("Сервер недоступен");
   }
@@ -2331,9 +2735,10 @@ async function fetchJson(path, options = {}) {
 }
 
 async function fetchText(path) {
+  const url = resolveApiPath(path);
   let response;
   try {
-    response = await fetch(`${API_BASE}${path}`);
+    response = await fetch(url);
   } catch (error) {
     throw new Error("Сервер недоступен");
   }
@@ -2455,6 +2860,72 @@ function setButtonLoading(button, isLoading) {
   }
 }
 
+function toggleFeatureElements(elements, hidden) {
+  elements
+    .filter(Boolean)
+    .forEach((element) => {
+      const target = element.closest?.("[data-feature-root]")
+        || element.closest?.(".form-row")
+        || element;
+      if (!target) {
+        return;
+      }
+      if (hidden) {
+        target.classList.add("feature-hidden");
+      } else {
+        target.classList.remove("feature-hidden");
+      }
+    });
+}
+
+function applyFeatureFlags() {
+  const modelElements = [];
+  if (modelInput) {
+    modelElements.push(modelInput);
+  }
+  document.querySelectorAll('[data-feature="model-selector"]').forEach((element) => {
+    modelElements.push(element);
+  });
+  toggleFeatureElements(modelElements, featureState.hideModelSelector);
+
+  const tokenElements = [];
+  if (maxTokensInput) {
+    tokenElements.push(maxTokensInput);
+  }
+  if (minCharsInput) {
+    tokenElements.push(minCharsInput);
+  }
+  if (maxCharsInput) {
+    tokenElements.push(maxCharsInput);
+  }
+  if (kInput) {
+    tokenElements.push(kInput);
+  }
+  document.querySelectorAll('[data-feature="token-sliders"]').forEach((element) => {
+    tokenElements.push(element);
+  });
+  toggleFeatureElements(tokenElements, featureState.hideTokenSliders);
+}
+
+async function initFeatureFlags() {
+  applyFeatureFlags();
+  try {
+    const config = await fetchJson("/api/features");
+    if (config && typeof config === "object") {
+      if (typeof config.hide_model_selector === "boolean") {
+        featureState.hideModelSelector = config.hide_model_selector;
+      }
+      if (typeof config.hide_token_sliders === "boolean") {
+        featureState.hideTokenSliders = config.hide_token_sliders;
+      }
+    }
+  } catch (error) {
+    console.debug("Не удалось загрузить настройки фич", error);
+  } finally {
+    applyFeatureFlags();
+  }
+}
+
 function resolveDevActions() {
   let rawValue;
   if (typeof globalThis !== "undefined" && typeof globalThis.SHOW_DEV_ACTIONS !== "undefined") {
@@ -2497,13 +2968,45 @@ function isNotFoundError(error) {
   return Boolean(error && typeof error.status === "number" && error.status === 404);
 }
 
-async function downloadArtifactFile(path, fallbackName = "artifact.txt", artifact = null) {
-  if (!path) {
+async function downloadArtifactFile(resource, fallbackName = "artifact.txt", artifact = null) {
+  const normalized = (() => {
+    if (!resource) {
+      return null;
+    }
+    if (typeof resource === "string") {
+      const trimmed = resource.trim();
+      if (!trimmed) {
+        return null;
+      }
+      return {
+        url: resolveApiPath(`/api/artifacts/download?path=${encodeURIComponent(trimmed)}`),
+        name: fallbackName,
+      };
+    }
+    if (typeof resource === "object") {
+      const candidateUrl = typeof resource.url === "string" && resource.url.trim() ? resource.url.trim() : null;
+      const candidatePath = typeof resource.path === "string" && resource.path.trim() ? resource.path.trim() : null;
+      const name = typeof resource.name === "string" && resource.name.trim() ? resource.name.trim() : fallbackName;
+      if (candidateUrl) {
+        return { url: resolveApiPath(candidateUrl), name };
+      }
+      if (candidatePath) {
+        return {
+          url: resolveApiPath(`/api/artifacts/download?path=${encodeURIComponent(candidatePath)}`),
+          name,
+        };
+      }
+    }
+    return null;
+  })();
+
+  if (!normalized) {
     showToast({ message: "Файл недоступен", type: "warn" });
     return "error";
   }
+
   try {
-    const response = await fetch(`${API_BASE}/api/artifacts/download?path=${encodeURIComponent(path)}`);
+    const response = await fetch(normalized.url);
     if (!response.ok) {
       let message = `HTTP ${response.status}`;
       let notFound = false;
@@ -2539,7 +3042,7 @@ async function downloadArtifactFile(path, fallbackName = "artifact.txt", artifac
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = path.split("/").pop() || fallbackName;
+    anchor.download = normalized.name || fallbackName;
     document.body.append(anchor);
     anchor.click();
     anchor.remove();

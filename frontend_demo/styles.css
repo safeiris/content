@@ -15,6 +15,10 @@ body {
   overflow-x: hidden;
 }
 
+.feature-hidden {
+  display: none !important;
+}
+
 .app-shell {
   width: min(100%, var(--app-max-width));
   margin: 0 auto;
@@ -674,6 +678,7 @@ button {
   border: 1px solid #d4d8dd;
   border-radius: 10px;
   padding: 10px 18px;
+  text-decoration: none;
   cursor: pointer;
   transition: border-color 0.2s ease;
 }
@@ -709,6 +714,22 @@ button {
   cursor: not-allowed;
   color: #9ca3af;
   border-color: #e5e7eb;
+}
+
+.secondary.is-disabled,
+.secondary[aria-disabled="true"] {
+  cursor: not-allowed;
+  color: #9ca3af;
+  border-color: #e5e7eb;
+  pointer-events: none;
+}
+
+.secondary.loading {
+  cursor: progress;
+}
+
+button.loading {
+  cursor: progress;
 }
 
 .ghost {
@@ -1522,10 +1543,7 @@ button {
   animation: spin 0.9s linear infinite;
 }
 
-button.loading {
-  cursor: progress;
-}
-
+.secondary.loading .btn-label,
 button.loading .btn-label {
   opacity: 0.75;
 }
