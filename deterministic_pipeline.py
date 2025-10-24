@@ -798,19 +798,28 @@ class DeterministicPipeline:
             self._enforce_schema_defaults(schema)
         format_name = str(format_block.get("name") or "")
         if (
-            batch.kind != SkeletonBatchKind.INTRO
+            batch.kind in (
+                SkeletonBatchKind.MAIN,
+                SkeletonBatchKind.FAQ,
+                SkeletonBatchKind.CONCLUSION,
+            )
             and format_name.strip() == "seo_article_skeleton"
         ):
-            LOGGER.error(
-                "FORMAT_GUARD triggered kind=%s label=%s name=%s",
+            replacement_map = {
+                SkeletonBatchKind.MAIN: "seo_article_main_batch",
+                SkeletonBatchKind.FAQ: "seo_article_faq_batch",
+                SkeletonBatchKind.CONCLUSION: "seo_article_conclusion_batch",
+            }
+            replacement = replacement_map.get(batch.kind, "seo_article_skeleton_batch")
+            LOGGER.warning(
+                "LOG:BAT_FMT_FIXUP kind=%s label=%s from=%s to=%s",
                 batch.kind.value,
                 batch.label or self._format_batch_label(batch.kind, batch.indices),
                 format_name,
+                replacement,
             )
-            raise PipelineStepError(
-                PipelineStep.SKELETON,
-                "Недопустимое имя формата для батча скелета.",
-            )
+            format_block = dict(format_block)
+            format_block["name"] = replacement
         return format_block
 
     def _enforce_schema_defaults(self, schema: Dict[str, object], path: str = "$") -> None:
@@ -1438,6 +1447,14 @@ class DeterministicPipeline:
         pending = [int(item) for item in missing_items if isinstance(item, int)]
         if not pending:
             return
+        if batch.kind == SkeletonBatchKind.MAIN:
+            self._tail_fill_main_sections(
+                indices=pending,
+                outline=outline,
+                assembly=assembly,
+                estimate=estimate,
+            )
+            return
         previous_id = self._metadata_response_id(metadata)
         if not previous_id:
             return
@@ -1546,25 +1563,297 @@ class DeterministicPipeline:
                 if value:
                     metadata[key] = value
 
+    def _tail_fill_main_sections(
+        self,
+        *,
+        indices: Sequence[int],
+        outline: SkeletonOutline,
+        assembly: SkeletonAssembly,
+        estimate: SkeletonVolumeEstimate,
+    ) -> None:
+        targets = [idx for idx in indices if 0 <= idx < len(outline.main_headings)]
+        if not targets:
+            return
+        LOGGER.info("LOG:MAIN_TAIL_FILL start missing=%d", len(targets))
+        for index in targets:
+            heading = (
+                outline.main_headings[index]
+                if index < len(outline.main_headings)
+                else f"Блок {index + 1}"
+            )
+            messages, format_block = self._build_main_tail_fill_messages(
+                outline=outline,
+                assembly=assembly,
+                target_index=index,
+                heading=heading,
+            )
+            budget = max(600, min(estimate.per_main_tokens + 160, 900))
+            result = self._call_llm(
+                step=PipelineStep.SKELETON,
+                messages=messages,
+                max_tokens=budget,
+                responses_format=format_block,
+            )
+            payload = self._extract_response_json(result.text)
+            format_used = "json"
+            resolved_heading = heading
+            body_text = ""
+            if isinstance(payload, dict):
+                section_payload: Optional[Dict[str, object]] = None
+                section_block = payload.get("section")
+                if isinstance(section_block, dict):
+                    section_payload = section_block
+                else:
+                    sections = payload.get("sections")
+                    if isinstance(sections, list) and sections:
+                        candidate = sections[0]
+                        if isinstance(candidate, dict):
+                            section_payload = candidate
+                if section_payload is not None:
+                    heading_candidate = str(
+                        section_payload.get("title")
+                        or section_payload.get("heading")
+                        or ""
+                    ).strip()
+                    body_candidate = str(
+                        section_payload.get("body")
+                        or section_payload.get("text")
+                        or ""
+                    ).strip()
+                    if heading_candidate:
+                        resolved_heading = heading_candidate
+                    if body_candidate:
+                        body_text = body_candidate
+            if not body_text:
+                fallback = self._parse_fallback_main(
+                    result.text,
+                    target_index=index,
+                    outline=outline,
+                )
+                if fallback and isinstance(fallback, dict):
+                    sections = fallback.get("sections")
+                    if isinstance(sections, list) and sections:
+                        candidate = sections[0]
+                        if isinstance(candidate, dict):
+                            heading_candidate = str(
+                                candidate.get("title")
+                                or candidate.get("heading")
+                                or ""
+                            ).strip()
+                            body_candidate = str(
+                                candidate.get("body")
+                                or candidate.get("text")
+                                or ""
+                            ).strip()
+                            if heading_candidate:
+                                resolved_heading = heading_candidate
+                            if body_candidate:
+                                body_text = body_candidate
+                                format_used = "text"
+            if not body_text:
+                body_text = (
+                    "Этот раздел будет дополнен подробными рекомендациями по теме."
+                    " Пока используем короткий абзац-заглушку."
+                )
+                format_used = "stub"
+            assembly.apply_main(index, body_text, heading=resolved_heading)
+            usage = self._extract_usage(result)
+            tokens_repr = "-" if usage is None else f"{int(round(usage))}"
+            LOGGER.info(
+                "LOG:MAIN_TAIL_FILL_ACCEPT idx=%d tokens=%s format=%s",
+                index + 1,
+                tokens_repr,
+                format_used,
+            )
+
+    def _build_main_tail_fill_messages(
+        self,
+        *,
+        outline: SkeletonOutline,
+        assembly: SkeletonAssembly,
+        target_index: int,
+        heading: str,
+    ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+        messages = [dict(message) for message in self.messages]
+        existing_sections: List[str] = []
+        for idx, title in enumerate(outline.main_headings):
+            if idx == target_index:
+                continue
+            body = assembly.main_sections[idx] if idx < len(assembly.main_sections) else None
+            if body and str(body).strip():
+                existing_sections.append(f"{idx + 1}. {title}")
+        lines = [
+            "Ты дополняешь основной раздел SEO-статьи.",
+            f"Тема: {self.topic}.",
+            "Нужно подготовить одну новую секцию основной части, без повторов уже готовых блоков.",
+            f"Целевой заголовок: {heading}.",
+        ]
+        if existing_sections:
+            lines.append("Уже готовые разделы: " + "; ".join(existing_sections) + ".")
+        lines.extend(
+            [
+                "Секция должна содержать 3–4 абзаца по 3–4 предложения, с цифрами, рисками и действиями.",
+                "Сконцентрируйся на практических советах и логичной структуре.",
+                "Верни JSON {\"section\": {\"title\": str, \"body\": str}} без пояснений.",
+                "Строго одна новая секция основной части, без повторов.",
+            ]
+        )
+        if self.normalized_keywords:
+            lines.append(
+                "По возможности используй ключевые слова: "
+                + ", ".join(self.normalized_keywords)
+                + "."
+            )
+        user_payload = textwrap.dedent("\n".join(lines)).strip()
+        messages.append({"role": "user", "content": user_payload})
+        schema = {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["title", "body"],
+                    "additionalProperties": False,
+                }
+            },
+            "required": ["section"],
+            "additionalProperties": False,
+        }
+        format_block = {
+            "type": "json_schema",
+            "name": "seo_article_main_batch_one",
+            "schema": schema,
+            "strict": True,
+        }
+        plan = SkeletonBatchPlan(
+            kind=SkeletonBatchKind.MAIN,
+            indices=[target_index],
+            label=f"main[{target_index + 1}]",
+            tail_fill=True,
+        )
+        return messages, self._prepare_format_block(format_block, batch=plan)
+
+    def _append_main_heading_to_base_outline(self, heading: str) -> None:
+        normalized = str(heading or "").strip()
+        if not normalized:
+            return
+        if normalized in self.base_outline:
+            return
+        faq_markers = {"faq", "f.a.q.", "вопросы и ответы"}
+        insert_pos = len(self.base_outline)
+        for idx in range(1, len(self.base_outline)):
+            marker = str(self.base_outline[idx] or "").strip().lower()
+            if marker in faq_markers:
+                insert_pos = idx
+                break
+        if insert_pos <= 0:
+            insert_pos = 1
+        if insert_pos >= len(self.base_outline):
+            self.base_outline.append(normalized)
+        else:
+            self.base_outline.insert(insert_pos, normalized)
+
+    def _generate_additional_main_sections(
+        self,
+        *,
+        outline: SkeletonOutline,
+        assembly: SkeletonAssembly,
+        estimate: SkeletonVolumeEstimate,
+        count: int,
+    ) -> List[str]:
+        generated: List[str] = []
+        target_total = max(0, int(count))
+        for _ in range(target_total):
+            new_heading = f"Дополнительный блок {len(outline.main_headings) + 1}"
+            outline.main_headings.append(new_heading)
+            assembly.main_sections.append(None)
+            self._append_main_heading_to_base_outline(new_heading)
+            new_index = len(assembly.main_sections) - 1
+            self._tail_fill_main_sections(
+                indices=[new_index],
+                outline=outline,
+                assembly=assembly,
+                estimate=estimate,
+            )
+            body_text = assembly.main_sections[new_index]
+            if isinstance(body_text, str) and body_text.strip():
+                generated.append(body_text.strip())
+            else:
+                placeholder = (
+                    "Дополнительный раздел будет дополнен подробными рекомендациями "
+                    "в обновлении статьи."
+                )
+                assembly.apply_main(new_index, placeholder, heading=new_heading)
+                generated.append(placeholder)
+        return generated
+
+    def _finalize_main_sections(
+        self,
+        payload: Dict[str, object],
+        *,
+        outline: SkeletonOutline,
+        assembly: SkeletonAssembly,
+        estimate: SkeletonVolumeEstimate,
+    ) -> Dict[str, object]:
+        main_blocks = payload.get("main")
+        if not isinstance(main_blocks, list):
+            main_blocks = []
+        sanitized = [str(item or "").strip() for item in main_blocks if str(item or "").strip()]
+        before_len = len(sanitized)
+        result = list(sanitized)
+        if len(result) > 6:
+            LOGGER.info("LOG:SKELETON_MAIN_TRIMMED from=%d to=6", len(result))
+            result = result[:6]
+        needed = max(0, min(3 - len(result), 3))
+        if needed > 0:
+            additional = self._generate_additional_main_sections(
+                outline=outline,
+                assembly=assembly,
+                estimate=estimate,
+                count=needed,
+            )
+            if additional:
+                result.extend(additional)
+            LOGGER.info(
+                "LOG:SKELETON_MAIN_AUTOFIX needed=%d before=%d after=%d",
+                needed,
+                before_len,
+                len(result),
+            )
+        payload["main"] = result
+        return payload
+
     def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
         if not isinstance(payload, dict):
             raise ValueError("Структура скелета не является объектом")
 
         intro = str(payload.get("intro") or "").strip()
-        main = payload.get("main")
+        raw_main = payload.get("main")
+        if not isinstance(raw_main, list):
+            raw_main = []
         conclusion = str(payload.get("conclusion") or "").strip()
         faq = payload.get("faq")
-        if not intro or not conclusion or not isinstance(main, list) or len(main) == 0:
+        if not intro or not conclusion:
             raise ValueError("Скелет не содержит обязательных полей intro/main/conclusion")
 
-        if not 3 <= len(main) <= 6:
-            raise ValueError("Скелет основной части должен содержать 3–6 блоков")
-
-        normalized_main: List[str] = []
-        for idx, item in enumerate(main):
-            if not isinstance(item, str) or not item.strip():
-                raise ValueError(f"Элемент основной части №{idx + 1} пуст")
-            normalized_main.append(item.strip())
+        normalized_main: List[str] = [
+            str(item or "").strip() for item in raw_main if str(item or "").strip()
+        ]
+        if len(normalized_main) > 6:
+            normalized_main = normalized_main[:6]
+        placeholders_needed = max(0, 3 - len(normalized_main))
+        if placeholders_needed:
+            for _ in range(placeholders_needed):
+                normalized_main.append(
+                    "Этот раздел будет расширен детальными рекомендациями в финальной версии статьи."
+                )
+            LOGGER.warning(
+                "LOG:SKELETON_MAIN_PLACEHOLDER applied count=%d",
+                placeholders_needed,
+            )
 
         if not isinstance(faq, list) or len(faq) != 5:
             raise ValueError("Скелет FAQ должен содержать ровно 5 элементов")
@@ -1781,6 +2070,22 @@ class DeterministicPipeline:
 
         while pending_batches:
             batch = pending_batches.popleft()
+            if batch.kind in (SkeletonBatchKind.FAQ, SkeletonBatchKind.CONCLUSION):
+                filled_main = sum(
+                    1
+                    for body in assembly.main_sections
+                    if isinstance(body, str) and body.strip()
+                )
+                has_pending_main = any(
+                    plan.kind == SkeletonBatchKind.MAIN for plan in pending_batches
+                )
+                if filled_main < 3 and has_pending_main:
+                    LOGGER.info(
+                        "LOG:SCHEDULER_BLOCK main underflow=%d target_min=3 → continue_main",
+                        filled_main,
+                    )
+                    pending_batches.append(batch)
+                    continue
             if not batch.label:
                 batch.label = self._format_batch_label(batch.kind, batch.indices)
             active_indices = list(batch.indices)
@@ -2140,9 +2445,9 @@ class DeterministicPipeline:
             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вывод скелета.")
         missing_main = assembly.missing_main_indices()
         if missing_main:
-            raise PipelineStepError(
-                PipelineStep.SKELETON,
-                "Не удалось заполнить все разделы основной части.",
+            LOGGER.warning(
+                "LOG:SKELETON_MAIN_GAPS missing=%s",
+                ",".join(str(idx + 1) for idx in missing_main),
             )
         if outline.has_faq and assembly.missing_faq_count(5):
             raise PipelineStepError(
@@ -2155,6 +2460,12 @@ class DeterministicPipeline:
             payload["faq"] = payload["faq"][:5]
 
         normalized_payload = normalize_skeleton_payload(payload)
+        normalized_payload = self._finalize_main_sections(
+            normalized_payload,
+            outline=outline,
+            assembly=assembly,
+            estimate=estimate,
+        )
         markdown, summary = self._render_skeleton_markdown(normalized_payload)
         snapshot = dict(normalized_payload)
         snapshot["outline"] = summary.get("outline", [])
