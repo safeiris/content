@@ -31,6 +31,7 @@ class JobStepStatus(str, Enum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    DEGRADED = "degraded"
     SKIPPED = "skipped"
 
 
@@ -43,6 +44,7 @@ class JobStep:
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     payload: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
 
     def mark_running(self) -> None:
         self.status = JobStepStatus.RUNNING
@@ -53,11 +55,20 @@ class JobStep:
         if payload:
             self.payload.update(payload)
         self.finished_at = utcnow()
+        self.error = None
 
-    def mark_failed(self, **payload: Any) -> None:
+    def mark_degraded(self, reason: str | None = None, **payload: Any) -> None:
+        self.status = JobStepStatus.DEGRADED
+        if payload:
+            self.payload.update(payload)
+        self.error = reason
+        self.finished_at = utcnow()
+
+    def mark_failed(self, reason: str | None = None, **payload: Any) -> None:
         self.status = JobStepStatus.FAILED
         if payload:
             self.payload.update(payload)
+        self.error = reason
         self.finished_at = utcnow()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -67,6 +78,7 @@ class JobStep:
             "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
             "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
             "payload": self.payload or None,
+            "error": self.error,
         }
 
 
@@ -81,21 +93,24 @@ class Job:
     finished_at: Optional[datetime] = None
     steps: List[JobStep] = field(default_factory=list)
     result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
+    error: Optional[Dict[str, Any]] = None
     degradation_flags: List[str] = field(default_factory=list)
+    trace_id: Optional[str] = None
 
     def mark_running(self) -> None:
         self.status = JobStatus.RUNNING
         self.started_at = self.started_at or utcnow()
 
-    def mark_succeeded(self, result: Dict[str, Any]) -> None:
+    def mark_succeeded(self, result: Dict[str, Any], *, degradation_flags: Optional[List[str]] = None) -> None:
         self.status = JobStatus.SUCCEEDED
         self.result = result
+        if degradation_flags:
+            self.degradation_flags.extend(flag for flag in degradation_flags if flag)
         self.finished_at = utcnow()
 
-    def mark_failed(self, error: str, *, degradation_flags: Optional[List[str]] = None) -> None:
+    def mark_failed(self, error: str | Dict[str, Any], *, degradation_flags: Optional[List[str]] = None) -> None:
         self.status = JobStatus.FAILED
-        self.error = error
+        self.error = {"message": error} if isinstance(error, str) else error
         self.finished_at = utcnow()
         if degradation_flags:
             self.degradation_flags.extend(flag for flag in degradation_flags if flag)
@@ -111,4 +126,5 @@ class Job:
             "result": self.result,
             "error": self.error,
             "degradation_flags": list(self.degradation_flags) or None,
+            "trace_id": self.trace_id,
         }

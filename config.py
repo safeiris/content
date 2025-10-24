@@ -40,7 +40,13 @@ OPENAI_TIMEOUT_S = max(1, _env_int("OPENAI_TIMEOUT_S", 60))
 OPENAI_MAX_RETRIES = max(0, _env_int("OPENAI_MAX_RETRIES", 4))
 OPENAI_RPS = max(1, _env_int("OPENAI_RPS", 2))
 OPENAI_RPM = max(OPENAI_RPS, _env_int("OPENAI_RPM", 60))
+OPENAI_CACHE_TTL_S = max(1, _env_int("OPENAI_CACHE_TTL_S", 30))
+OPENAI_CLIENT_MAX_QUEUE = max(1, _env_int("OPENAI_CLIENT_MAX_QUEUE", 16))
+OPENAI_MODEL = str(os.getenv("OPENAI_MODEL", "gpt-5")).strip() or "gpt-5"
+
 JOB_SOFT_TIMEOUT_S = max(1, _env_int("JOB_SOFT_TIMEOUT_S", 20))
+JOB_STORE_TTL_S = max(JOB_SOFT_TIMEOUT_S, _env_int("JOB_STORE_TTL_S", 900))
+JOB_MAX_RETRIES_PER_STEP = max(0, _env_int("JOB_MAX_RETRIES_PER_STEP", 1))
 
 USE_MOCK_LLM = _env_bool("USE_MOCK_LLM", False)
 OFFLINE_MODE = _env_bool("OFFLINE_MODE", False)

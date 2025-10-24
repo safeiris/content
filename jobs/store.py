@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
-from .models import Job
+from .models import Job, JobStep
 
 
 class JobStore:
@@ -28,6 +28,42 @@ class JobStore:
         with self._lock:
             self._purge_expired_locked()
             return self._jobs.get(job_id)
+
+    def update_step(self, job_id: str, step_name: str, mutator: Callable[[JobStep], None]) -> Optional[Job]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return None
+            for step in job.steps:
+                if step.name == step_name:
+                    mutator(step)
+                    break
+            self._expiry[job_id] = time.time() + self._ttl_seconds
+            return job
+
+    def set_result(self, job_id: str, result: dict, *, degradation_flags: Optional[list[str]] = None) -> Optional[Job]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return None
+            job.mark_succeeded(result, degradation_flags=degradation_flags)
+            self._expiry[job_id] = time.time() + self._ttl_seconds
+            return job
+
+    def set_failed(
+        self,
+        job_id: str,
+        error: dict | str,
+        *,
+        degradation_flags: Optional[list[str]] = None,
+    ) -> Optional[Job]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return None
+            job.mark_failed(error, degradation_flags=degradation_flags)
+            self._expiry[job_id] = time.time() + self._ttl_seconds
+            return job
 
     def touch(self, job_id: str) -> None:
         with self._lock:

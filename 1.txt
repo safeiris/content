@@ -1,12 +1,8 @@
 diff --git a/config.py b/config.py
-index 435a91ebb5731be02a1d998dcefc916a0c9a5d6f..24c30c6fb73470b3c04e9df8aa258c569fef2639 100644
+index 24c30c6fb73470b3c04e9df8aa258c569fef2639..9aa4c4af8bda196a37f0830cdf6a60adc8a69e12 100644
 --- a/config.py
 +++ b/config.py
-@@ -14,50 +14,55 @@ def _env_int(name: str, default: int) -> int:
- 
- 
- def _env_float_list(name: str, default: str) -> tuple[float, ...]:
-     raw = str(os.getenv(name, "")).strip()
+@@ -18,51 +18,57 @@ def _env_float_list(name: str, default: str) -> tuple[float, ...]:
      if not raw:
          raw = default
      parts = [part.strip() for part in raw.split(",") if part.strip()]
@@ -28,11 +24,17 @@ index 435a91ebb5731be02a1d998dcefc916a0c9a5d6f..24c30c6fb73470b3c04e9df8aa258c56
      return raw not in {"0", "false", "off", "no"}
  
  OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
-+OPENAI_TIMEOUT_S = max(1, _env_int("OPENAI_TIMEOUT_S", 60))
-+OPENAI_MAX_RETRIES = max(0, _env_int("OPENAI_MAX_RETRIES", 4))
-+OPENAI_RPS = max(1, _env_int("OPENAI_RPS", 2))
-+OPENAI_RPM = max(OPENAI_RPS, _env_int("OPENAI_RPM", 60))
-+JOB_SOFT_TIMEOUT_S = max(1, _env_int("JOB_SOFT_TIMEOUT_S", 20))
+ OPENAI_TIMEOUT_S = max(1, _env_int("OPENAI_TIMEOUT_S", 60))
+ OPENAI_MAX_RETRIES = max(0, _env_int("OPENAI_MAX_RETRIES", 4))
+ OPENAI_RPS = max(1, _env_int("OPENAI_RPS", 2))
+ OPENAI_RPM = max(OPENAI_RPS, _env_int("OPENAI_RPM", 60))
++OPENAI_CACHE_TTL_S = max(1, _env_int("OPENAI_CACHE_TTL_S", 30))
++OPENAI_CLIENT_MAX_QUEUE = max(1, _env_int("OPENAI_CLIENT_MAX_QUEUE", 16))
++OPENAI_MODEL = str(os.getenv("OPENAI_MODEL", "gpt-5")).strip() or "gpt-5"
++
+ JOB_SOFT_TIMEOUT_S = max(1, _env_int("JOB_SOFT_TIMEOUT_S", 20))
++JOB_STORE_TTL_S = max(JOB_SOFT_TIMEOUT_S, _env_int("JOB_STORE_TTL_S", 900))
++JOB_MAX_RETRIES_PER_STEP = max(0, _env_int("JOB_MAX_RETRIES_PER_STEP", 1))
  
  USE_MOCK_LLM = _env_bool("USE_MOCK_LLM", False)
  OFFLINE_MODE = _env_bool("OFFLINE_MODE", False)
@@ -58,626 +60,1463 @@ index 435a91ebb5731be02a1d998dcefc916a0c9a5d6f..24c30c6fb73470b3c04e9df8aa258c56
  
  # Дефолтные настройки ядра
  DEFAULT_TONE = "экспертный, дружелюбный"
-diff --git a/domain/__init__.py b/domain/__init__.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..548479f14dc8f517726ac8504ea7ad2cf28f2478
---- /dev/null
-+++ b/domain/__init__.py
-@@ -0,0 +1,11 @@
-+"""Domain-level helpers for prompt and policy management."""
-+
-+from .prompt_builder import build_prompt  # noqa: F401
-+from .generation_policy import TokenBudget, build_token_budget, estimate_tokens  # noqa: F401
-+
-+__all__ = [
-+    "build_prompt",
-+    "TokenBudget",
-+    "build_token_budget",
-+    "estimate_tokens",
-+]
 diff --git a/domain/generation_policy.py b/domain/generation_policy.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..062f71cbdc7ef6b07cfbefd9032724e66fd1ea6f
---- /dev/null
+index 062f71cbdc7ef6b07cfbefd9032724e66fd1ea6f..622fe0f4c50e59868a8b964334a40165af2d89c6 100644
+--- a/domain/generation_policy.py
 +++ b/domain/generation_policy.py
-@@ -0,0 +1,60 @@
-+"""Helpers describing generation policies and token budgeting."""
-+from __future__ import annotations
-+
-+from dataclasses import dataclass
-+from typing import List, Sequence
-+
-+AVERAGE_CHARS_PER_TOKEN = 4
-+JSONLD_RESERVE_TOKENS = 320
-+FAQ_RESERVE_TOKENS = 180
-+
-+
-+@dataclass
-+class TokenBudget:
-+    total_limit: int
-+    estimated_prompt_tokens: int
-+    available_for_body: int
-+    needs_segmentation: bool
-+    segments: List[str]
-+
-+
-+def estimate_tokens(system: str, messages: Sequence[dict]) -> int:
-+    """Rough token estimation without external dependencies."""
-+
-+    total_chars = len(system or "")
-+    for message in messages:
-+        content = str(message.get("content", ""))
-+        total_chars += len(content)
-+    tokens = max(1, int(total_chars / AVERAGE_CHARS_PER_TOKEN))
-+    return tokens
-+
-+
-+def _segment_structure(structure: Sequence[str]) -> List[str]:
-+    segments: List[str] = []
-+    for item in structure:
-+        normalized = (item or "").strip()
-+        if not normalized:
-+            continue
-+        if normalized.lower().startswith("основ"):
-+            segments.append(f"{normalized} — часть 1")
-+            segments.append(f"{normalized} — часть 2")
-+        else:
-+            segments.append(normalized)
-+    return segments or ["Введение", "Основная часть", "FAQ", "Вывод"]
-+
-+
-+def build_token_budget(structure: Sequence[str], *, max_tokens: int, system: str, messages: Sequence[dict]) -> TokenBudget:
-+    estimated_prompt = estimate_tokens(system, messages)
-+    reserve = JSONLD_RESERVE_TOKENS + FAQ_RESERVE_TOKENS
-+    available = max(0, max_tokens - reserve)
-+    needs_segmentation = estimated_prompt > available and available > 0
-+    segments = list(structure)
-+    if needs_segmentation:
-+        segments = _segment_structure(structure)
-+    return TokenBudget(
-+        total_limit=max_tokens,
-+        estimated_prompt_tokens=estimated_prompt,
-+        available_for_body=available,
-+        needs_segmentation=needs_segmentation,
-+        segments=segments,
-+    )
+@@ -9,52 +9,63 @@ JSONLD_RESERVE_TOKENS = 320
+ FAQ_RESERVE_TOKENS = 180
+ 
+ 
+ @dataclass
+ class TokenBudget:
+     total_limit: int
+     estimated_prompt_tokens: int
+     available_for_body: int
+     needs_segmentation: bool
+     segments: List[str]
+ 
+ 
+ def estimate_tokens(system: str, messages: Sequence[dict]) -> int:
+     """Rough token estimation without external dependencies."""
+ 
+     total_chars = len(system or "")
+     for message in messages:
+         content = str(message.get("content", ""))
+         total_chars += len(content)
+     tokens = max(1, int(total_chars / AVERAGE_CHARS_PER_TOKEN))
+     return tokens
+ 
+ 
+ def _segment_structure(structure: Sequence[str]) -> List[str]:
+     segments: List[str] = []
++    main_index = 0
+     for item in structure:
+         normalized = (item or "").strip()
+         if not normalized:
+             continue
+-        if normalized.lower().startswith("основ"):
+-            segments.append(f"{normalized} — часть 1")
+-            segments.append(f"{normalized} — часть 2")
++        lower = normalized.lower()
++        if "основ" in lower:
++            main_index += 1
++            segments.append(f"Основная часть {main_index}")
+         else:
+             segments.append(normalized)
+-    return segments or ["Введение", "Основная часть", "FAQ", "Вывод"]
++    if not segments:
++        segments = ["Введение", "Основная часть 1", "Основная часть 2", "Вывод"]
++    if len([s for s in segments if s.lower().startswith("основ")]) < 2:
++        segments.insert(1, "Основная часть 1")
++        segments.insert(2, "Основная часть 2")
++    if segments[0].lower() != "введение":
++        segments.insert(0, "Введение")
++    if segments[-1].lower() != "вывод":
++        segments.append("Вывод")
++    return segments
+ 
+ 
+ def build_token_budget(structure: Sequence[str], *, max_tokens: int, system: str, messages: Sequence[dict]) -> TokenBudget:
+     estimated_prompt = estimate_tokens(system, messages)
+     reserve = JSONLD_RESERVE_TOKENS + FAQ_RESERVE_TOKENS
+     available = max(0, max_tokens - reserve)
+     needs_segmentation = estimated_prompt > available and available > 0
+     segments = list(structure)
+     if needs_segmentation:
+         segments = _segment_structure(structure)
+     return TokenBudget(
+         total_limit=max_tokens,
+         estimated_prompt_tokens=estimated_prompt,
+         available_for_body=available,
+         needs_segmentation=needs_segmentation,
+         segments=segments,
+     )
 diff --git a/domain/prompt_builder.py b/domain/prompt_builder.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..b4eae43e03a7c16696074ac50bdaffd054272aa8
---- /dev/null
+index b4eae43e03a7c16696074ac50bdaffd054272aa8..88bf08ad68136a9ca4f0dcf3c3c30338c1c8b918 100644
+--- a/domain/prompt_builder.py
 +++ b/domain/prompt_builder.py
-@@ -0,0 +1,56 @@
-+"""Pure prompt construction utilities."""
-+from __future__ import annotations
+@@ -1,56 +1,70 @@
+ """Pure prompt construction utilities."""
+ from __future__ import annotations
+ 
++from functools import lru_cache
++from pathlib import Path
+ from typing import Dict, Iterable, List, Sequence, Tuple
+ 
+ _DEFAULT_TONE = "экспертный, дружелюбный"
+ _DEFAULT_GOAL = "Сформируй структурированную SEO-статью."
++_FINANCE_PROFILE_PATH = Path("profiles/finance/style_profile.md")
 +
-+from typing import Dict, Iterable, List, Sequence, Tuple
 +
-+_DEFAULT_TONE = "экспертный, дружелюбный"
-+_DEFAULT_GOAL = "Сформируй структурированную SEO-статью."
-+
-+
-+def _format_keywords(keywords: Iterable[str]) -> str:
-+    cleaned = [kw.strip() for kw in keywords if kw and kw.strip()]
-+    if not cleaned:
++@lru_cache(maxsize=1)
++def _load_finance_profile() -> str:
++    try:
++        return _FINANCE_PROFILE_PATH.read_text(encoding="utf-8").strip()
++    except FileNotFoundError:
 +        return ""
-+    return "Ключевые слова: " + ", ".join(cleaned)
+ 
+ 
+ def _format_keywords(keywords: Iterable[str]) -> str:
+     cleaned = [kw.strip() for kw in keywords if kw and kw.strip()]
+     if not cleaned:
+         return ""
+     return "Ключевые слова: " + ", ".join(cleaned)
+ 
+ 
+ def build_prompt(
+     *,
+     theme: str,
+     tone: str,
+     audience: str,
+     keywords: Sequence[str],
+     structure: Sequence[str],
+     goal: str,
+ ) -> Tuple[str, List[Dict[str, str]]]:
+     """Build system and user messages for the generation request."""
+ 
++    profile_excerpt = _load_finance_profile()
+     system_parts = [
+-        "Ты профессиональный русскоязычный автор, который пишет без воды и повторов.",
++        "Ты финансовый обозреватель портала «Трубы» и пишешь понятные тексты про деньги.",
+         f"Пиши в тоне: {tone or _DEFAULT_TONE}.",
+         "Всегда придерживайся указанной структуры и не добавляй лишних разделов.",
+     ]
++    if profile_excerpt:
++        system_parts.append("Следуй стилю из профиля:\n" + profile_excerpt)
+     if audience:
+         system_parts.append(f"Целевая аудитория: {audience}.")
+     if goal:
+         system_parts.append(goal)
+     else:
+         system_parts.append(_DEFAULT_GOAL)
+ 
+     structure_lines = "\n".join(f"- {item}" for item in structure if item)
+     keyword_line = _format_keywords(keywords)
+ 
+     user_payload = [
+         f"Тема: {theme.strip()}.",
+         "Используй структуру:\n" + structure_lines,
+     ]
+     if keyword_line:
+         user_payload.append(keyword_line)
+ 
+     messages = [
+         {
+             "role": "user",
+             "content": "\n\n".join(segment for segment in user_payload if segment),
+         }
+     ]
+     return " \n".join(system_parts), messages
+diff --git a/frontend_demo/script.js b/frontend_demo/script.js
+index d28184ab70b0d9daca9fe90250dd206105724303..cf17728596a3407eda814dd055dfa1ee03990d83 100644
+--- a/frontend_demo/script.js
++++ b/frontend_demo/script.js
+@@ -79,50 +79,66 @@ const previewSystem = document.getElementById("preview-system");
+ const previewUser = document.getElementById("preview-user");
+ const contextList = document.getElementById("context-list");
+ const contextSummary = document.getElementById("context-summary");
+ const contextBadge = document.getElementById("context-badge");
+ const customContextBlock = document.getElementById("custom-context-block");
+ const customContextTextarea = document.getElementById("customContext");
+ const customContextCounter = document.getElementById("customContextCounter");
+ const customContextFileInput = document.getElementById("customContextFile");
+ const customContextClearBtn = document.getElementById("customContextClear");
+ const generateBtn = briefForm.querySelector("button[type='submit']");
+ const advancedSettings = document.getElementById("advanced-settings");
+ const advancedSupportSection = document.querySelector("[data-section='support']");
+ const usedKeywordsSection = document.getElementById("used-keywords");
+ const usedKeywordsList = document.getElementById("used-keywords-list");
+ const usedKeywordsEmpty = document.getElementById("used-keywords-empty");
+ 
+ const ADVANCED_SETTINGS_STORAGE_KEY = "content-demo:advanced-settings-open";
+ 
+ const LOG_STATUS_LABELS = {
+   info: "INFO",
+   success: "SUCCESS",
+   warn: "WARN",
+   error: "ERROR",
+ };
+ 
++const STEP_LABELS = {
++  draft: "Черновик",
++  refine: "Уточнение",
++  jsonld: "JSON-LD",
++  post_analysis: "Пост-анализ",
++};
 +
++const DEGRADATION_LABELS = {
++  draft_failed: "Черновик по запасному сценарию",
++  refine_skipped: "Шаг уточнения пропущен",
++  jsonld_missing: "JSON-LD отсутствует",
++  jsonld_repaired: "JSON-LD восстановлен",
++  post_analysis_skipped: "Проверки пропущены",
++  soft_timeout: "Сработал мягкий таймаут",
++};
 +
-+def build_prompt(
-+    *,
-+    theme: str,
-+    tone: str,
-+    audience: str,
-+    keywords: Sequence[str],
-+    structure: Sequence[str],
-+    goal: str,
-+) -> Tuple[str, List[Dict[str, str]]]:
-+    """Build system and user messages for the generation request."""
+ const DEFAULT_PROGRESS_MESSAGE = progressMessage?.textContent?.trim() || "Готовим данные…";
+ const MAX_TOASTS = 3;
+ const MAX_CUSTOM_CONTEXT_CHARS = 20000;
+ const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
+ 
+ const HEALTH_STATUS_MESSAGES = {
+   openai_key: {
+     label: "OpenAI",
+     ok: "активен",
+     fail: "не найден",
+   },
+   llm_ping: {
+     label: "LLM",
+     ok: "отвечает",
+     fail: "нет ответа",
+   },
+   retrieval_index: {
+     label: "Retrieval index",
+     ok: "найден",
+     fail: "не найден",
+   },
+   artifacts_writable: {
+     label: "Каталог артефактов",
+     ok: "доступен",
+     fail: "недоступен",
+@@ -1061,153 +1077,256 @@ async function handlePromptPreview() {
+       }
+     }
+     const preview = await fetchJson("/api/prompt/preview", {
+       method: "POST",
+       body: JSON.stringify(previewRequest),
+     });
+     updatePromptPreview(preview);
+     switchTab("result");
+   } catch (error) {
+     console.error(error);
+     showToast({ message: `Не удалось собрать промпт: ${getErrorMessage(error)}`, type: "error" });
+   } finally {
+     setButtonLoading(previewBtn, false);
+     setInteractiveBusy(false);
+     showProgress(false);
+   }
+ }
+ 
+ async function handleGenerate(event) {
+   event.preventDefault();
+   try {
+     const payload = buildRequestPayload();
+     toggleRetryButton(false);
+     setInteractiveBusy(true);
+     setButtonLoading(generateBtn, true);
+-    showProgress(true, "Генерируем материалы…");
++    showProgress(true, DEFAULT_PROGRESS_MESSAGE);
+     renderUsedKeywords(null);
+     const requestModel = payload.model || null;
+     const requestBody = {
+       theme: payload.theme,
+       data: payload.data,
+       k: payload.k,
+       model: requestModel,
+       temperature: payload.temperature,
+       max_tokens: payload.maxTokens,
+       context_source: payload.context_source,
+       keywords: Array.isArray(payload.data?.keywords) ? payload.data.keywords : [],
+       length_range: { min: 3500, max: 6000, mode: "no_spaces" },
+       faq_required: true,
+       faq_count: 5,
+     };
+     if (payload.context_source === "custom") {
+       requestBody.context_text = payload.context_text;
+       if (payload.context_filename) {
+         requestBody.context_filename = payload.context_filename;
+       }
+     }
+-    const response = await fetchJson("/api/generate", {
++    const initialResponse = await fetchJson("/api/generate", {
+       method: "POST",
+       body: JSON.stringify(requestBody),
+     });
+-    const markdown = response?.markdown ?? "";
+-    const meta = (response?.meta_json && typeof response.meta_json === "object") ? response.meta_json : {};
+-    const responseStatus = typeof response?.status === "string" ? response.status.trim().toLowerCase() : "";
+-    const metaStatus = typeof meta?.status === "string" ? meta.status.trim().toLowerCase() : "";
+-    if (["failed", "error"].includes(responseStatus) || ["failed", "error"].includes(metaStatus)) {
+-      const backendError = typeof response?.error === "string" && response.error.trim()
+-        ? response.error.trim()
+-        : typeof meta?.error === "string" && meta.error.trim()
+-          ? meta.error.trim()
+-          : "";
+-      const backendMessage = typeof response?.backend_message === "string" && response.backend_message.trim()
+-        ? response.backend_message.trim()
+-        : typeof meta?.backend_message === "string" && meta.backend_message.trim()
+-          ? meta.backend_message.trim()
+-          : "";
+-      const messageParts = [backendMessage, backendError].filter(Boolean);
+-      const failureMessage = messageParts.length > 0
+-        ? messageParts.join(" ")
+-        : "Генерация завершилась с ошибкой.";
+-      throw new Error(failureMessage);
+-    }
+-    const artifactPaths = response?.artifact_paths;
+-    const metadataCharacters = typeof meta.characters === "number" ? meta.characters : undefined;
+-    const characters = typeof metadataCharacters === "number" ? metadataCharacters : markdown.trim().length;
+-    const hasContent = characters > 0;
+-    state.currentResult = { markdown, meta, artifactPaths, characters, hasContent };
+-    const fallbackModel = response?.fallback_used ?? meta.fallback_used;
+-    const fallbackReason = response?.fallback_reason ?? meta.fallback_reason;
+-    draftView.innerHTML = markdownToHtml(markdown);
+-    resultTitle.textContent = payload.data.theme || "Результат генерации";
+-    const metaParts = [];
+-    if (hasContent) {
+-      metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
+-    }
+-    metaParts.push(`Модель: ${meta.model_used ?? "—"}`);
+-    resultMeta.textContent = metaParts.join(" · ");
+-    renderMetadata(meta);
+-    renderUsedKeywords(meta);
+-    updateResultBadges(meta);
+-    toggleRetryButton(!hasContent);
+-    updatePromptPreview({
+-      system: meta.system_prompt_preview,
+-      context: meta.clips || [],
+-      user: meta.user_prompt_preview,
+-      context_used: meta.context_used,
+-      context_index_missing: meta.context_index_missing,
+-      context_budget_tokens_est: meta.context_budget_tokens_est,
+-      context_budget_tokens_limit: meta.context_budget_tokens_limit,
+-      k: payload.k,
+-    });
+-    if (fallbackModel) {
+-      const reasonText = describeFallbackNotice(fallbackReason);
+-      showToast({
+-        message: `Использована резервная модель (${fallbackModel}). ${reasonText}`,
+-        type: "warn",
+-        duration: 6000,
++    let snapshot = normalizeJobResponse(initialResponse);
++    showProgress(true, describeJobProgress(snapshot));
++    if (snapshot.status !== "succeeded" || !snapshot.result) {
++      if (!snapshot.job_id) {
++        throw new Error("Сервер вернул пустой ответ без идентификатора задания.");
++      }
++      snapshot = await pollJobUntilDone(snapshot.job_id, {
++        onUpdate: (update) => {
++          showProgress(true, describeJobProgress(update));
++          applyProgressiveResult(update);
++        },
+       });
+     }
+-    enableDownloadButtons(artifactPaths);
++    renderGenerationResult(snapshot, { payload });
+     try {
+       await loadArtifacts();
+     } catch (refreshError) {
+       console.error(refreshError);
+       showToast({ message: `Не удалось обновить список материалов: ${getErrorMessage(refreshError)}`, type: "warn" });
+     }
+     switchTab("result");
+     showToast({ message: "Готово", type: "success" });
+   } catch (error) {
+     console.error(error);
+     showToast({ message: `Не удалось выполнить генерацию: ${getErrorMessage(error)}`, type: "error" });
+   } finally {
+     setButtonLoading(generateBtn, false);
+     setInteractiveBusy(false);
+     showProgress(false);
+   }
+ }
+ 
++function normalizeJobResponse(response) {
++  if (!response || typeof response !== "object") {
++    return { status: "pending", result: null, steps: [], degradation_flags: [], job_id: null };
++  }
++  if (typeof response.markdown === "string" || typeof response.meta_json === "object") {
++    return {
++      status: "succeeded",
++      job_id: response.job_id || null,
++      steps: Array.isArray(response.steps) ? response.steps : [],
++      degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
++      trace_id: response.trace_id || null,
++      result: {
++        markdown: typeof response.markdown === "string" ? response.markdown : "",
++        meta_json: (response.meta_json && typeof response.meta_json === "object") ? response.meta_json : {},
++        faq_entries: Array.isArray(response.faq_entries) ? response.faq_entries : [],
++      },
++    };
++  }
++  return {
++    status: typeof response.status === "string" ? response.status : "pending",
++    job_id: response.job_id || null,
++    steps: Array.isArray(response.steps) ? response.steps : [],
++    degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
++    trace_id: response.trace_id || null,
++    result: response.result && typeof response.result === "object" ? response.result : null,
++  };
++}
 +
-+    system_parts = [
-+        "Ты профессиональный русскоязычный автор, который пишет без воды и повторов.",
-+        f"Пиши в тоне: {tone or _DEFAULT_TONE}.",
-+        "Всегда придерживайся указанной структуры и не добавляй лишних разделов.",
-+    ]
-+    if audience:
-+        system_parts.append(f"Целевая аудитория: {audience}.")
-+    if goal:
-+        system_parts.append(goal)
-+    else:
-+        system_parts.append(_DEFAULT_GOAL)
++function describeJobProgress(snapshot) {
++  if (!snapshot || !Array.isArray(snapshot.steps) || snapshot.steps.length === 0) {
++    return DEFAULT_PROGRESS_MESSAGE;
++  }
++  const running = snapshot.steps.find((step) => step && step.status === "running");
++  if (running) {
++    return `Шаг: ${STEP_LABELS[running.name] || running.name}`;
++  }
++  const pending = snapshot.steps.find((step) => step && step.status === "pending");
++  if (pending) {
++    return `Шаг: ${STEP_LABELS[pending.name] || pending.name}`;
++  }
++  const degraded = [...snapshot.steps].reverse().find((step) => step && step.status === "degraded");
++  if (degraded) {
++    return `Завершено с деградацией: ${STEP_LABELS[degraded.name] || degraded.name}`;
++  }
++  const succeeded = [...snapshot.steps].reverse().find((step) => step && step.status === "succeeded");
++  if (succeeded) {
++    return `Шаг завершён: ${STEP_LABELS[succeeded.name] || succeeded.name}`;
++  }
++  return DEFAULT_PROGRESS_MESSAGE;
++}
 +
-+    structure_lines = "\n".join(f"- {item}" for item in structure if item)
-+    keyword_line = _format_keywords(keywords)
++function applyProgressiveResult(snapshot) {
++  const result = snapshot?.result;
++  if (!result || typeof result !== "object") {
++    return;
++  }
++  const markdown = typeof result.markdown === "string" ? result.markdown : "";
++  if (markdown) {
++    draftView.innerHTML = markdownToHtml(markdown);
++  }
++  const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
++  updateResultBadges(meta, Array.isArray(snapshot?.degradation_flags) ? snapshot.degradation_flags : []);
++}
 +
-+    user_payload = [
-+        f"Тема: {theme.strip()}.",
-+        "Используй структуру:\n" + structure_lines,
-+    ]
-+    if keyword_line:
-+        user_payload.append(keyword_line)
++async function pollJobUntilDone(jobId, { onUpdate } = {}) {
++  let delayMs = 600;
++  while (true) {
++    await delay(delayMs);
++    const snapshot = await fetchJson(`/api/jobs/${encodeURIComponent(jobId)}`);
++    if (typeof onUpdate === "function") {
++      onUpdate(snapshot);
++    }
++    if (snapshot?.status === "failed") {
++      const message = snapshot?.error?.message || "Генерация завершилась с ошибкой.";
++      const error = new Error(message);
++      if (snapshot?.trace_id) {
++        error.traceId = snapshot.trace_id;
++      }
++      throw error;
++    }
++    if (snapshot?.status === "succeeded" && snapshot.result) {
++      return snapshot;
++    }
++    delayMs = Math.min(delayMs * 1.3, 4000);
++  }
++}
 +
-+    messages = [
-+        {
-+            "role": "user",
-+            "content": "\n\n".join(segment for segment in user_payload if segment),
-+        }
-+    ]
-+    return " \n".join(system_parts), messages
-diff --git a/jobs/__init__.py b/jobs/__init__.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..f6103fb6dd4defe1d521fb8a0efc794b1c68d123
---- /dev/null
-+++ b/jobs/__init__.py
-@@ -0,0 +1,14 @@
-+"""Job management primitives for asynchronous generation."""
++function renderGenerationResult(snapshot, { payload }) {
++  const normalized = normalizeJobResponse(snapshot);
++  const result = normalized.result || {};
++  const markdown = typeof result.markdown === "string" ? result.markdown : "";
++  const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
++  const degradationFlags = Array.isArray(normalized.degradation_flags) ? normalized.degradation_flags : [];
++  const characters = typeof meta.characters === "number" ? meta.characters : markdown.replace(/\s+/g, "").length;
++  const hasContent = markdown.trim().length > 0;
++  state.currentResult = {
++    markdown,
++    meta,
++    artifactPaths: result.artifact_paths ?? null,
++    characters,
++    hasContent,
++    degradationFlags,
++  };
++  draftView.innerHTML = markdownToHtml(markdown);
++  resultTitle.textContent = payload?.data?.theme || "Результат генерации";
++  const metaParts = [];
++  if (hasContent) {
++    metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
++  }
++  if (degradationFlags.length) {
++    metaParts.push(`Деградации: ${degradationFlags.length}`);
++  }
++  if (meta.model_used) {
++    metaParts.push(`Модель: ${meta.model_used}`);
++  }
++  resultMeta.textContent = metaParts.join(" · ") || "Деградаций нет";
++  renderMetadata(meta);
++  renderUsedKeywords(meta);
++  updateResultBadges(meta, degradationFlags);
++  toggleRetryButton(!hasContent);
++  updatePromptPreview({
++    system: meta.system_prompt_preview,
++    context: Array.isArray(meta.clips) ? meta.clips : [],
++    user: meta.user_prompt_preview,
++    context_used: meta.context_used,
++    context_index_missing: meta.context_index_missing,
++    context_budget_tokens_est: meta.context_budget_tokens_est,
++    context_budget_tokens_limit: meta.context_budget_tokens_limit,
++    k: payload?.k,
++  });
++  enableDownloadButtons(result.artifact_paths ?? null);
++  if (degradationFlags.length) {
++    const label = degradationFlags.map(describeDegradationFlag).join(", ");
++    showToast({ message: `Частичная деградация: ${label}`, type: "warn", duration: 6000 });
++  }
++}
 +
-+from .models import Job, JobStatus, JobStep, JobStepStatus  # noqa: F401
-+from .store import JobStore  # noqa: F401
-+from .runner import JobRunner  # noqa: F401
++function describeDegradationFlag(flag) {
++  if (!flag) {
++    return "unknown";
++  }
++  return DEGRADATION_LABELS[flag] || flag;
++}
 +
-+__all__ = [
-+    "Job",
-+    "JobStatus",
-+    "JobStep",
-+    "JobStepStatus",
-+    "JobStore",
-+    "JobRunner",
-+]
++const delay = (ms) => new Promise((resolve) => {
++  setTimeout(resolve, ms);
++});
++
+ function handleRetryClick(event) {
+   event.preventDefault();
+   if (briefForm && typeof briefForm.requestSubmit === "function") {
+     briefForm.requestSubmit(generateBtn);
+     return;
+   }
+   if (generateBtn) {
+     generateBtn.click();
+   }
+ }
+ 
+ function buildRequestPayload() {
+   const theme = pipeSelect.value;
+   if (!theme) {
+     throw new Error("Выберите тематику");
+   }
+   const topic = document.getElementById("topic-input").value.trim();
+   if (!topic) {
+     throw new Error("Укажите тему материала");
+   }
+ 
+   const keywords = keywordsInput.value
+     .split(/\r?\n|,/)
+     .map((item) => item.trim())
+     .filter(Boolean);
+@@ -1610,51 +1729,51 @@ function renderUsedKeywords(meta) {
+   usedKeywordsList.innerHTML = "";
+   if (!coverage.length) {
+     usedKeywordsSection.hidden = false;
+     usedKeywordsList.style.display = "none";
+     usedKeywordsEmpty.hidden = false;
+     usedKeywordsEmpty.textContent = "Ключевые слова не заданы.";
+     return;
+   }
+ 
+   usedKeywordsSection.hidden = false;
+   usedKeywordsList.style.display = "flex";
+   usedKeywordsEmpty.hidden = true;
+ 
+   coverage.forEach((entry) => {
+     if (!entry || typeof entry.term !== "string") {
+       return;
+     }
+     const li = document.createElement("li");
+     const count = Number(entry.count) || 0;
+     li.textContent = count > 0 ? `${entry.term} (${count}\u00d7)` : `${entry.term} (нет)`;
+     li.dataset.status = entry.found ? "found" : "missing";
+     usedKeywordsList.append(li);
+   });
+ }
+ 
+-function updateResultBadges(meta) {
++function updateResultBadges(meta, degradationFlags = []) {
+   resultBadges.innerHTML = "";
+   if (!meta || typeof meta !== "object") {
+     return;
+   }
+ 
+   const appendBadge = (text, type = "neutral") => {
+     if (!text) {
+       return;
+     }
+     const badge = document.createElement("span");
+     badge.className = `badge ${type}`;
+     badge.textContent = text;
+     resultBadges.append(badge);
+   };
+ 
+   const post = meta.post_analysis && typeof meta.post_analysis === "object" ? meta.post_analysis : null;
+   const currentResult = state.currentResult;
+   const characters = typeof meta.characters === "number"
+     ? meta.characters
+     : currentResult?.characters ?? (currentResult?.markdown?.trim().length ?? 0);
+   const hasContent = Boolean(currentResult?.hasContent ?? (characters > 0));
+   if (!hasContent) {
+     appendBadge("Пустой ответ", "warning");
+   }
+   const appliedLimits =
+@@ -1737,50 +1856,56 @@ function updateResultBadges(meta) {
+     const usedCount = normalizedUsed.length;
+     const missingCount = requestedValues.filter((value) => !normalizedUsed.includes(value.toLowerCase())).length;
+     appendBadge(`Источники ${usedCount}/${requestedCount}`, missingCount > 0 ? "warning" : "success");
+   } else if (usedSources.length > 0) {
+     appendBadge(`Источники: ${usedSources.length}`, "neutral");
+   }
+ 
+   const fallbackUsed = Boolean(meta.fallback_used || post?.fallback);
+   if (fallbackUsed) {
+     appendBadge(`Fallback: ${describeFallbackNotice(meta.fallback_reason)}`, "warning");
+   }
+ 
+   const modelLabel = meta.model_used || meta.model;
+   if (modelLabel) {
+     appendBadge(`Модель: ${modelLabel}`, fallbackUsed ? "warning" : "neutral");
+   }
+ 
+   const retries = Number(meta.post_analysis_retry_count ?? post?.retry_count ?? 0);
+   if (retries > 0) {
+     appendBadge(`Повторов: ${retries}`, "neutral");
+   }
+ 
+   if (meta.length_adjustment) {
+     appendBadge(`Коррекция длины: ${meta.length_adjustment}`, "neutral");
+   }
++
++  if (Array.isArray(degradationFlags) && degradationFlags.length) {
++    [...new Set(degradationFlags)].forEach((flag) => {
++      appendBadge(describeDegradationFlag(flag), "warning");
++    });
++  }
+ }
+ 
+ const FALLBACK_REASON_MESSAGES = {
+   model_unavailable: "Основная модель недоступна для текущего ключа или тарифа.",
+   empty_completion: "Основная модель вернула пустой ответ.",
+ };
+ 
+ function describeFallbackNotice(reason) {
+   if (!reason) {
+     return "Причина не указана.";
+   }
+   return FALLBACK_REASON_MESSAGES[reason] ?? `Причина: ${reason}`;
+ }
+ 
+ function updatePromptPreview(preview) {
+   if (!preview) {
+     previewSystem.textContent = "";
+     previewUser.textContent = "";
+     contextList.innerHTML = "";
+     contextSummary.textContent = "";
+     contextBadge.textContent = "не запрошен";
+     contextBadge.className = "badge neutral";
+     return;
+   }
+   previewSystem.textContent = preview.system ?? "";
+@@ -1912,51 +2037,51 @@ async function handleDownload(type) {
+ async function showArtifact(artifact) {
+   try {
+     showProgress(true, "Загружаем артефакт…");
+     const markdownPath = artifact.path;
+     if (!markdownPath) {
+       handleMissingArtifact(artifact);
+       return;
+     }
+     const markdown = await fetchText(`/api/artifacts/download?path=${encodeURIComponent(markdownPath)}`);
+     const metadataPath = artifact.metadata_path;
+     let metadata = artifact.metadata || {};
+     if (!Object.keys(metadata).length && metadataPath) {
+       try {
+         const jsonText = await fetchText(`/api/artifacts/download?path=${encodeURIComponent(metadataPath)}`);
+         metadata = JSON.parse(jsonText);
+       } catch (parseError) {
+         console.warn("Не удалось разобрать метаданные", parseError);
+         metadata = {};
+       }
+     }
+     draftView.innerHTML = markdownToHtml(markdown);
+     resultTitle.textContent = metadata.input_data?.theme || metadata.theme || artifact.name;
+     const characters = metadata.characters ?? markdown.length;
+     resultMeta.textContent = `Символов: ${characters.toLocaleString("ru-RU")} · Модель: ${metadata.model_used ?? "—"}`;
+     renderMetadata(metadata);
+-    updateResultBadges(metadata);
++    updateResultBadges(metadata, Array.isArray(metadata?.degradation_flags) ? metadata.degradation_flags : []);
+     enableDownloadButtons({ markdown: artifact.path, metadata: metadataPath });
+     updatePromptPreview({
+       system: metadata.system_prompt_preview,
+       context: metadata.clips || [],
+       user: metadata.user_prompt_preview,
+       context_used: metadata.context_used,
+       context_index_missing: metadata.context_index_missing,
+       context_budget_tokens_est: metadata.context_budget_tokens_est,
+       context_budget_tokens_limit: metadata.context_budget_tokens_limit,
+       k: metadata.retrieval_k,
+       context_source: metadata.context_source,
+       context_text: metadata.custom_context_text,
+       context_len: metadata.context_len,
+       context_filename: metadata.context_filename,
+     });
+     switchTab("result");
+   } catch (error) {
+     console.error(error);
+     if (isNotFoundError(error)) {
+       handleMissingArtifact(artifact);
+       return;
+     }
+     showToast({ message: `Не удалось открыть артефакт: ${getErrorMessage(error)}`, type: "error" });
+   } finally {
+     showProgress(false);
+@@ -2179,50 +2304,52 @@ async function fetchJson(path, options = {}) {
+   if (options.method && options.method !== "GET") {
+     headers["Content-Type"] = "application/json";
+   }
+ 
+   let response;
+   try {
+     response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+   } catch (error) {
+     throw new Error("Сервер недоступен");
+   }
+ 
+   let text;
+   try {
+     text = await response.text();
+   } catch (error) {
+     throw new Error("Не удалось прочитать ответ сервера");
+   }
+ 
+   if (!response.ok) {
+     let message = text || `HTTP ${response.status}`;
+     if (text) {
+       try {
+         const data = JSON.parse(text);
+         if (data && typeof data.error === "string" && data.error.trim()) {
+           message = data.error.trim();
++        } else if (data && data.error && typeof data.error.message === "string" && data.error.message.trim()) {
++          message = data.error.message.trim();
+         }
+       } catch (parseError) {
+         if (!(parseError instanceof Error) || parseError.name !== "SyntaxError") {
+           parseError.status = response.status;
+           throw parseError;
+         }
+       }
+     }
+     const error = new Error(message || `HTTP ${response.status}`);
+     error.status = response.status;
+     throw error;
+   }
+ 
+   if (!text.trim()) {
+     return {};
+   }
+ 
+   try {
+     return JSON.parse(text);
+   } catch (error) {
+     throw new Error("Некорректный JSON в ответе сервера");
+   }
+ }
+ 
+ async function fetchText(path) {
 diff --git a/jobs/models.py b/jobs/models.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..7897a6245dd4c4be196caa89e71e2045621e6257
---- /dev/null
+index 7897a6245dd4c4be196caa89e71e2045621e6257..07ff00be931a81be6b702b746bf4978171049a93 100644
+--- a/jobs/models.py
 +++ b/jobs/models.py
-@@ -0,0 +1,114 @@
-+"""Data models describing asynchronous generation jobs."""
-+from __future__ import annotations
-+
-+from dataclasses import dataclass, field
-+from datetime import datetime, timezone
-+from enum import Enum
-+from typing import Any, Dict, List, Optional
-+
-+ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
-+
-+
-+def utcnow() -> datetime:
-+    """Return a timezone-aware UTC datetime."""
-+
-+    return datetime.now(timezone.utc)
-+
-+
-+class JobStatus(str, Enum):
-+    """Lifecycle states for a background job."""
-+
-+    PENDING = "pending"
-+    RUNNING = "running"
-+    SUCCEEDED = "succeeded"
-+    FAILED = "failed"
-+
-+
-+class JobStepStatus(str, Enum):
-+    """Lifecycle states for an individual pipeline step."""
-+
-+    PENDING = "pending"
-+    RUNNING = "running"
-+    SUCCEEDED = "succeeded"
-+    FAILED = "failed"
-+    SKIPPED = "skipped"
-+
-+
-+@dataclass
-+class JobStep:
-+    """Progress information for a single pipeline step."""
-+
-+    name: str
-+    status: JobStepStatus = JobStepStatus.PENDING
-+    started_at: Optional[datetime] = None
-+    finished_at: Optional[datetime] = None
-+    payload: Dict[str, Any] = field(default_factory=dict)
-+
-+    def mark_running(self) -> None:
-+        self.status = JobStepStatus.RUNNING
-+        self.started_at = self.started_at or utcnow()
-+
-+    def mark_succeeded(self, **payload: Any) -> None:
-+        self.status = JobStepStatus.SUCCEEDED
-+        if payload:
-+            self.payload.update(payload)
-+        self.finished_at = utcnow()
-+
-+    def mark_failed(self, **payload: Any) -> None:
-+        self.status = JobStepStatus.FAILED
-+        if payload:
-+            self.payload.update(payload)
-+        self.finished_at = utcnow()
-+
-+    def to_dict(self) -> Dict[str, Any]:
-+        return {
-+            "name": self.name,
-+            "status": self.status.value,
-+            "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
-+            "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
-+            "payload": self.payload or None,
-+        }
-+
-+
-+@dataclass
-+class Job:
-+    """Representation of a long-running generation request."""
-+
-+    id: str
-+    status: JobStatus = JobStatus.PENDING
-+    created_at: datetime = field(default_factory=utcnow)
-+    started_at: Optional[datetime] = None
-+    finished_at: Optional[datetime] = None
-+    steps: List[JobStep] = field(default_factory=list)
-+    result: Optional[Dict[str, Any]] = None
+@@ -9,106 +9,122 @@ from typing import Any, Dict, List, Optional
+ ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+ 
+ 
+ def utcnow() -> datetime:
+     """Return a timezone-aware UTC datetime."""
+ 
+     return datetime.now(timezone.utc)
+ 
+ 
+ class JobStatus(str, Enum):
+     """Lifecycle states for a background job."""
+ 
+     PENDING = "pending"
+     RUNNING = "running"
+     SUCCEEDED = "succeeded"
+     FAILED = "failed"
+ 
+ 
+ class JobStepStatus(str, Enum):
+     """Lifecycle states for an individual pipeline step."""
+ 
+     PENDING = "pending"
+     RUNNING = "running"
+     SUCCEEDED = "succeeded"
+     FAILED = "failed"
++    DEGRADED = "degraded"
+     SKIPPED = "skipped"
+ 
+ 
+ @dataclass
+ class JobStep:
+     """Progress information for a single pipeline step."""
+ 
+     name: str
+     status: JobStepStatus = JobStepStatus.PENDING
+     started_at: Optional[datetime] = None
+     finished_at: Optional[datetime] = None
+     payload: Dict[str, Any] = field(default_factory=dict)
 +    error: Optional[str] = None
-+    degradation_flags: List[str] = field(default_factory=list)
+ 
+     def mark_running(self) -> None:
+         self.status = JobStepStatus.RUNNING
+         self.started_at = self.started_at or utcnow()
+ 
+     def mark_succeeded(self, **payload: Any) -> None:
+         self.status = JobStepStatus.SUCCEEDED
+         if payload:
+             self.payload.update(payload)
+         self.finished_at = utcnow()
++        self.error = None
 +
-+    def mark_running(self) -> None:
-+        self.status = JobStatus.RUNNING
-+        self.started_at = self.started_at or utcnow()
-+
-+    def mark_succeeded(self, result: Dict[str, Any]) -> None:
-+        self.status = JobStatus.SUCCEEDED
-+        self.result = result
++    def mark_degraded(self, reason: str | None = None, **payload: Any) -> None:
++        self.status = JobStepStatus.DEGRADED
++        if payload:
++            self.payload.update(payload)
++        self.error = reason
 +        self.finished_at = utcnow()
-+
-+    def mark_failed(self, error: str, *, degradation_flags: Optional[List[str]] = None) -> None:
-+        self.status = JobStatus.FAILED
-+        self.error = error
-+        self.finished_at = utcnow()
+ 
+-    def mark_failed(self, **payload: Any) -> None:
++    def mark_failed(self, reason: str | None = None, **payload: Any) -> None:
+         self.status = JobStepStatus.FAILED
+         if payload:
+             self.payload.update(payload)
++        self.error = reason
+         self.finished_at = utcnow()
+ 
+     def to_dict(self) -> Dict[str, Any]:
+         return {
+             "name": self.name,
+             "status": self.status.value,
+             "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
+             "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
+             "payload": self.payload or None,
++            "error": self.error,
+         }
+ 
+ 
+ @dataclass
+ class Job:
+     """Representation of a long-running generation request."""
+ 
+     id: str
+     status: JobStatus = JobStatus.PENDING
+     created_at: datetime = field(default_factory=utcnow)
+     started_at: Optional[datetime] = None
+     finished_at: Optional[datetime] = None
+     steps: List[JobStep] = field(default_factory=list)
+     result: Optional[Dict[str, Any]] = None
+-    error: Optional[str] = None
++    error: Optional[Dict[str, Any]] = None
+     degradation_flags: List[str] = field(default_factory=list)
++    trace_id: Optional[str] = None
+ 
+     def mark_running(self) -> None:
+         self.status = JobStatus.RUNNING
+         self.started_at = self.started_at or utcnow()
+ 
+-    def mark_succeeded(self, result: Dict[str, Any]) -> None:
++    def mark_succeeded(self, result: Dict[str, Any], *, degradation_flags: Optional[List[str]] = None) -> None:
+         self.status = JobStatus.SUCCEEDED
+         self.result = result
 +        if degradation_flags:
 +            self.degradation_flags.extend(flag for flag in degradation_flags if flag)
-+
-+    def to_dict(self) -> Dict[str, Any]:
-+        return {
-+            "id": self.id,
-+            "status": self.status.value,
-+            "created_at": self.created_at.strftime(ISO_FORMAT),
-+            "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
-+            "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
-+            "steps": [step.to_dict() for step in self.steps],
-+            "result": self.result,
-+            "error": self.error,
-+            "degradation_flags": list(self.degradation_flags) or None,
-+        }
+         self.finished_at = utcnow()
+ 
+-    def mark_failed(self, error: str, *, degradation_flags: Optional[List[str]] = None) -> None:
++    def mark_failed(self, error: str | Dict[str, Any], *, degradation_flags: Optional[List[str]] = None) -> None:
+         self.status = JobStatus.FAILED
+-        self.error = error
++        self.error = {"message": error} if isinstance(error, str) else error
+         self.finished_at = utcnow()
+         if degradation_flags:
+             self.degradation_flags.extend(flag for flag in degradation_flags if flag)
+ 
+     def to_dict(self) -> Dict[str, Any]:
+         return {
+             "id": self.id,
+             "status": self.status.value,
+             "created_at": self.created_at.strftime(ISO_FORMAT),
+             "started_at": self.started_at.strftime(ISO_FORMAT) if self.started_at else None,
+             "finished_at": self.finished_at.strftime(ISO_FORMAT) if self.finished_at else None,
+             "steps": [step.to_dict() for step in self.steps],
+             "result": self.result,
+             "error": self.error,
+             "degradation_flags": list(self.degradation_flags) or None,
++            "trace_id": self.trace_id,
+         }
 diff --git a/jobs/runner.py b/jobs/runner.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..7b00469b0eca5ad2b3e410a82d7c397d29ab6840
---- /dev/null
+index 7b00469b0eca5ad2b3e410a82d7c397d29ab6840..0cf3a12360610597c2ceb66df0d59cbaf62bad46 100644
+--- a/jobs/runner.py
 +++ b/jobs/runner.py
-@@ -0,0 +1,161 @@
-+"""Background runner executing generation jobs."""
-+from __future__ import annotations
-+
-+import queue
-+import threading
-+import uuid
-+from dataclasses import dataclass
-+from typing import Any, Dict, Optional
-+
-+from config import JOB_SOFT_TIMEOUT_S
-+from observability.logger import get_logger, log_step
-+from orchestrate import generate_article_from_payload
-+from services.guardrails import parse_jsonld_or_repair
-+
-+from .models import Job, JobStep
-+from .store import JobStore
-+
-+LOGGER = get_logger("content_factory.jobs")
+@@ -1,161 +1,297 @@
+-"""Background runner executing generation jobs."""
++"""Background execution engine for generation jobs with soft degradation."""
+ from __future__ import annotations
+ 
+ import queue
+ import threading
++import time
+ import uuid
+-from dataclasses import dataclass
+-from typing import Any, Dict, Optional
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional
+ 
+-from config import JOB_SOFT_TIMEOUT_S
++from config import JOB_MAX_RETRIES_PER_STEP, JOB_SOFT_TIMEOUT_S
+ from observability.logger import get_logger, log_step
++from observability.metrics import get_registry
+ from orchestrate import generate_article_from_payload
+-from services.guardrails import parse_jsonld_or_repair
++from services.guardrails import GuardrailResult, parse_and_repair_jsonld
+ 
+-from .models import Job, JobStep
++from .models import Job, JobStep, JobStepStatus
+ from .store import JobStore
+ 
+-LOGGER = get_logger("content_factory.jobs")
++LOGGER = get_logger("content_factory.jobs.runner")
++REGISTRY = get_registry()
++QUEUE_GAUGE = REGISTRY.gauge("jobs.queue_length")
++JOB_COUNTER = REGISTRY.counter("jobs.processed_total")
+ 
+ 
+ @dataclass
+ class RunnerTask:
+     job_id: str
+     payload: Dict[str, Any]
++    trace_id: Optional[str] = None
 +
 +
 +@dataclass
-+class RunnerTask:
-+    job_id: str
-+    payload: Dict[str, Any]
++class PipelineContext:
++    markdown: str = ""
++    meta_json: Dict[str, Any] = field(default_factory=dict)
++    faq_entries: List[Dict[str, str]] = field(default_factory=list)
++    degradation_flags: List[str] = field(default_factory=list)
++    errors: List[str] = field(default_factory=list)
++    trace_id: Optional[str] = None
++
++    def ensure_markdown(self, fallback: str) -> None:
++        if not self.markdown.strip():
++            self.markdown = fallback
 +
 +
-+class JobRunner:
-+    """Serial job runner executing pipeline tasks in a background thread."""
-+
-+    def __init__(self, store: JobStore, *, soft_timeout_s: int = JOB_SOFT_TIMEOUT_S) -> None:
-+        self._store = store
-+        self._soft_timeout_s = soft_timeout_s
-+        self._tasks: "queue.Queue[RunnerTask]" = queue.Queue()
-+        self._events: Dict[str, threading.Event] = {}
-+        self._events_lock = threading.Lock()
-+        self._thread = threading.Thread(target=self._worker, name="job-runner", daemon=True)
-+        self._started = False
-+        self._shutdown = False
-+
-+    def start(self) -> None:
-+        if not self._started:
-+            self._thread.start()
-+            self._started = True
-+
-+    def stop(self) -> None:
-+        self._shutdown = True
-+        self._tasks.put(RunnerTask(job_id="__shutdown__", payload={}))
-+        if self._started:
-+            self._thread.join(timeout=1.0)
-+
-+    def submit(self, payload: Dict[str, Any]) -> Job:
-+        job_id = uuid.uuid4().hex
-+        steps = [
-+            JobStep(name="draft"),
-+            JobStep(name="refine"),
-+            JobStep(name="jsonld"),
-+            JobStep(name="post-analysis"),
-+        ]
-+        job = Job(id=job_id, steps=steps)
-+        self._store.create(job)
-+        event = threading.Event()
-+        with self._events_lock:
-+            self._events[job_id] = event
-+        self._tasks.put(RunnerTask(job_id=job_id, payload=payload))
-+        self.start()
-+        LOGGER.info("job_enqueued", extra={"job_id": job_id})
-+        return job
-+
-+    def wait(self, job_id: str, timeout: Optional[float] = None) -> bool:
-+        with self._events_lock:
-+            event = self._events.get(job_id)
-+        if not event:
-+            return False
-+        return event.wait(timeout)
-+
-+    def get_job(self, job_id: str) -> Optional[dict]:
-+        return self._store.snapshot(job_id)
-+
-+    def _worker(self) -> None:
-+        while not self._shutdown:
-+            task = self._tasks.get()
-+            if task.job_id == "__shutdown__":
-+                break
-+            try:
-+                self._run_job(task)
-+            except Exception as exc:  # noqa: BLE001
-+                LOGGER.exception("job_failed", extra={"job_id": task.job_id, "error": str(exc)})
-+            finally:
-+                with self._events_lock:
-+                    event = self._events.pop(task.job_id, None)
-+                if event:
-+                    event.set()
-+
-+    def _run_job(self, task: RunnerTask) -> None:
-+        job = self._store.get(task.job_id)
-+        if not job:
-+            LOGGER.warning("job_missing", extra={"job_id": task.job_id})
-+            return
-+
-+        job.mark_running()
-+        self._store.touch(job.id)
-+
-+        draft_step, refine_step, jsonld_step, post_step = job.steps
-+
-+        # Draft
-+        draft_step.mark_running()
-+        log_step(LOGGER, job_id=job.id, step=draft_step.name, status=draft_step.status.value)
-+        try:
-+            result = generate_article_from_payload(**task.payload)
-+            draft_step.mark_succeeded()
-+        except Exception as exc:  # noqa: BLE001
-+            draft_step.mark_failed(error=str(exc))
-+            job.mark_failed(str(exc))
-+            self._store.touch(job.id)
-+            log_step(
-+                LOGGER,
-+                job_id=job.id,
-+                step=draft_step.name,
-+                status=draft_step.status.value,
-+                error=str(exc),
-+            )
-+            return
-+
-+        log_step(LOGGER, job_id=job.id, step=draft_step.name, status=draft_step.status.value)
-+
-+        # Refine (placeholder for future incremental refinements)
-+        refine_step.mark_running()
-+        log_step(LOGGER, job_id=job.id, step=refine_step.name, status=refine_step.status.value)
-+        refine_step.mark_succeeded()
-+        log_step(LOGGER, job_id=job.id, step=refine_step.name, status=refine_step.status.value)
-+
-+        metadata = result.get("metadata") if isinstance(result, dict) else None
-+        raw_jsonld = ""
-+        if isinstance(metadata, dict):
-+            raw_jsonld = str(metadata.get("jsonld") or "")
-+
-+        # JSON-LD repair
-+        jsonld_step.mark_running()
-+        log_step(LOGGER, job_id=job.id, step=jsonld_step.name, status=jsonld_step.status.value)
-+        faq_entries, repair_attempts, degraded = parse_jsonld_or_repair(raw_jsonld)
-+        jsonld_payload: Dict[str, Any] = {"repair_attempts": repair_attempts, "faq_entries": faq_entries}
-+        if degraded:
-+            job.degradation_flags.append("jsonld_repaired")
-+            jsonld_payload["degraded"] = True
-+        jsonld_step.mark_succeeded(**jsonld_payload)
-+        log_step(LOGGER, job_id=job.id, step=jsonld_step.name, status=jsonld_step.status.value)
-+
-+        # Post analysis step
-+        post_step.mark_running()
-+        log_step(LOGGER, job_id=job.id, step=post_step.name, status=post_step.status.value)
-+        post_payload = {"jsonld_repair_attempts": repair_attempts}
-+        if faq_entries:
-+            post_payload["faq_preview"] = faq_entries[:2]
-+        post_step.mark_succeeded(**post_payload)
-+        log_step(LOGGER, job_id=job.id, step=post_step.name, status=post_step.status.value)
-+
-+        job.mark_succeeded(result)
-+        self._store.touch(job.id)
++@dataclass
++class StepResult:
++    status: JobStepStatus
++    payload: Dict[str, Any] = field(default_factory=dict)
++    degradation_flags: List[str] = field(default_factory=list)
++    error: Optional[str] = None
++    continue_pipeline: bool = True
+ 
+ 
+ class JobRunner:
+     """Serial job runner executing pipeline tasks in a background thread."""
+ 
+     def __init__(self, store: JobStore, *, soft_timeout_s: int = JOB_SOFT_TIMEOUT_S) -> None:
+         self._store = store
+         self._soft_timeout_s = soft_timeout_s
+         self._tasks: "queue.Queue[RunnerTask]" = queue.Queue()
+         self._events: Dict[str, threading.Event] = {}
+         self._events_lock = threading.Lock()
+         self._thread = threading.Thread(target=self._worker, name="job-runner", daemon=True)
+         self._started = False
+         self._shutdown = False
+ 
+     def start(self) -> None:
+         if not self._started:
+             self._thread.start()
+             self._started = True
+ 
+     def stop(self) -> None:
+         self._shutdown = True
+         self._tasks.put(RunnerTask(job_id="__shutdown__", payload={}))
+         if self._started:
+             self._thread.join(timeout=1.0)
+ 
+-    def submit(self, payload: Dict[str, Any]) -> Job:
++    def submit(self, payload: Dict[str, Any], *, trace_id: Optional[str] = None) -> Job:
+         job_id = uuid.uuid4().hex
+         steps = [
+             JobStep(name="draft"),
+             JobStep(name="refine"),
+             JobStep(name="jsonld"),
+-            JobStep(name="post-analysis"),
++            JobStep(name="post_analysis"),
+         ]
+-        job = Job(id=job_id, steps=steps)
++        job = Job(id=job_id, steps=steps, trace_id=trace_id)
+         self._store.create(job)
+         event = threading.Event()
+         with self._events_lock:
+             self._events[job_id] = event
+-        self._tasks.put(RunnerTask(job_id=job_id, payload=payload))
++        self._tasks.put(RunnerTask(job_id=job_id, payload=payload, trace_id=trace_id))
++        QUEUE_GAUGE.set(float(self._tasks.qsize()))
+         self.start()
+         LOGGER.info("job_enqueued", extra={"job_id": job_id})
+         return job
+ 
+     def wait(self, job_id: str, timeout: Optional[float] = None) -> bool:
+         with self._events_lock:
+             event = self._events.get(job_id)
+         if not event:
+             return False
+         return event.wait(timeout)
+ 
+     def get_job(self, job_id: str) -> Optional[dict]:
+-        return self._store.snapshot(job_id)
++        snapshot = self._store.snapshot(job_id)
++        if not snapshot:
++            return None
++        return snapshot
 +
 +    def soft_timeout(self) -> int:
 +        return self._soft_timeout_s
+ 
+     def _worker(self) -> None:
+         while not self._shutdown:
+             task = self._tasks.get()
++            QUEUE_GAUGE.set(float(self._tasks.qsize()))
+             if task.job_id == "__shutdown__":
+                 break
+             try:
+                 self._run_job(task)
+             except Exception as exc:  # noqa: BLE001
+                 LOGGER.exception("job_failed", extra={"job_id": task.job_id, "error": str(exc)})
+             finally:
+                 with self._events_lock:
+                     event = self._events.pop(task.job_id, None)
+                 if event:
+                     event.set()
+ 
+     def _run_job(self, task: RunnerTask) -> None:
+         job = self._store.get(task.job_id)
+         if not job:
+             LOGGER.warning("job_missing", extra={"job_id": task.job_id})
+             return
+ 
++        job.trace_id = job.trace_id or task.trace_id
+         job.mark_running()
+         self._store.touch(job.id)
+ 
+-        draft_step, refine_step, jsonld_step, post_step = job.steps
+-
+-        # Draft
+-        draft_step.mark_running()
+-        log_step(LOGGER, job_id=job.id, step=draft_step.name, status=draft_step.status.value)
+-        try:
+-            result = generate_article_from_payload(**task.payload)
+-            draft_step.mark_succeeded()
+-        except Exception as exc:  # noqa: BLE001
+-            draft_step.mark_failed(error=str(exc))
+-            job.mark_failed(str(exc))
+-            self._store.touch(job.id)
++        ctx = PipelineContext(trace_id=job.trace_id)
++        start_time = time.monotonic()
++        deadline = start_time + self._soft_timeout_s
++
++        for step in job.steps:
++            if time.monotonic() >= deadline:
++                ctx.degradation_flags.append("soft_timeout")
++                step.mark_degraded("soft_timeout")
++                log_step(
++                    LOGGER,
++                    job_id=job.id,
++                    step=step.name,
++                    status=step.status.value,
++                    reason="soft_timeout",
++                )
++                break
++
++            result = self._execute_step(step.name, task.payload, ctx)
++            if result.status == JobStepStatus.SUCCEEDED:
++                step.mark_succeeded(**result.payload)
++            elif result.status == JobStepStatus.DEGRADED:
++                step.mark_degraded(result.error, **result.payload)
++            else:
++                step.mark_failed(result.error, **result.payload)
+             log_step(
+                 LOGGER,
+                 job_id=job.id,
+-                step=draft_step.name,
+-                status=draft_step.status.value,
+-                error=str(exc),
++                step=step.name,
++                status=step.status.value,
++                error=result.error,
++                payload=result.payload or None,
+             )
+-            return
++            ctx.degradation_flags.extend(result.degradation_flags)
++            self._store.touch(job.id)
++            if not result.continue_pipeline:
++                break
+ 
+-        log_step(LOGGER, job_id=job.id, step=draft_step.name, status=draft_step.status.value)
+-
+-        # Refine (placeholder for future incremental refinements)
+-        refine_step.mark_running()
+-        log_step(LOGGER, job_id=job.id, step=refine_step.name, status=refine_step.status.value)
+-        refine_step.mark_succeeded()
+-        log_step(LOGGER, job_id=job.id, step=refine_step.name, status=refine_step.status.value)
+-
+-        metadata = result.get("metadata") if isinstance(result, dict) else None
+-        raw_jsonld = ""
+-        if isinstance(metadata, dict):
+-            raw_jsonld = str(metadata.get("jsonld") or "")
+-
+-        # JSON-LD repair
+-        jsonld_step.mark_running()
+-        log_step(LOGGER, job_id=job.id, step=jsonld_step.name, status=jsonld_step.status.value)
+-        faq_entries, repair_attempts, degraded = parse_jsonld_or_repair(raw_jsonld)
+-        jsonld_payload: Dict[str, Any] = {"repair_attempts": repair_attempts, "faq_entries": faq_entries}
+-        if degraded:
+-            job.degradation_flags.append("jsonld_repaired")
+-            jsonld_payload["degraded"] = True
+-        jsonld_step.mark_succeeded(**jsonld_payload)
+-        log_step(LOGGER, job_id=job.id, step=jsonld_step.name, status=jsonld_step.status.value)
+-
+-        # Post analysis step
+-        post_step.mark_running()
+-        log_step(LOGGER, job_id=job.id, step=post_step.name, status=post_step.status.value)
+-        post_payload = {"jsonld_repair_attempts": repair_attempts}
+-        if faq_entries:
+-            post_payload["faq_preview"] = faq_entries[:2]
+-        post_step.mark_succeeded(**post_payload)
+-        log_step(LOGGER, job_id=job.id, step=post_step.name, status=post_step.status.value)
+-
+-        job.mark_succeeded(result)
++        ctx.ensure_markdown(_build_fallback_text(task.payload))
++        if ctx.degradation_flags:
++            ctx.degradation_flags = list(dict.fromkeys(ctx.degradation_flags))
++        result_payload = {
++            "markdown": ctx.markdown,
++            "meta_json": ctx.meta_json,
++            "faq_entries": ctx.faq_entries,
++            "errors": ctx.errors or None,
++        }
++        job.mark_succeeded(result_payload, degradation_flags=ctx.degradation_flags)
+         self._store.touch(job.id)
++        JOB_COUNTER.inc()
+ 
+-    def soft_timeout(self) -> int:
+-        return self._soft_timeout_s
++    def _execute_step(
++        self,
++        step_name: str,
++        payload: Dict[str, Any],
++        ctx: PipelineContext,
++    ) -> StepResult:
++        if step_name == "draft":
++            return self._run_draft_step(payload, ctx)
++        if step_name == "refine":
++            return self._run_refine_step(ctx)
++        if step_name == "jsonld":
++            return self._run_jsonld_step(ctx)
++        if step_name == "post_analysis":
++            return self._run_post_analysis_step(ctx)
++        return StepResult(JobStepStatus.SUCCEEDED, payload={"skipped": True})
++
++    def _run_draft_step(self, payload: Dict[str, Any], ctx: PipelineContext) -> StepResult:
++        attempt = 0
++        last_error: Optional[str] = None
++        while attempt <= JOB_MAX_RETRIES_PER_STEP:
++            attempt += 1
++            try:
++                result = generate_article_from_payload(**payload)
++            except Exception as exc:  # noqa: BLE001
++                last_error = str(exc)
++                ctx.errors.append(last_error)
++                continue
++
++            markdown = str(result.get("text") or result.get("markdown") or "").strip()
++            metadata = result.get("metadata")
++            if isinstance(metadata, dict):
++                ctx.meta_json = metadata
++            if markdown:
++                ctx.markdown = markdown
++                return StepResult(JobStepStatus.SUCCEEDED, payload={"attempts": attempt})
++            last_error = "empty_response"
++            ctx.errors.append(last_error)
++
++        ctx.ensure_markdown(_build_fallback_text(payload, error=last_error))
++        flags = ["draft_failed"]
++        return StepResult(
++            JobStepStatus.DEGRADED,
++            payload={"attempts": attempt, "error": last_error},
++            degradation_flags=flags,
++            error=last_error,
++        )
++
++    def _run_refine_step(self, ctx: PipelineContext) -> StepResult:
++        if not ctx.markdown.strip():
++            ctx.ensure_markdown("Черновик пока пустой.")
++            return StepResult(
++                JobStepStatus.DEGRADED,
++                payload={"action": "fallback_text"},
++                degradation_flags=["refine_skipped"],
++                error="empty_markdown",
++            )
++        refined = ctx.markdown.strip()
++        if refined != ctx.markdown:
++            ctx.markdown = refined
++        return StepResult(JobStepStatus.SUCCEEDED, payload={"chars": len(refined)})
++
++    def _run_jsonld_step(self, ctx: PipelineContext) -> StepResult:
++        raw_jsonld = None
++        if isinstance(ctx.meta_json, dict):
++            raw_jsonld = ctx.meta_json.get("jsonld")
++        guardrail_result: GuardrailResult = parse_and_repair_jsonld(raw_jsonld, trace_id=ctx.trace_id)
++        ctx.degradation_flags.extend(guardrail_result.degradation_flags)
++        if guardrail_result.faq_entries:
++            ctx.faq_entries = guardrail_result.faq_entries
++        if guardrail_result.repaired_json is not None:
++            ctx.meta_json["jsonld"] = guardrail_result.repaired_json
++        status = JobStepStatus.SUCCEEDED if guardrail_result.ok else JobStepStatus.DEGRADED
++        return StepResult(
++            status,
++            payload={
++                "attempts": guardrail_result.attempts,
++                "faq_preview": guardrail_result.faq_entries[:2] if guardrail_result.faq_entries else None,
++            },
++            degradation_flags=guardrail_result.degradation_flags,
++            error=guardrail_result.error,
++        )
++
++    def _run_post_analysis_step(self, ctx: PipelineContext) -> StepResult:
++        if not ctx.markdown.strip():
++            return StepResult(
++                JobStepStatus.DEGRADED,
++                payload={"reason": "empty_markdown"},
++                degradation_flags=["post_analysis_skipped"],
++                error="no_markdown",
++            )
++        length = len(ctx.markdown.replace(" ", ""))
++        payload = {"chars_no_spaces": length, "faq_count": len(ctx.faq_entries)}
++        return StepResult(JobStepStatus.SUCCEEDED, payload=payload)
++
++
++def _build_fallback_text(payload: Dict[str, Any], *, error: Optional[str] = None) -> str:
++    theme = str(payload.get("theme") or payload.get("title") or "Материал").strip()
++    if not theme:
++        theme = "Материал"
++    message = [f"Предварительный черновик для темы: {theme}."]
++    if error:
++        message.append(f"Ошибка: {error}")
++    message.append("Контент недоступен, используйте черновик для доработки.")
++    return "\n\n".join(message)
++
++
++__all__ = ["JobRunner", "RunnerTask", "PipelineContext", "StepResult"]
 diff --git a/jobs/store.py b/jobs/store.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..b0663f0abda1dd77727eabedd7092ce3ba6c22ec
---- /dev/null
+index b0663f0abda1dd77727eabedd7092ce3ba6c22ec..a8bdea3fa44cc3d146ffbf7ee3940be6ae0d6211 100644
+--- a/jobs/store.py
 +++ b/jobs/store.py
-@@ -0,0 +1,56 @@
-+"""In-memory job store with TTL semantics."""
+@@ -1,56 +1,92 @@
+ """In-memory job store with TTL semantics."""
+ from __future__ import annotations
+ 
+ import threading
+ import time
+-from typing import Dict, Optional
++from typing import Callable, Dict, Optional
+ 
+-from .models import Job
++from .models import Job, JobStep
+ 
+ 
+ class JobStore:
+     """Thread-safe in-memory storage for jobs."""
+ 
+     def __init__(self, *, ttl_seconds: int = 3600) -> None:
+         self._ttl_seconds = max(1, int(ttl_seconds))
+         self._jobs: Dict[str, Job] = {}
+         self._expiry: Dict[str, float] = {}
+         self._lock = threading.RLock()
+ 
+     def create(self, job: Job) -> Job:
+         with self._lock:
+             self._jobs[job.id] = job
+             self._expiry[job.id] = time.time() + self._ttl_seconds
+             self._purge_expired_locked()
+             return job
+ 
+     def get(self, job_id: str) -> Optional[Job]:
+         with self._lock:
+             self._purge_expired_locked()
+             return self._jobs.get(job_id)
+ 
++    def update_step(self, job_id: str, step_name: str, mutator: Callable[[JobStep], None]) -> Optional[Job]:
++        with self._lock:
++            job = self._jobs.get(job_id)
++            if not job:
++                return None
++            for step in job.steps:
++                if step.name == step_name:
++                    mutator(step)
++                    break
++            self._expiry[job_id] = time.time() + self._ttl_seconds
++            return job
++
++    def set_result(self, job_id: str, result: dict, *, degradation_flags: Optional[list[str]] = None) -> Optional[Job]:
++        with self._lock:
++            job = self._jobs.get(job_id)
++            if not job:
++                return None
++            job.mark_succeeded(result, degradation_flags=degradation_flags)
++            self._expiry[job_id] = time.time() + self._ttl_seconds
++            return job
++
++    def set_failed(
++        self,
++        job_id: str,
++        error: dict | str,
++        *,
++        degradation_flags: Optional[list[str]] = None,
++    ) -> Optional[Job]:
++        with self._lock:
++            job = self._jobs.get(job_id)
++            if not job:
++                return None
++            job.mark_failed(error, degradation_flags=degradation_flags)
++            self._expiry[job_id] = time.time() + self._ttl_seconds
++            return job
++
+     def touch(self, job_id: str) -> None:
+         with self._lock:
+             if job_id in self._jobs:
+                 self._expiry[job_id] = time.time() + self._ttl_seconds
+ 
+     def delete(self, job_id: str) -> None:
+         with self._lock:
+             self._jobs.pop(job_id, None)
+             self._expiry.pop(job_id, None)
+ 
+     def snapshot(self, job_id: str) -> Optional[dict]:
+         job = self.get(job_id)
+         return job.to_dict() if job else None
+ 
+     def _purge_expired_locked(self) -> None:
+         now = time.time()
+         expired = [job_id for job_id, deadline in self._expiry.items() if deadline <= now]
+         for job_id in expired:
+             self._jobs.pop(job_id, None)
+             self._expiry.pop(job_id, None)
+ 
+     def __len__(self) -> int:  # pragma: no cover - trivial
+         with self._lock:
+             self._purge_expired_locked()
+             return len(self._jobs)
+diff --git a/observability/metrics.py b/observability/metrics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3e4dcf0e1212340c8d04caa9aca65e0d8008b68
+--- /dev/null
++++ b/observability/metrics.py
+@@ -0,0 +1,89 @@
++"""Lightweight in-process metrics helpers."""
 +from __future__ import annotations
 +
 +import threading
-+import time
++from dataclasses import dataclass, field
 +from typing import Dict, Optional
 +
-+from .models import Job
 +
++@dataclass
++class _BaseMetric:
++    name: str
++    _value: float = 0.0
++    _lock: threading.Lock = field(default_factory=threading.Lock)
 +
-+class JobStore:
-+    """Thread-safe in-memory storage for jobs."""
-+
-+    def __init__(self, *, ttl_seconds: int = 3600) -> None:
-+        self._ttl_seconds = max(1, int(ttl_seconds))
-+        self._jobs: Dict[str, Job] = {}
-+        self._expiry: Dict[str, float] = {}
-+        self._lock = threading.RLock()
-+
-+    def create(self, job: Job) -> Job:
++    def snapshot(self) -> float:
 +        with self._lock:
-+            self._jobs[job.id] = job
-+            self._expiry[job.id] = time.time() + self._ttl_seconds
-+            self._purge_expired_locked()
-+            return job
++            return float(self._value)
 +
-+    def get(self, job_id: str) -> Optional[Job]:
++
++class Counter(_BaseMetric):
++    """Simple monotonically increasing counter."""
++
++    def inc(self, amount: float = 1.0) -> None:
++        if amount == 0:
++            return
 +        with self._lock:
-+            self._purge_expired_locked()
-+            return self._jobs.get(job_id)
++            self._value += amount
 +
-+    def touch(self, job_id: str) -> None:
++
++class Gauge(_BaseMetric):
++    """Gauge metric supporting set/add operations."""
++
++    def set(self, value: float) -> None:
 +        with self._lock:
-+            if job_id in self._jobs:
-+                self._expiry[job_id] = time.time() + self._ttl_seconds
++            self._value = value
 +
-+    def delete(self, job_id: str) -> None:
++    def add(self, amount: float) -> None:
++        if amount == 0:
++            return
 +        with self._lock:
-+            self._jobs.pop(job_id, None)
-+            self._expiry.pop(job_id, None)
++            self._value += amount
 +
-+    def snapshot(self, job_id: str) -> Optional[dict]:
-+        job = self.get(job_id)
-+        return job.to_dict() if job else None
 +
-+    def _purge_expired_locked(self) -> None:
-+        now = time.time()
-+        expired = [job_id for job_id, deadline in self._expiry.items() if deadline <= now]
-+        for job_id in expired:
-+            self._jobs.pop(job_id, None)
-+            self._expiry.pop(job_id, None)
++class MetricsRegistry:
++    """Thread-safe registry storing metrics by name."""
 +
-+    def __len__(self) -> int:  # pragma: no cover - trivial
++    def __init__(self) -> None:
++        self._metrics: Dict[str, _BaseMetric] = {}
++        self._lock = threading.Lock()
++
++    def counter(self, name: str) -> Counter:
 +        with self._lock:
-+            self._purge_expired_locked()
-+            return len(self._jobs)
-diff --git a/observability/__init__.py b/observability/__init__.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..e812eae7172cb784807694ad0d3216d02eeba966
---- /dev/null
-+++ b/observability/__init__.py
-@@ -0,0 +1,11 @@
-+"""Observability helpers."""
++            metric = self._metrics.get(name)
++            if isinstance(metric, Counter):
++                return metric
++            counter = Counter(name=name)
++            self._metrics[name] = counter
++            return counter
 +
-+from .logger import bind_trace_id, clear_trace_id, configure_logging, get_logger, log_step  # noqa: F401
++    def gauge(self, name: str) -> Gauge:
++        with self._lock:
++            metric = self._metrics.get(name)
++            if isinstance(metric, Gauge):
++                return metric
++            gauge = Gauge(name=name)
++            self._metrics[name] = gauge
++            return gauge
++
++    def get(self, name: str) -> Optional[_BaseMetric]:
++        return self._metrics.get(name)
++
++    def snapshot(self) -> Dict[str, float]:
++        with self._lock:
++            return {name: metric.snapshot() for name, metric in self._metrics.items()}
++
++
++_DEFAULT_REGISTRY = MetricsRegistry()
++
++
++def get_registry() -> MetricsRegistry:
++    return _DEFAULT_REGISTRY
++
 +
 +__all__ = [
-+    "bind_trace_id",
-+    "clear_trace_id",
-+    "configure_logging",
-+    "get_logger",
-+    "log_step",
++    "Counter",
++    "Gauge",
++    "MetricsRegistry",
++    "get_registry",
 +]
-diff --git a/observability/logger.py b/observability/logger.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..ca4a97fc02420a31b80e7d27f99d505fc06b897b
---- /dev/null
-+++ b/observability/logger.py
-@@ -0,0 +1,69 @@
-+"""JSON logger helpers with request trace support."""
-+from __future__ import annotations
-+
-+import contextvars
-+import json
-+import logging
-+import sys
-+from datetime import datetime, timezone
-+from typing import Any, Dict
-+
-+_TRACE_ID = contextvars.ContextVar("trace_id", default=None)
-+_CONFIGURED = False
-+
-+
-+class JsonFormatter(logging.Formatter):
-+    """Serialize log records as JSON lines."""
-+
-+    def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
-+        payload: Dict[str, Any] = {
-+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-+            "level": record.levelname,
-+            "logger": record.name,
-+            "message": record.getMessage(),
-+        }
-+        trace_id = getattr(record, "trace_id", None) or _TRACE_ID.get()
-+        if trace_id:
-+            payload["trace_id"] = trace_id
-+        if record.exc_info:
-+            payload["exc_info"] = self.formatException(record.exc_info)
-+        for key, value in record.__dict__.items():
-+            if key.startswith("_"):
-+                continue
-+            if key in {"args", "levelname", "levelno", "msg", "pathname", "filename", "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName", "created", "msecs", "relativeCreated", "thread", "threadName", "processName", "process", "message", "asctime"}:
-+                continue
-+            payload.setdefault(key, value)
-+        return json.dumps(payload, ensure_ascii=False)
-+
-+
-+def configure_logging() -> None:
-+    global _CONFIGURED
-+    if _CONFIGURED:
-+        return
-+    handler = logging.StreamHandler(sys.stdout)
-+    handler.setFormatter(JsonFormatter())
-+    root = logging.getLogger()
-+    root.handlers.clear()
-+    root.addHandler(handler)
-+    root.setLevel(logging.INFO)
-+    _CONFIGURED = True
-+
-+
-+def get_logger(name: str) -> logging.Logger:
-+    configure_logging()
-+    return logging.getLogger(name)
-+
-+
-+def bind_trace_id(trace_id: str) -> None:
-+    _TRACE_ID.set(trace_id)
-+
-+
-+def clear_trace_id() -> None:
-+    _TRACE_ID.set(None)
-+
-+
-+def log_step(logger: logging.Logger, *, job_id: str, step: str, status: str, **details: Any) -> None:
-+    logger.info(
-+        "job_step",
-+        extra={"job_id": job_id, "step": step, "step_status": status, "details": details or None},
-+    )
 diff --git a/server/__init__.py b/server/__init__.py
-index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d6485c412c9 100644
+index 97c56956ceaad363ff36e64f16581d6485c412c9..3b6512f425b0f89de74cdc48a0bd88ebc5a27fa9 100644
 --- a/server/__init__.py
 +++ b/server/__init__.py
-@@ -1,78 +1,79 @@
+@@ -1,77 +1,84 @@
  """Flask application exposing the content factory pipeline via HTTP."""
  from __future__ import annotations
  
  import json
--import logging
  import mimetypes
  import os
  import secrets
-+import uuid
++import time
+ import uuid
  from datetime import datetime
  from functools import wraps
  from pathlib import Path
@@ -690,7 +1529,7 @@ index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d64
      abort,
      flash,
      jsonify,
-+    g,
+     g,
      redirect,
      render_template,
      request,
@@ -703,15 +1542,15 @@ index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d64
  from werkzeug.security import check_password_hash
  
  from assemble_messages import invalidate_style_profile_cache
--from config import DEFAULT_STRUCTURE
--from orchestrate import (
--    gather_health_status,
--    generate_article_from_payload,
--    make_generation_context,
--)
-+from config import DEFAULT_STRUCTURE, OPENAI_RPM, OPENAI_RPS
-+from jobs import JobRunner, JobStatus, JobStore
-+from orchestrate import gather_health_status, make_generation_context
+-from config import DEFAULT_STRUCTURE, OPENAI_RPM, OPENAI_RPS
++from config import (
++    DEFAULT_STRUCTURE,
++    JOB_STORE_TTL_S,
++    OPENAI_RPM,
++    OPENAI_RPS,
++)
+ from jobs import JobRunner, JobStatus, JobStore
+ from orchestrate import gather_health_status, make_generation_context
  from retrieval import build_index
  from artifacts_store import (
      cleanup_index as cleanup_artifact_index,
@@ -719,19 +1558,19 @@ index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d64
      list_artifacts as list_artifact_cards,
      resolve_artifact_path,
  )
-+from observability.logger import bind_trace_id, clear_trace_id, get_logger
+ from observability.logger import bind_trace_id, clear_trace_id, get_logger
++from observability.metrics import get_registry
  
  load_dotenv()
  
--LOGGER = logging.getLogger("content_factory.api")
--logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
-+LOGGER = get_logger("content_factory.api")
+ LOGGER = get_logger("content_factory.api")
  
  PIPELINE_CONFIG_FILENAME = "pipeline.json"
  
-+JOB_STORE = JobStore(ttl_seconds=3600)
-+JOB_RUNNER = JobRunner(JOB_STORE)
-+
+-JOB_STORE = JobStore(ttl_seconds=3600)
++JOB_STORE = JobStore(ttl_seconds=JOB_STORE_TTL_S)
+ JOB_RUNNER = JobRunner(JOB_STORE)
+ 
  USERS: Dict[str, Dict[str, str]] = {
      "admin": {
          "display_name": "Admin",
@@ -755,134 +1594,7 @@ index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d64
  
      @wraps(view_func)
      def wrapper(*args, **kwargs):
-         if not session.get("user"):
-             next_url = request.full_path if request.query_string else request.path
-@@ -89,67 +90,108 @@ def login_required(view_func):
- 
- class ApiError(Exception):
-     """Exception translated into an HTTP error response."""
- 
-     def __init__(self, message: str, status_code: int = 400) -> None:
-         super().__init__(message)
-         self.status_code = status_code
-         self.message = message
- 
- 
- def create_app() -> Flask:
-     frontend_root = (Path(__file__).resolve().parent.parent / "frontend_demo").resolve()
-     template_root = frontend_root / "templates"
-     app = Flask(__name__, template_folder=str(template_root))
-     if hasattr(app, "json"):
-         app.json.ensure_ascii = False
-     CORS(app, resources={r"/api/*": {"origins": "*"}})
- 
-     secret_key = os.environ.get("FLASK_SECRET_KEY")
-     if not secret_key:
-         LOGGER.warning("FLASK_SECRET_KEY is not set; generating a temporary secret key")
-     app.secret_key = secret_key or secrets.token_hex(32)
- 
-     index_path = frontend_root / "index.html"
- 
-+    @app.before_request
-+    def _bind_request_trace() -> None:
-+        trace_id = request.headers.get("X-Trace-Id") or uuid.uuid4().hex
-+        g.trace_id = trace_id
-+        bind_trace_id(trace_id)
-+
-+    @app.after_request
-+    def _append_trace(response):  # type: ignore[override]
-+        trace_id = getattr(g, "trace_id", None)
-+        if trace_id:
-+            response.headers.setdefault("X-Trace-Id", trace_id)
-+        clear_trace_id()
-+        return response
-+
-+    @app.teardown_request
-+    def _teardown_trace(_exc):  # type: ignore[override]
-+        clear_trace_id()
-+
-     @app.context_processor
-     def inject_current_user():
-         username = session.get("user")
-         return {
-             "current_user": USERS.get(username),
-             "current_username": username,
-         }
- 
-     @app.errorhandler(ApiError)
-     def _handle_api_error(exc: ApiError):  # type: ignore[override]
--        LOGGER.warning("API error: %s", exc.message)
--        return jsonify({"error": exc.message}), exc.status_code
-+        LOGGER.warning("API error", extra={"message": exc.message, "code": exc.status_code})
-+        trace_id = getattr(g, "trace_id", None)
-+        return (
-+            jsonify(
-+                {
-+                    "error": {
-+                        "message": exc.message,
-+                        "code": exc.status_code,
-+                        "trace_id": trace_id,
-+                    }
-+                }
-+            ),
-+            exc.status_code,
-+        )
- 
-     @app.errorhandler(Exception)
-     def _handle_generic_error(exc: Exception):  # type: ignore[override]
-         LOGGER.exception("Unhandled error")
--        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
-+        trace_id = getattr(g, "trace_id", None)
-+        return (
-+            jsonify(
-+                {
-+                    "error": {
-+                        "message": "Внутренняя ошибка сервера",
-+                        "trace_id": trace_id,
-+                    }
-+                }
-+            ),
-+            500,
-+        )
- 
-     @app.route("/login", methods=["GET", "POST"])
-     def login():
-         next_param = _get_safe_redirect_target(
-             request.args.get("next") or request.form.get("next")
-         )
- 
-         if session.get("user"):
-             if next_param:
-                 return redirect(next_param)
-             return redirect(url_for("serve_frontend", path=""))
- 
-         username = ""
-         if request.method == "POST":
-             username = str(request.form.get("username", "")).strip()
-             password = request.form.get("password", "")
-             user = USERS.get(username)
- 
-             if user and check_password_hash(user["password_hash"], password):
-                 session.clear()
-                 session["user"] = username
-                 session["authenticated_at"] = datetime.utcnow().isoformat()
-                 redirect_target = next_param or url_for("serve_frontend", path="")
-                 return redirect(redirect_target)
- 
-@@ -271,95 +313,120 @@ def create_app() -> Flask:
-         if not isinstance(raw_data, dict):
-             raise ApiError("Поле data должно быть объектом")
-         raw_data = dict(raw_data)
- 
-         style_payload = payload.get("style")
-         if isinstance(style_payload, dict):
-             raw_data["style"] = style_payload
- 
-         k = _safe_int(payload.get("k"))
-         if k < 0:
-             k = 0
- 
-         context_source, context_text, context_filename = _extract_context_settings(payload, raw_data)
+@@ -326,89 +333,110 @@ def create_app() -> Flask:
          effective_k = k
          if context_source in {"off", "custom"}:
              effective_k = 0
@@ -895,119 +1607,103 @@ index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d64
          temperature = _safe_float(payload.get("temperature", 0.3), default=0.3)
          temperature = max(0.0, min(2.0, temperature))
          max_tokens = max(1, _safe_int(payload.get("max_tokens", 1400), default=1400))
--
--        try:
--            result = generate_article_from_payload(
--                theme=theme,
--                data=raw_data,
--                k=k,
--                model=model,
--                temperature=temperature,
--                max_tokens=max_tokens,
--                append_style_profile=style_profile_override,
--                context_source=context_source,
--                context_text=context_text,
--                context_filename=context_filename,
--            )
--        except ApiError:
--            raise
--        except RuntimeError as exc:
--            status_code = getattr(exc, "status_code", 503)
--            raise ApiError(str(exc), status_code=status_code)
--        except Exception as exc:  # noqa: BLE001
--            LOGGER.exception("Generation failed")
--            raise ApiError("Не удалось завершить генерацию", status_code=500) from exc
--
--        response_payload: Dict[str, Any] = {
--            "markdown": result["text"],
--            "meta_json": result["metadata"],
--            "artifact_paths": result["artifact_paths"],
-+        task_payload = {
-+            "theme": theme,
-+            "data": raw_data,
-+            "k": k,
-+            "model": model,
-+            "temperature": temperature,
-+            "max_tokens": max_tokens,
-+            "append_style_profile": style_profile_override,
-+            "context_source": context_source,
-+            "context_text": context_text,
-+            "context_filename": context_filename,
+         task_payload = {
+             "theme": theme,
+             "data": raw_data,
+             "k": k,
+             "model": model,
+             "temperature": temperature,
+             "max_tokens": max_tokens,
+             "append_style_profile": style_profile_override,
+             "context_source": context_source,
+             "context_text": context_text,
+             "context_filename": context_filename,
          }
  
--        metadata = result.get("metadata") or {}
--        if isinstance(metadata, dict) and metadata.get("style_profile_applied"):
--            response_payload["style_profile_applied"] = True
--            if metadata.get("style_profile_source"):
--                response_payload["style_profile_source"] = metadata["style_profile_source"]
--            if metadata.get("style_profile_variant"):
--                response_payload["style_profile_variant"] = metadata["style_profile_variant"]
--        if isinstance(metadata, dict) and metadata.get("keywords_manual") is not None:
--            response_payload["keywords_manual"] = metadata.get("keywords_manual")
--        if isinstance(metadata, dict):
--            response_payload["model_used"] = metadata.get("model_used")
--            response_payload["fallback_used"] = metadata.get("fallback_used")
--            response_payload["fallback_reason"] = metadata.get("fallback_reason")
--            response_payload["api_route"] = metadata.get("api_route")
--
--        return jsonify(response_payload)
-+        job = JOB_RUNNER.submit(task_payload)
-+        sync_raw = payload.get("sync", request.args.get("sync"))
-+        sync_requested = str(sync_raw).lower() in {"1", "true", "yes"}
-+
-+        if sync_requested:
-+            finished = JOB_RUNNER.wait(job.id, timeout=JOB_RUNNER.soft_timeout())
-+            snapshot = JOB_RUNNER.get_job(job.id)
-+            if finished and snapshot:
-+                status = snapshot.get("status")
-+                if status == JobStatus.SUCCEEDED.value and snapshot.get("result"):
-+                    response_payload = _format_generation_success(snapshot["result"])
-+                    response_payload["job_id"] = job.id
-+                    response_payload["degradation_flags"] = snapshot.get("degradation_flags")
-+                    return jsonify(response_payload)
-+                if status == JobStatus.FAILED.value:
-+                    trace_id = getattr(g, "trace_id", None)
-+                    return (
-+                        jsonify(
-+                            {
-+                                "error": {
-+                                    "message": snapshot.get("error") or "Generation failed",
-+                                    "trace_id": trace_id,
-+                                },
-+                                "job_id": job.id,
-+                                "status": status,
-+                            }
-+                        ),
-+                        500,
-+                    )
-+
-+        snapshot = JOB_RUNNER.get_job(job.id) or job.to_dict()
-+        response_payload = {
-+            "job_id": job.id,
-+            "status": snapshot.get("status", JobStatus.PENDING.value),
-+            "steps": snapshot.get("steps"),
-+            "result": snapshot.get("result"),
-+            "degradation_flags": snapshot.get("degradation_flags"),
-+        }
-+        return jsonify(response_payload), 202
-+
-+    @app.get("/api/jobs/<job_id>")
-+    def job_status(job_id: str):
-+        snapshot = JOB_RUNNER.get_job(job_id)
-+        if not snapshot:
-+            trace_id = getattr(g, "trace_id", None)
-+            return (
-+                jsonify(
-+                    {
-+                        "error": {
-+                            "message": "Job not found",
-+                            "trace_id": trace_id,
+-        job = JOB_RUNNER.submit(task_payload)
++        trace_id = getattr(g, "trace_id", None)
++        job = JOB_RUNNER.submit(task_payload, trace_id=trace_id)
+         sync_raw = payload.get("sync", request.args.get("sync"))
+         sync_requested = str(sync_raw).lower() in {"1", "true", "yes"}
+ 
+         if sync_requested:
+             finished = JOB_RUNNER.wait(job.id, timeout=JOB_RUNNER.soft_timeout())
+             snapshot = JOB_RUNNER.get_job(job.id)
+-            if finished and snapshot:
++            if snapshot:
+                 status = snapshot.get("status")
+                 if status == JobStatus.SUCCEEDED.value and snapshot.get("result"):
+                     response_payload = _format_generation_success(snapshot["result"])
+                     response_payload["job_id"] = job.id
+-                    response_payload["degradation_flags"] = snapshot.get("degradation_flags")
++                    response_payload["degradation_flags"] = snapshot.get("degradation_flags") or []
++                    response_payload["trace_id"] = snapshot.get("trace_id")
+                     return jsonify(response_payload)
+                 if status == JobStatus.FAILED.value:
+-                    trace_id = getattr(g, "trace_id", None)
++                    trace_id = snapshot.get("trace_id") or getattr(g, "trace_id", None)
++                    error_payload = snapshot.get("error") or {}
++                    message = error_payload.get("message") if isinstance(error_payload, dict) else str(error_payload)
+                     return (
+                         jsonify(
+                             {
+                                 "error": {
+-                                    "message": snapshot.get("error") or "Generation failed",
++                                    "message": message or "Generation failed",
+                                     "trace_id": trace_id,
+                                 },
+                                 "job_id": job.id,
+                                 "status": status,
+                             }
+                         ),
+                         500,
+                     )
++            if finished:
++                # No snapshot available, treat as failure
++                trace_id = getattr(g, "trace_id", None)
++                return (
++                    jsonify(
++                        {
++                            "error": {
++                                "message": "Job completed without result",
++                                "trace_id": trace_id,
++                            },
++                            "job_id": job.id,
 +                        }
-+                    }
-+                ),
-+                404,
-+            )
-+        return jsonify(snapshot)
++                    ),
++                    500,
++                )
+ 
+         snapshot = JOB_RUNNER.get_job(job.id) or job.to_dict()
+         response_payload = {
+             "job_id": job.id,
+             "status": snapshot.get("status", JobStatus.PENDING.value),
+             "steps": snapshot.get("steps"),
+             "result": snapshot.get("result"),
+             "degradation_flags": snapshot.get("degradation_flags"),
++            "trace_id": snapshot.get("trace_id") or getattr(g, "trace_id", None),
+         }
+-        return jsonify(response_payload), 202
++        http_status = 200 if response_payload["status"] == JobStatus.SUCCEEDED.value else 202
++        return jsonify(response_payload), http_status
+ 
+     @app.get("/api/jobs/<job_id>")
+     def job_status(job_id: str):
+         snapshot = JOB_RUNNER.get_job(job_id)
+         if not snapshot:
+             trace_id = getattr(g, "trace_id", None)
+             return (
+                 jsonify(
+                     {
+                         "error": {
+                             "message": "Job not found",
+                             "trace_id": trace_id,
+                         }
+                     }
+                 ),
+                 404,
+             )
+         return jsonify(snapshot)
  
      @app.post("/api/reindex")
      def reindex():
@@ -1015,26 +1711,7 @@ index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d64
          theme = str(payload.get("theme", "")).strip()
          if not theme:
              raise ApiError("Не указана тема (theme)")
- 
-         try:
-             stats = build_index(theme)
-         except FileNotFoundError as exc:
-             raise ApiError(str(exc), status_code=404) from exc
-         except RuntimeError as exc:
-             raise ApiError(str(exc), status_code=400) from exc
- 
-         invalidate_style_profile_cache()
-         return jsonify(stats)
- 
-     @app.get("/api/artifacts")
-     def list_artifacts():
-         theme = request.args.get("theme")
-         items = list_artifact_cards(theme, auto_cleanup=True)
-         return jsonify(items)
- 
-     @app.delete("/api/artifacts")
-@@ -395,50 +462,59 @@ def create_app() -> Flask:
-     @app.get("/api/artifacts/download")
+@@ -463,58 +491,78 @@ def create_app() -> Flask:
      def download_artifact():
          raw_path = request.args.get("path")
          if not raw_path:
@@ -1059,15 +1736,35 @@ index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d64
      def health():
          theme = request.args.get("theme")
          status = gather_health_status(theme)
-+        checks = status.setdefault("checks", {})
-+        checks["openai_rate_limits"] = {
-+            "ok": True,
-+            "message": f"Лимиты клиента активны: {OPENAI_RPS} rps / {OPENAI_RPM} rpm",
+         checks = status.setdefault("checks", {})
++        metrics_snapshot = get_registry().snapshot()
++        queue_len = int(metrics_snapshot.get("jobs.queue_length", 0))
+         checks["openai_rate_limits"] = {
+             "ok": True,
+             "message": f"Лимиты клиента активны: {OPENAI_RPS} rps / {OPENAI_RPM} rpm",
+         }
+         checks["job_runner"] = {
+             "ok": True,
+             "message": f"Очередь заданий: {len(JOB_STORE)}; soft timeout={JOB_RUNNER.soft_timeout()}s",
+         }
++        checks["job_queue"] = {
++            "ok": queue_len < 10,
++            "message": f"Размер очереди: {queue_len}",
 +        }
-+        checks["job_runner"] = {
-+            "ok": True,
-+            "message": f"Очередь заданий: {len(JOB_STORE)}; soft timeout={JOB_RUNNER.soft_timeout()}s",
-+        }
++        if theme:
++            profile_path = (Path("profiles") / theme / "style_profile.md").resolve()
++            try:
++                mtime = profile_path.stat().st_mtime
++                freshness_days = max(0, (time.time() - mtime) / 86400.0)
++                checks["theme_profile_freshness"] = {
++                    "ok": freshness_days < 30,
++                    "message": f"Профиль обновлен {freshness_days:.1f} дн. назад",
++                }
++            except FileNotFoundError:
++                checks["theme_profile_freshness"] = {
++                    "ok": False,
++                    "message": f"Файл профиля не найден: {profile_path.as_posix()}",
++                }
          http_status = 200 if status.get("ok") else 503
          return jsonify(status), http_status
  
@@ -1093,431 +1790,667 @@ index 6b0e8689462d82b38ffaaa55e7982a52e221e3b8..97c56956ceaad363ff36e64f16581d64
  
          if (template_root / "index.html").exists():
              return render_template("index.html")
-@@ -610,50 +686,73 @@ def _extract_keywords(glossary_path: Path) -> List[str]:
-     keywords: List[str] = []
-     for line in glossary_path.read_text(encoding="utf-8").splitlines():
-         cleaned = line.strip()
-         if not cleaned:
-             continue
-         keyword = cleaned.split("—", 1)[0].strip()
-         if keyword:
-             keywords.append(keyword)
-         if len(keywords) >= 6:
-             break
-     return keywords
- 
- 
- def _load_pipeline_config(theme_dir: Path) -> Dict[str, Any]:
-     config_path = theme_dir / PIPELINE_CONFIG_FILENAME
-     if not config_path.exists():
-         return {}
-     try:
-         payload = json.loads(config_path.read_text(encoding="utf-8"))
-     except json.JSONDecodeError:
-         LOGGER.warning("Повреждён pipeline config: %s", config_path)
-         return {}
-     return payload if isinstance(payload, dict) else {}
- 
- 
-+def _format_generation_success(result: Dict[str, Any]) -> Dict[str, Any]:
-+    payload: Dict[str, Any] = {
-+        "markdown": result.get("text"),
-+        "meta_json": result.get("metadata"),
-+        "artifact_paths": result.get("artifact_paths"),
-+    }
-+    metadata = result.get("metadata") or {}
-+    if isinstance(metadata, dict):
-+        if metadata.get("style_profile_applied"):
-+            payload["style_profile_applied"] = True
-+            if metadata.get("style_profile_source"):
-+                payload["style_profile_source"] = metadata["style_profile_source"]
-+            if metadata.get("style_profile_variant"):
-+                payload["style_profile_variant"] = metadata["style_profile_variant"]
-+        if metadata.get("keywords_manual") is not None:
-+            payload["keywords_manual"] = metadata.get("keywords_manual")
-+        payload["model_used"] = metadata.get("model_used")
-+        payload["fallback_used"] = metadata.get("fallback_used")
-+        payload["fallback_reason"] = metadata.get("fallback_reason")
-+        payload["api_route"] = metadata.get("api_route")
-+    return payload
-+
-+
- def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[str, Any]:
-     topic = str(data.get("theme") or data.get("goal") or theme).strip() or "Тема не указана"
-     markdown = (
-         f"# Черновик (dry run)\n\n"
-         f"Тематика: {theme}\n\n"
-         f"Запрошенная тема: {topic}\n\n"
-         "Этот ответ сформирован без обращения к модели."
-     )
-     generated_at = datetime.utcnow().isoformat()
-     metadata: Dict[str, Any] = {
-         "model_used": "dry-run",
-         "characters": len(markdown),
-         "generated_at": generated_at,
-         "theme": theme,
-         "retrieval_k": k,
-         "input_data": data,
-         "clips": [],
-         "context_used": False,
-         "context_index_missing": False,
-         "context_budget_tokens_est": 0,
-         "context_budget_tokens_limit": 0,
-         "system_prompt_preview": "",
-         "user_prompt_preview": "",
-         "retry_used": False,
-         "plagiarism_detected": False,
 diff --git a/services/__init__.py b/services/__init__.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..12e78ef468516ef20527bd8dbb560e5e86e764b0
---- /dev/null
+index 12e78ef468516ef20527bd8dbb560e5e86e764b0..2233740e714ef98a9ddeeb1557bb5b8dc9d760a7 100644
+--- a/services/__init__.py
 +++ b/services/__init__.py
-@@ -0,0 +1,14 @@
-+"""Service layer utilities."""
-+
-+from .llm_client import OpenAIClient, RetryPolicy, get_default_client  # noqa: F401
-+from .guardrails import parse_jsonld_or_repair  # noqa: F401
-+from .rag_client import RAGClient, RAGResult  # noqa: F401
-+
-+__all__ = [
-+    "OpenAIClient",
-+    "RetryPolicy",
-+    "get_default_client",
-+    "parse_jsonld_or_repair",
-+    "RAGClient",
-+    "RAGResult",
-+]
+@@ -1,14 +1,15 @@
+ """Service layer utilities."""
+ 
+ from .llm_client import OpenAIClient, RetryPolicy, get_default_client  # noqa: F401
+-from .guardrails import parse_jsonld_or_repair  # noqa: F401
++from .guardrails import GuardrailResult, parse_and_repair_jsonld  # noqa: F401
+ from .rag_client import RAGClient, RAGResult  # noqa: F401
+ 
+ __all__ = [
+     "OpenAIClient",
+     "RetryPolicy",
+     "get_default_client",
+-    "parse_jsonld_or_repair",
++    "GuardrailResult",
++    "parse_and_repair_jsonld",
+     "RAGClient",
+     "RAGResult",
+ ]
 diff --git a/services/guardrails.py b/services/guardrails.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..c53de6999c0000509149c107c4ac73430cc126f8
---- /dev/null
+index c53de6999c0000509149c107c4ac73430cc126f8..52d10329d89a089a13fc98c6bbf386a16a4d20a4 100644
+--- a/services/guardrails.py
 +++ b/services/guardrails.py
-@@ -0,0 +1,128 @@
-+"""Post-generation guardrails and repair routines."""
-+from __future__ import annotations
-+
-+import json
-+import logging
-+import re
-+from typing import Dict, Iterable, List, Tuple
-+
-+LOGGER = logging.getLogger("content_factory.guardrails")
-+
-+_SCRIPT_RE = re.compile(r"<script[^>]*>(?P<body>.*?)</script>", re.DOTALL | re.IGNORECASE)
-+
-+
-+def _strip_script_tag(payload: str) -> str:
-+    match = _SCRIPT_RE.search(payload)
-+    if not match:
-+        return payload
-+    return match.group("body").strip()
-+
-+
-+def _normalize_json(candidate: str) -> str:
-+    """Apply lightweight normalisation to improve JSON parsing odds."""
-+
-+    normalized = candidate.strip()
-+    if not normalized:
-+        return normalized
-+    # Replace smart quotes and ensure standard quotes are used.
-+    normalized = normalized.replace("\u201c", '"').replace("\u201d", '"')
-+    normalized = normalized.replace("\u2018", '"').replace("\u2019", '"')
-+    # Remove trailing commas before closing braces/brackets.
-+    normalized = re.sub(r",\s*(\]|\})", r"\1", normalized)
-+    return normalized
+@@ -1,128 +1,175 @@
+-"""Post-generation guardrails and repair routines."""
++"""Soft guardrails for structured model output."""
+ from __future__ import annotations
+ 
+ import json
+ import logging
+ import re
+-from typing import Dict, Iterable, List, Tuple
++from dataclasses import dataclass, field
++from typing import Any, Dict, Iterable, List, Optional
+ 
+ LOGGER = logging.getLogger("content_factory.guardrails")
+ 
+ _SCRIPT_RE = re.compile(r"<script[^>]*>(?P<body>.*?)</script>", re.DOTALL | re.IGNORECASE)
++_SMART_QUOTES = {
++    "\u201c": '"',
++    "\u201d": '"',
++    "\u2018": '"',
++    "\u2019": '"',
++    "\u00ab": '"',
++    "\u00bb": '"',
++}
 +
 +
-+def _extract_faq_entries(document: Dict[str, object]) -> List[Dict[str, str]]:
-+    entities: Iterable[object] = []
-+    if isinstance(document, dict):
-+        if document.get("@type") == "FAQPage" and isinstance(document.get("mainEntity"), list):
-+            entities = document.get("mainEntity", [])
-+        elif isinstance(document.get("faq"), list):
-+            entities = document.get("faq", [])
-+    parsed: List[Dict[str, str]] = []
-+    for entity in entities:
-+        if not isinstance(entity, dict):
-+            continue
-+        if entity.get("@type") == "Question":
-+            question = str(entity.get("name", "")).strip()
-+            answer_block = entity.get("acceptedAnswer")
-+            if isinstance(answer_block, dict):
-+                answer_text = str(answer_block.get("text", "")).strip()
-+            else:
-+                answer_text = str(answer_block or "").strip()
-+        else:
-+            question = str(entity.get("question", "")).strip()
-+            answer_text = str(entity.get("answer", "")).strip()
-+        if question and answer_text:
-+            parsed.append({"question": question, "answer": answer_text})
-+    return parsed
++@dataclass(slots=True)
++class GuardrailResult:
++    """Outcome of JSON-LD parsing with repair attempts."""
++
++    ok: bool
++    faq_entries: List[Dict[str, str]]
++    attempts: int
++    degradation_flags: List[str] = field(default_factory=list)
++    repaired_json: Optional[str] = None
++    error: Optional[str] = None
 +
 +
-+def parse_jsonld_or_repair(text: str) -> Tuple[List[Dict[str, str]], int, bool]:
-+    """Parse FAQ JSON-LD, attempting repairs when needed."""
++def parse_and_repair_jsonld(raw_payload: Any, *, trace_id: Optional[str] = None, max_repairs: int = 2) -> GuardrailResult:
++    """Parse JSON-LD payload with light-weight repair strategies."""
 +
++    text_candidate = _normalize_payload(raw_payload)
++    if not text_candidate:
++        return GuardrailResult(
++            ok=False,
++            faq_entries=[],
++            attempts=0,
++            degradation_flags=["jsonld_missing"],
++            error="empty_payload",
++        )
+ 
 +    attempts = 0
-+    degraded = False
-+    if not text:
-+        return [], attempts, degraded
-+
-+    candidates = [text, _strip_script_tag(text)]
-+    normalized_candidates = []
++    candidates = _build_candidates(text_candidate)
++    degradation_flags: List[str] = []
+ 
+-def _strip_script_tag(payload: str) -> str:
+-    match = _SCRIPT_RE.search(payload)
+-    if not match:
+-        return payload
+-    return match.group("body").strip()
+-
+-
+-def _normalize_json(candidate: str) -> str:
+-    """Apply lightweight normalisation to improve JSON parsing odds."""
+-
+-    normalized = candidate.strip()
+-    if not normalized:
+-        return normalized
+-    # Replace smart quotes and ensure standard quotes are used.
+-    normalized = normalized.replace("\u201c", '"').replace("\u201d", '"')
+-    normalized = normalized.replace("\u2018", '"').replace("\u2019", '"')
+-    # Remove trailing commas before closing braces/brackets.
+-    normalized = re.sub(r",\s*(\]|\})", r"\1", normalized)
+-    return normalized
 +    for candidate in candidates:
-+        normalized = _normalize_json(candidate)
-+        if normalized and normalized not in normalized_candidates:
-+            normalized_candidates.append(normalized)
-+
-+    for candidate in normalized_candidates:
 +        attempts += 1
-+        try:
-+            document = json.loads(candidate)
-+        except json.JSONDecodeError as exc:
-+            LOGGER.debug("Failed to parse JSON-LD candidate: %s", exc)
-+            continue
-+        faq_entries = _extract_faq_entries(document)
++        faq_entries, repaired = _try_parse_candidate(candidate)
 +        if faq_entries:
-+            return faq_entries, attempts, degraded
++            return GuardrailResult(
++                ok=True,
++                faq_entries=faq_entries,
++                attempts=attempts,
++                degradation_flags=degradation_flags,
++                repaired_json=repaired,
++            )
 +
-+    # Second pass: try to wrap bare arrays/objects into a FAQ schema.
-+    for candidate in normalized_candidates:
++    # Repair loop: we do not call external services here, but we try to coerce structures.
++    repair_attempt = 0
++    last_error = "parse_failed"
++    while repair_attempt < max_repairs:
++        repair_attempt += 1
 +        attempts += 1
++        repaired_text = _apply_repair_heuristics(text_candidate, iteration=repair_attempt)
++        faq_entries, repaired_json = _try_parse_candidate(repaired_text)
++        if faq_entries:
++            degradation_flags.append("jsonld_repaired")
++            return GuardrailResult(
++                ok=True,
++                faq_entries=faq_entries,
++                attempts=attempts,
++                degradation_flags=degradation_flags,
++                repaired_json=repaired_json,
++            )
++        last_error = "repair_failed"
++
++    degradation_flags.append("jsonld_missing")
++    LOGGER.warning("JSON-LD parsing failed", extra={"trace_id": trace_id, "attempts": attempts})
++    return GuardrailResult(
++        ok=False,
++        faq_entries=[],
++        attempts=attempts,
++        degradation_flags=degradation_flags,
++        error=last_error,
++    )
++
++
++def _normalize_payload(raw_payload: Any) -> str:
++    if isinstance(raw_payload, (dict, list)):
 +        try:
-+            document = json.loads(candidate)
-+        except json.JSONDecodeError:
++            return json.dumps(raw_payload, ensure_ascii=False)
++        except TypeError:
++            return ""
++    if not isinstance(raw_payload, str):
++        return ""
++    text = raw_payload.strip()
++    if not text:
++        return ""
++    return text.translate(str.maketrans(_SMART_QUOTES))
++
++
++def _build_candidates(text: str) -> List[str]:
++    candidates = [text]
++    script_match = _SCRIPT_RE.search(text)
++    if script_match:
++        body = script_match.group("body").strip()
++        if body and body not in candidates:
++            candidates.append(body)
++    compact = re.sub(r",\s*(\]|\})", r"\1", text)
++    if compact and compact not in candidates:
++        candidates.append(compact)
++    return candidates
++
++
++def _try_parse_candidate(candidate: str) -> tuple[List[Dict[str, str]], Optional[str]]:
++    try:
++        document = json.loads(candidate)
++    except json.JSONDecodeError:
++        return [], None
++    faq_entries = _extract_faq_entries(document)
++    if faq_entries:
++        try:
++            repaired = json.dumps(document, ensure_ascii=False)
++        except TypeError:
++            repaired = candidate
++        return faq_entries, repaired
++    return [], None
+ 
+ 
+-def _extract_faq_entries(document: Dict[str, object]) -> List[Dict[str, str]]:
+-    entities: Iterable[object] = []
++def _extract_faq_entries(document: Any) -> List[Dict[str, str]]:
++    entries: Iterable[Any] = []
+     if isinstance(document, dict):
+         if document.get("@type") == "FAQPage" and isinstance(document.get("mainEntity"), list):
+-            entities = document.get("mainEntity", [])
++            entries = document.get("mainEntity", [])
+         elif isinstance(document.get("faq"), list):
+-            entities = document.get("faq", [])
+-    parsed: List[Dict[str, str]] = []
+-    for entity in entities:
+-        if not isinstance(entity, dict):
+-            continue
+-        if entity.get("@type") == "Question":
+-            question = str(entity.get("name", "")).strip()
+-            answer_block = entity.get("acceptedAnswer")
+-            if isinstance(answer_block, dict):
+-                answer_text = str(answer_block.get("text", "")).strip()
++            entries = document.get("faq", [])
++        elif isinstance(document.get("items"), list):
++            entries = document.get("items", [])
++    elif isinstance(document, list):
++        entries = document
++
++    normalized: List[Dict[str, str]] = []
++    for item in entries:
++        if isinstance(item, dict):
++            question = str(item.get("question") or item.get("name") or item.get("q") or "").strip()
++            answer_field = item.get("answer") or item.get("acceptedAnswer") or item.get("a")
++            if isinstance(answer_field, dict):
++                answer = str(answer_field.get("text") or "").strip()
+             else:
+-                answer_text = str(answer_block or "").strip()
++                answer = str(answer_field or "").strip()
++        elif isinstance(item, (list, tuple)) and len(item) >= 2:
++            question = str(item[0]).strip()
++            answer = str(item[1]).strip()
+         else:
+-            question = str(entity.get("question", "")).strip()
+-            answer_text = str(entity.get("answer", "")).strip()
+-        if question and answer_text:
+-            parsed.append({"question": question, "answer": answer_text})
+-    return parsed
+-
 +            continue
-+        if isinstance(document, list):
-+            faq_entries = []
-+            for idx, item in enumerate(document, start=1):
-+                if isinstance(item, dict):
-+                    question = str(item.get("q") or item.get("question") or "").strip()
-+                    answer = str(item.get("a") or item.get("answer") or "").strip()
-+                    if question and answer:
-+                        faq_entries.append({"question": question, "answer": answer})
-+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
-+                    question = str(item[0]).strip()
-+                    answer = str(item[1]).strip()
-+                    if question and answer:
-+                        faq_entries.append({"question": question, "answer": answer})
-+            if faq_entries:
-+                degraded = True
-+                return faq_entries, attempts, degraded
-+        if isinstance(document, dict):
-+            faq_field = document.get("faq")
-+            if isinstance(faq_field, list):
-+                repaired = []
-+                for entry in faq_field:
-+                    if not isinstance(entry, dict):
-+                        continue
-+                    question = str(entry.get("q") or entry.get("question") or "").strip()
-+                    answer = str(entry.get("a") or entry.get("answer") or "").strip()
-+                    if question and answer:
-+                        repaired.append({"question": question, "answer": answer})
-+                if repaired:
-+                    degraded = True
-+                    return repaired, attempts, degraded
-+
-+    # Parsing failed
-+    degraded = True
-+    LOGGER.warning("JSON-LD parsing failed after %d attempts", attempts)
-+    return [], attempts, degraded
++        if question and answer:
++            normalized.append({"question": question, "answer": answer})
++    return normalized
+ 
+-def parse_jsonld_or_repair(text: str) -> Tuple[List[Dict[str, str]], int, bool]:
+-    """Parse FAQ JSON-LD, attempting repairs when needed."""
+ 
+-    attempts = 0
+-    degraded = False
+-    if not text:
+-        return [], attempts, degraded
+-
+-    candidates = [text, _strip_script_tag(text)]
+-    normalized_candidates = []
+-    for candidate in candidates:
+-        normalized = _normalize_json(candidate)
+-        if normalized and normalized not in normalized_candidates:
+-            normalized_candidates.append(normalized)
++def _apply_repair_heuristics(text: str, *, iteration: int) -> str:
++    if iteration == 1:
++        return text.replace("'", '"')
++    normalized = re.sub(r",\s*(\]|\})", r"\1", text)
++    normalized = normalized.replace("`", '"')
++    return normalized
+ 
+-    for candidate in normalized_candidates:
+-        attempts += 1
+-        try:
+-            document = json.loads(candidate)
+-        except json.JSONDecodeError as exc:
+-            LOGGER.debug("Failed to parse JSON-LD candidate: %s", exc)
+-            continue
+-        faq_entries = _extract_faq_entries(document)
+-        if faq_entries:
+-            return faq_entries, attempts, degraded
+ 
+-    # Second pass: try to wrap bare arrays/objects into a FAQ schema.
+-    for candidate in normalized_candidates:
+-        attempts += 1
+-        try:
+-            document = json.loads(candidate)
+-        except json.JSONDecodeError:
+-            continue
+-        if isinstance(document, list):
+-            faq_entries = []
+-            for idx, item in enumerate(document, start=1):
+-                if isinstance(item, dict):
+-                    question = str(item.get("q") or item.get("question") or "").strip()
+-                    answer = str(item.get("a") or item.get("answer") or "").strip()
+-                    if question and answer:
+-                        faq_entries.append({"question": question, "answer": answer})
+-                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+-                    question = str(item[0]).strip()
+-                    answer = str(item[1]).strip()
+-                    if question and answer:
+-                        faq_entries.append({"question": question, "answer": answer})
+-            if faq_entries:
+-                degraded = True
+-                return faq_entries, attempts, degraded
+-        if isinstance(document, dict):
+-            faq_field = document.get("faq")
+-            if isinstance(faq_field, list):
+-                repaired = []
+-                for entry in faq_field:
+-                    if not isinstance(entry, dict):
+-                        continue
+-                    question = str(entry.get("q") or entry.get("question") or "").strip()
+-                    answer = str(entry.get("a") or entry.get("answer") or "").strip()
+-                    if question and answer:
+-                        repaired.append({"question": question, "answer": answer})
+-                if repaired:
+-                    degraded = True
+-                    return repaired, attempts, degraded
+-
+-    # Parsing failed
+-    degraded = True
+-    LOGGER.warning("JSON-LD parsing failed after %d attempts", attempts)
+-    return [], attempts, degraded
++__all__ = ["GuardrailResult", "parse_and_repair_jsonld"]
 diff --git a/services/llm_client.py b/services/llm_client.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..9cef7fc9ebfbeb3b4025f579541e7f2a209295fc
---- /dev/null
+index 9cef7fc9ebfbeb3b4025f579541e7f2a209295fc..61faacb0357f818eebdf8b28ac015aba129d7005 100644
+--- a/services/llm_client.py
 +++ b/services/llm_client.py
-@@ -0,0 +1,142 @@
-+"""Unified OpenAI client facade with rate limiting and idempotency."""
-+from __future__ import annotations
-+
-+import hashlib
-+import json
-+import random
-+import threading
-+import time
-+from collections import deque
-+from dataclasses import dataclass
-+from typing import Dict, Iterable, List, Optional, Sequence
-+
-+from config import OPENAI_MAX_RETRIES, OPENAI_RPM, OPENAI_RPS, OPENAI_TIMEOUT_S
-+from llm_client import GenerationResult, generate as _legacy_generate
-+
-+
+@@ -1,142 +1,238 @@
+ """Unified OpenAI client facade with rate limiting and idempotency."""
+ from __future__ import annotations
+ 
+ import hashlib
+ import json
+ import random
+ import threading
+ import time
+ from collections import deque
+ from dataclasses import dataclass
+ from typing import Dict, Iterable, List, Optional, Sequence
+ 
+-from config import OPENAI_MAX_RETRIES, OPENAI_RPM, OPENAI_RPS, OPENAI_TIMEOUT_S
++from config import (
++    G5_MAX_OUTPUT_TOKENS_MAX,
++    OPENAI_CACHE_TTL_S,
++    OPENAI_CLIENT_MAX_QUEUE,
++    OPENAI_MAX_RETRIES,
++    OPENAI_RPM,
++    OPENAI_RPS,
++    OPENAI_TIMEOUT_S,
++)
+ from llm_client import GenerationResult, generate as _legacy_generate
++from observability.logger import get_logger
+ 
+ 
+ @dataclass
+ class RetryPolicy:
+     max_retries: int = OPENAI_MAX_RETRIES
+     base_delay: float = 0.4
+     jitter: float = 0.3
+ 
+ 
 +@dataclass
-+class RetryPolicy:
-+    max_retries: int = OPENAI_MAX_RETRIES
-+    base_delay: float = 0.4
-+    jitter: float = 0.3
++class _CacheEntry:
++    result: GenerationResult
++    expires_at: float
 +
 +
-+class _RateLimiter:
-+    def __init__(self, *, rps: int, rpm: int) -> None:
-+        self._rps = max(1, rps)
-+        self._rpm = max(self._rps, rpm)
-+        self._per_second: deque[float] = deque()
-+        self._per_minute: deque[float] = deque()
-+        self._lock = threading.Lock()
-+
-+    def acquire(self) -> None:
-+        while True:
-+            with self._lock:
-+                now = time.monotonic()
-+                self._trim(now)
-+                if len(self._per_second) < self._rps and len(self._per_minute) < self._rpm:
-+                    self._per_second.append(now)
-+                    self._per_minute.append(now)
-+                    return
-+                wait_options: List[float] = []
-+                if self._per_second:
-+                    wait_options.append(1.0 - (now - self._per_second[0]))
-+                if self._per_minute:
-+                    wait_options.append(60.0 - (now - self._per_minute[0]))
-+            delay = max(0.05, min(wait_options) if wait_options else 0.05)
-+            time.sleep(delay)
-+
-+    def _trim(self, now: float) -> None:
-+        while self._per_second and now - self._per_second[0] >= 1.0:
-+            self._per_second.popleft()
-+        while self._per_minute and now - self._per_minute[0] >= 60.0:
-+            self._per_minute.popleft()
-+
-+
-+class OpenAIClient:
-+    """High-level facade delegating to the legacy generator with safeguards."""
-+
-+    def __init__(self) -> None:
-+        self._limiter = _RateLimiter(rps=OPENAI_RPS, rpm=OPENAI_RPM)
-+        self._cache: Dict[str, GenerationResult] = {}
-+        self._lock = threading.Lock()
-+
-+    def _make_key(
-+        self,
-+        *,
-+        system: str,
-+        messages: Sequence[Dict[str, str]],
-+        seed: Optional[str],
-+        structure: Optional[Iterable[str]],
-+    ) -> str:
-+        payload = {
-+            "system": system or "",
-+            "messages": list(messages),
-+            "seed": seed or "",
-+            "structure": list(structure) if structure else [],
-+        }
-+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-+
-+    def generate(
-+        self,
-+        *,
-+        system: str,
-+        messages: Sequence[Dict[str, str]],
-+        model: str = "gpt-5",
-+        response_format: str = "text",
-+        timeout: Optional[int] = None,
-+        retry_policy: Optional[RetryPolicy] = None,
-+        seed: Optional[str] = None,
-+        structure: Optional[Iterable[str]] = None,
-+        temperature: float = 0.3,
-+        max_tokens: int = 1400,
-+    ) -> GenerationResult:
-+        policy = retry_policy or RetryPolicy()
-+        key = self._make_key(system=system, messages=messages, seed=seed, structure=structure)
+ class _RateLimiter:
+     def __init__(self, *, rps: int, rpm: int) -> None:
+         self._rps = max(1, rps)
+         self._rpm = max(self._rps, rpm)
+         self._per_second: deque[float] = deque()
+         self._per_minute: deque[float] = deque()
+         self._lock = threading.Lock()
+ 
+     def acquire(self) -> None:
+         while True:
+             with self._lock:
+                 now = time.monotonic()
+                 self._trim(now)
+                 if len(self._per_second) < self._rps and len(self._per_minute) < self._rpm:
+                     self._per_second.append(now)
+                     self._per_minute.append(now)
+                     return
+                 wait_options: List[float] = []
+                 if self._per_second:
+                     wait_options.append(1.0 - (now - self._per_second[0]))
+                 if self._per_minute:
+                     wait_options.append(60.0 - (now - self._per_minute[0]))
+             delay = max(0.05, min(wait_options) if wait_options else 0.05)
+             time.sleep(delay)
+ 
+     def _trim(self, now: float) -> None:
+         while self._per_second and now - self._per_second[0] >= 1.0:
+             self._per_second.popleft()
+         while self._per_minute and now - self._per_minute[0] >= 60.0:
+             self._per_minute.popleft()
+ 
+ 
+ class OpenAIClient:
+     """High-level facade delegating to the legacy generator with safeguards."""
+ 
+     def __init__(self) -> None:
+         self._limiter = _RateLimiter(rps=OPENAI_RPS, rpm=OPENAI_RPM)
+-        self._cache: Dict[str, GenerationResult] = {}
++        self._cache: Dict[str, _CacheEntry] = {}
+         self._lock = threading.Lock()
++        self._pending_lock = threading.Condition()
++        self._pending_requests = 0
+ 
+     def _make_key(
+         self,
+         *,
+         system: str,
+         messages: Sequence[Dict[str, str]],
+         seed: Optional[str],
+         structure: Optional[Iterable[str]],
++        model: str,
++        temperature: float,
++        max_tokens: int,
++        response_format: str,
+     ) -> str:
+         payload = {
+             "system": system or "",
+             "messages": list(messages),
+             "seed": seed or "",
+             "structure": list(structure) if structure else [],
++            "model": model,
++            "temperature": temperature,
++            "max_tokens": max_tokens,
++            "response_format": response_format,
+         }
+         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+ 
++    def _get_cached(self, key: str) -> Optional[GenerationResult]:
 +        with self._lock:
-+            cached = self._cache.get(key)
-+        if cached:
-+            return cached
++            entry = self._cache.get(key)
++            if not entry:
++                return None
++            if entry.expires_at < time.time():
++                self._cache.pop(key, None)
++                return None
++            return entry.result
 +
-+        full_messages: List[Dict[str, str]] = []
-+        if system:
-+            full_messages.append({"role": "system", "content": system})
-+        full_messages.extend(dict(message) for message in messages)
++    def _set_cached(self, key: str, result: GenerationResult) -> None:
++        expires_at = time.time() + OPENAI_CACHE_TTL_S
++        with self._lock:
++            self._cache[key] = _CacheEntry(result=result, expires_at=expires_at)
 +
-+        attempts = 0
-+        last_error: Optional[Exception] = None
-+        while attempts <= policy.max_retries:
-+            attempts += 1
-+            self._limiter.acquire()
-+            try:
-+                result = _legacy_generate(
-+                    full_messages,
-+                    model=model,
-+                    temperature=temperature,
-+                    max_tokens=max_tokens,
-+                    timeout_s=timeout or OPENAI_TIMEOUT_S,
-+                )
-+                with self._lock:
-+                    self._cache[key] = result
-+                return result
-+            except Exception as exc:  # noqa: BLE001
-+                last_error = exc
-+                if attempts > policy.max_retries:
-+                    break
-+                delay = policy.base_delay * (2 ** (attempts - 1))
-+                jitter = random.random() * policy.jitter
-+                time.sleep(delay + jitter)
-+        if last_error:
-+            raise last_error
-+        raise RuntimeError("OpenAI client failed without raising an error")
++    def _acquire_slot(self) -> None:
++        with self._pending_lock:
++            while self._pending_requests >= OPENAI_CLIENT_MAX_QUEUE:
++                self._pending_lock.wait()
++            self._pending_requests += 1
++
++    def _release_slot(self) -> None:
++        with self._pending_lock:
++            self._pending_requests = max(0, self._pending_requests - 1)
++            self._pending_lock.notify()
++
+     def generate(
+         self,
+         *,
+         system: str,
+         messages: Sequence[Dict[str, str]],
+         model: str = "gpt-5",
+         response_format: str = "text",
+         timeout: Optional[int] = None,
+         retry_policy: Optional[RetryPolicy] = None,
+         seed: Optional[str] = None,
+         structure: Optional[Iterable[str]] = None,
+         temperature: float = 0.3,
+         max_tokens: int = 1400,
+     ) -> GenerationResult:
+         policy = retry_policy or RetryPolicy()
+-        key = self._make_key(system=system, messages=messages, seed=seed, structure=structure)
+-        with self._lock:
+-            cached = self._cache.get(key)
++        key = self._make_key(
++            system=system,
++            messages=messages,
++            seed=seed,
++            structure=structure,
++            model=model,
++            temperature=temperature,
++            max_tokens=max_tokens,
++            response_format=response_format,
++        )
++        cached = self._get_cached(key)
+         if cached:
++            LOGGER.info("llm_cache_hit", extra={"model": model, "max_tokens": max_tokens})
+             return cached
+ 
+         full_messages: List[Dict[str, str]] = []
+         if system:
+             full_messages.append({"role": "system", "content": system})
+         full_messages.extend(dict(message) for message in messages)
+ 
++        resolved_max_tokens = min(max_tokens, G5_MAX_OUTPUT_TOKENS_MAX)
++        if resolved_max_tokens != max_tokens:
++            LOGGER.warning(
++                "llm_max_tokens_capped",
++                extra={
++                    "requested": max_tokens,
++                    "cap": G5_MAX_OUTPUT_TOKENS_MAX,
++                    "resolved": resolved_max_tokens,
++                },
++            )
++
+         attempts = 0
+         last_error: Optional[Exception] = None
+-        while attempts <= policy.max_retries:
+-            attempts += 1
+-            self._limiter.acquire()
+-            try:
+-                result = _legacy_generate(
+-                    full_messages,
+-                    model=model,
+-                    temperature=temperature,
+-                    max_tokens=max_tokens,
+-                    timeout_s=timeout or OPENAI_TIMEOUT_S,
+-                )
+-                with self._lock:
+-                    self._cache[key] = result
+-                return result
+-            except Exception as exc:  # noqa: BLE001
+-                last_error = exc
+-                if attempts > policy.max_retries:
+-                    break
+-                delay = policy.base_delay * (2 ** (attempts - 1))
+-                jitter = random.random() * policy.jitter
+-                time.sleep(delay + jitter)
++        self._acquire_slot()
++        try:
++            while attempts <= policy.max_retries:
++                attempts += 1
++                self._limiter.acquire()
++                started_at = time.perf_counter()
++                try:
++                    result = _legacy_generate(
++                        full_messages,
++                        model=model,
++                        temperature=temperature,
++                        max_tokens=resolved_max_tokens,
++                        timeout_s=timeout or OPENAI_TIMEOUT_S,
++                    )
++                    duration_ms = int((time.perf_counter() - started_at) * 1000)
++                    LOGGER.info(
++                        "llm_request_succeeded",
++                        extra={
++                            "model": model,
++                            "attempt": attempts,
++                            "duration_ms": duration_ms,
++                            "max_tokens": resolved_max_tokens,
++                        },
++                    )
++                    self._set_cached(key, result)
++                    return result
++                except Exception as exc:  # noqa: BLE001
++                    last_error = exc
++                    LOGGER.warning(
++                        "llm_request_failed",
++                        extra={
++                            "model": model,
++                            "attempt": attempts,
++                            "error": str(exc),
++                        },
++                    )
++                    if attempts > policy.max_retries:
++                        break
++                    delay = policy.base_delay * (2 ** (attempts - 1))
++                    jitter = random.random() * policy.jitter
++                    time.sleep(delay + jitter)
++        finally:
++            self._release_slot()
+         if last_error:
+             raise last_error
+         raise RuntimeError("OpenAI client failed without raising an error")
+ 
+ 
+ _default_client = OpenAIClient()
+ 
+ 
+ def get_default_client() -> OpenAIClient:
+     return _default_client
+ 
+ 
++LOGGER = get_logger("content_factory.services.llm_client")
 +
 +
-+_default_client = OpenAIClient()
-+
-+
-+def get_default_client() -> OpenAIClient:
-+    return _default_client
-+
-+
-+__all__ = ["OpenAIClient", "RetryPolicy", "get_default_client"]
-diff --git a/services/rag_client.py b/services/rag_client.py
+ __all__ = ["OpenAIClient", "RetryPolicy", "get_default_client"]
+diff --git a/tests/test_guardrails.py b/tests/test_guardrails.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..dd5e7ddd2a0738d321753f9b5a62216ea9ac7b0f
+index 0000000000000000000000000000000000000000..78699b25728959c33f0895bff32289977e4f8ecc
 --- /dev/null
-+++ b/services/rag_client.py
-@@ -0,0 +1,45 @@
-+"""Resilient retrieval helper wrapping the legacy index utilities."""
++++ b/tests/test_guardrails.py
+@@ -0,0 +1,24 @@
++from services.guardrails import GuardrailResult, parse_and_repair_jsonld
++
++
++def test_parse_and_repair_jsonld_success():
++    payload = '{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Q","acceptedAnswer":{"text":"A"}}]}'
++    result = parse_and_repair_jsonld(payload)
++    assert isinstance(result, GuardrailResult)
++    assert result.ok is True
++    assert result.faq_entries == [{"question": "Q", "answer": "A"}]
++    assert result.degradation_flags == []
++
++
++def test_parse_and_repair_jsonld_repairs_single_quotes():
++    payload = "{'faq':[{'q':'What?','a':'Answer'}]}"
++    result = parse_and_repair_jsonld(payload)
++    assert result.ok is True
++    assert result.degradation_flags == ["jsonld_repaired"]
++    assert result.faq_entries == [{"question": "What?", "answer": "Answer"}]
++
++
++def test_parse_and_repair_jsonld_missing_payload():
++    result = parse_and_repair_jsonld("")
++    assert result.ok is False
++    assert "jsonld_missing" in result.degradation_flags
+diff --git a/tests/test_job_runner.py b/tests/test_job_runner.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a415ce4faafeb61df4fa96d0b6c31969cef55577
+--- /dev/null
++++ b/tests/test_job_runner.py
+@@ -0,0 +1,50 @@
 +from __future__ import annotations
 +
-+import logging
-+from dataclasses import dataclass
-+from typing import List, Sequence
++import pytest
 +
-+from assemble_messages import ContextBundle, retrieve_context
-+
-+LOGGER = logging.getLogger("content_factory.rag")
++from jobs.runner import JobRunner
++from jobs.store import JobStore
 +
 +
-+@dataclass
-+class RAGResult:
-+    documents: Sequence[dict]
-+    context_used: bool
-+    warnings: List[str]
++@pytest.fixture
++def job_store() -> JobStore:
++    return JobStore(ttl_seconds=30)
 +
 +
-+class RAGClient:
-+    """Best-effort RAG client that never interrupts the pipeline."""
++def test_job_runner_success(monkeypatch, job_store):
++    def _fake_generate(**_kwargs):
++        return {
++            "text": "Hello world",
++            "metadata": {
++                "jsonld": {
++                    "faq": [
++                        {"question": "What?", "answer": "Answer"},
++                    ]
++                }
++            },
++        }
 +
-+    def __init__(self, *, default_k: int = 3) -> None:
-+        self._default_k = max(0, int(default_k))
-+
-+    def fetch(self, *, theme: str, query: str, k: int | None = None) -> RAGResult:
-+        effective_k = self._default_k if k is None else max(0, int(k))
-+        if effective_k == 0:
-+            return RAGResult(documents=[], context_used=False, warnings=["retrieval_disabled"])
-+        try:
-+            bundle: ContextBundle = retrieve_context(theme_slug=theme, query=query, k=effective_k)
-+        except FileNotFoundError:
-+            LOGGER.warning("RAG index missing for theme=%s", theme)
-+            return RAGResult(documents=[], context_used=False, warnings=["index_missing"])
-+        except Exception as exc:  # noqa: BLE001
-+            LOGGER.warning("RAG retrieval failed: %s", exc)
-+            return RAGResult(documents=[], context_used=False, warnings=["retrieval_error"])
-+
-+        if not bundle.items:
-+            LOGGER.info("RAG returned no documents", extra={"theme": theme})
-+            return RAGResult(documents=[], context_used=False, warnings=["empty_result"])
-+        return RAGResult(documents=bundle.items, context_used=bundle.context_used, warnings=[])
++    monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
++    runner = JobRunner(job_store, soft_timeout_s=2)
++    job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-1")
++    assert runner.wait(job.id, timeout=5) is True
++    snapshot = runner.get_job(job.id)
++    assert snapshot["status"] == "succeeded"
++    assert snapshot["result"]["markdown"].startswith("Hello")
++    assert snapshot["degradation_flags"] in (None, [])
++    assert snapshot["trace_id"] == "trace-1"
 +
 +
-+__all__ = ["RAGClient", "RAGResult"]
++def test_job_runner_degradation(monkeypatch, job_store):
++    def _raise_generate(**_kwargs):
++        raise RuntimeError("boom")
++
++    monkeypatch.setattr("jobs.runner.generate_article_from_payload", _raise_generate)
++    runner = JobRunner(job_store, soft_timeout_s=1)
++    job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-2")
++    runner.wait(job.id, timeout=3)
++    snapshot = runner.get_job(job.id)
++    assert snapshot["status"] == "succeeded"
++    assert "draft_failed" in (snapshot.get("degradation_flags") or [])
++    assert "markdown" in snapshot["result"]
++    assert "demo" in snapshot["result"]["markdown"]
 

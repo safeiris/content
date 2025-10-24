@@ -101,6 +101,22 @@ const LOG_STATUS_LABELS = {
   error: "ERROR",
 };
 
+const STEP_LABELS = {
+  draft: "Черновик",
+  refine: "Уточнение",
+  jsonld: "JSON-LD",
+  post_analysis: "Пост-анализ",
+};
+
+const DEGRADATION_LABELS = {
+  draft_failed: "Черновик по запасному сценарию",
+  refine_skipped: "Шаг уточнения пропущен",
+  jsonld_missing: "JSON-LD отсутствует",
+  jsonld_repaired: "JSON-LD восстановлен",
+  post_analysis_skipped: "Проверки пропущены",
+  soft_timeout: "Сработал мягкий таймаут",
+};
+
 const DEFAULT_PROGRESS_MESSAGE = progressMessage?.textContent?.trim() || "Готовим данные…";
 const MAX_TOASTS = 3;
 const MAX_CUSTOM_CONTEXT_CHARS = 20000;
@@ -1083,7 +1099,7 @@ async function handleGenerate(event) {
     toggleRetryButton(false);
     setInteractiveBusy(true);
     setButtonLoading(generateBtn, true);
-    showProgress(true, "Генерируем материалы…");
+    showProgress(true, DEFAULT_PROGRESS_MESSAGE);
     renderUsedKeywords(null);
     const requestModel = payload.model || null;
     const requestBody = {
@@ -1105,69 +1121,24 @@ async function handleGenerate(event) {
         requestBody.context_filename = payload.context_filename;
       }
     }
-    const response = await fetchJson("/api/generate", {
+    const initialResponse = await fetchJson("/api/generate", {
       method: "POST",
       body: JSON.stringify(requestBody),
     });
-    const markdown = response?.markdown ?? "";
-    const meta = (response?.meta_json && typeof response.meta_json === "object") ? response.meta_json : {};
-    const responseStatus = typeof response?.status === "string" ? response.status.trim().toLowerCase() : "";
-    const metaStatus = typeof meta?.status === "string" ? meta.status.trim().toLowerCase() : "";
-    if (["failed", "error"].includes(responseStatus) || ["failed", "error"].includes(metaStatus)) {
-      const backendError = typeof response?.error === "string" && response.error.trim()
-        ? response.error.trim()
-        : typeof meta?.error === "string" && meta.error.trim()
-          ? meta.error.trim()
-          : "";
-      const backendMessage = typeof response?.backend_message === "string" && response.backend_message.trim()
-        ? response.backend_message.trim()
-        : typeof meta?.backend_message === "string" && meta.backend_message.trim()
-          ? meta.backend_message.trim()
-          : "";
-      const messageParts = [backendMessage, backendError].filter(Boolean);
-      const failureMessage = messageParts.length > 0
-        ? messageParts.join(" ")
-        : "Генерация завершилась с ошибкой.";
-      throw new Error(failureMessage);
-    }
-    const artifactPaths = response?.artifact_paths;
-    const metadataCharacters = typeof meta.characters === "number" ? meta.characters : undefined;
-    const characters = typeof metadataCharacters === "number" ? metadataCharacters : markdown.trim().length;
-    const hasContent = characters > 0;
-    state.currentResult = { markdown, meta, artifactPaths, characters, hasContent };
-    const fallbackModel = response?.fallback_used ?? meta.fallback_used;
-    const fallbackReason = response?.fallback_reason ?? meta.fallback_reason;
-    draftView.innerHTML = markdownToHtml(markdown);
-    resultTitle.textContent = payload.data.theme || "Результат генерации";
-    const metaParts = [];
-    if (hasContent) {
-      metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
-    }
-    metaParts.push(`Модель: ${meta.model_used ?? "—"}`);
-    resultMeta.textContent = metaParts.join(" · ");
-    renderMetadata(meta);
-    renderUsedKeywords(meta);
-    updateResultBadges(meta);
-    toggleRetryButton(!hasContent);
-    updatePromptPreview({
-      system: meta.system_prompt_preview,
-      context: meta.clips || [],
-      user: meta.user_prompt_preview,
-      context_used: meta.context_used,
-      context_index_missing: meta.context_index_missing,
-      context_budget_tokens_est: meta.context_budget_tokens_est,
-      context_budget_tokens_limit: meta.context_budget_tokens_limit,
-      k: payload.k,
-    });
-    if (fallbackModel) {
-      const reasonText = describeFallbackNotice(fallbackReason);
-      showToast({
-        message: `Использована резервная модель (${fallbackModel}). ${reasonText}`,
-        type: "warn",
-        duration: 6000,
+    let snapshot = normalizeJobResponse(initialResponse);
+    showProgress(true, describeJobProgress(snapshot));
+    if (snapshot.status !== "succeeded" || !snapshot.result) {
+      if (!snapshot.job_id) {
+        throw new Error("Сервер вернул пустой ответ без идентификатора задания.");
+      }
+      snapshot = await pollJobUntilDone(snapshot.job_id, {
+        onUpdate: (update) => {
+          showProgress(true, describeJobProgress(update));
+          applyProgressiveResult(update);
+        },
       });
     }
-    enableDownloadButtons(artifactPaths);
+    renderGenerationResult(snapshot, { payload });
     try {
       await loadArtifacts();
     } catch (refreshError) {
@@ -1185,6 +1156,154 @@ async function handleGenerate(event) {
     showProgress(false);
   }
 }
+
+function normalizeJobResponse(response) {
+  if (!response || typeof response !== "object") {
+    return { status: "pending", result: null, steps: [], degradation_flags: [], job_id: null };
+  }
+  if (typeof response.markdown === "string" || typeof response.meta_json === "object") {
+    return {
+      status: "succeeded",
+      job_id: response.job_id || null,
+      steps: Array.isArray(response.steps) ? response.steps : [],
+      degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
+      trace_id: response.trace_id || null,
+      result: {
+        markdown: typeof response.markdown === "string" ? response.markdown : "",
+        meta_json: (response.meta_json && typeof response.meta_json === "object") ? response.meta_json : {},
+        faq_entries: Array.isArray(response.faq_entries) ? response.faq_entries : [],
+      },
+    };
+  }
+  return {
+    status: typeof response.status === "string" ? response.status : "pending",
+    job_id: response.job_id || null,
+    steps: Array.isArray(response.steps) ? response.steps : [],
+    degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
+    trace_id: response.trace_id || null,
+    result: response.result && typeof response.result === "object" ? response.result : null,
+  };
+}
+
+function describeJobProgress(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.steps) || snapshot.steps.length === 0) {
+    return DEFAULT_PROGRESS_MESSAGE;
+  }
+  const running = snapshot.steps.find((step) => step && step.status === "running");
+  if (running) {
+    return `Шаг: ${STEP_LABELS[running.name] || running.name}`;
+  }
+  const pending = snapshot.steps.find((step) => step && step.status === "pending");
+  if (pending) {
+    return `Шаг: ${STEP_LABELS[pending.name] || pending.name}`;
+  }
+  const degraded = [...snapshot.steps].reverse().find((step) => step && step.status === "degraded");
+  if (degraded) {
+    return `Завершено с деградацией: ${STEP_LABELS[degraded.name] || degraded.name}`;
+  }
+  const succeeded = [...snapshot.steps].reverse().find((step) => step && step.status === "succeeded");
+  if (succeeded) {
+    return `Шаг завершён: ${STEP_LABELS[succeeded.name] || succeeded.name}`;
+  }
+  return DEFAULT_PROGRESS_MESSAGE;
+}
+
+function applyProgressiveResult(snapshot) {
+  const result = snapshot?.result;
+  if (!result || typeof result !== "object") {
+    return;
+  }
+  const markdown = typeof result.markdown === "string" ? result.markdown : "";
+  if (markdown) {
+    draftView.innerHTML = markdownToHtml(markdown);
+  }
+  const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
+  updateResultBadges(meta, Array.isArray(snapshot?.degradation_flags) ? snapshot.degradation_flags : []);
+}
+
+async function pollJobUntilDone(jobId, { onUpdate } = {}) {
+  let delayMs = 600;
+  while (true) {
+    await delay(delayMs);
+    const snapshot = await fetchJson(`/api/jobs/${encodeURIComponent(jobId)}`);
+    if (typeof onUpdate === "function") {
+      onUpdate(snapshot);
+    }
+    if (snapshot?.status === "failed") {
+      const message = snapshot?.error?.message || "Генерация завершилась с ошибкой.";
+      const error = new Error(message);
+      if (snapshot?.trace_id) {
+        error.traceId = snapshot.trace_id;
+      }
+      throw error;
+    }
+    if (snapshot?.status === "succeeded" && snapshot.result) {
+      return snapshot;
+    }
+    delayMs = Math.min(delayMs * 1.3, 4000);
+  }
+}
+
+function renderGenerationResult(snapshot, { payload }) {
+  const normalized = normalizeJobResponse(snapshot);
+  const result = normalized.result || {};
+  const markdown = typeof result.markdown === "string" ? result.markdown : "";
+  const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
+  const degradationFlags = Array.isArray(normalized.degradation_flags) ? normalized.degradation_flags : [];
+  const characters = typeof meta.characters === "number" ? meta.characters : markdown.replace(/\s+/g, "").length;
+  const hasContent = markdown.trim().length > 0;
+  state.currentResult = {
+    markdown,
+    meta,
+    artifactPaths: result.artifact_paths ?? null,
+    characters,
+    hasContent,
+    degradationFlags,
+  };
+  draftView.innerHTML = markdownToHtml(markdown);
+  resultTitle.textContent = payload?.data?.theme || "Результат генерации";
+  const metaParts = [];
+  if (hasContent) {
+    metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
+  }
+  if (degradationFlags.length) {
+    metaParts.push(`Деградации: ${degradationFlags.length}`);
+  }
+  if (meta.model_used) {
+    metaParts.push(`Модель: ${meta.model_used}`);
+  }
+  resultMeta.textContent = metaParts.join(" · ") || "Деградаций нет";
+  renderMetadata(meta);
+  renderUsedKeywords(meta);
+  updateResultBadges(meta, degradationFlags);
+  toggleRetryButton(!hasContent);
+  updatePromptPreview({
+    system: meta.system_prompt_preview,
+    context: Array.isArray(meta.clips) ? meta.clips : [],
+    user: meta.user_prompt_preview,
+    context_used: meta.context_used,
+    context_index_missing: meta.context_index_missing,
+    context_budget_tokens_est: meta.context_budget_tokens_est,
+    context_budget_tokens_limit: meta.context_budget_tokens_limit,
+    k: payload?.k,
+  });
+  enableDownloadButtons(result.artifact_paths ?? null);
+  if (degradationFlags.length) {
+    const label = degradationFlags.map(describeDegradationFlag).join(", ");
+    showToast({ message: `Частичная деградация: ${label}`, type: "warn", duration: 6000 });
+  }
+}
+
+function describeDegradationFlag(flag) {
+  if (!flag) {
+    return "unknown";
+  }
+  return DEGRADATION_LABELS[flag] || flag;
+}
+
+const delay = (ms) => new Promise((resolve) => {
+  setTimeout(resolve, ms);
+});
 
 function handleRetryClick(event) {
   event.preventDefault();
@@ -1632,7 +1751,7 @@ function renderUsedKeywords(meta) {
   });
 }
 
-function updateResultBadges(meta) {
+function updateResultBadges(meta, degradationFlags = []) {
   resultBadges.innerHTML = "";
   if (!meta || typeof meta !== "object") {
     return;
@@ -1758,6 +1877,12 @@ function updateResultBadges(meta) {
 
   if (meta.length_adjustment) {
     appendBadge(`Коррекция длины: ${meta.length_adjustment}`, "neutral");
+  }
+
+  if (Array.isArray(degradationFlags) && degradationFlags.length) {
+    [...new Set(degradationFlags)].forEach((flag) => {
+      appendBadge(describeDegradationFlag(flag), "warning");
+    });
   }
 }
 
@@ -1934,7 +2059,7 @@ async function showArtifact(artifact) {
     const characters = metadata.characters ?? markdown.length;
     resultMeta.textContent = `Символов: ${characters.toLocaleString("ru-RU")} · Модель: ${metadata.model_used ?? "—"}`;
     renderMetadata(metadata);
-    updateResultBadges(metadata);
+    updateResultBadges(metadata, Array.isArray(metadata?.degradation_flags) ? metadata.degradation_flags : []);
     enableDownloadButtons({ markdown: artifact.path, metadata: metadataPath });
     updatePromptPreview({
       system: metadata.system_prompt_preview,
@@ -2201,6 +2326,8 @@ async function fetchJson(path, options = {}) {
         const data = JSON.parse(text);
         if (data && typeof data.error === "string" && data.error.trim()) {
           message = data.error.trim();
+        } else if (data && data.error && typeof data.error.message === "string" && data.error.message.trim()) {
+          message = data.error.message.trim();
         }
       } catch (parseError) {
         if (!(parseError instanceof Error) || parseError.name !== "SyntaxError") {

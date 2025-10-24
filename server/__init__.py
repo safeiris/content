@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import secrets
+import time
 import uuid
 from datetime import datetime
 from functools import wraps
@@ -31,7 +32,12 @@ from flask_cors import CORS
 from werkzeug.security import check_password_hash
 
 from assemble_messages import invalidate_style_profile_cache
-from config import DEFAULT_STRUCTURE, OPENAI_RPM, OPENAI_RPS
+from config import (
+    DEFAULT_STRUCTURE,
+    JOB_STORE_TTL_S,
+    OPENAI_RPM,
+    OPENAI_RPS,
+)
 from jobs import JobRunner, JobStatus, JobStore
 from orchestrate import gather_health_status, make_generation_context
 from retrieval import build_index
@@ -42,6 +48,7 @@ from artifacts_store import (
     resolve_artifact_path,
 )
 from observability.logger import bind_trace_id, clear_trace_id, get_logger
+from observability.metrics import get_registry
 
 load_dotenv()
 
@@ -49,7 +56,7 @@ LOGGER = get_logger("content_factory.api")
 
 PIPELINE_CONFIG_FILENAME = "pipeline.json"
 
-JOB_STORE = JobStore(ttl_seconds=3600)
+JOB_STORE = JobStore(ttl_seconds=JOB_STORE_TTL_S)
 JOB_RUNNER = JobRunner(JOB_STORE)
 
 USERS: Dict[str, Dict[str, str]] = {
@@ -348,27 +355,31 @@ def create_app() -> Flask:
             "context_filename": context_filename,
         }
 
-        job = JOB_RUNNER.submit(task_payload)
+        trace_id = getattr(g, "trace_id", None)
+        job = JOB_RUNNER.submit(task_payload, trace_id=trace_id)
         sync_raw = payload.get("sync", request.args.get("sync"))
         sync_requested = str(sync_raw).lower() in {"1", "true", "yes"}
 
         if sync_requested:
             finished = JOB_RUNNER.wait(job.id, timeout=JOB_RUNNER.soft_timeout())
             snapshot = JOB_RUNNER.get_job(job.id)
-            if finished and snapshot:
+            if snapshot:
                 status = snapshot.get("status")
                 if status == JobStatus.SUCCEEDED.value and snapshot.get("result"):
                     response_payload = _format_generation_success(snapshot["result"])
                     response_payload["job_id"] = job.id
-                    response_payload["degradation_flags"] = snapshot.get("degradation_flags")
+                    response_payload["degradation_flags"] = snapshot.get("degradation_flags") or []
+                    response_payload["trace_id"] = snapshot.get("trace_id")
                     return jsonify(response_payload)
                 if status == JobStatus.FAILED.value:
-                    trace_id = getattr(g, "trace_id", None)
+                    trace_id = snapshot.get("trace_id") or getattr(g, "trace_id", None)
+                    error_payload = snapshot.get("error") or {}
+                    message = error_payload.get("message") if isinstance(error_payload, dict) else str(error_payload)
                     return (
                         jsonify(
                             {
                                 "error": {
-                                    "message": snapshot.get("error") or "Generation failed",
+                                    "message": message or "Generation failed",
                                     "trace_id": trace_id,
                                 },
                                 "job_id": job.id,
@@ -377,6 +388,21 @@ def create_app() -> Flask:
                         ),
                         500,
                     )
+            if finished:
+                # No snapshot available, treat as failure
+                trace_id = getattr(g, "trace_id", None)
+                return (
+                    jsonify(
+                        {
+                            "error": {
+                                "message": "Job completed without result",
+                                "trace_id": trace_id,
+                            },
+                            "job_id": job.id,
+                        }
+                    ),
+                    500,
+                )
 
         snapshot = JOB_RUNNER.get_job(job.id) or job.to_dict()
         response_payload = {
@@ -385,8 +411,10 @@ def create_app() -> Flask:
             "steps": snapshot.get("steps"),
             "result": snapshot.get("result"),
             "degradation_flags": snapshot.get("degradation_flags"),
+            "trace_id": snapshot.get("trace_id") or getattr(g, "trace_id", None),
         }
-        return jsonify(response_payload), 202
+        http_status = 200 if response_payload["status"] == JobStatus.SUCCEEDED.value else 202
+        return jsonify(response_payload), http_status
 
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id: str):
@@ -485,6 +513,8 @@ def create_app() -> Flask:
         theme = request.args.get("theme")
         status = gather_health_status(theme)
         checks = status.setdefault("checks", {})
+        metrics_snapshot = get_registry().snapshot()
+        queue_len = int(metrics_snapshot.get("jobs.queue_length", 0))
         checks["openai_rate_limits"] = {
             "ok": True,
             "message": f"Лимиты клиента активны: {OPENAI_RPS} rps / {OPENAI_RPM} rpm",
@@ -493,6 +523,24 @@ def create_app() -> Flask:
             "ok": True,
             "message": f"Очередь заданий: {len(JOB_STORE)}; soft timeout={JOB_RUNNER.soft_timeout()}s",
         }
+        checks["job_queue"] = {
+            "ok": queue_len < 10,
+            "message": f"Размер очереди: {queue_len}",
+        }
+        if theme:
+            profile_path = (Path("profiles") / theme / "style_profile.md").resolve()
+            try:
+                mtime = profile_path.stat().st_mtime
+                freshness_days = max(0, (time.time() - mtime) / 86400.0)
+                checks["theme_profile_freshness"] = {
+                    "ok": freshness_days < 30,
+                    "message": f"Профиль обновлен {freshness_days:.1f} дн. назад",
+                }
+            except FileNotFoundError:
+                checks["theme_profile_freshness"] = {
+                    "ok": False,
+                    "message": f"Файл профиля не найден: {profile_path.as_posix()}",
+                }
         http_status = 200 if status.get("ok") else 503
         return jsonify(status), http_status
 

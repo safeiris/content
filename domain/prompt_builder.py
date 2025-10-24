@@ -1,10 +1,21 @@
 """Pure prompt construction utilities."""
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 _DEFAULT_TONE = "экспертный, дружелюбный"
 _DEFAULT_GOAL = "Сформируй структурированную SEO-статью."
+_FINANCE_PROFILE_PATH = Path("profiles/finance/style_profile.md")
+
+
+@lru_cache(maxsize=1)
+def _load_finance_profile() -> str:
+    try:
+        return _FINANCE_PROFILE_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
 
 
 def _format_keywords(keywords: Iterable[str]) -> str:
@@ -25,11 +36,14 @@ def build_prompt(
 ) -> Tuple[str, List[Dict[str, str]]]:
     """Build system and user messages for the generation request."""
 
+    profile_excerpt = _load_finance_profile()
     system_parts = [
-        "Ты профессиональный русскоязычный автор, который пишет без воды и повторов.",
+        "Ты финансовый обозреватель портала «Трубы» и пишешь понятные тексты про деньги.",
         f"Пиши в тоне: {tone or _DEFAULT_TONE}.",
         "Всегда придерживайся указанной структуры и не добавляй лишних разделов.",
     ]
+    if profile_excerpt:
+        system_parts.append("Следуй стилю из профиля:\n" + profile_excerpt)
     if audience:
         system_parts.append(f"Целевая аудитория: {audience}.")
     if goal:

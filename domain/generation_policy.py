@@ -31,16 +31,27 @@ def estimate_tokens(system: str, messages: Sequence[dict]) -> int:
 
 def _segment_structure(structure: Sequence[str]) -> List[str]:
     segments: List[str] = []
+    main_index = 0
     for item in structure:
         normalized = (item or "").strip()
         if not normalized:
             continue
-        if normalized.lower().startswith("основ"):
-            segments.append(f"{normalized} — часть 1")
-            segments.append(f"{normalized} — часть 2")
+        lower = normalized.lower()
+        if "основ" in lower:
+            main_index += 1
+            segments.append(f"Основная часть {main_index}")
         else:
             segments.append(normalized)
-    return segments or ["Введение", "Основная часть", "FAQ", "Вывод"]
+    if not segments:
+        segments = ["Введение", "Основная часть 1", "Основная часть 2", "Вывод"]
+    if len([s for s in segments if s.lower().startswith("основ")]) < 2:
+        segments.insert(1, "Основная часть 1")
+        segments.insert(2, "Основная часть 2")
+    if segments[0].lower() != "введение":
+        segments.insert(0, "Введение")
+    if segments[-1].lower() != "вывод":
+        segments.append("Вывод")
+    return segments
 
 
 def build_token_budget(structure: Sequence[str], *, max_tokens: int, system: str, messages: Sequence[dict]) -> TokenBudget:

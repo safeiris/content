@@ -10,8 +10,17 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from config import OPENAI_MAX_RETRIES, OPENAI_RPM, OPENAI_RPS, OPENAI_TIMEOUT_S
+from config import (
+    G5_MAX_OUTPUT_TOKENS_MAX,
+    OPENAI_CACHE_TTL_S,
+    OPENAI_CLIENT_MAX_QUEUE,
+    OPENAI_MAX_RETRIES,
+    OPENAI_RPM,
+    OPENAI_RPS,
+    OPENAI_TIMEOUT_S,
+)
 from llm_client import GenerationResult, generate as _legacy_generate
+from observability.logger import get_logger
 
 
 @dataclass
@@ -19,6 +28,12 @@ class RetryPolicy:
     max_retries: int = OPENAI_MAX_RETRIES
     base_delay: float = 0.4
     jitter: float = 0.3
+
+
+@dataclass
+class _CacheEntry:
+    result: GenerationResult
+    expires_at: float
 
 
 class _RateLimiter:
@@ -58,8 +73,10 @@ class OpenAIClient:
 
     def __init__(self) -> None:
         self._limiter = _RateLimiter(rps=OPENAI_RPS, rpm=OPENAI_RPM)
-        self._cache: Dict[str, GenerationResult] = {}
+        self._cache: Dict[str, _CacheEntry] = {}
         self._lock = threading.Lock()
+        self._pending_lock = threading.Condition()
+        self._pending_requests = 0
 
     def _make_key(
         self,
@@ -68,15 +85,49 @@ class OpenAIClient:
         messages: Sequence[Dict[str, str]],
         seed: Optional[str],
         structure: Optional[Iterable[str]],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        response_format: str,
     ) -> str:
         payload = {
             "system": system or "",
             "messages": list(messages),
             "seed": seed or "",
             "structure": list(structure) if structure else [],
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "response_format": response_format,
         }
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _get_cached(self, key: str) -> Optional[GenerationResult]:
+        with self._lock:
+            entry = self._cache.get(key)
+            if not entry:
+                return None
+            if entry.expires_at < time.time():
+                self._cache.pop(key, None)
+                return None
+            return entry.result
+
+    def _set_cached(self, key: str, result: GenerationResult) -> None:
+        expires_at = time.time() + OPENAI_CACHE_TTL_S
+        with self._lock:
+            self._cache[key] = _CacheEntry(result=result, expires_at=expires_at)
+
+    def _acquire_slot(self) -> None:
+        with self._pending_lock:
+            while self._pending_requests >= OPENAI_CLIENT_MAX_QUEUE:
+                self._pending_lock.wait()
+            self._pending_requests += 1
+
+    def _release_slot(self) -> None:
+        with self._pending_lock:
+            self._pending_requests = max(0, self._pending_requests - 1)
+            self._pending_lock.notify()
 
     def generate(
         self,
@@ -93,10 +144,19 @@ class OpenAIClient:
         max_tokens: int = 1400,
     ) -> GenerationResult:
         policy = retry_policy or RetryPolicy()
-        key = self._make_key(system=system, messages=messages, seed=seed, structure=structure)
-        with self._lock:
-            cached = self._cache.get(key)
+        key = self._make_key(
+            system=system,
+            messages=messages,
+            seed=seed,
+            structure=structure,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=response_format,
+        )
+        cached = self._get_cached(key)
         if cached:
+            LOGGER.info("llm_cache_hit", extra={"model": model, "max_tokens": max_tokens})
             return cached
 
         full_messages: List[Dict[str, str]] = []
@@ -104,29 +164,62 @@ class OpenAIClient:
             full_messages.append({"role": "system", "content": system})
         full_messages.extend(dict(message) for message in messages)
 
+        resolved_max_tokens = min(max_tokens, G5_MAX_OUTPUT_TOKENS_MAX)
+        if resolved_max_tokens != max_tokens:
+            LOGGER.warning(
+                "llm_max_tokens_capped",
+                extra={
+                    "requested": max_tokens,
+                    "cap": G5_MAX_OUTPUT_TOKENS_MAX,
+                    "resolved": resolved_max_tokens,
+                },
+            )
+
         attempts = 0
         last_error: Optional[Exception] = None
-        while attempts <= policy.max_retries:
-            attempts += 1
-            self._limiter.acquire()
-            try:
-                result = _legacy_generate(
-                    full_messages,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout_s=timeout or OPENAI_TIMEOUT_S,
-                )
-                with self._lock:
-                    self._cache[key] = result
-                return result
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                if attempts > policy.max_retries:
-                    break
-                delay = policy.base_delay * (2 ** (attempts - 1))
-                jitter = random.random() * policy.jitter
-                time.sleep(delay + jitter)
+        self._acquire_slot()
+        try:
+            while attempts <= policy.max_retries:
+                attempts += 1
+                self._limiter.acquire()
+                started_at = time.perf_counter()
+                try:
+                    result = _legacy_generate(
+                        full_messages,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=resolved_max_tokens,
+                        timeout_s=timeout or OPENAI_TIMEOUT_S,
+                    )
+                    duration_ms = int((time.perf_counter() - started_at) * 1000)
+                    LOGGER.info(
+                        "llm_request_succeeded",
+                        extra={
+                            "model": model,
+                            "attempt": attempts,
+                            "duration_ms": duration_ms,
+                            "max_tokens": resolved_max_tokens,
+                        },
+                    )
+                    self._set_cached(key, result)
+                    return result
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    LOGGER.warning(
+                        "llm_request_failed",
+                        extra={
+                            "model": model,
+                            "attempt": attempts,
+                            "error": str(exc),
+                        },
+                    )
+                    if attempts > policy.max_retries:
+                        break
+                    delay = policy.base_delay * (2 ** (attempts - 1))
+                    jitter = random.random() * policy.jitter
+                    time.sleep(delay + jitter)
+        finally:
+            self._release_slot()
         if last_error:
             raise last_error
         raise RuntimeError("OpenAI client failed without raising an error")
@@ -137,6 +230,9 @@ _default_client = OpenAIClient()
 
 def get_default_client() -> OpenAIClient:
     return _default_client
+
+
+LOGGER = get_logger("content_factory.services.llm_client")
 
 
 __all__ = ["OpenAIClient", "RetryPolicy", "get_default_client"]
