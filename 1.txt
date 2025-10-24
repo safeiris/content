@@ -1,10 +1,15 @@
 diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 1a2f824ee2589372f902faea499863fc2201b0bd..8730358b82cfee89d591edcc243d6225896947e3 100644
+index 8730358b82cfee89d591edcc243d6225896947e3..65cfceea026ff6b27f9d254bca7afa7d0ac56b34 100644
 --- a/deterministic_pipeline.py
 +++ b/deterministic_pipeline.py
-@@ -5,50 +5,51 @@ from __future__ import annotations
+@@ -1,31 +1,32 @@
+ """LLM-driven content pipeline with explicit step-level guarantees."""
+ 
+ from __future__ import annotations
+ 
  import json
  import logging
++import math
  import re
  import textwrap
  import time
@@ -28,580 +33,605 @@ index 1a2f824ee2589372f902faea499863fc2201b0bd..8730358b82cfee89d591edcc243d6225
      build_term_pattern,
      inject_keywords,
  )
-+from length_controller import ensure_article_length
+ from length_controller import ensure_article_length
  from length_limits import compute_soft_length_bounds
- from length_trimmer import TrimResult, TrimValidationError, trim_text
- from skeleton_utils import normalize_skeleton_payload
- from validators import (
-     ValidationError,
-     ValidationResult,
-     length_no_spaces,
-     strip_jsonld,
-     validate_article,
- )
- 
- 
- LOGGER = logging.getLogger("content_factory.pipeline")
- 
- FAQ_START = "<!--FAQ_START-->"
- FAQ_END = "<!--FAQ_END-->"
- 
- _TEMPLATE_SNIPPETS = [
-     "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
-     "Отмечаем юридические нюансы, возможные риски и добавляем чек-лист",
-     "В выводах собираем план действий, назначаем контрольные даты",
- ]
- 
- 
- class PipelineStep(str, Enum):
-@@ -2538,92 +2539,183 @@ class DeterministicPipeline:
-             sanitized = self._sanitize_entries(entries_source)
-             if len(sanitized) != 5:
-                 raise PipelineStepError(
-                     PipelineStep.FAQ,
-                     "FAQ должно содержать ровно 5 пар вопросов и ответов.",
-                 )
-             faq_block = self._render_faq_markdown(sanitized)
-             merged_text = self._merge_faq(text, faq_block)
-             self.jsonld = self._build_jsonld(sanitized)
-             self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
-             LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in sanitized))
-             self._update_log(
-                 PipelineStep.FAQ,
-                 "ok",
-                 entries=[entry["question"] for entry in sanitized],
-                 **self._metrics(merged_text),
-             )
-             self.checkpoints[PipelineStep.FAQ] = merged_text
-             return merged_text
- 
-         raise PipelineStepError(
-             PipelineStep.FAQ,
-             "Не удалось сформировать блок FAQ: отсутствуют подготовленные данные.",
+@@ -285,50 +286,75 @@ class DeterministicPipeline:
+             PipelineLogEntry(step=step, started_at=time.time(), finished_at=time.time(), status=status, notes=dict(notes))
          )
  
-+    def _build_fail_safe_article(self) -> str:
-+        topic = self.topic or "SEO-статья"
-+        intro = (
-+            "Эта резервная версия подготовлена автоматически. Она кратко передаёт ключевые "
-+            "смыслы темы и даёт базовые рекомендации по дальнейшему самостоятельному изучению."
-+        )
-+        main_sections = [
-+            (
-+                "Быстрый запуск",
-+                (
-+                    "Сформулируйте цель и определите метрики, по которым будете отслеживать прогресс. "
-+                    "Подготовьте рабочую таблицу с ответственными лицами, сроками и ожидаемыми результатами."
-+                ),
-+            ),
-+            (
-+                "Практическая проработка",
-+                (
-+                    "Разбейте внедрение на последовательные этапы, начиная с самых простых действий. "
-+                    "Используйте доступные инструменты аналитики и фиксируйте промежуточные выводы после каждой итерации."
-+                ),
-+            ),
-+            (
-+                "Контроль и корректировки",
-+                (
-+                    "Каждую неделю сопоставляйте ожидания с фактическими результатами, чтобы вовремя увидеть отклонения. "
-+                    "Фиксируйте инсайты и формируйте короткие резюме, которые помогут защитить инициативу перед командой."
-+                ),
-+            ),
-+        ]
-+        faq_entries = [
-+            (
-+                "С чего начать?",
-+                "Определите ключевую задачу и запишите стартовые показатели, от которых будете отталкиваться в анализе.",
-+            ),
-+            (
-+                "Как распределить ответственность?",
-+                "Назначьте владельца процесса и закрепите за ним контрольные точки. Остальным участникам оставьте конкретные действия.",
-+            ),
-+            (
-+                "Какие инструменты использовать?",
-+                "Выберите аналитические сервисы, с которыми команда уже знакома, чтобы не тратить время на внедрение сложных решений.",
-+            ),
-+            (
-+                "Как оценить первые результаты?",
-+                "Сравните фактические метрики с планом через неделю и месяц, отметьте, какие корректировки потребуются.",
-+            ),
-+            (
-+                "Что делать при задержках?",
-+                "Зафиксируйте причину, подготовьте три варианта компенсации и обсудите их с ключевыми заинтересованными сторонами.",
-+            ),
-+        ]
-+        conclusion = (
-+            "Зафиксируйте выводы, выберите одну метрику оперативного контроля и договоритесь о дате следующей оценки результатов. "
-+            "Запишите идеи для последующих улучшений, чтобы постепенно расширять эффект от инициативы."
-+        )
-+
-+        lines: List[str] = [f"# {topic}", "", "## Введение", intro, ""]
-+        for heading, paragraph in main_sections:
-+            lines.extend([f"## {heading}", paragraph, ""])
-+        lines.extend(["## FAQ", "<!--FAQ_START-->"])
-+        for index, (question, answer) in enumerate(faq_entries, start=1):
-+            lines.append(f"**Вопрос {index}.** {question}")
-+            lines.append(f"**Ответ.** {answer}")
-+            lines.append("")
-+        if lines and lines[-1] == "":
-+            lines.pop()
-+        lines.extend(["<!--FAQ_END-->", ""])
-+        lines.extend(["## Заключение", conclusion, ""])
-+        article = "\n".join(lines).strip() + "\n"
-+        controller = ensure_article_length(
-+            article,
-+            min_chars=self.min_chars,
-+            max_chars=self.max_chars,
-+            protected_blocks=self.locked_terms,
-+        )
-+        return controller.text if controller.text else article
-+
-     def _run_trim(self, text: str) -> TrimResult:
-         self._log(PipelineStep.TRIM, "running")
-         reserve = self.jsonld_reserve if self.jsonld else 0
-         target_max = max(self.min_chars, self.max_chars - reserve)
-         try:
-             result = trim_text(
-                 text,
-                 min_chars=self.min_chars,
-                 max_chars=target_max,
-                 protected_blocks=self.locked_terms,
-             )
-         except TrimValidationError as exc:
-             raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
-         current_length = length_no_spaces(result.text)
+     def _register_llm_result(self, result: GenerationResult, usage: Optional[float]) -> None:
+         if result.model_used:
+             self._model_used = result.model_used
+         elif self._model_used is None:
+             self._model_used = self.model
+         if result.fallback_used:
+             self._fallback_used = result.fallback_used
+         if result.fallback_reason:
+             self._fallback_reason = result.fallback_reason
+         if result.api_route:
+             self._api_route = result.api_route
+         if usage is not None:
+             self._token_usage = usage
  
-         soft_min, soft_max, tolerance_below, tolerance_above = compute_soft_length_bounds(
-             self.min_chars, self.max_chars
-         )
-         strict_violation = current_length < self.min_chars or current_length > self.max_chars
-         length_notes: Dict[str, object] = {}
-         if strict_violation:
--            if current_length < soft_min or current_length > soft_max:
--                raise PipelineStepError(
--                    PipelineStep.TRIM,
--                    (
--                        "Объём после трима вне диапазона "
--                        f"{self.min_chars}–{self.max_chars} (без пробелов)."
--                    ),
--                )
--            LOGGER.warning(
--                "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
--                current_length,
--                self.min_chars,
--                self.max_chars,
--                soft_min,
--                soft_max,
-+            controller = ensure_article_length(
-+                result.text,
-+                min_chars=self.min_chars,
-+                max_chars=self.max_chars,
-+                protected_blocks=self.locked_terms,
-             )
--            length_notes["length_relaxed"] = True
--            length_notes["length_soft_min"] = soft_min
--            length_notes["length_soft_max"] = soft_max
--            length_notes["length_tolerance_below"] = tolerance_below
--            length_notes["length_tolerance_above"] = tolerance_above
-+            if controller.adjusted:
-+                length_notes["length_controller_adjusted"] = True
-+                length_notes["length_controller_iterations"] = controller.iterations
-+                length_notes["length_controller_history"] = list(controller.history)
-+                length_notes["length_controller_success"] = controller.success
-+                result = TrimResult(text=controller.text, removed_paragraphs=result.removed_paragraphs)
-+                current_length = controller.length
-+                strict_violation = current_length < self.min_chars or current_length > self.max_chars
-+            if strict_violation:
-+                LOGGER.warning(
-+                    "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
-+                    current_length,
-+                    self.min_chars,
-+                    self.max_chars,
-+                    soft_min,
-+                    soft_max,
-+                )
-+                length_notes["length_relaxed"] = True
-+                length_notes["length_soft_min"] = soft_min
-+                length_notes["length_soft_max"] = soft_max
-+                length_notes["length_tolerance_below"] = tolerance_below
-+                length_notes["length_tolerance_above"] = tolerance_above
-+                if current_length < soft_min or current_length > soft_max:
-+                    length_notes["length_controller_success"] = False
-+                    length_notes["length_controller_reason"] = controller.failure_reason
-+                    fail_safe_article = self._build_fail_safe_article()
-+                    result = TrimResult(text=fail_safe_article, removed_paragraphs=result.removed_paragraphs)
-+                    current_length = length_no_spaces(result.text)
-+                    length_notes["length_controller_fallback"] = True
+     def _prompt_length(self, messages: Sequence[Dict[str, object]]) -> int:
+         length = 0
+         for message in messages:
+             content = message.get("content")
+             if isinstance(content, str):
+                 length += len(content)
+         return length
  
-         missing_locks = [
-             term
-             for term in self.normalized_keywords
-             if LOCK_START_TEMPLATE.format(term=term) not in result.text
++    def _approx_prompt_tokens(self, messages: Sequence[Dict[str, object]]) -> int:
++        """Rough token estimate based on message character count."""
++
++        total_chars = self._prompt_length(messages)
++        if total_chars <= 0:
++            return 0
++        # Empirical heuristic: ~4 characters per token for mixed Russian text.
++        return max(1, int(math.ceil(total_chars / 4.0)))
++
++    def _should_force_single_main_batches(
++        self,
++        outline: SkeletonOutline,
++        estimate: "SkeletonVolumeEstimate",
++    ) -> bool:
++        """Return True when main batches must be generated one-by-one."""
++
++        approx_tokens = self._approx_prompt_tokens(self.messages)
++        if approx_tokens >= 3400:
++            return True
++        if estimate.requires_chunking:
++            return True
++        if len(outline.main_headings) >= 5 and estimate.cap_tokens:
++            return True
++        return False
++
+     def _extract_usage(self, result: GenerationResult) -> Optional[float]:
+         metadata = result.metadata or {}
+         if not isinstance(metadata, dict):
+             return None
+         candidates = [
+             metadata.get("usage_output_tokens"),
+             metadata.get("token_usage"),
+             metadata.get("output_tokens"),
          ]
-         if missing_locks:
-             raise PipelineStepError(
-                 PipelineStep.TRIM,
-                 "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing_locks)),
-             )
+         usage_block = metadata.get("usage")
+         if isinstance(usage_block, dict):
+             candidates.append(usage_block.get("output_tokens"))
+             candidates.append(usage_block.get("total_tokens"))
+         for candidate in candidates:
+             if isinstance(candidate, (int, float)):
+                 return float(candidate)
+         return None
  
-         faq_block = ""
-         if FAQ_START in result.text and FAQ_END in result.text:
-             faq_block = result.text.split(FAQ_START, 1)[1].split(FAQ_END, 1)[0]
-         faq_pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", faq_block)
-         if len(faq_pairs) != 5:
-             raise PipelineStepError(
-                 PipelineStep.TRIM,
-                 "FAQ должен содержать ровно 5 вопросов после тримминга.",
-             )
+     def _call_llm(
+         self,
+         *,
+         step: PipelineStep,
+         messages: Sequence[Dict[str, object]],
+         max_tokens: Optional[int] = None,
+         override_model: Optional[str] = None,
+@@ -477,55 +503,62 @@ class DeterministicPipeline:
+         per_main_tokens = max(220, int(remaining_for_main / main_count)) if main_count else 0
+         predicted = intro_tokens + conclusion_tokens + per_main_tokens * main_count + per_faq_tokens * faq_count
+         start_max = int(predicted * 1.2)
+         if cap is not None and cap > 0:
+             start_max = min(start_max, cap)
+         start_max = max(600, start_max)
+         requires_chunking = bool(cap is not None and predicted > cap)
          LOGGER.info(
-             "TRIM_OK chars_no_spaces=%d removed_paragraphs=%d",
-             current_length,
-             len(result.removed_paragraphs),
-diff --git a/length_controller.py b/length_controller.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..ac5dcd23e86443920fb8fa4d7cd18541de32d738
---- /dev/null
-+++ b/length_controller.py
-@@ -0,0 +1,174 @@
-+from __future__ import annotations
-+
-+import re
-+from dataclasses import dataclass
-+from typing import Iterable, List, Optional, Tuple
-+
-+from length_trimmer import TrimValidationError, trim_text
-+from validators import length_no_spaces
-+
-+_FAQ_START = "<!--FAQ_START-->"
-+_JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">.*?</script>", re.DOTALL)
-+
-+_FILLER_PARAGRAPHS: Tuple[str, ...] = (
-+    (
-+        "**Дополнительное пояснение.** Раскройте, как читатель может применить рекомендации в ближайшие дни, "
-+        "какие инструменты выбрать и как оценить первые результаты. Укажите контрольные точки, чтобы пользователь "
-+        "понимал, что продвижение идёт по плану."
-+        "\n\n"
-+        "**Практический пример.** Опишите типовой сценарий, когда команда сталкивается с нехваткой ресурсов. Поясните, "
-+        "как приоритизировать задачи, какие риски отслеживать и как быстро скорректировать стратегию, если показатели "
-+        "проседают."
-+    ),
-+    (
-+        "**Краткая памятка.** Сформулируйте три шага, которые можно выполнить сразу после прочтения статьи, и добавьте "
-+        "подсказки по коммуникации с коллегами или подрядчиком. Напомните, какие метрики проверять через неделю и через "
-+        "месяц, чтобы убедиться в эффективности."
-+        "\n\n"
-+        "**Мотивационный акцент.** Укрепите уверенность читателя, напомнив, что даже небольшие итерации дают накопительный "
-+        "эффект. Укажите, как документировать выводы и когда стоит возвращаться к материалу за дополнительными идеями."
-+    ),
-+)
-+
-+
-+@dataclass(frozen=True)
-+class LengthControllerResult:
-+    text: str
-+    length: int
-+    iterations: int
-+    adjusted: bool
-+    success: bool
-+    history: Tuple[int, ...]
-+    failure_reason: Optional[str] = None
-+
-+
-+def _split_jsonld_block(text: str) -> Tuple[str, str]:
-+    match = _JSONLD_PATTERN.search(text)
-+    if not match:
-+        return text, ""
-+    jsonld_block = match.group(0)
-+    before = text[: match.start()].rstrip()
-+    after = text[match.end() :].lstrip()
-+    article = before
-+    if after:
-+        article = f"{article}\n\n{after}" if article else after
-+    return article, jsonld_block.strip()
-+
-+
-+def _append_filler_block(text: str, filler: str) -> str:
-+    article, jsonld = _split_jsonld_block(text)
-+    insert_pos = article.find(_FAQ_START)
-+    if insert_pos < 0:
-+        insert_pos = len(article)
-+    before = article[:insert_pos].rstrip()
-+    after = article[insert_pos:].lstrip()
-+    filler_clean = filler.strip()
-+    pieces: List[str] = []
-+    if before:
-+        pieces.append(before)
-+    if filler_clean:
-+        pieces.append(filler_clean)
-+    if after:
-+        pieces.append(after)
-+    combined = "\n\n".join(pieces).rstrip() + "\n"
-+    if jsonld:
-+        combined = f"{combined.rstrip()}\n\n{jsonld}\n"
-+    return combined
-+
-+
-+def _select_filler(iteration: int) -> str:
-+    if not _FILLER_PARAGRAPHS:
-+        return ""
-+    index = iteration % len(_FILLER_PARAGRAPHS)
-+    return _FILLER_PARAGRAPHS[index]
-+
-+
-+def ensure_article_length(
-+    text: str,
-+    *,
-+    min_chars: int,
-+    max_chars: int,
-+    protected_blocks: Iterable[str] | None = None,
-+    max_iterations: int = 6,
-+) -> LengthControllerResult:
-+    """Ensure that article text fits the requested length range.
-+
-+    The controller alternates between trimming (when the article is too long)
-+    and appending structured filler paragraphs (when the article is too short).
-+    It never raises ``TrimValidationError`` and always returns the best effort
-+    result, marking ``success`` when the final length falls inside the range.
-+    """
-+
-+    protected = [str(term).strip() for term in (protected_blocks or []) if str(term).strip()]
-+    current_text = text
-+    history: List[int] = []
-+    iterations = 0
-+    adjusted = False
-+    failure_reason: Optional[str] = None
-+
-+    current_min = max(0, int(min_chars))
-+    current_max = max(current_min, int(max_chars))
-+
-+    while True:
-+        length_now = length_no_spaces(current_text)
-+        history.append(length_now)
-+        if current_min <= length_now <= current_max:
-+            return LengthControllerResult(
-+                text=current_text,
-+                length=length_now,
-+                iterations=iterations,
-+                adjusted=adjusted,
-+                success=True,
-+                history=tuple(history),
-+            )
-+
-+        if iterations >= max_iterations:
-+            failure_reason = failure_reason or "max_iterations"
-+            break
-+
-+        adjusted = True
-+        iterations += 1
-+
-+        if length_now > current_max:
-+            try:
-+                trimmed = trim_text(
-+                    current_text,
-+                    min_chars=current_min,
-+                    max_chars=current_max,
-+                    protected_blocks=protected,
+             "SKELETON_ESTIMATE predicted=%d start_max=%d cap=%s → resolved max_output_tokens=%d",
+             predicted,
+             start_max,
+             cap if cap is not None else "-",
+             start_max,
+         )
+         return SkeletonVolumeEstimate(
+             predicted_tokens=predicted,
+             start_max_tokens=start_max,
+             cap_tokens=cap,
+             intro_tokens=intro_tokens,
+             conclusion_tokens=conclusion_tokens,
+             per_main_tokens=per_main_tokens,
+             per_faq_tokens=per_faq_tokens,
+             requires_chunking=requires_chunking,
+         )
+ 
+-    def _build_skeleton_batches(self, outline: SkeletonOutline) -> List[SkeletonBatchPlan]:
++    def _build_skeleton_batches(
++        self,
++        outline: SkeletonOutline,
++        estimate: SkeletonVolumeEstimate,
++    ) -> List[SkeletonBatchPlan]:
+         batches: List[SkeletonBatchPlan] = [SkeletonBatchPlan(kind=SkeletonBatchKind.INTRO, label="intro")]
+         main_count = len(outline.main_headings)
+         if main_count > 0:
+-            batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
++            if self._should_force_single_main_batches(outline, estimate):
++                batch_size = 1
++            else:
++                batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
+             start = 0
+             while start < main_count:
+                 end = min(start + batch_size, main_count)
+                 indices = list(range(start, end))
+                 if len(indices) == 1:
+                     label = f"main[{indices[0] + 1}]"
+                 else:
+                     label = f"main[{indices[0] + 1}-{indices[-1] + 1}]"
+                 batches.append(
+                     SkeletonBatchPlan(
+                         kind=SkeletonBatchKind.MAIN,
+                         indices=indices,
+                         label=label,
+                     )
+                 )
+                 start = end
+         if outline.has_faq:
+             total_faq = 5
+             produced = 0
+             first_batch = min(SKELETON_FAQ_BATCH, total_faq)
+             if first_batch > 0:
+                 indices = list(range(produced, produced + first_batch))
+                 label = (
+                     f"faq[{indices[0] + 1}-{indices[-1] + 1}]"
+                     if len(indices) > 1
+@@ -1436,50 +1469,74 @@ class DeterministicPipeline:
+             }
+         return None
+ 
+     def _tail_fill_batch(
+         self,
+         batch: SkeletonBatchPlan,
+         *,
+         outline: SkeletonOutline,
+         assembly: SkeletonAssembly,
+         estimate: SkeletonVolumeEstimate,
+         missing_items: Sequence[int],
+         metadata: Dict[str, object],
+     ) -> None:
+         pending = [int(item) for item in missing_items if isinstance(item, int)]
+         if not pending:
+             return
+         if batch.kind == SkeletonBatchKind.MAIN:
+             self._tail_fill_main_sections(
+                 indices=pending,
+                 outline=outline,
+                 assembly=assembly,
+                 estimate=estimate,
+             )
+             return
+         previous_id = self._metadata_response_id(metadata)
++        if not previous_id and batch.kind == SkeletonBatchKind.FAQ:
++            budget = self._batch_token_budget(batch, estimate, 1)
++            max_tokens = max(320, min(budget, TAIL_FILL_MAX_TOKENS))
++            for index in pending:
++                fallback_plan = SkeletonBatchPlan(
++                    kind=SkeletonBatchKind.FAQ,
++                    indices=[index],
++                    label=self._format_batch_label(SkeletonBatchKind.FAQ, [index]),
++                    tail_fill=True,
 +                )
-+            except TrimValidationError as exc:  # pragma: no cover - defensive branch
-+                failure_reason = f"trim_failed:{exc}" if not failure_reason else failure_reason
-+                break
-+
-+            new_length = length_no_spaces(trimmed.text)
-+            if new_length >= length_now:
-+                if current_max > current_min:
-+                    current_max = max(current_min, current_max - 50)
++                payload, result = self._run_fallback_batch(
++                    fallback_plan,
++                    outline=outline,
++                    assembly=assembly,
++                    target_indices=[index],
++                    max_tokens=max_tokens,
++                    previous_response_id=None,
++                )
++                if payload is None or result is None:
 +                    continue
-+                failure_reason = failure_reason or "trim_stalled"
-+                current_text = trimmed.text
-+                break
-+
-+            current_text = trimmed.text
-+            continue
-+
-+        filler = _select_filler(iterations - 1)
-+        if not filler:
-+            failure_reason = failure_reason or "no_filler"
-+            break
-+        current_text = _append_filler_block(current_text, filler)
-+
-+    final_length = length_no_spaces(current_text)
-+    return LengthControllerResult(
-+        text=current_text,
-+        length=final_length,
-+        iterations=iterations,
-+        adjusted=adjusted,
-+        success=False,
-+        history=tuple(history),
-+        failure_reason=failure_reason,
-+    )
-+
-+
-+__all__ = ["LengthControllerResult", "ensure_article_length"]
-diff --git a/skeleton_utils.py b/skeleton_utils.py
-index 448ea5ceefb571f766adc2198d157fa10bbc7a5e..fc5cf34ea074b13aa25c1020fc6b82b7bea637c6 100644
---- a/skeleton_utils.py
-+++ b/skeleton_utils.py
-@@ -1,64 +1,75 @@
- # -*- coding: utf-8 -*-
- """Helpers for normalizing skeleton payloads returned by LLM."""
++                normalized_entries, _ = self._normalize_faq_batch(payload, [index])
++                for _, question, answer in normalized_entries:
++                    assembly.apply_faq(question, answer)
++            return
+         if not previous_id:
+             return
+         if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
+             groups = [[index] for index in pending]
+         else:
+             groups = [list(pending)]
  
- from __future__ import annotations
+         for group in groups:
+             if not group:
+                 continue
+             tail_plan = SkeletonBatchPlan(
+                 kind=batch.kind,
+                 indices=list(group),
+                 label=batch.label + "#tail",
+                 tail_fill=True,
+             )
+             messages, format_block = self._build_batch_messages(
+                 tail_plan,
+                 outline=outline,
+                 assembly=assembly,
+                 target_indices=list(group),
+                 tail_fill=True,
+             )
+             budget = self._batch_token_budget(batch, estimate, len(group))
+             max_tokens = max(400, min(budget, TAIL_FILL_MAX_TOKENS, 800))
+@@ -2035,99 +2092,100 @@ class DeterministicPipeline:
+                 ),
+             },
+             {"role": "user", "content": f"{payload}\n\n{article_block}"},
+         ]
  
- import logging
- from typing import Any, Dict
+     def _sync_locked_terms(self, text: str) -> None:
+         pattern = re.compile(r"<!--LOCK_START term=\"([^\"]+)\"-->")
+         self.locked_terms = pattern.findall(text)
+         if self.normalized_keywords:
+             article = strip_jsonld(text)
+             found = 0
+             for term in self.normalized_keywords:
+                 lock_token = LOCK_START_TEMPLATE.format(term=term)
+                 lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
+                 if lock_pattern.search(text) and build_term_pattern(term).search(article):
+                     found += 1
+             self.keywords_coverage_percent = round(found / len(self.normalized_keywords) * 100, 2)
  
+     # ------------------------------------------------------------------
+     # Step implementations
+     # ------------------------------------------------------------------
+     def _run_skeleton(self) -> str:
+         self._log(PipelineStep.SKELETON, "running")
+         outline = self._prepare_outline()
+         estimate = self._predict_skeleton_volume(outline)
+-        batches = self._build_skeleton_batches(outline)
++        batches = self._build_skeleton_batches(outline, estimate)
+         assembly = SkeletonAssembly(outline=outline)
+         metadata_snapshot: Dict[str, object] = {}
+         last_result: Optional[GenerationResult] = None
  
- LOGGER = logging.getLogger(__name__)
+         pending_batches = deque(batches)
+         scheduled_main_indices: Set[int] = set()
+         parse_none_streaks: Dict[str, int] = {}
+         for plan in pending_batches:
+             if plan.kind == SkeletonBatchKind.MAIN:
+                 scheduled_main_indices.update(plan.indices)
+         split_serial = 0
  
- _CANONICAL_CONCLUSION_KEYS = ("conclusion", "outro", "ending", "final", "summary")
-+_DEFAULT_MAIN_PLACEHOLDER = (
-+    "Этот раздел будет расширен детальными рекомендациями в финальной версии статьи."
-+)
+         while pending_batches:
+             batch = pending_batches.popleft()
+             if batch.kind in (SkeletonBatchKind.FAQ, SkeletonBatchKind.CONCLUSION):
+                 filled_main = sum(
+                     1
+                     for body in assembly.main_sections
+                     if isinstance(body, str) and body.strip()
+                 )
+                 has_pending_main = any(
+                     plan.kind == SkeletonBatchKind.MAIN for plan in pending_batches
+                 )
+                 if filled_main < 3 and has_pending_main:
+                     LOGGER.info(
+                         "LOG:SCHEDULER_BLOCK main underflow=%d target_min=3 → continue_main",
+                         filled_main,
+                     )
+                     pending_batches.append(batch)
+                     continue
+             if not batch.label:
+                 batch.label = self._format_batch_label(batch.kind, batch.indices)
+             active_indices = list(batch.indices)
+             limit_override: Optional[int] = None
+             override_to_cap = False
+             retries = 0
+             consecutive_empty_incomplete = 0
+             payload_obj: Optional[object] = None
+             metadata_snapshot = {}
+             result: Optional[GenerationResult] = None
+             last_max_tokens = estimate.start_max_tokens
+             continuation_id: Optional[str] = None
+             batch_partial = False
+             first_attempt_for_batch = True
+             best_payload_obj: Optional[object] = None
+             best_result: Optional[GenerationResult] = None
+             best_metadata_snapshot: Dict[str, object] = {}
+             last_reason_lower = ""
++            forced_tail_indices: List[int] = []
  
+             while True:
+                 messages, format_block = self._build_batch_messages(
+                     batch,
+                     outline=outline,
+                     assembly=assembly,
+                     target_indices=active_indices,
+                     tail_fill=batch.tail_fill,
+                 )
+                 base_budget = self._batch_token_budget(batch, estimate, len(active_indices) or 1)
+                 if first_attempt_for_batch:
+                     max_tokens_to_use = estimate.start_max_tokens
+                 else:
+                     max_tokens_to_use = base_budget
+                 if limit_override is not None:
+                     if override_to_cap:
+                         max_tokens_to_use = max(max_tokens_to_use, limit_override)
+                     else:
+                         max_tokens_to_use = min(max_tokens_to_use, limit_override)
+                 last_max_tokens = max_tokens_to_use
+                 first_attempt_for_batch = False
+                 request_prev_id = continuation_id or ""
+                 result = self._call_llm(
+                     step=PipelineStep.SKELETON,
+                     messages=messages,
+@@ -2152,57 +2210,56 @@ class DeterministicPipeline:
+                     best_payload_obj = payload_obj
+                     best_result = result
+                     best_metadata_snapshot = dict(metadata_snapshot)
+                 metadata_prev_id = str(
+                     metadata_snapshot.get("previous_response_id")
+                     or request_prev_id
+                     or ""
+                 )
+                 schema_label = str(result.schema or "")
+                 schema_is_none = schema_label.endswith(".none")
+                 parse_none_count = 0
+                 if metadata_prev_id:
+                     if schema_is_none and is_incomplete and not has_payload:
+                         parse_none_count = parse_none_streaks.get(metadata_prev_id, 0) + 1
+                         parse_none_streaks[metadata_prev_id] = parse_none_count
+                     else:
+                         parse_none_streaks.pop(metadata_prev_id, None)
+                 if not is_incomplete or has_payload:
+                     batch_partial = bool(is_incomplete and has_payload)
+                     if metadata_prev_id:
+                         parse_none_streaks.pop(metadata_prev_id, None)
+                     if request_prev_id and request_prev_id != metadata_prev_id:
+                         parse_none_streaks.pop(request_prev_id, None)
+                     break
+                 consecutive_empty_incomplete += 1
+-                should_autosplit = (
+-                    self._can_split_batch(batch.kind, active_indices)
+-                    and len(active_indices) > 1
+-                    and consecutive_empty_incomplete >= 2
+-                    and reason_lower == "max_output_tokens"
+-                    and parse_none_count >= 2
+-                )
++                should_autosplit = False
++                if self._can_split_batch(batch.kind, active_indices) and len(active_indices) > 1:
++                    if reason_lower == "max_output_tokens" and consecutive_empty_incomplete >= 1:
++                        should_autosplit = True
++                    elif consecutive_empty_incomplete >= 2 and parse_none_count >= 2:
++                        should_autosplit = True
+                 if should_autosplit:
+                     keep, remainder = self._split_batch_indices(active_indices)
+                     original_size = len(active_indices)
+                     if remainder:
+                         split_serial += 1
+                         remainder_label = self._format_batch_label(
+                             batch.kind,
+                             remainder,
+                             suffix=f"#split{split_serial}",
+                         )
+                         pending_batches.appendleft(
+                             SkeletonBatchPlan(
+                                 kind=batch.kind,
+                                 indices=list(remainder),
+                                 label=remainder_label,
+                                 tail_fill=batch.tail_fill,
+                             )
+                         )
+                     LOGGER.info(
+                         "BATCH_AUTOSPLIT kind=%s label=%s from=%d to=%d",
+                         batch.kind.value,
+                         batch.label or self._format_batch_label(batch.kind, active_indices),
+                         original_size,
+                         len(keep) or 0,
+                     )
+@@ -2304,175 +2361,210 @@ class DeterministicPipeline:
+                         continuation_id = response_id_candidate
+                         parse_none_streaks.pop(response_id_candidate, None)
+                     batch_partial = True
  
- def _as_list(value: Any) -> list:
-     if isinstance(value, list):
-         return list(value)
-     if value is None:
-         return []
-     return [value]
+             if payload_obj is None and best_payload_obj is not None:
+                 payload_obj = best_payload_obj
+                 result = best_result
+                 metadata_snapshot = dict(best_metadata_snapshot)
+                 batch_partial = True
+                 response_id_candidate = self._metadata_response_id(metadata_snapshot)
+                 if response_id_candidate:
+                     parse_none_streaks.pop(response_id_candidate, None)
+             if (
+                 payload_obj is None
+                 and best_payload_obj is None
+                 and last_reason_lower == "max_output_tokens"
+             ):
+                 placeholder = self._build_batch_placeholder(
+                     batch,
+                     outline=outline,
+                     target_indices=active_indices,
+                 )
+                 if placeholder is not None:
+                     payload_obj = placeholder
+                     batch_partial = True
++                    if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
++                        forced_tail_indices = list(active_indices)
+                     LOGGER.warning(
+-                        "SKELETON_PLACEHOLDER_APPLIED kind=%s label=%s", 
++                        "SKELETON_PLACEHOLDER_APPLIED kind=%s label=%s",
+                         batch.kind.value,
+                         batch.label,
+                     )
+             if payload_obj is None and batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ) and active_indices:
+                 fallback_payload, fallback_result = self._run_fallback_batch(
+                     batch,
+                     outline=outline,
+                     assembly=assembly,
+                     target_indices=active_indices,
+                     max_tokens=last_max_tokens,
+                     previous_response_id=continuation_id,
+                 )
+                 if fallback_payload is not None and fallback_result is not None:
+                     payload_obj = fallback_payload
+                     result = fallback_result
+                     metadata_snapshot = fallback_result.metadata or {}
+                     response_id_candidate = self._metadata_response_id(metadata_snapshot)
+                     if response_id_candidate:
+                         continuation_id = response_id_candidate
+                         parse_none_streaks.pop(response_id_candidate, None)
+                     batch_partial = True
+             if payload_obj is None:
+                 raise PipelineStepError(
+                     PipelineStep.SKELETON,
+                     "Скелет не содержит данных после генерации.",
+                 )
  
+             if batch.kind == SkeletonBatchKind.INTRO:
+                 normalized, missing_fields = self._normalize_intro_batch(payload_obj, outline)
+                 intro_text = normalized.get("intro", "")
+                 headers = normalized.get("main_headers") or []
+                 if len(headers) < len(outline.main_headings):
+                     headers = headers + outline.main_headings[len(headers) :]
+                 assembly.apply_intro(intro_text, headers, normalized.get("conclusion_heading"))
+                 current_total = len(assembly.main_sections)
+                 new_indices = [
+                     idx for idx in range(current_total) if idx not in scheduled_main_indices
+                 ]
+                 if new_indices:
+                     start_pos = 0
+-                    batch_size = max(1, SKELETON_BATCH_SIZE_MAIN)
++                    if self._should_force_single_main_batches(outline, estimate):
++                        batch_size = 1
++                    else:
++                        batch_size = max(1, SKELETON_BATCH_SIZE_MAIN)
+                     while start_pos < len(new_indices):
+                         chunk = new_indices[start_pos : start_pos + batch_size]
+                         if not chunk:
+                             break
+                         chunk_label = self._format_batch_label(SkeletonBatchKind.MAIN, chunk)
+                         pending_batches.append(
+                             SkeletonBatchPlan(
+                                 kind=SkeletonBatchKind.MAIN,
+                                 indices=list(chunk),
+                                 label=chunk_label,
+                             )
+                         )
+                         scheduled_main_indices.update(chunk)
+                         start_pos += batch_size
+                 if missing_fields:
+                     self._tail_fill_batch(
+                         batch,
+                         outline=outline,
+                         assembly=assembly,
+                         estimate=estimate,
+                         missing_items=[0],
+                         metadata=metadata_snapshot,
+                     )
+             elif batch.kind == SkeletonBatchKind.MAIN:
+                 normalized_sections, missing_indices = self._normalize_main_batch(
+                     payload_obj, target_indices, outline
+                 )
+                 for index, heading, body in normalized_sections:
+                     assembly.apply_main(index, body, heading=heading)
+-                if missing_indices:
++                if forced_tail_indices:
++                    merged = list(dict.fromkeys(missing_indices + forced_tail_indices))
++                else:
++                    merged = list(missing_indices)
++                if merged:
+                     self._tail_fill_batch(
+                         batch,
+                         outline=outline,
+                         assembly=assembly,
+                         estimate=estimate,
+-                        missing_items=missing_indices,
++                        missing_items=merged,
+                         metadata=metadata_snapshot,
+                     )
+             elif batch.kind == SkeletonBatchKind.FAQ:
+                 normalized_entries, missing_faq = self._normalize_faq_batch(payload_obj, target_indices)
+                 for _, question, answer in normalized_entries:
+                     assembly.apply_faq(question, answer)
+-                if missing_faq:
++                if forced_tail_indices:
++                    merged_faq = list(dict.fromkeys(missing_faq + forced_tail_indices))
++                else:
++                    merged_faq = list(missing_faq)
++                if merged_faq:
+                     self._tail_fill_batch(
+                         batch,
+                         outline=outline,
+                         assembly=assembly,
+                         estimate=estimate,
+-                        missing_items=missing_faq,
++                        missing_items=merged_faq,
+                         metadata=metadata_snapshot,
+                     )
+             else:
+                 conclusion_text, missing_flag = self._normalize_conclusion_batch(payload_obj)
+                 assembly.apply_conclusion(conclusion_text)
+                 if missing_flag:
+                     self._tail_fill_batch(
+                         batch,
+                         outline=outline,
+                         assembly=assembly,
+                         estimate=estimate,
+                         missing_items=[0],
+                         metadata=metadata_snapshot,
+                     )
  
- def _describe_keys(payload: Dict[str, Any]) -> str:
-     descriptors = []
-     if "intro" in payload:
-         descriptors.append("intro")
-     if "main" in payload:
-         descriptors.append("main[]")
-     if "faq" in payload:
-         descriptors.append("faq[]")
-     if "conclusion" in payload:
-         descriptors.append("conclusion")
-     return ",".join(descriptors)
+             self._apply_inline_faq(payload_obj, assembly)
+             LOGGER.info(
+                 "BATCH_ACCEPT state=%s kind=%s label=%s",
+                 "partial" if batch_partial else "complete",
+                 batch.kind.value,
+                 batch.label,
+             )
  
+         if not assembly.intro:
+             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вводный блок скелета.")
+         if not assembly.conclusion:
+             raise PipelineStepError(PipelineStep.SKELETON, "Не удалось получить вывод скелета.")
+         missing_main = assembly.missing_main_indices()
+         if missing_main:
+             LOGGER.warning(
+                 "LOG:SKELETON_MAIN_GAPS missing=%s",
+                 ",".join(str(idx + 1) for idx in missing_main),
+             )
++            self._tail_fill_main_sections(
++                indices=missing_main,
++                outline=outline,
++                assembly=assembly,
++                estimate=estimate,
++            )
++            missing_main = assembly.missing_main_indices()
++            if missing_main:
++                for index in missing_main:
++                    heading = (
++                        outline.main_headings[index]
++                        if 0 <= index < len(outline.main_headings)
++                        else f"Раздел {index + 1}"
++                    )
++                    placeholder = (
++                        f"Раздел «{heading}» будет дополнен после завершения генерации статьи."
++                    )
++                    assembly.apply_main(index, placeholder, heading=heading)
++                LOGGER.warning(
++                    "LOG:SKELETON_MAIN_PLACEHOLDER_FINAL count=%d",
++                    len(missing_main),
++                )
+         if outline.has_faq and assembly.missing_faq_count(5):
+             raise PipelineStepError(
+                 PipelineStep.SKELETON,
+                 "Не удалось собрать полный FAQ на этапе скелета.",
+             )
  
- def normalize_skeleton_payload(payload: Any) -> Any:
-     """Return a normalized skeleton payload with canonical keys."""
+         payload = assembly.build_payload()
+         if outline.has_faq and len(payload.get("faq", [])) > 5:
+             payload["faq"] = payload["faq"][:5]
  
-     if not isinstance(payload, dict):
-         return payload
- 
-     normalized: Dict[str, Any] = dict(payload)
- 
-     conclusion_value = None
-     for key in _CANONICAL_CONCLUSION_KEYS:
-         if key in normalized:
-             value = normalized.get(key)
-             if value is not None and str(value).strip():
-                 conclusion_value = value
-                 break
-     if conclusion_value is not None:
-         normalized["conclusion"] = conclusion_value
-     for legacy_key in ("outro", "ending", "final", "summary"):
-         normalized.pop(legacy_key, None)
- 
--    normalized["main"] = _as_list(normalized.get("main"))
-+    normalized_main = [
-+        str(item or "").strip() for item in _as_list(normalized.get("main")) if str(item or "").strip()
-+    ]
-+    if len(normalized_main) > 6:
-+        LOGGER.info("LOG:SKELETON_MAIN_TRIM normalize from=%d to=6", len(normalized_main))
-+        normalized_main = normalized_main[:6]
-+    while len(normalized_main) < 3:
-+        normalized_main.append(_DEFAULT_MAIN_PLACEHOLDER)
-+    normalized["main"] = normalized_main
-     normalized["faq"] = _as_list(normalized.get("faq"))
- 
-     keys_descriptor = _describe_keys(normalized)
-     LOGGER.info("LOG:SKELETON_NORMALIZED keys=%s", keys_descriptor)
-     return normalized
- 
- 
- __all__ = ["normalize_skeleton_payload"]
-diff --git a/tests/test_length_controller.py b/tests/test_length_controller.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..ed8655c1eecb3923f35efe111f7090a0118c8211
---- /dev/null
-+++ b/tests/test_length_controller.py
-@@ -0,0 +1,41 @@
-+from length_controller import ensure_article_length
-+from validators import length_no_spaces
-+
-+
-+def _base_article() -> str:
-+    faq_pairs = []
-+    for idx in range(1, 6):
-+        faq_pairs.append(f"**Вопрос {idx}.** Что-то?")
-+        faq_pairs.append(f"**Ответ.** Ответ {idx}.")
-+        faq_pairs.append("")
-+    faq_section = "\n".join(["## FAQ", "<!--FAQ_START-->"] + faq_pairs[:-1] + ["<!--FAQ_END-->"])
-+    return (
-+        "# Заголовок\n\n"
-+        "## Раздел 1\n\n"
-+        "Короткий абзац с базовой мыслью.\n\n"
-+        "## Раздел 2\n\n"
-+        "Ещё один короткий абзац.\n\n"
-+        f"{faq_section}\n\n"
-+        "## Заключение\n\n"
-+        "Финальный вывод.\n"
-+    )
-+
-+
-+def test_ensure_article_length_extends_short_article():
-+    article = _base_article()
-+    result = ensure_article_length(article, min_chars=800, max_chars=1200, protected_blocks=[])
-+
-+    assert result.success is True
-+    assert result.adjusted is True
-+    assert result.length >= 800
-+    assert length_no_spaces(result.text) == result.length
-+
-+
-+def test_ensure_article_length_trims_long_article():
-+    extra = "\n\n".join(f"Дополнительный абзац {idx}." for idx in range(12))
-+    article = _base_article().replace("## FAQ", f"{extra}\n\n## FAQ")
-+    result = ensure_article_length(article, min_chars=500, max_chars=600, protected_blocks=[])
-+
-+    assert result.success is True
-+    assert result.length <= 600
-+    assert length_no_spaces(result.text) == result.length
-diff --git a/tests/test_skeleton_utils.py b/tests/test_skeleton_utils.py
-index a1af4452e9c6b0430c5de73779968be4de770ca2..8f3705555779eaec3a14853a47697bb118baa54e 100644
---- a/tests/test_skeleton_utils.py
-+++ b/tests/test_skeleton_utils.py
-@@ -1,17 +1,32 @@
- from skeleton_utils import normalize_skeleton_payload
- 
- 
- def test_normalize_skeleton_payload_standardizes_keys():
-     raw_payload = {
-         "intro": "Intro",
-         "main": "Section",
-         "faq": {"q": "Q?", "a": "A!"},
-         "outro": "Bye",
-     }
- 
-     normalized = normalize_skeleton_payload(raw_payload)
- 
-     assert "outro" not in normalized
-     assert normalized["conclusion"] == "Bye"
--    assert normalized["main"] == ["Section"]
-+    assert len(normalized["main"]) == 3
-+    assert normalized["main"][0] == "Section"
-     assert normalized["faq"] == [{"q": "Q?", "a": "A!"}]
-+
-+
-+def test_normalize_skeleton_payload_enforces_main_range():
-+    raw_payload = {
-+        "intro": "Intro",
-+        "main": [f"Block {idx}" for idx in range(10)],
-+        "faq": [],
-+        "conclusion": "Bye",
-+    }
-+
-+    normalized = normalize_skeleton_payload(raw_payload)
-+
-+    assert len(normalized["main"]) == 6
-+    assert normalized["main"][0] == "Block 0"
+         normalized_payload = normalize_skeleton_payload(payload)
+         normalized_payload = self._finalize_main_sections(
+             normalized_payload,
+             outline=outline,
+             assembly=assembly,
+             estimate=estimate,
+         )
+         markdown, summary = self._render_skeleton_markdown(normalized_payload)
+         snapshot = dict(normalized_payload)
+         snapshot["outline"] = summary.get("outline", [])
+         if "faq" in summary:
+             snapshot["faq"] = summary.get("faq", [])
+         self.skeleton_payload = snapshot
+         self._skeleton_faq_entries = [
+             {"question": entry.get("q", ""), "answer": entry.get("a", "")}
 

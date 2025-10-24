@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import textwrap
 import time
@@ -307,6 +308,31 @@ class DeterministicPipeline:
                 length += len(content)
         return length
 
+    def _approx_prompt_tokens(self, messages: Sequence[Dict[str, object]]) -> int:
+        """Rough token estimate based on message character count."""
+
+        total_chars = self._prompt_length(messages)
+        if total_chars <= 0:
+            return 0
+        # Empirical heuristic: ~4 characters per token for mixed Russian text.
+        return max(1, int(math.ceil(total_chars / 4.0)))
+
+    def _should_force_single_main_batches(
+        self,
+        outline: SkeletonOutline,
+        estimate: "SkeletonVolumeEstimate",
+    ) -> bool:
+        """Return True when main batches must be generated one-by-one."""
+
+        approx_tokens = self._approx_prompt_tokens(self.messages)
+        if approx_tokens >= 3400:
+            return True
+        if estimate.requires_chunking:
+            return True
+        if len(outline.main_headings) >= 5 and estimate.cap_tokens:
+            return True
+        return False
+
     def _extract_usage(self, result: GenerationResult) -> Optional[float]:
         metadata = result.metadata or {}
         if not isinstance(metadata, dict):
@@ -499,11 +525,18 @@ class DeterministicPipeline:
             requires_chunking=requires_chunking,
         )
 
-    def _build_skeleton_batches(self, outline: SkeletonOutline) -> List[SkeletonBatchPlan]:
+    def _build_skeleton_batches(
+        self,
+        outline: SkeletonOutline,
+        estimate: SkeletonVolumeEstimate,
+    ) -> List[SkeletonBatchPlan]:
         batches: List[SkeletonBatchPlan] = [SkeletonBatchPlan(kind=SkeletonBatchKind.INTRO, label="intro")]
         main_count = len(outline.main_headings)
         if main_count > 0:
-            batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
+            if self._should_force_single_main_batches(outline, estimate):
+                batch_size = 1
+            else:
+                batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
             start = 0
             while start < main_count:
                 end = min(start + batch_size, main_count)
@@ -1458,6 +1491,30 @@ class DeterministicPipeline:
             )
             return
         previous_id = self._metadata_response_id(metadata)
+        if not previous_id and batch.kind == SkeletonBatchKind.FAQ:
+            budget = self._batch_token_budget(batch, estimate, 1)
+            max_tokens = max(320, min(budget, TAIL_FILL_MAX_TOKENS))
+            for index in pending:
+                fallback_plan = SkeletonBatchPlan(
+                    kind=SkeletonBatchKind.FAQ,
+                    indices=[index],
+                    label=self._format_batch_label(SkeletonBatchKind.FAQ, [index]),
+                    tail_fill=True,
+                )
+                payload, result = self._run_fallback_batch(
+                    fallback_plan,
+                    outline=outline,
+                    assembly=assembly,
+                    target_indices=[index],
+                    max_tokens=max_tokens,
+                    previous_response_id=None,
+                )
+                if payload is None or result is None:
+                    continue
+                normalized_entries, _ = self._normalize_faq_batch(payload, [index])
+                for _, question, answer in normalized_entries:
+                    assembly.apply_faq(question, answer)
+            return
         if not previous_id:
             return
         if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
@@ -2057,7 +2114,7 @@ class DeterministicPipeline:
         self._log(PipelineStep.SKELETON, "running")
         outline = self._prepare_outline()
         estimate = self._predict_skeleton_volume(outline)
-        batches = self._build_skeleton_batches(outline)
+        batches = self._build_skeleton_batches(outline, estimate)
         assembly = SkeletonAssembly(outline=outline)
         metadata_snapshot: Dict[str, object] = {}
         last_result: Optional[GenerationResult] = None
@@ -2106,6 +2163,7 @@ class DeterministicPipeline:
             best_result: Optional[GenerationResult] = None
             best_metadata_snapshot: Dict[str, object] = {}
             last_reason_lower = ""
+            forced_tail_indices: List[int] = []
 
             while True:
                 messages, format_block = self._build_batch_messages(
@@ -2174,13 +2232,12 @@ class DeterministicPipeline:
                         parse_none_streaks.pop(request_prev_id, None)
                     break
                 consecutive_empty_incomplete += 1
-                should_autosplit = (
-                    self._can_split_batch(batch.kind, active_indices)
-                    and len(active_indices) > 1
-                    and consecutive_empty_incomplete >= 2
-                    and reason_lower == "max_output_tokens"
-                    and parse_none_count >= 2
-                )
+                should_autosplit = False
+                if self._can_split_batch(batch.kind, active_indices) and len(active_indices) > 1:
+                    if reason_lower == "max_output_tokens" and consecutive_empty_incomplete >= 1:
+                        should_autosplit = True
+                    elif consecutive_empty_incomplete >= 2 and parse_none_count >= 2:
+                        should_autosplit = True
                 if should_autosplit:
                     keep, remainder = self._split_batch_indices(active_indices)
                     original_size = len(active_indices)
@@ -2326,8 +2383,10 @@ class DeterministicPipeline:
                 if placeholder is not None:
                     payload_obj = placeholder
                     batch_partial = True
+                    if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
+                        forced_tail_indices = list(active_indices)
                     LOGGER.warning(
-                        "SKELETON_PLACEHOLDER_APPLIED kind=%s label=%s", 
+                        "SKELETON_PLACEHOLDER_APPLIED kind=%s label=%s",
                         batch.kind.value,
                         batch.label,
                     )
@@ -2368,7 +2427,10 @@ class DeterministicPipeline:
                 ]
                 if new_indices:
                     start_pos = 0
-                    batch_size = max(1, SKELETON_BATCH_SIZE_MAIN)
+                    if self._should_force_single_main_batches(outline, estimate):
+                        batch_size = 1
+                    else:
+                        batch_size = max(1, SKELETON_BATCH_SIZE_MAIN)
                     while start_pos < len(new_indices):
                         chunk = new_indices[start_pos : start_pos + batch_size]
                         if not chunk:
@@ -2398,26 +2460,34 @@ class DeterministicPipeline:
                 )
                 for index, heading, body in normalized_sections:
                     assembly.apply_main(index, body, heading=heading)
-                if missing_indices:
+                if forced_tail_indices:
+                    merged = list(dict.fromkeys(missing_indices + forced_tail_indices))
+                else:
+                    merged = list(missing_indices)
+                if merged:
                     self._tail_fill_batch(
                         batch,
                         outline=outline,
                         assembly=assembly,
                         estimate=estimate,
-                        missing_items=missing_indices,
+                        missing_items=merged,
                         metadata=metadata_snapshot,
                     )
             elif batch.kind == SkeletonBatchKind.FAQ:
                 normalized_entries, missing_faq = self._normalize_faq_batch(payload_obj, target_indices)
                 for _, question, answer in normalized_entries:
                     assembly.apply_faq(question, answer)
-                if missing_faq:
+                if forced_tail_indices:
+                    merged_faq = list(dict.fromkeys(missing_faq + forced_tail_indices))
+                else:
+                    merged_faq = list(missing_faq)
+                if merged_faq:
                     self._tail_fill_batch(
                         batch,
                         outline=outline,
                         assembly=assembly,
                         estimate=estimate,
-                        missing_items=missing_faq,
+                        missing_items=merged_faq,
                         metadata=metadata_snapshot,
                     )
             else:
@@ -2451,6 +2521,28 @@ class DeterministicPipeline:
                 "LOG:SKELETON_MAIN_GAPS missing=%s",
                 ",".join(str(idx + 1) for idx in missing_main),
             )
+            self._tail_fill_main_sections(
+                indices=missing_main,
+                outline=outline,
+                assembly=assembly,
+                estimate=estimate,
+            )
+            missing_main = assembly.missing_main_indices()
+            if missing_main:
+                for index in missing_main:
+                    heading = (
+                        outline.main_headings[index]
+                        if 0 <= index < len(outline.main_headings)
+                        else f"Раздел {index + 1}"
+                    )
+                    placeholder = (
+                        f"Раздел «{heading}» будет дополнен после завершения генерации статьи."
+                    )
+                    assembly.apply_main(index, placeholder, heading=heading)
+                LOGGER.warning(
+                    "LOG:SKELETON_MAIN_PLACEHOLDER_FINAL count=%d",
+                    len(missing_main),
+                )
         if outline.has_faq and assembly.missing_faq_count(5):
             raise PipelineStepError(
                 PipelineStep.SKELETON,
