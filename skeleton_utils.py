@@ -10,6 +10,9 @@ from typing import Any, Dict
 LOGGER = logging.getLogger(__name__)
 
 _CANONICAL_CONCLUSION_KEYS = ("conclusion", "outro", "ending", "final", "summary")
+_DEFAULT_MAIN_PLACEHOLDER = (
+    "Этот раздел будет расширен детальными рекомендациями в финальной версии статьи."
+)
 
 
 def _as_list(value: Any) -> list:
@@ -53,7 +56,15 @@ def normalize_skeleton_payload(payload: Any) -> Any:
     for legacy_key in ("outro", "ending", "final", "summary"):
         normalized.pop(legacy_key, None)
 
-    normalized["main"] = _as_list(normalized.get("main"))
+    normalized_main = [
+        str(item or "").strip() for item in _as_list(normalized.get("main")) if str(item or "").strip()
+    ]
+    if len(normalized_main) > 6:
+        LOGGER.info("LOG:SKELETON_MAIN_TRIM normalize from=%d to=6", len(normalized_main))
+        normalized_main = normalized_main[:6]
+    while len(normalized_main) < 3:
+        normalized_main.append(_DEFAULT_MAIN_PLACEHOLDER)
+    normalized["main"] = normalized_main
     normalized["faq"] = _as_list(normalized.get("faq"))
 
     keys_descriptor = _describe_keys(normalized)

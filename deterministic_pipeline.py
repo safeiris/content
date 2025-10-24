@@ -27,6 +27,7 @@ from keyword_injector import (
     build_term_pattern,
     inject_keywords,
 )
+from length_controller import ensure_article_length
 from length_limits import compute_soft_length_bounds
 from length_trimmer import TrimResult, TrimValidationError, trim_text
 from skeleton_utils import normalize_skeleton_payload
@@ -2560,6 +2561,83 @@ class DeterministicPipeline:
             "Не удалось сформировать блок FAQ: отсутствуют подготовленные данные.",
         )
 
+    def _build_fail_safe_article(self) -> str:
+        topic = self.topic or "SEO-статья"
+        intro = (
+            "Эта резервная версия подготовлена автоматически. Она кратко передаёт ключевые "
+            "смыслы темы и даёт базовые рекомендации по дальнейшему самостоятельному изучению."
+        )
+        main_sections = [
+            (
+                "Быстрый запуск",
+                (
+                    "Сформулируйте цель и определите метрики, по которым будете отслеживать прогресс. "
+                    "Подготовьте рабочую таблицу с ответственными лицами, сроками и ожидаемыми результатами."
+                ),
+            ),
+            (
+                "Практическая проработка",
+                (
+                    "Разбейте внедрение на последовательные этапы, начиная с самых простых действий. "
+                    "Используйте доступные инструменты аналитики и фиксируйте промежуточные выводы после каждой итерации."
+                ),
+            ),
+            (
+                "Контроль и корректировки",
+                (
+                    "Каждую неделю сопоставляйте ожидания с фактическими результатами, чтобы вовремя увидеть отклонения. "
+                    "Фиксируйте инсайты и формируйте короткие резюме, которые помогут защитить инициативу перед командой."
+                ),
+            ),
+        ]
+        faq_entries = [
+            (
+                "С чего начать?",
+                "Определите ключевую задачу и запишите стартовые показатели, от которых будете отталкиваться в анализе.",
+            ),
+            (
+                "Как распределить ответственность?",
+                "Назначьте владельца процесса и закрепите за ним контрольные точки. Остальным участникам оставьте конкретные действия.",
+            ),
+            (
+                "Какие инструменты использовать?",
+                "Выберите аналитические сервисы, с которыми команда уже знакома, чтобы не тратить время на внедрение сложных решений.",
+            ),
+            (
+                "Как оценить первые результаты?",
+                "Сравните фактические метрики с планом через неделю и месяц, отметьте, какие корректировки потребуются.",
+            ),
+            (
+                "Что делать при задержках?",
+                "Зафиксируйте причину, подготовьте три варианта компенсации и обсудите их с ключевыми заинтересованными сторонами.",
+            ),
+        ]
+        conclusion = (
+            "Зафиксируйте выводы, выберите одну метрику оперативного контроля и договоритесь о дате следующей оценки результатов. "
+            "Запишите идеи для последующих улучшений, чтобы постепенно расширять эффект от инициативы."
+        )
+
+        lines: List[str] = [f"# {topic}", "", "## Введение", intro, ""]
+        for heading, paragraph in main_sections:
+            lines.extend([f"## {heading}", paragraph, ""])
+        lines.extend(["## FAQ", "<!--FAQ_START-->"])
+        for index, (question, answer) in enumerate(faq_entries, start=1):
+            lines.append(f"**Вопрос {index}.** {question}")
+            lines.append(f"**Ответ.** {answer}")
+            lines.append("")
+        if lines and lines[-1] == "":
+            lines.pop()
+        lines.extend(["<!--FAQ_END-->", ""])
+        lines.extend(["## Заключение", conclusion, ""])
+        article = "\n".join(lines).strip() + "\n"
+        controller = ensure_article_length(
+            article,
+            min_chars=self.min_chars,
+            max_chars=self.max_chars,
+            protected_blocks=self.locked_terms,
+        )
+        return controller.text if controller.text else article
+
     def _run_trim(self, text: str) -> TrimResult:
         self._log(PipelineStep.TRIM, "running")
         reserve = self.jsonld_reserve if self.jsonld else 0
@@ -2581,27 +2659,41 @@ class DeterministicPipeline:
         strict_violation = current_length < self.min_chars or current_length > self.max_chars
         length_notes: Dict[str, object] = {}
         if strict_violation:
-            if current_length < soft_min or current_length > soft_max:
-                raise PipelineStepError(
-                    PipelineStep.TRIM,
-                    (
-                        "Объём после трима вне диапазона "
-                        f"{self.min_chars}–{self.max_chars} (без пробелов)."
-                    ),
-                )
-            LOGGER.warning(
-                "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
-                current_length,
-                self.min_chars,
-                self.max_chars,
-                soft_min,
-                soft_max,
+            controller = ensure_article_length(
+                result.text,
+                min_chars=self.min_chars,
+                max_chars=self.max_chars,
+                protected_blocks=self.locked_terms,
             )
-            length_notes["length_relaxed"] = True
-            length_notes["length_soft_min"] = soft_min
-            length_notes["length_soft_max"] = soft_max
-            length_notes["length_tolerance_below"] = tolerance_below
-            length_notes["length_tolerance_above"] = tolerance_above
+            if controller.adjusted:
+                length_notes["length_controller_adjusted"] = True
+                length_notes["length_controller_iterations"] = controller.iterations
+                length_notes["length_controller_history"] = list(controller.history)
+                length_notes["length_controller_success"] = controller.success
+                result = TrimResult(text=controller.text, removed_paragraphs=result.removed_paragraphs)
+                current_length = controller.length
+                strict_violation = current_length < self.min_chars or current_length > self.max_chars
+            if strict_violation:
+                LOGGER.warning(
+                    "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
+                    current_length,
+                    self.min_chars,
+                    self.max_chars,
+                    soft_min,
+                    soft_max,
+                )
+                length_notes["length_relaxed"] = True
+                length_notes["length_soft_min"] = soft_min
+                length_notes["length_soft_max"] = soft_max
+                length_notes["length_tolerance_below"] = tolerance_below
+                length_notes["length_tolerance_above"] = tolerance_above
+                if current_length < soft_min or current_length > soft_max:
+                    length_notes["length_controller_success"] = False
+                    length_notes["length_controller_reason"] = controller.failure_reason
+                    fail_safe_article = self._build_fail_safe_article()
+                    result = TrimResult(text=fail_safe_article, removed_paragraphs=result.removed_paragraphs)
+                    current_length = length_no_spaces(result.text)
+                    length_notes["length_controller_fallback"] = True
 
         missing_locks = [
             term

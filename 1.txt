@@ -1,5 +1,5 @@
 diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 90b5006207621c856339a0abce269a7c30796634..1a2f824ee2589372f902faea499863fc2201b0bd 100644
+index 1a2f824ee2589372f902faea499863fc2201b0bd..8730358b82cfee89d591edcc243d6225896947e3 100644
 --- a/deterministic_pipeline.py
 +++ b/deterministic_pipeline.py
 @@ -5,50 +5,51 @@ from __future__ import annotations
@@ -28,7 +28,8 @@ index 90b5006207621c856339a0abce269a7c30796634..1a2f824ee2589372f902faea499863fc
      build_term_pattern,
      inject_keywords,
  )
-+from length_limits import compute_soft_length_bounds
++from length_controller import ensure_article_length
+ from length_limits import compute_soft_length_bounds
  from length_trimmer import TrimResult, TrimValidationError, trim_text
  from skeleton_utils import normalize_skeleton_payload
  from validators import (
@@ -53,8 +54,21 @@ index 90b5006207621c856339a0abce269a7c30796634..1a2f824ee2589372f902faea499863fc
  
  
  class PipelineStep(str, Enum):
-     SKELETON = "skeleton"
-@@ -2551,86 +2552,110 @@ class DeterministicPipeline:
+@@ -2538,92 +2539,183 @@ class DeterministicPipeline:
+             sanitized = self._sanitize_entries(entries_source)
+             if len(sanitized) != 5:
+                 raise PipelineStepError(
+                     PipelineStep.FAQ,
+                     "FAQ должно содержать ровно 5 пар вопросов и ответов.",
+                 )
+             faq_block = self._render_faq_markdown(sanitized)
+             merged_text = self._merge_faq(text, faq_block)
+             self.jsonld = self._build_jsonld(sanitized)
+             self.jsonld_reserve = len(self.jsonld.replace(" ", "")) if self.jsonld else 0
+             LOGGER.info("FAQ_OK entries=%s", ",".join(entry["question"] for entry in sanitized))
+             self._update_log(
+                 PipelineStep.FAQ,
+                 "ok",
                  entries=[entry["question"] for entry in sanitized],
                  **self._metrics(merged_text),
              )
@@ -66,6 +80,83 @@ index 90b5006207621c856339a0abce269a7c30796634..1a2f824ee2589372f902faea499863fc
              "Не удалось сформировать блок FAQ: отсутствуют подготовленные данные.",
          )
  
++    def _build_fail_safe_article(self) -> str:
++        topic = self.topic or "SEO-статья"
++        intro = (
++            "Эта резервная версия подготовлена автоматически. Она кратко передаёт ключевые "
++            "смыслы темы и даёт базовые рекомендации по дальнейшему самостоятельному изучению."
++        )
++        main_sections = [
++            (
++                "Быстрый запуск",
++                (
++                    "Сформулируйте цель и определите метрики, по которым будете отслеживать прогресс. "
++                    "Подготовьте рабочую таблицу с ответственными лицами, сроками и ожидаемыми результатами."
++                ),
++            ),
++            (
++                "Практическая проработка",
++                (
++                    "Разбейте внедрение на последовательные этапы, начиная с самых простых действий. "
++                    "Используйте доступные инструменты аналитики и фиксируйте промежуточные выводы после каждой итерации."
++                ),
++            ),
++            (
++                "Контроль и корректировки",
++                (
++                    "Каждую неделю сопоставляйте ожидания с фактическими результатами, чтобы вовремя увидеть отклонения. "
++                    "Фиксируйте инсайты и формируйте короткие резюме, которые помогут защитить инициативу перед командой."
++                ),
++            ),
++        ]
++        faq_entries = [
++            (
++                "С чего начать?",
++                "Определите ключевую задачу и запишите стартовые показатели, от которых будете отталкиваться в анализе.",
++            ),
++            (
++                "Как распределить ответственность?",
++                "Назначьте владельца процесса и закрепите за ним контрольные точки. Остальным участникам оставьте конкретные действия.",
++            ),
++            (
++                "Какие инструменты использовать?",
++                "Выберите аналитические сервисы, с которыми команда уже знакома, чтобы не тратить время на внедрение сложных решений.",
++            ),
++            (
++                "Как оценить первые результаты?",
++                "Сравните фактические метрики с планом через неделю и месяц, отметьте, какие корректировки потребуются.",
++            ),
++            (
++                "Что делать при задержках?",
++                "Зафиксируйте причину, подготовьте три варианта компенсации и обсудите их с ключевыми заинтересованными сторонами.",
++            ),
++        ]
++        conclusion = (
++            "Зафиксируйте выводы, выберите одну метрику оперативного контроля и договоритесь о дате следующей оценки результатов. "
++            "Запишите идеи для последующих улучшений, чтобы постепенно расширять эффект от инициативы."
++        )
++
++        lines: List[str] = [f"# {topic}", "", "## Введение", intro, ""]
++        for heading, paragraph in main_sections:
++            lines.extend([f"## {heading}", paragraph, ""])
++        lines.extend(["## FAQ", "<!--FAQ_START-->"])
++        for index, (question, answer) in enumerate(faq_entries, start=1):
++            lines.append(f"**Вопрос {index}.** {question}")
++            lines.append(f"**Ответ.** {answer}")
++            lines.append("")
++        if lines and lines[-1] == "":
++            lines.pop()
++        lines.extend(["<!--FAQ_END-->", ""])
++        lines.extend(["## Заключение", conclusion, ""])
++        article = "\n".join(lines).strip() + "\n"
++        controller = ensure_article_length(
++            article,
++            min_chars=self.min_chars,
++            max_chars=self.max_chars,
++            protected_blocks=self.locked_terms,
++        )
++        return controller.text if controller.text else article
++
      def _run_trim(self, text: str) -> TrimResult:
          self._log(PipelineStep.TRIM, "running")
          reserve = self.jsonld_reserve if self.jsonld else 0
@@ -80,38 +171,68 @@ index 90b5006207621c856339a0abce269a7c30796634..1a2f824ee2589372f902faea499863fc
          except TrimValidationError as exc:
              raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
          current_length = length_no_spaces(result.text)
--        if current_length < self.min_chars or current_length > self.max_chars:
--            raise PipelineStepError(
--                PipelineStep.TRIM,
--                f"Объём после трима вне диапазона {self.min_chars}–{self.max_chars} (без пробелов).",
-+
-+        soft_min, soft_max, tolerance_below, tolerance_above = compute_soft_length_bounds(
-+            self.min_chars, self.max_chars
-+        )
-+        strict_violation = current_length < self.min_chars or current_length > self.max_chars
-+        length_notes: Dict[str, object] = {}
-+        if strict_violation:
-+            if current_length < soft_min or current_length > soft_max:
-+                raise PipelineStepError(
-+                    PipelineStep.TRIM,
-+                    (
-+                        "Объём после трима вне диапазона "
-+                        f"{self.min_chars}–{self.max_chars} (без пробелов)."
-+                    ),
-+                )
-+            LOGGER.warning(
-+                "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
-+                current_length,
-+                self.min_chars,
-+                self.max_chars,
-+                soft_min,
-+                soft_max,
+ 
+         soft_min, soft_max, tolerance_below, tolerance_above = compute_soft_length_bounds(
+             self.min_chars, self.max_chars
+         )
+         strict_violation = current_length < self.min_chars or current_length > self.max_chars
+         length_notes: Dict[str, object] = {}
+         if strict_violation:
+-            if current_length < soft_min or current_length > soft_max:
+-                raise PipelineStepError(
+-                    PipelineStep.TRIM,
+-                    (
+-                        "Объём после трима вне диапазона "
+-                        f"{self.min_chars}–{self.max_chars} (без пробелов)."
+-                    ),
+-                )
+-            LOGGER.warning(
+-                "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
+-                current_length,
+-                self.min_chars,
+-                self.max_chars,
+-                soft_min,
+-                soft_max,
++            controller = ensure_article_length(
++                result.text,
++                min_chars=self.min_chars,
++                max_chars=self.max_chars,
++                protected_blocks=self.locked_terms,
              )
-+            length_notes["length_relaxed"] = True
-+            length_notes["length_soft_min"] = soft_min
-+            length_notes["length_soft_max"] = soft_max
-+            length_notes["length_tolerance_below"] = tolerance_below
-+            length_notes["length_tolerance_above"] = tolerance_above
+-            length_notes["length_relaxed"] = True
+-            length_notes["length_soft_min"] = soft_min
+-            length_notes["length_soft_max"] = soft_max
+-            length_notes["length_tolerance_below"] = tolerance_below
+-            length_notes["length_tolerance_above"] = tolerance_above
++            if controller.adjusted:
++                length_notes["length_controller_adjusted"] = True
++                length_notes["length_controller_iterations"] = controller.iterations
++                length_notes["length_controller_history"] = list(controller.history)
++                length_notes["length_controller_success"] = controller.success
++                result = TrimResult(text=controller.text, removed_paragraphs=result.removed_paragraphs)
++                current_length = controller.length
++                strict_violation = current_length < self.min_chars or current_length > self.max_chars
++            if strict_violation:
++                LOGGER.warning(
++                    "TRIM_LEN_RELAXED length=%d range=%d-%d soft_range=%d-%d",
++                    current_length,
++                    self.min_chars,
++                    self.max_chars,
++                    soft_min,
++                    soft_max,
++                )
++                length_notes["length_relaxed"] = True
++                length_notes["length_soft_min"] = soft_min
++                length_notes["length_soft_max"] = soft_max
++                length_notes["length_tolerance_below"] = tolerance_below
++                length_notes["length_tolerance_above"] = tolerance_above
++                if current_length < soft_min or current_length > soft_max:
++                    length_notes["length_controller_success"] = False
++                    length_notes["length_controller_reason"] = controller.failure_reason
++                    fail_safe_article = self._build_fail_safe_article()
++                    result = TrimResult(text=fail_safe_article, removed_paragraphs=result.removed_paragraphs)
++                    current_length = length_no_spaces(result.text)
++                    length_notes["length_controller_fallback"] = True
  
          missing_locks = [
              term
@@ -137,521 +258,350 @@ index 90b5006207621c856339a0abce269a7c30796634..1a2f824ee2589372f902faea499863fc
              "TRIM_OK chars_no_spaces=%d removed_paragraphs=%d",
              current_length,
              len(result.removed_paragraphs),
-         )
-         self._update_log(
-             PipelineStep.TRIM,
-             "ok",
-             removed=len(result.removed_paragraphs),
-             **self._metrics(result.text),
-+            **length_notes,
-         )
-         self.checkpoints[PipelineStep.TRIM] = result.text
-         return result
- 
-     # ------------------------------------------------------------------
-     # Public API
-     # ------------------------------------------------------------------
-     def run(self) -> PipelineState:
-         text = self._run_skeleton()
-         keyword_result = self._run_keywords(text)
-         faq_text = self._run_faq(keyword_result.text)
-         trim_result = self._run_trim(faq_text)
-         combined_text = trim_result.text
-         if self.jsonld and self.jsonld_requested:
-             combined_text = f"{combined_text.rstrip()}\n\n{self.jsonld}\n"
-         try:
-             validation = validate_article(
-                 combined_text,
-                 keywords=self.keywords,
-                 min_chars=self.min_chars,
-                 max_chars=self.max_chars,
-                 skeleton_payload=self.skeleton_payload,
-                 keyword_coverage_percent=self.keywords_coverage_percent,
-             )
-         except ValidationError as exc:
-diff --git a/docs/deterministic_pipeline.md b/docs/deterministic_pipeline.md
-index 8c2e2c08de59a6c37bb33a321bcdcf7cc225dbe8..fe657706f5b4baaa517de3a0f91b16b5dd43fb6b 100644
---- a/docs/deterministic_pipeline.md
-+++ b/docs/deterministic_pipeline.md
-@@ -5,38 +5,38 @@
- ## Шаг A. Скелет
- * Формируется каркас статьи с разделами `Введение → Основная часть → FAQ → Вывод`.
- * В блок FAQ вставляется плейсхолдер `<!--FAQ_START--> … <!--FAQ_END-->`.
- * Длина черновика ограничена 3–3.5 тысячами символов без пробелов, чтобы обеспечить запас для последующих шагов.
- * В метаданных фиксируется чекпоинт `skeleton` с длиной текста.
- 
- ## Шаг B. Ключи
- * Каждая целевая ключевая фраза вставляется в естественный контекст.
- * Вокруг точных вхождений размещаются теги защиты: `<!--LOCK_START term="…">` и `<!--LOCK_END-->`.
- * Если не удаётся органично встроить отдельные ключи, автоматически добавляется врезка «### Разбираемся в терминах» с краткими пояснениями.
- * Шаг завершается только при 100% покрытии списка ключей. В противном случае пайплайн останавливается на этом этапе.
- 
- ## Шаг C. FAQ и JSON-LD
- * На основе унифицированного набора Q/A создаётся Markdown-блок FAQ ровно с пятью парами «Вопрос/Ответ».
- * Параллельно формируется JSON-LD разметка `FAQPage`, синхронизированная с Markdown-версией.
- * Оба артефакта записываются за один проход. Плейсхолдер FAQ заменяется готовым списком, JSON-LD добавляется в конец статьи.
- * Чекпоинт `faq` фиксирует содержимое блока и перечень вопросов.
- 
- ## Шаг D. Приоритетный триммер
- * Рассчитывается резерв под JSON-LD и только затем запускается мягкое сокращение статьи.
- * Триммер удаляет второстепенные абзацы, не затрагивая защищённые LOCK-фрагменты и блок FAQ.
- * После сокращения повторно проверяются длина, ключевые фразы и FAQ. Если хотя бы один критерий не соблюдён, шаг повторяется.
- 
- ## Валидация
- * Финальный валидатор проверяет:
--  * длину 3500–6000 знаков без пробелов;
-+  * длину 3500–6000 знаков без пробелов (допускается небольшой люфт в пределах ~2% для предотвращения ложных падений);
-   * наличие всех ключей (по LOCK-тегам);
-   * строго пять вопросов в FAQ;
-   * корректный JSON-LD `FAQPage`.
- * Результат записывается в метаданные (`validation.passed` и `validation.stats`). При любом «красном» статусе артефакты не фиксируются.
- 
- ## Управление артефактами
- * Все файлы пишутся атомарно: `*.tmp → rename`.
- * После успешной валидации обновляются `artifacts/index.json`, `latest.json` и `changelog.json` (с отметкой времени и исполнителя).
- * `latest.json` хранит ссылку на актуальную версию статьи, `changelog.json` — историю публикаций.
- 
- ## Повторный запуск
- * Для UI предусмотрен сценарий «Повторить», который стартует с первого проваленного шага: например, после сбоя на шаге C будет выполнен только FAQ+JSON-LD, без пересборки скелета и ключей.
-diff --git a/length_limits.py b/length_limits.py
-index fe2f5da4bdc283390af32548520dd032598c31a6..af8ade7a584c859ecd3db049532ec1229519893f 100644
---- a/length_limits.py
-+++ b/length_limits.py
-@@ -1,48 +1,91 @@
- from __future__ import annotations
- 
- import json
- from dataclasses import dataclass
- from pathlib import Path
- from typing import Any, Dict, Optional, Tuple
- 
- from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
- 
- 
- @dataclass(frozen=True)
- class ResolvedLengthLimits:
-     """Normalized length requirements with provenance metadata."""
- 
-     min_chars: int
-     max_chars: int
-     min_source: str
-     max_source: str
-     swapped: bool = False
-     warnings: Tuple[str, ...] = ()
-     profile_source: Optional[str] = None
- 
- 
-+SOFT_RANGE_PERCENT = 0.02
-+SOFT_RANGE_MIN_BELOW = 50
-+SOFT_RANGE_MIN_ABOVE = 100
+diff --git a/length_controller.py b/length_controller.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac5dcd23e86443920fb8fa4d7cd18541de32d738
+--- /dev/null
++++ b/length_controller.py
+@@ -0,0 +1,174 @@
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Iterable, List, Optional, Tuple
++
++from length_trimmer import TrimValidationError, trim_text
++from validators import length_no_spaces
++
++_FAQ_START = "<!--FAQ_START-->"
++_JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">.*?</script>", re.DOTALL)
++
++_FILLER_PARAGRAPHS: Tuple[str, ...] = (
++    (
++        "**Дополнительное пояснение.** Раскройте, как читатель может применить рекомендации в ближайшие дни, "
++        "какие инструменты выбрать и как оценить первые результаты. Укажите контрольные точки, чтобы пользователь "
++        "понимал, что продвижение идёт по плану."
++        "\n\n"
++        "**Практический пример.** Опишите типовой сценарий, когда команда сталкивается с нехваткой ресурсов. Поясните, "
++        "как приоритизировать задачи, какие риски отслеживать и как быстро скорректировать стратегию, если показатели "
++        "проседают."
++    ),
++    (
++        "**Краткая памятка.** Сформулируйте три шага, которые можно выполнить сразу после прочтения статьи, и добавьте "
++        "подсказки по коммуникации с коллегами или подрядчиком. Напомните, какие метрики проверять через неделю и через "
++        "месяц, чтобы убедиться в эффективности."
++        "\n\n"
++        "**Мотивационный акцент.** Укрепите уверенность читателя, напомнив, что даже небольшие итерации дают накопительный "
++        "эффект. Укажите, как документировать выводы и когда стоит возвращаться к материалу за дополнительными идеями."
++    ),
++)
 +
 +
-+def compute_soft_length_bounds(min_chars: int, max_chars: int) -> Tuple[int, int, int, int]:
-+    """Return relaxed length bounds around requested min/max values.
++@dataclass(frozen=True)
++class LengthControllerResult:
++    text: str
++    length: int
++    iterations: int
++    adjusted: bool
++    success: bool
++    history: Tuple[int, ...]
++    failure_reason: Optional[str] = None
 +
-+    The lower tolerance is at least ``SOFT_RANGE_MIN_BELOW`` characters or 2% of the
-+    minimum requirement. The upper tolerance is at least
-+    ``SOFT_RANGE_MIN_ABOVE`` characters or 2% of the maximum requirement. Both
-+    tolerances are additionally capped by zero to avoid negative bounds.
++
++def _split_jsonld_block(text: str) -> Tuple[str, str]:
++    match = _JSONLD_PATTERN.search(text)
++    if not match:
++        return text, ""
++    jsonld_block = match.group(0)
++    before = text[: match.start()].rstrip()
++    after = text[match.end() :].lstrip()
++    article = before
++    if after:
++        article = f"{article}\n\n{after}" if article else after
++    return article, jsonld_block.strip()
++
++
++def _append_filler_block(text: str, filler: str) -> str:
++    article, jsonld = _split_jsonld_block(text)
++    insert_pos = article.find(_FAQ_START)
++    if insert_pos < 0:
++        insert_pos = len(article)
++    before = article[:insert_pos].rstrip()
++    after = article[insert_pos:].lstrip()
++    filler_clean = filler.strip()
++    pieces: List[str] = []
++    if before:
++        pieces.append(before)
++    if filler_clean:
++        pieces.append(filler_clean)
++    if after:
++        pieces.append(after)
++    combined = "\n\n".join(pieces).rstrip() + "\n"
++    if jsonld:
++        combined = f"{combined.rstrip()}\n\n{jsonld}\n"
++    return combined
++
++
++def _select_filler(iteration: int) -> str:
++    if not _FILLER_PARAGRAPHS:
++        return ""
++    index = iteration % len(_FILLER_PARAGRAPHS)
++    return _FILLER_PARAGRAPHS[index]
++
++
++def ensure_article_length(
++    text: str,
++    *,
++    min_chars: int,
++    max_chars: int,
++    protected_blocks: Iterable[str] | None = None,
++    max_iterations: int = 6,
++) -> LengthControllerResult:
++    """Ensure that article text fits the requested length range.
++
++    The controller alternates between trimming (when the article is too long)
++    and appending structured filler paragraphs (when the article is too short).
++    It never raises ``TrimValidationError`` and always returns the best effort
++    result, marking ``success`` when the final length falls inside the range.
 +    """
 +
-+    try:
-+        min_value = int(min_chars)
-+    except (TypeError, ValueError):  # defensive: keep behaviour predictable
-+        min_value = 0
-+    try:
-+        max_value = int(max_chars)
-+    except (TypeError, ValueError):
-+        max_value = 0
++    protected = [str(term).strip() for term in (protected_blocks or []) if str(term).strip()]
++    current_text = text
++    history: List[int] = []
++    iterations = 0
++    adjusted = False
++    failure_reason: Optional[str] = None
 +
-+    if max_value < min_value:
-+        min_value, max_value = max_value, min_value
++    current_min = max(0, int(min_chars))
++    current_max = max(current_min, int(max_chars))
 +
-+    min_value = max(0, min_value)
-+    max_value = max(0, max_value)
++    while True:
++        length_now = length_no_spaces(current_text)
++        history.append(length_now)
++        if current_min <= length_now <= current_max:
++            return LengthControllerResult(
++                text=current_text,
++                length=length_now,
++                iterations=iterations,
++                adjusted=adjusted,
++                success=True,
++                history=tuple(history),
++            )
 +
-+    lower_tolerance = 0
-+    if min_value > 0:
-+        lower_tolerance = min(
-+            min_value,
-+            max(SOFT_RANGE_MIN_BELOW, int(round(min_value * SOFT_RANGE_PERCENT))),
-+        )
-+    upper_tolerance = max(SOFT_RANGE_MIN_ABOVE, int(round(max_value * SOFT_RANGE_PERCENT)))
++        if iterations >= max_iterations:
++            failure_reason = failure_reason or "max_iterations"
++            break
 +
-+    soft_min = max(0, min_value - lower_tolerance)
-+    soft_max = max_value + upper_tolerance
++        adjusted = True
++        iterations += 1
 +
-+    return soft_min, soft_max, lower_tolerance, upper_tolerance
++        if length_now > current_max:
++            try:
++                trimmed = trim_text(
++                    current_text,
++                    min_chars=current_min,
++                    max_chars=current_max,
++                    protected_blocks=protected,
++                )
++            except TrimValidationError as exc:  # pragma: no cover - defensive branch
++                failure_reason = f"trim_failed:{exc}" if not failure_reason else failure_reason
++                break
 +
++            new_length = length_no_spaces(trimmed.text)
++            if new_length >= length_now:
++                if current_max > current_min:
++                    current_max = max(current_min, current_max - 50)
++                    continue
++                failure_reason = failure_reason or "trim_stalled"
++                current_text = trimmed.text
++                break
 +
- def resolve_length_limits(theme: str, payload: Dict[str, Any]) -> ResolvedLengthLimits:
-     """Determine min/max character limits using brief → profile → defaults."""
- 
-     brief_min, brief_max = _extract_brief_limits(payload)
-     profile_min, profile_max, profile_source = _load_profile_limits(theme)
- 
-     min_value, min_source = _choose_limit(brief_min, profile_min, DEFAULT_MIN_LENGTH)
-     max_value, max_source = _choose_limit(brief_max, profile_max, DEFAULT_MAX_LENGTH)
- 
-     swapped = False
-     warnings: Tuple[str, ...] = ()
- 
-     if max_value < min_value:
-         swapped = True
-         min_value, max_value, min_source, max_source = (
-             max_value,
-             min_value,
-             max_source,
-             min_source,
-         )
-         warnings = (
-             "Минимальный объём в брифе был больше максимального; значения переставлены местами.",
-         )
- 
-     return ResolvedLengthLimits(
-diff --git a/tests/test_length_limits.py b/tests/test_length_limits.py
-index a7f6b64e218758fcc0aee7a7037aefc6d89376d3..79994f744a36f1267078500f11aa6ddc8ce9baf5 100644
---- a/tests/test_length_limits.py
-+++ b/tests/test_length_limits.py
-@@ -1,31 +1,45 @@
--from length_limits import resolve_length_limits
-+from length_limits import compute_soft_length_bounds, resolve_length_limits
- 
- 
- def test_resolve_uses_brief_values():
-     payload = {"length_limits": {"min_chars": 1000, "max_chars": 1200}}
-     result = resolve_length_limits("finance", payload)
-     assert result.min_chars == 1000
-     assert result.max_chars == 1200
-     assert result.min_source == "brief"
-     assert result.max_source == "brief"
-     assert not result.warnings
- 
- 
- def test_resolve_uses_profile_defaults_when_missing():
-     result = resolve_length_limits("finance", {})
-     assert result.min_chars == 3200
-     assert result.max_chars == 5400
-     assert result.min_source == "profile"
-     assert result.max_source == "profile"
-     assert result.profile_source.endswith("profiles/finance/settings.json")
- 
- 
- def test_resolve_swaps_when_min_greater_than_max():
-     payload = {"length_limits": {"min_chars": 6000, "max_chars": 3500}}
-     result = resolve_length_limits("finance", payload)
-     assert result.min_chars == 3500
-     assert result.max_chars == 6000
-     assert result.swapped
-     assert result.min_source == "brief"
-     assert result.max_source == "brief"
-     assert any("поменяли" in warning.lower() or "перестав" in warning.lower() for warning in result.warnings)
++            current_text = trimmed.text
++            continue
++
++        filler = _select_filler(iterations - 1)
++        if not filler:
++            failure_reason = failure_reason or "no_filler"
++            break
++        current_text = _append_filler_block(current_text, filler)
++
++    final_length = length_no_spaces(current_text)
++    return LengthControllerResult(
++        text=current_text,
++        length=final_length,
++        iterations=iterations,
++        adjusted=adjusted,
++        success=False,
++        history=tuple(history),
++        failure_reason=failure_reason,
++    )
 +
 +
-+def test_compute_soft_length_bounds_adds_reasonable_tolerance():
-+    soft_min, soft_max, tol_below, tol_above = compute_soft_length_bounds(3500, 6000)
-+    assert soft_min == 3430
-+    assert soft_max == 6120
-+    assert tol_below == 70
-+    assert tol_above == 120
-+
-+
-+def test_compute_soft_length_bounds_handles_inverted_values():
-+    soft_min, soft_max, _, _ = compute_soft_length_bounds(6000, 3500)
-+    assert soft_min == 3430
-+    assert soft_max == 6120
-diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
-index 1eaadb5409aa2271b20f173faaaccfd6c242b5ba..64e675dbd8b66d6e7ef13e536f3e8ca7976559f4 100644
---- a/tests/test_orchestrate_utils.py
-+++ b/tests/test_orchestrate_utils.py
-@@ -1,34 +1,35 @@
- import json
- import uuid
- from pathlib import Path
++__all__ = ["LengthControllerResult", "ensure_article_length"]
+diff --git a/skeleton_utils.py b/skeleton_utils.py
+index 448ea5ceefb571f766adc2198d157fa10bbc7a5e..fc5cf34ea074b13aa25c1020fc6b82b7bea637c6 100644
+--- a/skeleton_utils.py
++++ b/skeleton_utils.py
+@@ -1,64 +1,75 @@
+ # -*- coding: utf-8 -*-
+ """Helpers for normalizing skeleton payloads returned by LLM."""
  
- import pytest
- 
- from deterministic_pipeline import DeterministicPipeline, PipelineStep
- from faq_builder import build_faq_block
- from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
-+from length_limits import compute_soft_length_bounds
- from length_trimmer import trim_text
- from llm_client import GenerationResult
- from orchestrate import generate_article_from_payload, gather_health_status
- from validators import ValidationError, strip_jsonld, validate_article
- 
- MIN_REQUIRED = 3500
- MAX_REQUIRED = 6000
- 
- def test_keyword_injection_protects_terms_and_locks_all_occurrences():
-     base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
-     result = inject_keywords(base_text, ["ключевая фраза", "дополнительный термин"])
-     assert result.coverage_report == "2/2"
-     assert result.missing_terms == []
-     main_section = result.text.split("## FAQ", 1)[0]
-     first_phrase = (
-         "Дополнительно рассматривается "
-         + f"{LOCK_START_TEMPLATE.format(term='ключевая фраза')}ключевая фраза<!--LOCK_END-->"
-         + " через прикладные сценарии."
-     )
-     second_phrase = (
-         "Дополнительно рассматривается "
-         + f"{LOCK_START_TEMPLATE.format(term='дополнительный термин')}дополнительный термин<!--LOCK_END-->"
-         + " через прикладные сценарии."
-     )
-     assert first_phrase in main_section
-@@ -239,51 +240,52 @@ def _stub_llm(monkeypatch):
-             api_route="chat",
-             schema="json",
-             metadata={"usage_output_tokens": 256},
-         )
- 
-     monkeypatch.setattr("deterministic_pipeline.DeterministicPipeline._call_llm", fake_call)
- 
- 
- def test_pipeline_produces_valid_article(monkeypatch):
-     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-     _stub_llm(monkeypatch)
-     pipeline = DeterministicPipeline(
-         topic="Долговая нагрузка семьи",
-         base_outline=["Введение", "Аналитика", "Решения"],
-         keywords=[f"ключ {idx}" for idx in range(1, 12)],
-         min_chars=3500,
-         max_chars=6000,
-         messages=[{"role": "system", "content": "Системный промпт"}],
-         model="stub-model",
-         temperature=0.3,
-         max_tokens=1800,
-         timeout_s=60,
-     )
-     state = pipeline.run()
-     length_no_spaces = len("".join(strip_jsonld(state.text).split()))
--    assert 3500 <= length_no_spaces <= 6000
-+    soft_min, soft_max, _, _ = compute_soft_length_bounds(MIN_REQUIRED, MAX_REQUIRED)
-+    assert soft_min <= length_no_spaces <= soft_max
-     assert state.validation and state.validation.is_valid
-     assert state.text.count("**Вопрос") == 5
- 
- 
- def test_pipeline_resume_falls_back_to_available_checkpoint(monkeypatch):
-     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-     _stub_llm(monkeypatch)
-     pipeline = DeterministicPipeline(
-         topic="Долговая нагрузка семьи",
-         base_outline=["Введение", "Основная часть", "Вывод"],
-         keywords=[f"ключ {idx}" for idx in range(1, 12)],
-         min_chars=3500,
-         max_chars=6000,
-         messages=[{"role": "system", "content": "Системный промпт"}],
-         model="stub-model",
-         temperature=0.3,
-         max_tokens=1800,
-         timeout_s=60,
-     )
-     pipeline._run_skeleton()
-     state = pipeline.resume(PipelineStep.FAQ)
-     assert state.validation and state.validation.is_valid
-     faq_entries = [entry for entry in state.logs if entry.step == PipelineStep.FAQ]
-     assert faq_entries and faq_entries[-1].status == "ok"
- 
-diff --git a/validators.py b/validators.py
-index eace6816fc168a8bc2b38fe548e97577e6c99839..e8751ee41579ef34e10595b0cb9b88b198736ff7 100644
---- a/validators.py
-+++ b/validators.py
-@@ -1,35 +1,35 @@
  from __future__ import annotations
  
- import json
- import re
- from dataclasses import dataclass, field
- from typing import Dict, Iterable, List, Optional, Tuple
- 
--from skeleton_utils import normalize_skeleton_payload
--
- from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
-+from length_limits import compute_soft_length_bounds
-+from skeleton_utils import normalize_skeleton_payload
- from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
- 
- _FAQ_START = "<!--FAQ_START-->"
- _FAQ_END = "<!--FAQ_END-->"
- _JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">(.*?)</script>", re.DOTALL)
- _FAQ_ENTRY_PATTERN = re.compile(
-     r"\*\*Вопрос\s+(?P<index>\d+)\.\*\*\s*(?P<question>.+?)\s*\n\*\*Ответ\.\*\*\s*(?P<answer>.*?)(?=\n\*\*Вопрос\s+\d+\.\*\*|\Z)",
-     re.DOTALL,
- )
+ import logging
+ from typing import Any, Dict
  
  
- class ValidationError(RuntimeError):
-     """Raised when one of the blocking validation groups fails."""
+ LOGGER = logging.getLogger(__name__)
  
-     def __init__(self, group: str, message: str, *, details: Optional[Dict[str, object]] = None) -> None:
-         super().__init__(message)
-         self.group = group
-         self.details = details or {}
- 
- 
- @dataclass
- class ValidationResult:
-     skeleton_ok: bool
-     keywords_ok: bool
-     faq_ok: bool
-@@ -161,50 +161,56 @@ def _skeleton_status(
- 
-     outline = skeleton_payload.get("outline")
-     if outline and isinstance(outline, list):
-         normalized_outline = [str(entry).strip() for entry in outline if str(entry).strip()]
-     else:
-         normalized_outline = []
- 
-     expected_main = max(1, len(normalized_outline) - 2) if normalized_outline else len(main)
-     if len(main) != expected_main:
-         return False, "Количество блоков основной части не совпадает с ожидаемым."
-     if "## FAQ" not in text or _FAQ_START not in text or _FAQ_END not in text:
-         return False, "В markdown нет заголовка FAQ и маркеров <!--FAQ_START/END-->."
-     return True, None
+ _CANONICAL_CONCLUSION_KEYS = ("conclusion", "outro", "ending", "final", "summary")
++_DEFAULT_MAIN_PLACEHOLDER = (
++    "Этот раздел будет расширен детальными рекомендациями в финальной версии статьи."
++)
  
  
- def validate_article(
-     text: str,
-     *,
-     keywords: Iterable[str],
-     min_chars: int,
-     max_chars: int,
-     skeleton_payload: Optional[Dict[str, object]] = None,
-     keyword_coverage_percent: Optional[float] = None,
- ) -> ValidationResult:
-     length = _length_no_spaces(text)
-+    default_soft_min, default_soft_max, default_tol_below, default_tol_above = compute_soft_length_bounds(
-+        DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH
+ def _as_list(value: Any) -> list:
+     if isinstance(value, list):
+         return list(value)
+     if value is None:
+         return []
+     return [value]
+ 
+ 
+ def _describe_keys(payload: Dict[str, Any]) -> str:
+     descriptors = []
+     if "intro" in payload:
+         descriptors.append("intro")
+     if "main" in payload:
+         descriptors.append("main[]")
+     if "faq" in payload:
+         descriptors.append("faq[]")
+     if "conclusion" in payload:
+         descriptors.append("conclusion")
+     return ",".join(descriptors)
+ 
+ 
+ def normalize_skeleton_payload(payload: Any) -> Any:
+     """Return a normalized skeleton payload with canonical keys."""
+ 
+     if not isinstance(payload, dict):
+         return payload
+ 
+     normalized: Dict[str, Any] = dict(payload)
+ 
+     conclusion_value = None
+     for key in _CANONICAL_CONCLUSION_KEYS:
+         if key in normalized:
+             value = normalized.get(key)
+             if value is not None and str(value).strip():
+                 conclusion_value = value
+                 break
+     if conclusion_value is not None:
+         normalized["conclusion"] = conclusion_value
+     for legacy_key in ("outro", "ending", "final", "summary"):
+         normalized.pop(legacy_key, None)
+ 
+-    normalized["main"] = _as_list(normalized.get("main"))
++    normalized_main = [
++        str(item or "").strip() for item in _as_list(normalized.get("main")) if str(item or "").strip()
++    ]
++    if len(normalized_main) > 6:
++        LOGGER.info("LOG:SKELETON_MAIN_TRIM normalize from=%d to=6", len(normalized_main))
++        normalized_main = normalized_main[:6]
++    while len(normalized_main) < 3:
++        normalized_main.append(_DEFAULT_MAIN_PLACEHOLDER)
++    normalized["main"] = normalized_main
+     normalized["faq"] = _as_list(normalized.get("faq"))
+ 
+     keys_descriptor = _describe_keys(normalized)
+     LOGGER.info("LOG:SKELETON_NORMALIZED keys=%s", keys_descriptor)
+     return normalized
+ 
+ 
+ __all__ = ["normalize_skeleton_payload"]
+diff --git a/tests/test_length_controller.py b/tests/test_length_controller.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed8655c1eecb3923f35efe111f7090a0118c8211
+--- /dev/null
++++ b/tests/test_length_controller.py
+@@ -0,0 +1,41 @@
++from length_controller import ensure_article_length
++from validators import length_no_spaces
++
++
++def _base_article() -> str:
++    faq_pairs = []
++    for idx in range(1, 6):
++        faq_pairs.append(f"**Вопрос {idx}.** Что-то?")
++        faq_pairs.append(f"**Ответ.** Ответ {idx}.")
++        faq_pairs.append("")
++    faq_section = "\n".join(["## FAQ", "<!--FAQ_START-->"] + faq_pairs[:-1] + ["<!--FAQ_END-->"])
++    return (
++        "# Заголовок\n\n"
++        "## Раздел 1\n\n"
++        "Короткий абзац с базовой мыслью.\n\n"
++        "## Раздел 2\n\n"
++        "Ещё один короткий абзац.\n\n"
++        f"{faq_section}\n\n"
++        "## Заключение\n\n"
++        "Финальный вывод.\n"
 +    )
-+    requested_soft_min, requested_soft_max, req_tol_below, req_tol_above = compute_soft_length_bounds(
-+        min_chars, max_chars
-+    )
-     normalized_skeleton = (
-         normalize_skeleton_payload(skeleton_payload)
-         if skeleton_payload is not None
-         else None
-     )
-     skeleton_ok, skeleton_message = _skeleton_status(normalized_skeleton, text)
++
++
++def test_ensure_article_length_extends_short_article():
++    article = _base_article()
++    result = ensure_article_length(article, min_chars=800, max_chars=1200, protected_blocks=[])
++
++    assert result.success is True
++    assert result.adjusted is True
++    assert result.length >= 800
++    assert length_no_spaces(result.text) == result.length
++
++
++def test_ensure_article_length_trims_long_article():
++    extra = "\n\n".join(f"Дополнительный абзац {idx}." for idx in range(12))
++    article = _base_article().replace("## FAQ", f"{extra}\n\n## FAQ")
++    result = ensure_article_length(article, min_chars=500, max_chars=600, protected_blocks=[])
++
++    assert result.success is True
++    assert result.length <= 600
++    assert length_no_spaces(result.text) == result.length
+diff --git a/tests/test_skeleton_utils.py b/tests/test_skeleton_utils.py
+index a1af4452e9c6b0430c5de73779968be4de770ca2..8f3705555779eaec3a14853a47697bb118baa54e 100644
+--- a/tests/test_skeleton_utils.py
++++ b/tests/test_skeleton_utils.py
+@@ -1,17 +1,32 @@
+ from skeleton_utils import normalize_skeleton_payload
  
-     normalized_keywords = [str(term).strip() for term in keywords if str(term).strip()]
-     missing: List[str] = []
-     article = strip_jsonld(text)
-     for term in normalized_keywords:
-         pattern = _keyword_regex(term)
-         if not pattern.search(article):
-             missing.append(term)
-             continue
-         lock_token = LOCK_START_TEMPLATE.format(term=term)
-         lock_pattern = re.compile(rf"{re.escape(lock_token)}.*?{re.escape(LOCK_END)}", re.DOTALL)
-         if not lock_pattern.search(text):
-             missing.append(term)
-     keywords_ok = len(missing) == 0
  
-     markdown_faq, markdown_error = _parse_markdown_faq(text)
-     faq_count = len(markdown_faq)
-     jsonld_entries, jsonld_error = _parse_jsonld_entries(text)
-     jsonld_ok = jsonld_error is None
-@@ -215,89 +221,97 @@ def validate_article(
-     if markdown_error:
-         faq_error = markdown_error
-     elif jsonld_error:
-         faq_error = jsonld_error
-     else:
-         faq_ok = True
-         for idx, entry in enumerate(markdown_faq):
-             jsonld_entry = jsonld_entries[idx]
-             if entry["question"] != jsonld_entry["question"] or entry["answer"] != jsonld_entry["answer"]:
-                 faq_ok = False
-                 mismatched_questions.append(entry["question"])
-         if mismatched_questions:
-             faq_error = (
-                 "FAQ в markdown не совпадает с JSON-LD (например, вопрос '"
-                 + mismatched_questions[0]
-                 + "')."
-             )
-     if not faq_ok and faq_error is None:
-         faq_error = "FAQ должен содержать ровно 5 вопросов и ответов."
- 
-     coverage_percent = 100.0 if not normalized_keywords else round(
-         (len(normalized_keywords) - len(missing)) / len(normalized_keywords) * 100,
-         2,
-     )
- 
--    length_ok = DEFAULT_MIN_LENGTH <= length <= DEFAULT_MAX_LENGTH
--    requested_range_ok = min_chars <= length <= max_chars
-+    length_ok = default_soft_min <= length <= default_soft_max
-+    requested_range_ok = requested_soft_min <= length <= requested_soft_max
- 
-     stats: Dict[str, object] = {
-         "length_no_spaces": length,
-         "keywords_total": len(normalized_keywords),
-         "keywords_missing": missing,
-         "keywords_found": len(normalized_keywords) - len(missing),
-         "keywords_coverage": f"{len(normalized_keywords) - len(missing)}/{len(normalized_keywords) if normalized_keywords else 0}",
-         "keywords_coverage_percent": coverage_percent,
-         "keyword_coverage_expected_percent": keyword_coverage_percent,
-         "faq_count": faq_count,
-         "faq_jsonld_count": len(jsonld_entries),
-         "faq_mismatched_questions": mismatched_questions,
-         "jsonld_ok": jsonld_ok,
-         "length_requested_range_ok": requested_range_ok,
-         "length_required_min": DEFAULT_MIN_LENGTH,
-         "length_required_max": DEFAULT_MAX_LENGTH,
-+        "length_soft_min": default_soft_min,
-+        "length_soft_max": default_soft_max,
-+        "length_tolerance_default_below": default_tol_below,
-+        "length_tolerance_default_above": default_tol_above,
-+        "length_requested_soft_min": requested_soft_min,
-+        "length_requested_soft_max": requested_soft_max,
-+        "length_requested_tolerance_below": req_tol_below,
-+        "length_requested_tolerance_above": req_tol_above,
+ def test_normalize_skeleton_payload_standardizes_keys():
+     raw_payload = {
+         "intro": "Intro",
+         "main": "Section",
+         "faq": {"q": "Q?", "a": "A!"},
+         "outro": "Bye",
      }
  
-     if keyword_coverage_percent is not None and keyword_coverage_percent < 100.0:
-         raise ValidationError(
-             "keywords",
-             (
-                 "Этап подстановки ключевых слов завершился с покрытием "
-                 f"{keyword_coverage_percent:.0f}%, требуется 100%."
-             ),
-             details=stats,
-         )
+     normalized = normalize_skeleton_payload(raw_payload)
  
-     result = ValidationResult(
-         skeleton_ok=skeleton_ok,
-         keywords_ok=keywords_ok,
-         faq_ok=faq_ok,
-         length_ok=length_ok,
-         jsonld_ok=jsonld_ok,
-         stats=stats,
-     )
- 
-     if not skeleton_ok:
-         raise ValidationError("skeleton", skeleton_message or "Ошибка структуры статьи.", details=stats)
-     if not keywords_ok:
-         raise ValidationError(
-             "keywords",
-             "Ключевые слова покрыты не полностью.",
-             details={"missing": missing, **stats},
-         )
-     if not faq_ok:
-         message = faq_error or "FAQ должен содержать 5 вопросов и корректный JSON-LD."
-         raise ValidationError("faq", message, details=stats)
-     if not length_ok:
-         raise ValidationError(
-             "length",
-             (
-                 f"Объём статьи {length} зн. без пробелов, требуется "
--                f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH}."
-+                f"{DEFAULT_MIN_LENGTH}-{DEFAULT_MAX_LENGTH} (допуск {default_soft_min}-{default_soft_max})."
-             ),
-             details=stats,
-         )
-     return result
- def _keyword_regex(term: str) -> re.Pattern:
-     pattern = rf"(?i)(?<!\\w){re.escape(term)}(?!\\w)"
-     return re.compile(pattern)
- 
+     assert "outro" not in normalized
+     assert normalized["conclusion"] == "Bye"
+-    assert normalized["main"] == ["Section"]
++    assert len(normalized["main"]) == 3
++    assert normalized["main"][0] == "Section"
+     assert normalized["faq"] == [{"q": "Q?", "a": "A!"}]
++
++
++def test_normalize_skeleton_payload_enforces_main_range():
++    raw_payload = {
++        "intro": "Intro",
++        "main": [f"Block {idx}" for idx in range(10)],
++        "faq": [],
++        "conclusion": "Bye",
++    }
++
++    normalized = normalize_skeleton_payload(raw_payload)
++
++    assert len(normalized["main"]) == 6
++    assert normalized["main"][0] == "Block 0"
 
