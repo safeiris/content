@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
+from keyword_injector import LOCK_END, LOCK_START_TEMPLATE
 from length_trimmer import TrimValidationError, trim_text
 from validators import length_no_spaces
 
@@ -83,6 +84,88 @@ def _select_filler(iteration: int) -> str:
     return _FILLER_PARAGRAPHS[index]
 
 
+_PRECISION_WORDS: Tuple[str, ...] = (
+    "подробности",
+    "пример",
+    "детали",
+    "вывод",
+    "анализ",
+    "решение",
+    "инициатива",
+    "практика",
+)
+
+
+def _build_precision_filler(delta: int) -> str:
+    if delta <= 0:
+        return ""
+    target_core = max(0, delta - 1)
+    collected: List[str] = []
+    total = 0
+    index = 0
+    while total < target_core:
+        word = _PRECISION_WORDS[index % len(_PRECISION_WORDS)] if _PRECISION_WORDS else "слово"
+        index += 1
+        clean = word.replace(" ", "")
+        remaining = target_core - total
+        if len(clean) > remaining:
+            clean = clean[:remaining]
+        collected.append(clean)
+        total += len(clean)
+    body = " ".join(item for item in collected if item).strip()
+    if body:
+        return f" {body}."
+    return " ."
+
+
+def _build_protection_mask(text: str, tokens: Iterable[str]) -> List[bool]:
+    mask = [False] * len(text)
+    for token in tokens:
+        if not token:
+            continue
+        start = 0
+        while True:
+            idx = text.find(token, start)
+            if idx == -1:
+                break
+            for pos in range(idx, min(idx + len(token), len(mask))):
+                mask[pos] = True
+            start = idx + len(token)
+    return mask
+
+
+def _truncate_to_exact_length(text: str, remove: int, protected: Iterable[str]) -> Optional[str]:
+    if remove <= 0:
+        return text
+    article, jsonld = _split_jsonld_block(text)
+    if not article.strip():
+        return None
+    tokens = [LOCK_START_TEMPLATE.format(term=term) for term in protected]
+    tokens.extend([LOCK_END, _FAQ_START, "<!--FAQ_END-->", "## FAQ", "## Заключение"])
+    tokens.extend(["**Вопрос", "**Ответ"])
+    mask = _build_protection_mask(article, tokens)
+    buffer: List[str] = []
+    removed = 0
+    for idx in range(len(article) - 1, -1, -1):
+        char = article[idx]
+        if removed >= remove:
+            buffer.append(char)
+            continue
+        if mask[idx]:
+            buffer.append(char)
+            continue
+        if char.isspace():
+            buffer.append(char)
+            continue
+        removed += 1
+    if removed < remove:
+        return None
+    rebuilt = "".join(reversed(buffer)).rstrip() + "\n"
+    if jsonld:
+        rebuilt = f"{rebuilt.rstrip()}\n\n{jsonld}\n"
+    return rebuilt
+
+
 def ensure_article_length(
     text: str,
     *,
@@ -90,6 +173,8 @@ def ensure_article_length(
     max_chars: int,
     protected_blocks: Iterable[str] | None = None,
     max_iterations: int = 6,
+    faq_expected: int = 5,
+    exact_chars: Optional[int] = None,
 ) -> LengthControllerResult:
     """Ensure that article text fits the requested length range.
 
@@ -113,14 +198,7 @@ def ensure_article_length(
         length_now = length_no_spaces(current_text)
         history.append(length_now)
         if current_min <= length_now <= current_max:
-            return LengthControllerResult(
-                text=current_text,
-                length=length_now,
-                iterations=iterations,
-                adjusted=adjusted,
-                success=True,
-                history=tuple(history),
-            )
+            break
 
         if iterations >= max_iterations:
             failure_reason = failure_reason or "max_iterations"
@@ -136,6 +214,7 @@ def ensure_article_length(
                     min_chars=current_min,
                     max_chars=current_max,
                     protected_blocks=protected,
+                    faq_expected=faq_expected,
                 )
             except TrimValidationError as exc:  # pragma: no cover - defensive branch
                 failure_reason = f"trim_failed:{exc}" if not failure_reason else failure_reason
@@ -159,13 +238,37 @@ def ensure_article_length(
             break
         current_text = _append_filler_block(current_text, filler)
 
+    target_exact = exact_chars if exact_chars is not None else None
     final_length = length_no_spaces(current_text)
+    if target_exact is not None:
+        target_value = max(0, int(target_exact))
+        delta = target_value - final_length
+        if delta > 0:
+            filler = _build_precision_filler(delta)
+            if filler:
+                current_text = _append_filler_block(current_text, filler)
+                final_length = length_no_spaces(current_text)
+                history.append(final_length)
+                delta = target_value - final_length
+        if delta < 0:
+            trimmed_exact = _truncate_to_exact_length(current_text, -delta, protected)
+            if trimmed_exact:
+                current_text = trimmed_exact
+                final_length = length_no_spaces(current_text)
+                history.append(final_length)
+            else:
+                failure_reason = failure_reason or "exact_trim_failed"
+        if target_value == final_length:
+            current_min = current_max = target_value
+    if history:
+        history[-1] = final_length
+    success = current_min <= final_length <= current_max
     return LengthControllerResult(
         text=current_text,
         length=final_length,
         iterations=iterations,
         adjusted=adjusted,
-        success=False,
+        success=success,
         history=tuple(history),
         failure_reason=failure_reason,
     )

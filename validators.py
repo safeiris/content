@@ -61,7 +61,7 @@ def _faq_pairs(text: str) -> List[str]:
     return re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block)
 
 
-def _parse_markdown_faq(text: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
+def _parse_markdown_faq(text: str, expected_count: int) -> Tuple[List[Dict[str, str]], Optional[str]]:
     if _FAQ_START not in text or _FAQ_END not in text:
         return [], "Блок FAQ в markdown отсутствует."
 
@@ -78,17 +78,18 @@ def _parse_markdown_faq(text: str) -> Tuple[List[Dict[str, str]], Optional[str]]
             return entries, f"Ответ на вопрос '{question}' должен состоять из 1–3 абзацев."
         entries.append({"index": index, "question": question, "answer": answer})
 
-    if len(entries) != 5:
-        return entries, "FAQ должен содержать ровно 5 вопросов и ответов."
+    if expected_count > 0 and len(entries) != expected_count:
+        return entries, f"FAQ должен содержать ровно {expected_count} вопросов и ответов."
 
-    indices = [entry["index"] for entry in entries]
-    if indices != list(range(1, len(entries) + 1)):
-        return entries, "Нумерация вопросов в FAQ должна идти последовательно от 1 до 5."
+    if expected_count > 0:
+        indices = [entry["index"] for entry in entries]
+        if indices != list(range(1, len(entries) + 1)):
+            return entries, "Нумерация вопросов в FAQ должна идти последовательно."
 
     return entries, None
 
 
-def _parse_jsonld_entries(text: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
+def _parse_jsonld_entries(text: str, expected_count: int) -> Tuple[List[Dict[str, str]], Optional[str]]:
     match = _JSONLD_PATTERN.search(text)
     if not match:
         return [], "JSON-LD FAQ недействителен или отсутствует."
@@ -99,8 +100,8 @@ def _parse_jsonld_entries(text: str) -> Tuple[List[Dict[str, str]], Optional[str
     if not isinstance(payload, dict) or payload.get("@type") != "FAQPage":
         return [], "JSON-LD FAQ недействителен или отсутствует."
     entities = payload.get("mainEntity")
-    if not isinstance(entities, list) or len(entities) != 5:
-        return [], "JSON-LD FAQ должен содержать ровно 5 вопросов и ответов."
+    if expected_count > 0 and (not isinstance(entities, list) or len(entities) != expected_count):
+        return [], f"JSON-LD FAQ должен содержать ровно {expected_count} вопросов и ответов."
     parsed: List[Dict[str, str]] = []
     for idx, entry in enumerate(entities, start=1):
         if not isinstance(entry, dict) or entry.get("@type") != "Question":
@@ -181,6 +182,7 @@ def validate_article(
     max_chars: int,
     skeleton_payload: Optional[Dict[str, object]] = None,
     keyword_coverage_percent: Optional[float] = None,
+    faq_expected: Optional[int] = None,
 ) -> ValidationResult:
     length = _length_no_spaces(text)
     default_soft_min, default_soft_max, default_tol_below, default_tol_above = compute_soft_length_bounds(
@@ -210,9 +212,10 @@ def validate_article(
             missing.append(term)
     keywords_ok = len(missing) == 0
 
-    markdown_faq, markdown_error = _parse_markdown_faq(text)
+    target_faq = 5 if faq_expected is None else max(0, int(faq_expected))
+    markdown_faq, markdown_error = _parse_markdown_faq(text, target_faq)
     faq_count = len(markdown_faq)
-    jsonld_entries, jsonld_error = _parse_jsonld_entries(text)
+    jsonld_entries, jsonld_error = _parse_jsonld_entries(text, target_faq)
     jsonld_ok = jsonld_error is None
 
     faq_ok = False
@@ -222,6 +225,11 @@ def validate_article(
         faq_error = markdown_error
     elif jsonld_error:
         faq_error = jsonld_error
+    elif target_faq == 0:
+        faq_ok = True
+        jsonld_ok = True
+        markdown_faq = []
+        jsonld_entries = []
     else:
         faq_ok = True
         for idx, entry in enumerate(markdown_faq):
@@ -235,8 +243,8 @@ def validate_article(
                 + mismatched_questions[0]
                 + "')."
             )
-    if not faq_ok and faq_error is None:
-        faq_error = "FAQ должен содержать ровно 5 вопросов и ответов."
+    if not faq_ok and faq_error is None and target_faq > 0:
+        faq_error = f"FAQ должен содержать ровно {target_faq} вопросов и ответов."
 
     coverage_percent = 100.0 if not normalized_keywords else round(
         (len(normalized_keywords) - len(missing)) / len(normalized_keywords) * 100,
@@ -256,6 +264,7 @@ def validate_article(
         "keyword_coverage_expected_percent": keyword_coverage_percent,
         "faq_count": faq_count,
         "faq_jsonld_count": len(jsonld_entries),
+        "faq_expected": target_faq,
         "faq_mismatched_questions": mismatched_questions,
         "jsonld_ok": jsonld_ok,
         "length_requested_range_ok": requested_range_ok,
@@ -299,7 +308,13 @@ def validate_article(
             details={"missing": missing, **stats},
         )
     if not faq_ok:
-        message = faq_error or "FAQ должен содержать 5 вопросов и корректный JSON-LD."
+        expected_label = target_faq if target_faq > 0 else 0
+        default_message = "FAQ должен содержать корректные данные."
+        if expected_label > 0:
+            default_message = (
+                f"FAQ должен содержать {expected_label} вопросов и корректный JSON-LD."
+            )
+        message = faq_error or default_message
         raise ValidationError("faq", message, details=stats)
     if not length_ok:
         raise ValidationError(

@@ -234,6 +234,7 @@ class DeterministicPipeline:
         backoff_schedule: Optional[List[float]] = None,
         provided_faq: Optional[List[Dict[str, str]]] = None,
         jsonld_requested: bool = True,
+        faq_questions: Optional[int] = None,
     ) -> None:
         if not model or not str(model).strip():
             raise PipelineStepError(PipelineStep.SKELETON, "Не указана модель для генерации.")
@@ -252,6 +253,13 @@ class DeterministicPipeline:
         self.backoff_schedule = list(backoff_schedule) if backoff_schedule else None
         self.provided_faq = provided_faq or []
         self.jsonld_requested = bool(jsonld_requested)
+        try:
+            faq_target = int(faq_questions) if faq_questions is not None else 5
+        except (TypeError, ValueError):
+            faq_target = 5
+        if faq_target < 0:
+            faq_target = 0
+        self.faq_target = faq_target
 
         self.logs: List[PipelineLogEntry] = []
         self.checkpoints: Dict[PipelineStep, str] = {}
@@ -490,7 +498,7 @@ class DeterministicPipeline:
         avg_chars = max(min_chars, int((min_chars + max_chars) / 2))
         approx_tokens = max(1100, int(avg_chars / 3.2))
         main_count = max(1, len(outline.main_headings))
-        faq_count = 5 if outline.has_faq else 0
+        faq_count = self.faq_target if outline.has_faq else 0
         intro_tokens = max(160, int(approx_tokens * 0.12))
         conclusion_tokens = max(140, int(approx_tokens * 0.1))
         faq_pool = max(0, int(approx_tokens * 0.2)) if faq_count else 0
@@ -553,8 +561,8 @@ class DeterministicPipeline:
                     )
                 )
                 start = end
-        if outline.has_faq:
-            total_faq = 5
+        if outline.has_faq and self.faq_target > 0:
+            total_faq = self.faq_target
             produced = 0
             first_batch = min(SKELETON_FAQ_BATCH, total_faq)
             if first_batch > 0:
@@ -715,7 +723,7 @@ class DeterministicPipeline:
             return
         existing_questions = {entry.get("q") for entry in assembly.faq_entries}
         for entry in faq_items:
-            if assembly.missing_faq_count(5) == 0:
+            if assembly.missing_faq_count(self.faq_target) == 0:
                 break
             if not isinstance(entry, dict):
                 continue
@@ -1914,8 +1922,14 @@ class DeterministicPipeline:
                 placeholders_needed,
             )
 
-        if not isinstance(faq, list) or len(faq) != 5:
-            raise ValueError("Скелет FAQ должен содержать ровно 5 элементов")
+        expected_faq = self.faq_target if self.faq_target > 0 else 0
+        if expected_faq > 0:
+            if not isinstance(faq, list) or len(faq) != expected_faq:
+                raise ValueError(
+                    f"Скелет FAQ должен содержать ровно {expected_faq} элементов"
+                )
+        else:
+            faq = []
 
         normalized_faq: List[Dict[str, str]] = []
         for idx, entry in enumerate(faq, start=1):
@@ -2046,9 +2060,15 @@ class DeterministicPipeline:
         if not isinstance(entries, list):
             raise PipelineStepError(PipelineStep.FAQ, "В ответе отсутствует массив faq.")
         sanitized = self._sanitize_entries(entries)
-        if len(sanitized) != 5:
-            raise PipelineStepError(PipelineStep.FAQ, "FAQ должно содержать ровно 5 пар вопросов и ответов.")
-        return sanitized
+        expected = self.faq_target if self.faq_target > 0 else 0
+        if expected > 0:
+            if len(sanitized) != expected:
+                raise PipelineStepError(
+                    PipelineStep.FAQ,
+                    f"FAQ должно содержать ровно {expected} пар вопросов и ответов.",
+                )
+            return sanitized
+        return []
 
     def _build_faq_messages(self, base_text: str) -> List[Dict[str, str]]:
         hints: List[str] = []
@@ -2543,15 +2563,17 @@ class DeterministicPipeline:
                     "LOG:SKELETON_MAIN_PLACEHOLDER_FINAL count=%d",
                     len(missing_main),
                 )
-        if outline.has_faq and assembly.missing_faq_count(5):
+        if outline.has_faq and assembly.missing_faq_count(self.faq_target):
             raise PipelineStepError(
                 PipelineStep.SKELETON,
                 "Не удалось собрать полный FAQ на этапе скелета.",
             )
 
         payload = assembly.build_payload()
-        if outline.has_faq and len(payload.get("faq", [])) > 5:
-            payload["faq"] = payload["faq"][:5]
+        if outline.has_faq and self.faq_target > 0:
+            faq_items = payload.get("faq", [])
+            if isinstance(faq_items, list) and len(faq_items) > self.faq_target:
+                payload["faq"] = faq_items[: self.faq_target]
 
         normalized_payload = normalize_skeleton_payload(payload)
         normalized_payload = self._finalize_main_sections(
@@ -2627,12 +2649,12 @@ class DeterministicPipeline:
                 if isinstance(item, dict)
             ]
 
-        if entries_source:
+        if entries_source and self.faq_target > 0:
             sanitized = self._sanitize_entries(entries_source)
-            if len(sanitized) != 5:
+            if len(sanitized) != self.faq_target:
                 raise PipelineStepError(
                     PipelineStep.FAQ,
-                    "FAQ должно содержать ровно 5 пар вопросов и ответов.",
+                    f"FAQ должно содержать ровно {self.faq_target} пар вопросов и ответов.",
                 )
             faq_block = self._render_faq_markdown(sanitized)
             merged_text = self._merge_faq(text, faq_block)
@@ -2647,6 +2669,19 @@ class DeterministicPipeline:
             )
             self.checkpoints[PipelineStep.FAQ] = merged_text
             return merged_text
+
+        if self.faq_target <= 0:
+            LOGGER.info("FAQ_SKIPPED disabled for текущий запрос")
+            self._update_log(
+                PipelineStep.FAQ,
+                "skipped",
+                entries=[],
+                **self._metrics(text),
+            )
+            self.checkpoints[PipelineStep.FAQ] = text
+            self.jsonld = None
+            self.jsonld_reserve = 0
+            return text
 
         raise PipelineStepError(
             PipelineStep.FAQ,
@@ -2682,7 +2717,7 @@ class DeterministicPipeline:
                 ),
             ),
         ]
-        faq_entries = [
+        base_faq_entries = [
             (
                 "С чего начать?",
                 "Определите ключевую задачу и запишите стартовые показатели, от которых будете отталкиваться в анализе.",
@@ -2704,6 +2739,20 @@ class DeterministicPipeline:
                 "Зафиксируйте причину, подготовьте три варианта компенсации и обсудите их с ключевыми заинтересованными сторонами.",
             ),
         ]
+        if self.faq_target > 0:
+            faq_entries = list(base_faq_entries)
+            if len(faq_entries) < self.faq_target and faq_entries:
+                seed = faq_entries[-1][1]
+                for idx in range(len(faq_entries) + 1, self.faq_target + 1):
+                    faq_entries.append(
+                        (
+                            f"Дополнительный вопрос {idx}?",
+                            f"Раскройте нюансы подхода, опираясь на резервный сценарий: {seed}",
+                        )
+                    )
+            faq_entries = faq_entries[: self.faq_target]
+        else:
+            faq_entries = []
         conclusion = (
             "Зафиксируйте выводы, выберите одну метрику оперативного контроля и договоритесь о дате следующей оценки результатов. "
             "Запишите идеи для последующих улучшений, чтобы постепенно расширять эффект от инициативы."
@@ -2712,14 +2761,15 @@ class DeterministicPipeline:
         lines: List[str] = [f"# {topic}", "", "## Введение", intro, ""]
         for heading, paragraph in main_sections:
             lines.extend([f"## {heading}", paragraph, ""])
-        lines.extend(["## FAQ", "<!--FAQ_START-->"])
-        for index, (question, answer) in enumerate(faq_entries, start=1):
-            lines.append(f"**Вопрос {index}.** {question}")
-            lines.append(f"**Ответ.** {answer}")
-            lines.append("")
-        if lines and lines[-1] == "":
-            lines.pop()
-        lines.extend(["<!--FAQ_END-->", ""])
+        if faq_entries:
+            lines.extend(["## FAQ", "<!--FAQ_START-->"])
+            for index, (question, answer) in enumerate(faq_entries, start=1):
+                lines.append(f"**Вопрос {index}.** {question}")
+                lines.append(f"**Ответ.** {answer}")
+                lines.append("")
+            if lines and lines[-1] == "":
+                lines.pop()
+            lines.extend(["<!--FAQ_END-->", ""])
         lines.extend(["## Заключение", conclusion, ""])
         article = "\n".join(lines).strip() + "\n"
         controller = ensure_article_length(
@@ -2727,6 +2777,8 @@ class DeterministicPipeline:
             min_chars=self.min_chars,
             max_chars=self.max_chars,
             protected_blocks=self.locked_terms,
+            faq_expected=self.faq_target,
+            exact_chars=self.min_chars if self.min_chars == self.max_chars else None,
         )
         return controller.text if controller.text else article
 
@@ -2740,6 +2792,7 @@ class DeterministicPipeline:
                 min_chars=self.min_chars,
                 max_chars=target_max,
                 protected_blocks=self.locked_terms,
+                faq_expected=self.faq_target,
             )
         except TrimValidationError as exc:
             raise PipelineStepError(PipelineStep.TRIM, str(exc)) from exc
@@ -2756,6 +2809,8 @@ class DeterministicPipeline:
                 min_chars=self.min_chars,
                 max_chars=self.max_chars,
                 protected_blocks=self.locked_terms,
+                faq_expected=self.faq_target,
+                exact_chars=self.min_chars if self.min_chars == self.max_chars else None,
             )
             if controller.adjusted:
                 length_notes["length_controller_adjusted"] = True
@@ -2799,14 +2854,15 @@ class DeterministicPipeline:
             )
 
         faq_block = ""
-        if FAQ_START in result.text and FAQ_END in result.text:
-            faq_block = result.text.split(FAQ_START, 1)[1].split(FAQ_END, 1)[0]
-        faq_pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", faq_block)
-        if len(faq_pairs) != 5:
-            raise PipelineStepError(
-                PipelineStep.TRIM,
-                "FAQ должен содержать ровно 5 вопросов после тримминга.",
-            )
+        if self.faq_target > 0:
+            if FAQ_START in result.text and FAQ_END in result.text:
+                faq_block = result.text.split(FAQ_START, 1)[1].split(FAQ_END, 1)[0]
+            faq_pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", faq_block)
+            if len(faq_pairs) != self.faq_target:
+                raise PipelineStepError(
+                    PipelineStep.TRIM,
+                    f"FAQ должен содержать ровно {self.faq_target} вопросов после тримминга.",
+                )
         LOGGER.info(
             "TRIM_OK chars_no_spaces=%d removed_paragraphs=%d",
             current_length,
@@ -2841,6 +2897,7 @@ class DeterministicPipeline:
                 max_chars=self.max_chars,
                 skeleton_payload=self.skeleton_payload,
                 keyword_coverage_percent=self.keywords_coverage_percent,
+                faq_expected=self.faq_target,
             )
         except ValidationError as exc:
             raise PipelineStepError(PipelineStep.TRIM, str(exc), status_code=400) from exc

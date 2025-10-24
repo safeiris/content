@@ -62,6 +62,7 @@ class GenerationContext:
     custom_context_truncated: bool = False
     jsonld_requested: bool = False
     length_limits: Optional[ResolvedLengthLimits] = None
+    faq_questions: int = 0
 
 
 def _local_now() -> datetime:
@@ -162,6 +163,22 @@ def make_generation_context(
         payload["_length_limits_warnings"] = list(length_info.warnings)
     jsonld_requested = bool(payload.get("include_jsonld", False))
     payload.pop("include_jsonld", None)
+
+    include_faq_flag = bool(payload.get("include_faq", True))
+    faq_requested_raw = payload.get("faq_questions")
+    resolved_faq = 0
+    if include_faq_flag:
+        try:
+            resolved_faq = int(faq_requested_raw)
+        except (TypeError, ValueError):
+            resolved_faq = 0
+        if resolved_faq <= 0:
+            resolved_faq = 5
+    payload["include_faq"] = include_faq_flag
+    if resolved_faq > 0:
+        payload["faq_questions"] = resolved_faq
+    else:
+        payload.pop("faq_questions", None)
 
     keywords_mode_raw = payload.get("keywords_mode")
     normalized_mode = None
@@ -271,6 +288,7 @@ def make_generation_context(
         custom_context_truncated=custom_context_truncated,
         jsonld_requested=jsonld_requested,
         length_limits=length_info,
+        faq_questions=resolved_faq if include_faq_flag else 0,
     )
 def _make_output_path(theme: str, outfile: Optional[str]) -> Path:
     if outfile:
@@ -343,6 +361,7 @@ def _build_metadata(
             "min": generation_context.length_limits.min_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[0],
             "max": generation_context.length_limits.max_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[1],
         },
+        "faq_questions_requested": generation_context.faq_questions,
         "pipeline_logs": _serialize_pipeline_logs(pipeline_logs),
         "pipeline_checkpoints": _serialize_checkpoints(checkpoints),
         "validation": {
@@ -464,6 +483,7 @@ def _generate_variant(
         backoff_schedule=backoff_schedule,
         provided_faq=prepared_data.get("faq_entries") if isinstance(prepared_data.get("faq_entries"), list) else None,
         jsonld_requested=generation_context.jsonld_requested,
+        faq_questions=generation_context.faq_questions,
     )
     state = pipeline.run()
     if not state.validation or not state.validation.is_valid:
@@ -513,7 +533,7 @@ def generate_article_from_payload(
     context_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     resolved_timeout = timeout if timeout is not None else 60
-    resolved_model = (model or DEFAULT_MODEL).strip()
+    resolved_model = DEFAULT_MODEL
     output_path = _make_output_path(theme, outfile)
     result = _generate_variant(
         theme=theme,

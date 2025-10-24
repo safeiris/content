@@ -40,6 +40,7 @@ from config import (
 )
 from jobs import JobRunner, JobStatus, JobStore
 from orchestrate import gather_health_status, make_generation_context
+from llm_client import DEFAULT_MODEL
 from retrieval import build_index
 from artifacts_store import (
     cleanup_index as cleanup_artifact_index,
@@ -228,6 +229,27 @@ def create_app() -> Flask:
             raise ApiError("Поле data должно быть объектом")
         raw_data = dict(raw_data)
 
+        explicit_keywords = payload.get("keywords")
+        if explicit_keywords and "keywords" not in raw_data:
+            raw_data["keywords"] = explicit_keywords
+
+        explicit_length = payload.get("length_range")
+        if (
+            isinstance(explicit_length, dict)
+            and "length_limits" not in raw_data
+            and {"min", "max"} <= set(explicit_length.keys())
+        ):
+            raw_data["length_limits"] = {
+                "min_chars": explicit_length.get("min"),
+                "max_chars": explicit_length.get("max"),
+            }
+
+        if "faq_required" in payload and "include_faq" not in raw_data:
+            raw_data["include_faq"] = bool(payload.get("faq_required"))
+
+        if payload.get("faq_count") and "faq_questions" not in raw_data:
+            raw_data["faq_questions"] = payload.get("faq_count")
+
         style_payload = payload.get("style")
         if isinstance(style_payload, dict):
             raw_data["style"] = style_payload
@@ -338,7 +360,14 @@ def create_app() -> Flask:
         if payload.get("dry_run"):
             return jsonify(_make_dry_run_response(theme=theme, data=raw_data, k=effective_k))
 
-        model = payload.get("model")
+        requested_model = str(payload.get("model", "")).strip()
+        if requested_model and requested_model.lower() != DEFAULT_MODEL.lower():
+            LOGGER.info(
+                "IGNORED_MODEL_OVERRIDE requested=%s enforced=%s",
+                requested_model,
+                DEFAULT_MODEL,
+            )
+        model = DEFAULT_MODEL
         temperature = _safe_float(payload.get("temperature", 0.3), default=0.3)
         temperature = max(0.0, min(2.0, temperature))
         max_tokens = max(1, _safe_int(payload.get("max_tokens", 1400), default=1400))

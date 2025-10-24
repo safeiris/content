@@ -100,13 +100,17 @@ def _validate_locked_terms(text: str, terms: Sequence[str]) -> None:
         )
 
 
-def _validate_faq(text: str) -> None:
+def _validate_faq(text: str, expected_count: int) -> None:
+    if expected_count <= 0:
+        return
     if _FAQ_START not in text or _FAQ_END not in text:
         raise TrimValidationError("После тримминга нарушена структура блока FAQ.")
     block = text.split(_FAQ_START, 1)[1].split(_FAQ_END, 1)[0]
     pairs = re.findall(r"\*\*Вопрос\s+\d+\.\*\*", block)
-    if len(pairs) != 5:
-        raise TrimValidationError("FAQ должен содержать ровно 5 вопросов и ответов.")
+    if len(pairs) != expected_count:
+        raise TrimValidationError(
+            f"FAQ должен содержать ровно {expected_count} вопросов и ответов."
+        )
 
 
 def trim_text(
@@ -115,6 +119,7 @@ def trim_text(
     min_chars: int,
     max_chars: int,
     protected_blocks: Iterable[str] | None = None,
+    faq_expected: int = 5,
 ) -> TrimResult:
     article, jsonld_block = _extract_jsonld(text)
     working = article
@@ -157,7 +162,7 @@ def trim_text(
 
     working = working.rstrip() + "\n"
     _validate_locked_terms(working, protected_terms)
-    _validate_faq(working)
+    _validate_faq(working, faq_expected)
 
     final_text = working
     if jsonld_block:
