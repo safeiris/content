@@ -120,6 +120,8 @@ const MAX_TOASTS = 3;
 const MAX_CUSTOM_CONTEXT_CHARS = 20000;
 const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
 
+const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 5200, max: 6800, hard: 7200 });
+
 const HEALTH_STATUS_MESSAGES = {
   openai_key: {
     label: "OpenAI",
@@ -1088,7 +1090,7 @@ async function handleGenerate(event) {
       max_tokens: payload.maxTokens,
       context_source: payload.context_source,
       keywords: Array.isArray(payload.data?.keywords) ? payload.data.keywords : [],
-      length_range: { min: 3500, max: 6000, mode: "no_spaces" },
+      length_range: { min: DEFAULT_LENGTH_RANGE.min, max: DEFAULT_LENGTH_RANGE.max, mode: "no_spaces" },
       faq_required: true,
       faq_count: 5,
     };
@@ -1242,6 +1244,11 @@ function renderGenerationResult(snapshot, { payload }) {
   const metaParts = [];
   if (hasContent) {
     metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
+    metaParts.push(
+      `Ориентир: ${DEFAULT_LENGTH_RANGE.min.toLocaleString("ru-RU")}` +
+        `–${DEFAULT_LENGTH_RANGE.max.toLocaleString("ru-RU")}` +
+        ` (≤ ${DEFAULT_LENGTH_RANGE.hard.toLocaleString("ru-RU")})`,
+    );
   }
   if (degradationFlags.length) {
     metaParts.push(`Деградации: ${degradationFlags.length}`);
@@ -1314,8 +1321,8 @@ function buildRequestPayload() {
 
   const minCharsRaw = String(minCharsInput?.value ?? "").trim();
   const maxCharsRaw = String(maxCharsInput?.value ?? "").trim();
-  const minChars = minCharsRaw === "" ? 3500 : Number.parseInt(minCharsRaw, 10);
-  const maxChars = maxCharsRaw === "" ? 6000 : Number.parseInt(maxCharsRaw, 10);
+  const minChars = minCharsRaw === "" ? DEFAULT_LENGTH_RANGE.min : Number.parseInt(minCharsRaw, 10);
+  const maxChars = maxCharsRaw === "" ? DEFAULT_LENGTH_RANGE.max : Number.parseInt(maxCharsRaw, 10);
   if (!Number.isInteger(minChars) || minChars <= 0) {
     throw new Error("Минимальный объём должен быть положительным целым числом");
   }
@@ -1506,10 +1513,20 @@ function buildQualityReport(meta) {
       lengthBlock.max ?? appliedLimits?.max ?? meta.length_limits?.max_chars ?? 0,
     );
     const within = Boolean(lengthBlock.within_limits);
-    const label = within
-      ? `Объём: ${chars.toLocaleString("ru-RU")} зн. (в норме)`
-      : `Объём: ${chars.toLocaleString("ru-RU")} зн. (нужно ${min}–${max})`;
-    list.append(createQualityItem(within ? "success" : "warning", label));
+    const relaxedAccepted =
+      (typeof meta?.length_relaxed_status === "string" && meta.length_relaxed_status === "accepted") ||
+      (typeof lengthBlock.relaxed_status === "string" && lengthBlock.relaxed_status === "accepted");
+    const statusOk = within || relaxedAccepted;
+    const rangeLabel = `${min.toLocaleString("ru-RU")}–${max.toLocaleString("ru-RU")}`;
+    let label = `Объём: ${chars.toLocaleString("ru-RU")} зн.`;
+    if (statusOk && !within && relaxedAccepted) {
+      label += ` (length_relaxed, допустимо до ${DEFAULT_LENGTH_RANGE.hard.toLocaleString("ru-RU")})`;
+    } else if (statusOk) {
+      label += " (в норме)";
+    } else {
+      label += ` (нужно ${rangeLabel})`;
+    }
+    list.append(createQualityItem(statusOk ? "success" : "warning", label));
   }
 
   const limitWarnings = [];

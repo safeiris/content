@@ -14,8 +14,8 @@ from llm_client import GenerationResult
 from orchestrate import generate_article_from_payload, gather_health_status
 from validators import ValidationError, strip_jsonld, validate_article
 
-MIN_REQUIRED = 3500
-MAX_REQUIRED = 6000
+MIN_REQUIRED = 5200
+MAX_REQUIRED = 6800
 
 def test_keyword_injection_protects_terms_and_locks_all_occurrences():
     base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
@@ -132,7 +132,7 @@ def test_validator_length_ignores_jsonld():
         "Содержательный абзац с фактами и цифрами, объясняющий контекст и приводящий примеры. "
         "Практические советы включают последовательность действий, промежуточные выводы и точные формулировки."
     )
-    intro = "\n\n".join([intro_paragraph for _ in range(22)])
+    intro = "\n\n".join([intro_paragraph for _ in range(32)])
     article = (
         "## Введение\n\n"
         f"{intro}\n\n"
@@ -159,28 +159,53 @@ def test_validator_length_ignores_jsonld():
     assert result.jsonld_ok
 
 
+def test_validator_rejects_placeholder_blocks():
+    text = (
+        "# Заголовок\n\n"
+        "## Основной раздел\n\n"
+        "Этот раздел будет дополнен после завершения генерации статьи.\n\n"
+        "## FAQ\n\n"
+        "<!--FAQ_START-->\n"
+        "<!--FAQ_END-->\n"
+    )
+
+    with pytest.raises(ValidationError) as exc:
+        validate_article(
+            text,
+            required_keywords=[],
+            min_chars=100,
+            max_chars=1200,
+            faq_expected=0,
+        )
+
+    assert exc.value.group == "skeleton"
+
+
 def _stub_llm(monkeypatch):
     base_paragraph = (
         "Абзац с анализом показателей и практическими советами для семейного бюджета. "
         "Расчёт коэффициентов сопровождаем примерами и перечнем действий."
     )
+    base_paragraph += (
+        " Дополнительный пример с цифрами показывает, как распределять платежи по неделям и какие метрики заносить в рабочий журнал."
+    )
     outline = ["Введение", "Аналитика", "Решения"]
     intro_block = []
-    for idx in range(4):
+    for idx in range(8):
         intro_block.append(
             f"{base_paragraph} Введение блок {idx + 1} показывает, как сформировать картину текущей ситуации и определить безопасные пределы долга."
         )
     intro_text = "\n\n".join(intro_block)
 
     main_blocks = []
-    for idx in range(5):
+    for idx in range(9):
         main_blocks.append(
             f"{base_paragraph} Аналитика блок {idx + 1} фокусируется на цифрах, добавляет формулы и объясняет, как применять их на практике."
         )
     main_text = "\n\n".join(main_blocks)
 
     outro_parts = []
-    for idx in range(3):
+    for idx in range(5):
         outro_parts.append(
             f"{base_paragraph} Решения блок {idx + 1} переводит выводы в план действий, перечисляет контрольные даты и роли участников."
         )
@@ -253,11 +278,11 @@ def test_pipeline_produces_valid_article(monkeypatch):
         topic="Долговая нагрузка семьи",
         base_outline=["Введение", "Аналитика", "Решения"],
         required_keywords=[f"ключ {idx}" for idx in range(1, 12)],
-        min_chars=3500,
-        max_chars=6000,
+        min_chars=MIN_REQUIRED,
+        max_chars=MAX_REQUIRED,
         messages=[{"role": "system", "content": "Системный промпт"}],
         model="stub-model",
-        max_tokens=1800,
+        max_tokens=2600,
         timeout_s=60,
     )
     state = pipeline.run()
@@ -275,11 +300,11 @@ def test_pipeline_resume_falls_back_to_available_checkpoint(monkeypatch):
         topic="Долговая нагрузка семьи",
         base_outline=["Введение", "Основная часть", "Вывод"],
         required_keywords=[f"ключ {idx}" for idx in range(1, 12)],
-        min_chars=3500,
-        max_chars=6000,
+        min_chars=MIN_REQUIRED,
+        max_chars=MAX_REQUIRED,
         messages=[{"role": "system", "content": "Системный промпт"}],
         model="stub-model",
-        max_tokens=1800,
+        max_tokens=2600,
         timeout_s=60,
     )
     pipeline._run_skeleton()

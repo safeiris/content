@@ -17,6 +17,7 @@ _FAQ_ENTRY_PATTERN = re.compile(
     r"\*\*Вопрос\s+(?P<index>\d+)\.\*\*\s*(?P<question>.+?)\s*\n\*\*Ответ\.\*\*\s*(?P<answer>.*?)(?=\n\*\*Вопрос\s+\d+\.\*\*|\Z)",
     re.DOTALL,
 )
+_PLACEHOLDER_PATTERN = re.compile(r"будет дополнен", re.IGNORECASE)
 
 
 class ValidationError(RuntimeError):
@@ -213,6 +214,8 @@ def validate_article(
     )
     missing: List[str] = []
     article = strip_jsonld(text)
+    placeholder_present = bool(_PLACEHOLDER_PATTERN.search(article))
+
     for term in required_list:
         pattern = _keyword_regex(term)
         if not pattern.search(article):
@@ -275,6 +278,7 @@ def validate_article(
 
     stats: Dict[str, object] = {
         "length_no_spaces": length,
+        "placeholders_present": placeholder_present,
         "keywords_total": len(required_list),
         "keywords_missing": missing,
         "keywords_found": len(required_list) - len(missing),
@@ -321,6 +325,13 @@ def validate_article(
         jsonld_ok=jsonld_ok,
         stats=stats,
     )
+
+    if placeholder_present:
+        raise ValidationError(
+            "skeleton",
+            "В тексте остались плейсхолдеры «будет дополнен».",
+            details=stats,
+        )
 
     if not skeleton_ok:
         raise ValidationError("skeleton", skeleton_message or "Ошибка структуры статьи.", details=stats)

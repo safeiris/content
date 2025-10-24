@@ -1,8 +1,8 @@
 {
   "defaults": {
     "length_limits": {
-      "min_chars": 3200,
-      "max_chars": 5400
+      "min_chars": 5200,
+      "max_chars": 6800
     }
   }
 }

@@ -14,6 +14,8 @@ from enum import Enum
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from config import (
+    DEFAULT_MAX_LENGTH,
+    DEFAULT_MIN_LENGTH,
     G5_MAX_OUTPUT_TOKENS_MAX,
     G5_MAX_OUTPUT_TOKENS_STEP1,
     SKELETON_BATCH_SIZE_MAIN,
@@ -50,6 +52,8 @@ FAQ_START = "<!--FAQ_START-->"
 FAQ_END = "<!--FAQ_END-->"
 
 _JSONLD_PATTERN = re.compile(r"<script\s+type=\"application/ld\+json\">.*?</script>", re.DOTALL)
+
+ARTICLE_HARD_CHAR_CAP = 7200
 
 _TEMPLATE_SNIPPETS = [
     "рассматриваем на реальных примерах, чтобы показать связь между цифрами",
@@ -516,10 +520,16 @@ class DeterministicPipeline:
 
     def _predict_skeleton_volume(self, outline: SkeletonOutline) -> SkeletonVolumeEstimate:
         cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-        min_chars = max(3200, int(self.min_chars) if self.min_chars > 0 else 3200)
-        max_chars = max(min_chars + 400, int(self.max_chars) if self.max_chars > 0 else min_chars + 1200)
-        avg_chars = max(min_chars, int((min_chars + max_chars) / 2))
-        approx_tokens = max(1100, int(avg_chars / 3.2))
+        requested_min = int(self.min_chars) if self.min_chars > 0 else DEFAULT_MIN_LENGTH
+        requested_max = int(self.max_chars) if self.max_chars > 0 else DEFAULT_MAX_LENGTH
+        min_chars = max(2000, requested_min)
+        hard_cap = ARTICLE_HARD_CHAR_CAP if ARTICLE_HARD_CHAR_CAP > 0 else None
+        max_candidate = max(min_chars + 400, requested_max)
+        if hard_cap is not None:
+            max_candidate = min(max_candidate, hard_cap)
+        max_chars = max_candidate
+        avg_chars = max(min_chars, int(round((min_chars + max_chars) / 2)))
+        approx_tokens = max(1400, int(avg_chars / 3.1))
         main_count = max(1, len(outline.main_headings))
         faq_count = self.faq_target if outline.has_faq else 0
         intro_tokens = max(160, int(approx_tokens * 0.12))
@@ -529,16 +539,16 @@ class DeterministicPipeline:
         allocated_faq = per_faq_tokens * faq_count
         remaining_for_main = max(
             approx_tokens - intro_tokens - conclusion_tokens - allocated_faq,
-            220 * main_count,
+            250 * main_count,
         )
-        per_main_tokens = max(220, int(remaining_for_main / main_count)) if main_count else 0
+        per_main_tokens = max(250, int(remaining_for_main / main_count)) if main_count else 0
         predicted = intro_tokens + conclusion_tokens + per_main_tokens * main_count + per_faq_tokens * faq_count
-        start_max = int(predicted * 1.2)
+        start_max = int(predicted * 1.25)
         step1_cap = G5_MAX_OUTPUT_TOKENS_STEP1 if G5_MAX_OUTPUT_TOKENS_STEP1 > 0 else 1200
         if cap is not None and cap > 0:
             start_max = min(start_max, cap)
         start_max = min(start_max, step1_cap)
-        start_max = max(600, start_max)
+        start_max = max(900, start_max)
         requires_chunking = bool(cap is not None and predicted > cap)
         LOGGER.info(
             "SKELETON_ESTIMATE predicted=%d start_max=%d cap=%s → resolved max_output_tokens=%d",
@@ -2274,6 +2284,7 @@ class DeterministicPipeline:
             if plan.kind == SkeletonBatchKind.MAIN:
                 scheduled_main_indices.update(plan.indices)
         split_serial = 0
+        tail_fill_allowed = False
 
         while pending_batches:
             batch = pending_batches.popleft()
@@ -2352,6 +2363,8 @@ class DeterministicPipeline:
                 reason = str(metadata_snapshot.get("incomplete_reason") or "")
                 reason_lower = reason.strip().lower()
                 last_reason_lower = reason_lower
+                if reason_lower == "max_output_tokens":
+                    tail_fill_allowed = True
                 is_incomplete = status.lower() == "incomplete" or bool(reason)
                 has_payload = self._batch_has_payload(batch.kind, payload_obj)
                 if payload_obj is not None and has_payload:
@@ -2492,6 +2505,7 @@ class DeterministicPipeline:
                 and batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ)
                 and active_indices
             ):
+                tail_fill_allowed = True
                 cap_payload, cap_result = self._run_cap_fallback_batch(
                     batch,
                     outline=outline,
@@ -2532,6 +2546,7 @@ class DeterministicPipeline:
                     payload_obj = placeholder
                     batch_partial = True
                     if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
+                        tail_fill_allowed = True
                         forced_tail_indices = list(active_indices)
                     LOGGER.warning(
                         "SKELETON_PLACEHOLDER_APPLIED kind=%s label=%s",
@@ -2594,14 +2609,21 @@ class DeterministicPipeline:
                         scheduled_main_indices.update(chunk)
                         start_pos += batch_size
                 if missing_fields:
-                    self._tail_fill_batch(
-                        batch,
-                        outline=outline,
-                        assembly=assembly,
-                        estimate=estimate,
-                        missing_items=[0],
-                        metadata=metadata_snapshot,
-                    )
+                    if tail_fill_allowed:
+                        self._tail_fill_batch(
+                            batch,
+                            outline=outline,
+                            assembly=assembly,
+                            estimate=estimate,
+                            missing_items=[0],
+                            metadata=metadata_snapshot,
+                        )
+                    else:
+                        LOGGER.info(
+                            "LOG:TAIL_FILL_SKIPPED reason=max_tokens_not_hit kind=%s items=%s",
+                            batch.kind.value,
+                            "0",
+                        )
             elif batch.kind == SkeletonBatchKind.MAIN:
                 normalized_sections, missing_indices = self._normalize_main_batch(
                     payload_obj, target_indices, outline
@@ -2613,6 +2635,12 @@ class DeterministicPipeline:
                 else:
                     merged = list(missing_indices)
                 if merged:
+                    if not tail_fill_allowed:
+                        LOGGER.info(
+                            "LOG:TAIL_FILL_FORCED reason=missing_content kind=%s items=%s",
+                            batch.kind.value,
+                            ",".join(str(idx) for idx in merged),
+                        )
                     self._tail_fill_batch(
                         batch,
                         outline=outline,
@@ -2630,6 +2658,12 @@ class DeterministicPipeline:
                 else:
                     merged_faq = list(missing_faq)
                 if merged_faq:
+                    if not tail_fill_allowed:
+                        LOGGER.info(
+                            "LOG:TAIL_FILL_FORCED reason=missing_content kind=%s items=%s",
+                            batch.kind.value,
+                            ",".join(str(idx) for idx in merged_faq),
+                        )
                     self._tail_fill_batch(
                         batch,
                         outline=outline,
@@ -2642,14 +2676,21 @@ class DeterministicPipeline:
                 conclusion_text, missing_flag = self._normalize_conclusion_batch(payload_obj)
                 assembly.apply_conclusion(conclusion_text)
                 if missing_flag:
-                    self._tail_fill_batch(
-                        batch,
-                        outline=outline,
-                        assembly=assembly,
-                        estimate=estimate,
-                        missing_items=[0],
-                        metadata=metadata_snapshot,
-                    )
+                    if tail_fill_allowed:
+                        self._tail_fill_batch(
+                            batch,
+                            outline=outline,
+                            assembly=assembly,
+                            estimate=estimate,
+                            missing_items=[0],
+                            metadata=metadata_snapshot,
+                        )
+                    else:
+                        LOGGER.info(
+                            "LOG:TAIL_FILL_SKIPPED reason=max_tokens_not_hit kind=%s items=%s",
+                            batch.kind.value,
+                            "0",
+                        )
 
             self._apply_inline_faq(payload_obj, assembly)
             LOGGER.info(
@@ -2669,13 +2710,20 @@ class DeterministicPipeline:
                 "LOG:SKELETON_MAIN_GAPS missing=%s",
                 ",".join(str(idx + 1) for idx in missing_main),
             )
-            self._tail_fill_main_sections(
-                indices=missing_main,
-                outline=outline,
-                assembly=assembly,
-                estimate=estimate,
-            )
-            missing_main = assembly.missing_main_indices()
+            if tail_fill_allowed:
+                self._tail_fill_main_sections(
+                    indices=missing_main,
+                    outline=outline,
+                    assembly=assembly,
+                    estimate=estimate,
+                )
+                missing_main = assembly.missing_main_indices()
+            else:
+                LOGGER.info(
+                    "LOG:TAIL_FILL_SKIPPED reason=max_tokens_not_hit kind=%s items=%s",
+                    "main",
+                    ",".join(str(idx) for idx in missing_main),
+                )
             if missing_main:
                 for index in missing_main:
                     heading = (
@@ -2926,7 +2974,11 @@ class DeterministicPipeline:
     def _run_trim(self, text: str) -> TrimResult:
         self._log(PipelineStep.TRIM, "running")
         reserve = self.jsonld_reserve if self.jsonld else 0
-        target_max = max(self.min_chars, self.max_chars - reserve)
+        hard_cap = ARTICLE_HARD_CHAR_CAP if ARTICLE_HARD_CHAR_CAP > 0 else None
+        effective_upper = self.max_chars
+        if hard_cap is not None:
+            effective_upper = min(effective_upper, hard_cap)
+        target_max = max(self.min_chars, effective_upper - reserve)
         try:
             result = trim_text(
                 text,
@@ -2950,6 +3002,7 @@ class DeterministicPipeline:
             effective_max = max(effective_max, int(result.relaxed_limit or self.max_chars))
             length_notes["length_relaxed"] = True
             length_notes["length_relaxed_limit"] = effective_max
+            length_notes["length_relaxed_status"] = "accepted"
         strict_violation = current_length < self.min_chars or current_length > effective_max
         if strict_violation:
             controller = ensure_article_length(
@@ -2987,6 +3040,7 @@ class DeterministicPipeline:
                 length_notes["length_soft_max"] = soft_max
                 length_notes["length_tolerance_below"] = tolerance_below
                 length_notes["length_tolerance_above"] = tolerance_above
+                length_notes.setdefault("length_relaxed_status", "accepted")
                 if current_length < soft_min or current_length > soft_max:
                     controller_success = controller.success if controller.adjusted else False
                     length_notes["length_controller_success"] = controller_success
@@ -3071,6 +3125,7 @@ class DeterministicPipeline:
                 if current_length > effective_max:
                     length_notes.setdefault("length_relaxed", True)
                     length_notes["length_relaxed_limit"] = effective_max
+                    length_notes.setdefault("length_relaxed_status", "accepted")
 
         self.keywords_required_coverage_percent = coverage_post.required_percent
         self.keywords_coverage_percent = coverage_post.overall_percent

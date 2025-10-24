@@ -175,6 +175,7 @@ def ensure_article_length(
     max_iterations: int = 6,
     faq_expected: int = 5,
     exact_chars: Optional[int] = None,
+    max_fill_iterations: int = 2,
 ) -> LengthControllerResult:
     """Ensure that article text fits the requested length range.
 
@@ -190,6 +191,7 @@ def ensure_article_length(
     iterations = 0
     adjusted = False
     failure_reason: Optional[str] = None
+    fill_attempts = 0
 
     current_min = max(0, int(min_chars))
     current_max = max(current_min, int(max_chars))
@@ -232,11 +234,15 @@ def ensure_article_length(
             current_text = trimmed.text
             continue
 
+        if fill_attempts >= max_fill_iterations:
+            failure_reason = failure_reason or "fill_limit"
+            break
         filler = _select_filler(iterations - 1)
         if not filler:
             failure_reason = failure_reason or "no_filler"
             break
         current_text = _append_filler_block(current_text, filler)
+        fill_attempts += 1
 
     target_exact = exact_chars if exact_chars is not None else None
     final_length = length_no_spaces(current_text)
