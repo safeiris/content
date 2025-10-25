@@ -343,7 +343,7 @@ def test_generate_marks_final_cap_as_degraded():
     }
     with patch("llm_client.LOGGER"):
         with pytest.raises(RuntimeError) as excinfo:
-            _generate_with_dummy(responses=[payload], max_tokens=3600)
+            _generate_with_dummy(responses=[payload, payload], max_tokens=3600)
     message = str(excinfo.value)
     assert message.startswith("skeleton_incomplete: max_output_tokens_exhausted")
     assert "tried=[" in message
@@ -398,7 +398,7 @@ def test_responses_continue_includes_model_and_tokens(monkeypatch):
     expected_tokens = min(
         llm_client_module.G5_MAX_OUTPUT_TOKENS_MAX,
         llm_client_module.RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA,
-        max(primary_payload["max_output_tokens"] * 2, 512),
+        max(1024, primary_payload["max_output_tokens"] * 2),
     )
     assert continue_payload["max_output_tokens"] == expected_tokens
 

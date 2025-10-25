@@ -76,7 +76,8 @@ _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
 RESPONSES_MAX_OUTPUT_TOKENS_MIN = 16
 RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS = 64
 RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT = 256
-RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA = 1200
+RESPONSES_SCHEMA_PRIMARY_MAX_OUTPUT_TOKENS = 1200
+RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA = 2048
 
 
 def clamp_responses_max_output_tokens(
@@ -247,9 +248,10 @@ RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
 SKELETON_COMPACT_INSTRUCTION = (
     "Значения полей — кратко: по 1–2 предложения, без развернутых эссе. "
     "При нехватке лимита — оставляй пустые строки, но JSON должен быть валиден. "
-    "Краткость обязательна: каждое строковое поле ≤ 220 символов. "
-    "В массивах не более 4 элементов. Если не уверена — поставь \"\" (пустую строку). "
-    "Выводи только валидный JSON по схеме."
+    "Краткость обязательна: каждое строковое поле ≤ указанного в схеме maxLength. "
+    "main — не более 4 пунктов, faq — не более 6. "
+    "Если не уверена — ставь пустую строку \"\". "
+    "Выводи только валидный JSON по схеме, без текста вокруг."
 )
 
 
@@ -259,10 +261,10 @@ DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
     "schema": {
         "type": "object",
         "properties": {
-            "intro": {"type": "string", "maxLength": 220},
+            "intro": {"type": "string", "minLength": 0, "maxLength": 200},
             "main": {
                 "type": "array",
-                "items": {"type": "string", "maxLength": 220},
+                "items": {"type": "string", "minLength": 0, "maxLength": 200},
                 "minItems": 3,
                 "maxItems": 4,
             },
@@ -271,16 +273,15 @@ DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "q": {"type": "string", "maxLength": 220},
-                        "a": {"type": "string", "maxLength": 220},
+                        "q": {"type": "string", "minLength": 0, "maxLength": 120},
+                        "a": {"type": "string", "minLength": 0, "maxLength": 220},
                     },
                     "required": ["q", "a"],
                     "additionalProperties": False,
                 },
-                "minItems": 5,
-                "maxItems": 5,
+                "maxItems": 6,
             },
-            "conclusion": {"type": "string", "maxLength": 220},
+            "conclusion": {"type": "string", "minLength": 0, "maxLength": 200},
         },
         "required": ["intro", "main", "faq", "conclusion"],
         "additionalProperties": False,
@@ -1899,6 +1900,18 @@ def generate(
             upper_cap = min(env_upper_cap, format_cap)
         else:
             upper_cap = format_cap
+        if format_is_structured and RESPONSES_SCHEMA_PRIMARY_MAX_OUTPUT_TOKENS > 0:
+            primary_cap = min(
+                RESPONSES_SCHEMA_PRIMARY_MAX_OUTPUT_TOKENS,
+                RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA,
+            )
+            if max_tokens_value > primary_cap:
+                LOGGER.info(
+                    "responses max_output_tokens primary_cap applied requested=%s limit=%s",
+                    raw_max_tokens,
+                    primary_cap,
+                )
+                max_tokens_value = primary_cap
         if upper_cap is not None and max_tokens_value > upper_cap:
             LOGGER.info(
                 "responses max_output_tokens clamped requested=%s limit=%s",
@@ -2310,14 +2323,21 @@ def generate(
                                 schema_escalations < max_schema_escalations
                                 and int(current_max) < int(allowed_cap)
                             ):
-                                doubled = int(current_max) * 2
-                                next_max_candidate = max(doubled, 1024)
+                                current_max_int = int(current_max)
+                                doubled = current_max_int * 2
+                                next_max_candidate = max(1024, doubled)
+                                schema_cap = int(RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA)
                                 next_max = min(
-                                    int(allowed_cap),
-                                    int(RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA),
+                                    schema_cap,
                                     next_max_candidate,
                                 )
-                                if next_max > int(current_max):
+                                if allowed_cap is not None:
+                                    try:
+                                        allowed_cap_int = int(allowed_cap)
+                                    except (TypeError, ValueError):
+                                        allowed_cap_int = schema_cap
+                                    next_max = min(next_max, allowed_cap_int)
+                                if next_max > current_max_int:
                                     schema_escalations += 1
                                     token_escalations += 1
                                     retry_used = True

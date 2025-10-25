@@ -1,109 +1,62 @@
-diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 307525d80601d7f557c0f5f576bc1495360e6877..94c18559651e7f4cbced18f1a2551b44214415bf 100644
---- a/deterministic_pipeline.py
-+++ b/deterministic_pipeline.py
-@@ -2113,90 +2113,90 @@ class DeterministicPipeline:
-             if isinstance(body_text, str) and body_text.strip():
-                 generated.append(body_text.strip())
-             else:
-                 placeholder = (
-                     "Дополнительный раздел будет дополнен подробными рекомендациями "
-                     "в обновлении статьи."
-                 )
-                 assembly.apply_main(new_index, placeholder, heading=new_heading)
-                 generated.append(placeholder)
-         return generated
- 
-     def _finalize_main_sections(
-         self,
-         payload: Dict[str, object],
-         *,
-         outline: SkeletonOutline,
-         assembly: SkeletonAssembly,
-         estimate: SkeletonVolumeEstimate,
-     ) -> Dict[str, object]:
-         main_blocks = payload.get("main")
-         if not isinstance(main_blocks, list):
-             main_blocks = []
-         sanitized = [str(item or "").strip() for item in main_blocks if str(item or "").strip()]
-         before_len = len(sanitized)
-         result = list(sanitized)
--        if len(result) > 6:
--            LOGGER.info("LOG:SKELETON_MAIN_TRIMMED from=%d to=6", len(result))
--            result = result[:6]
-+        if len(result) > 4:
-+            LOGGER.info("LOG:SKELETON_MAIN_TRIMMED from=%d to=4", len(result))
-+            result = result[:4]
-         needed = max(0, min(3 - len(result), 3))
-         if needed > 0:
-             additional = self._generate_additional_main_sections(
-                 outline=outline,
-                 assembly=assembly,
-                 estimate=estimate,
-                 count=needed,
-             )
-             if additional:
-                 result.extend(additional)
-             LOGGER.info(
-                 "LOG:SKELETON_MAIN_AUTOFIX needed=%d before=%d after=%d",
-                 needed,
-                 before_len,
-                 len(result),
-             )
-         payload["main"] = result
-         return payload
- 
-     def _render_skeleton_markdown(self, payload: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
-         if not isinstance(payload, dict):
-             raise ValueError("Структура скелета не является объектом")
- 
-         intro = str(payload.get("intro") or "").strip()
-         raw_main = payload.get("main")
-         if not isinstance(raw_main, list):
-             raw_main = []
-         conclusion = str(payload.get("conclusion") or "").strip()
-         faq = payload.get("faq")
-         if not intro or not conclusion:
-             raise ValueError("Скелет не содержит обязательных полей intro/main/conclusion")
- 
-         normalized_main: List[str] = [
-             str(item or "").strip() for item in raw_main if str(item or "").strip()
-         ]
--        if len(normalized_main) > 6:
--            normalized_main = normalized_main[:6]
-+        if len(normalized_main) > 4:
-+            normalized_main = normalized_main[:4]
-         placeholders_needed = max(0, 3 - len(normalized_main))
-         if placeholders_needed:
-             for _ in range(placeholders_needed):
-                 normalized_main.append(
-                     "Этот раздел будет расширен детальными рекомендациями в финальной версии статьи."
-                 )
-             LOGGER.warning(
-                 "LOG:SKELETON_MAIN_PLACEHOLDER applied count=%d",
-                 placeholders_needed,
-             )
- 
-         expected_faq = self.faq_target if self.faq_target > 0 else 0
-         if expected_faq > 0:
-             if not isinstance(faq, list) or len(faq) != expected_faq:
-                 raise ValueError(
-                     f"Скелет FAQ должен содержать ровно {expected_faq} элементов"
-                 )
-         else:
-             faq = []
- 
-         normalized_faq: List[Dict[str, str]] = []
-         for idx, entry in enumerate(faq, start=1):
-             if not isinstance(entry, dict):
-                 raise ValueError(f"FAQ элемент №{idx} имеет неверный формат")
-             question = str(entry.get("q") or "").strip()
 diff --git a/llm_client.py b/llm_client.py
-index b1bfc329b33e383564809b84b349b001a9d6ad4f..6c69e8a9184a3662be8d1256950bd8a0bcafa458 100644
+index 6c69e8a9184a3662be8d1256950bd8a0bcafa458..4e170c4140d2f006a93b352862d43188b174e915 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -224,82 +224,85 @@ def extract_min_tokens_requirement(response: Optional[httpx.Response]) -> Option
-         if match:
+@@ -54,51 +54,52 @@ MAX_RESPONSES_POLL_ATTEMPTS = (
+ )
+ if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
+     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
+ GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
+ LIVING_STYLE_INSTRUCTION = (
+     "Стиль текста: живой, человечный, уверенный.\n"
+     "Пиши так, как будто объясняешь это умному человеку, но без канцелярита.\n"
+     "Избегай сухих определений, добавляй лёгкие переходы и короткие фразы.\n"
+     "Разбивай длинные абзацы, вставляй мини-примеры и пояснения своими словами.\n"
+     "Тон — дружелюбный, экспертный, без лишней официальности."
+ )
+ _PROMPT_CACHE: "OrderedDict[Tuple[Tuple[str, str], ...], List[Dict[str, str]]]" = OrderedDict()
+ _PROMPT_CACHE_LIMIT = 16
+ 
+ _HTTP_CLIENT_LIMITS = httpx.Limits(
+     max_connections=16,
+     max_keepalive_connections=16,
+     keepalive_expiry=120.0,
+ )
+ _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
+ 
+ 
+ RESPONSES_MAX_OUTPUT_TOKENS_MIN = 16
+ RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS = 64
+ RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT = 256
+-RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA = 1200
++RESPONSES_SCHEMA_PRIMARY_MAX_OUTPUT_TOKENS = 1200
++RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA = 2048
+ 
+ 
+ def clamp_responses_max_output_tokens(
+     value: object,
+     *,
+     format_type: Optional[str] = None,
+ ) -> int:
+     """Clamp max_output_tokens to the supported Responses bounds."""
+ 
+     try:
+         numeric_value = int(value)  # type: ignore[arg-type]
+     except (TypeError, ValueError):
+         numeric_value = RESPONSES_MAX_OUTPUT_TOKENS_MIN
+     normalized_type = str(format_type or "").strip().lower()
+     lower_bound = RESPONSES_MAX_OUTPUT_TOKENS_MIN
+     if normalized_type in {"json_schema", "json_object"}:
+         upper_bound = RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA
+         lower_bound = max(lower_bound, RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS)
+     else:
+         upper_bound = RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT
+     return max(lower_bound, min(numeric_value, upper_bound))
+ 
+ 
+ def reset_http_client_cache() -> None:
+     """Close and clear pooled HTTP clients.
+@@ -225,84 +226,84 @@ def extract_min_tokens_requirement(response: Optional[httpx.Response]) -> Option
              try:
                  value = int(match.group(1))
              except (TypeError, ValueError):
@@ -128,11 +81,14 @@ index b1bfc329b33e383564809b84b349b001a9d6ad4f..6c69e8a9184a3662be8d1256950bd8a0
  RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
  SKELETON_COMPACT_INSTRUCTION = (
      "Значения полей — кратко: по 1–2 предложения, без развернутых эссе. "
--    "При нехватке лимита — оставляй пустые строки, но JSON должен быть валиден."
-+    "При нехватке лимита — оставляй пустые строки, но JSON должен быть валиден. "
-+    "Краткость обязательна: каждое строковое поле ≤ 220 символов. "
-+    "В массивах не более 4 элементов. Если не уверена — поставь \"\" (пустую строку). "
-+    "Выводи только валидный JSON по схеме."
+     "При нехватке лимита — оставляй пустые строки, но JSON должен быть валиден. "
+-    "Краткость обязательна: каждое строковое поле ≤ 220 символов. "
+-    "В массивах не более 4 элементов. Если не уверена — поставь \"\" (пустую строку). "
+-    "Выводи только валидный JSON по схеме."
++    "Краткость обязательна: каждое строковое поле ≤ указанного в схеме maxLength. "
++    "main — не более 4 пунктов, faq — не более 6. "
++    "Если не уверена — ставь пустую строку \"\". "
++    "Выводи только валидный JSON по схеме, без текста вокруг."
  )
  
  
@@ -142,34 +98,34 @@ index b1bfc329b33e383564809b84b349b001a9d6ad4f..6c69e8a9184a3662be8d1256950bd8a0
      "schema": {
          "type": "object",
          "properties": {
--            "intro": {"type": "string"},
-+            "intro": {"type": "string", "maxLength": 220},
+-            "intro": {"type": "string", "maxLength": 220},
++            "intro": {"type": "string", "minLength": 0, "maxLength": 200},
              "main": {
                  "type": "array",
--                "items": {"type": "string"},
-+                "items": {"type": "string", "maxLength": 220},
+-                "items": {"type": "string", "maxLength": 220},
++                "items": {"type": "string", "minLength": 0, "maxLength": 200},
                  "minItems": 3,
--                "maxItems": 6,
-+                "maxItems": 4,
+                 "maxItems": 4,
              },
              "faq": {
                  "type": "array",
                  "items": {
                      "type": "object",
                      "properties": {
--                        "q": {"type": "string"},
--                        "a": {"type": "string"},
-+                        "q": {"type": "string", "maxLength": 220},
-+                        "a": {"type": "string", "maxLength": 220},
+-                        "q": {"type": "string", "maxLength": 220},
+-                        "a": {"type": "string", "maxLength": 220},
++                        "q": {"type": "string", "minLength": 0, "maxLength": 120},
++                        "a": {"type": "string", "minLength": 0, "maxLength": 220},
                      },
                      "required": ["q", "a"],
                      "additionalProperties": False,
                  },
-                 "minItems": 5,
-                 "maxItems": 5,
+-                "minItems": 5,
+-                "maxItems": 5,
++                "maxItems": 6,
              },
--            "conclusion": {"type": "string"},
-+            "conclusion": {"type": "string", "maxLength": 220},
+-            "conclusion": {"type": "string", "maxLength": 220},
++            "conclusion": {"type": "string", "minLength": 0, "maxLength": 200},
          },
          "required": ["intro", "main", "faq", "conclusion"],
          "additionalProperties": False,
@@ -195,14 +151,70 @@ index b1bfc329b33e383564809b84b349b001a9d6ad4f..6c69e8a9184a3662be8d1256950bd8a0
          "additionalProperties": False,
      },
      "strict": False,
-@@ -2278,56 +2281,64 @@ def generate(
-                         LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
-                 if status == "incomplete":
-                     response_id_value = metadata.get("response_id") or ""
-                     prev_field_present = "previous_response_id" in data or (
-                         isinstance(metadata.get("previous_response_id"), str)
-                         and metadata.get("previous_response_id")
-                     )
+@@ -1877,50 +1878,62 @@ def generate(
+                     fixed = True
+             if not fmt_name:
+                 fmt_name = "-"
+             return format_block, fmt_type, fmt_name, has_schema, fixed
+ 
+         sanitized_payload["text"] = {"format": deepcopy(format_template)}
+ 
+         raw_max_tokens = sanitized_payload.get("max_output_tokens")
+         try:
+             max_tokens_value = int(raw_max_tokens)
+         except (TypeError, ValueError):
+             max_tokens_value = 0
+         if max_tokens_value <= 0:
+             fallback_default = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
+             max_tokens_value = fallback_default
+         format_cap = (
+             RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA
+             if format_is_structured
+             else RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT
+         )
+         env_upper_cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+         if env_upper_cap is not None and env_upper_cap > 0:
+             upper_cap = min(env_upper_cap, format_cap)
+         else:
+             upper_cap = format_cap
++        if format_is_structured and RESPONSES_SCHEMA_PRIMARY_MAX_OUTPUT_TOKENS > 0:
++            primary_cap = min(
++                RESPONSES_SCHEMA_PRIMARY_MAX_OUTPUT_TOKENS,
++                RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA,
++            )
++            if max_tokens_value > primary_cap:
++                LOGGER.info(
++                    "responses max_output_tokens primary_cap applied requested=%s limit=%s",
++                    raw_max_tokens,
++                    primary_cap,
++                )
++                max_tokens_value = primary_cap
+         if upper_cap is not None and max_tokens_value > upper_cap:
+             LOGGER.info(
+                 "responses max_output_tokens clamped requested=%s limit=%s",
+                 raw_max_tokens,
+                 upper_cap,
+             )
+             max_tokens_value = upper_cap
+         sanitized_payload["max_output_tokens"] = max_tokens_value
+         LOGGER.info(
+             "resolved max_output_tokens=%s (requested=%s, cap=%s)",
+             max_tokens_value,
+             raw_max_tokens if raw_max_tokens is not None else "-",
+             upper_cap if upper_cap is not None else "-",
+         )
+ 
+         if "temperature" in sanitized_payload:
+             sanitized_payload.pop("temperature", None)
+ 
+         def _log_payload(snapshot: Dict[str, object]) -> None:
+             keys = sorted(snapshot.keys())
+             LOGGER.info("responses payload_keys=%s", keys)
+             input_candidate = snapshot.get("input", "")
+             length = len(input_candidate) if isinstance(input_candidate, str) else 0
+             LOGGER.info("responses input_len=%d", length)
+             LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
+@@ -2288,58 +2301,65 @@ def generate(
                      if (
                          response_id_value
                          and reason in {"max_output_tokens", "soft_timeout"}
@@ -221,24 +233,33 @@ index b1bfc329b33e383564809b84b349b001a9d6ad4f..6c69e8a9184a3662be8d1256950bd8a0
                                  current_tokens_int = int(current_tokens_value)
                              except (TypeError, ValueError):
                                  current_tokens_int = int(current_max)
-+                            max_schema_escalations = max(
-+                                0, min(RESPONSES_MAX_ESCALATIONS, 1)
-+                            )
+                             max_schema_escalations = max(
+                                 0, min(RESPONSES_MAX_ESCALATIONS, 1)
+                             )
                              if (
--                                schema_escalations < RESPONSES_MAX_ESCALATIONS
-+                                schema_escalations < max_schema_escalations
+                                 schema_escalations < max_schema_escalations
                                  and int(current_max) < int(allowed_cap)
                              ):
--                                next_max_candidate = max(int(current_max) * 2, 512)
--                                next_max = min(int(allowed_cap), next_max_candidate)
-+                                doubled = int(current_max) * 2
-+                                next_max_candidate = max(doubled, 1024)
-+                                next_max = min(
-+                                    int(allowed_cap),
-+                                    int(RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA),
-+                                    next_max_candidate,
-+                                )
-                                 if next_max > int(current_max):
+-                                doubled = int(current_max) * 2
+-                                next_max_candidate = max(doubled, 1024)
++                                current_max_int = int(current_max)
++                                doubled = current_max_int * 2
++                                next_max_candidate = max(1024, doubled)
++                                schema_cap = int(RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA)
+                                 next_max = min(
+-                                    int(allowed_cap),
+-                                    int(RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA),
++                                    schema_cap,
+                                     next_max_candidate,
+                                 )
+-                                if next_max > int(current_max):
++                                if allowed_cap is not None:
++                                    try:
++                                        allowed_cap_int = int(allowed_cap)
++                                    except (TypeError, ValueError):
++                                        allowed_cap_int = schema_cap
++                                    next_max = min(next_max, allowed_cap_int)
++                                if next_max > current_max_int:
                                      schema_escalations += 1
                                      token_escalations += 1
                                      retry_used = True
@@ -263,122 +284,95 @@ index b1bfc329b33e383564809b84b349b001a9d6ad4f..6c69e8a9184a3662be8d1256950bd8a0
                                      shrink_next_attempt = False
                                      if attempts > 0:
                                          attempts -= 1
-diff --git a/skeleton_utils.py b/skeleton_utils.py
-index b9f79e311cd1f9fd728bbdee7f7fde4c72a92aa2..b64208b20479d47d6e40dba281d27b71c66a791c 100644
---- a/skeleton_utils.py
-+++ b/skeleton_utils.py
-@@ -130,53 +130,53 @@ def _describe_keys(payload: Dict[str, Any]) -> str:
- 
- 
- def normalize_skeleton_payload(payload: Any) -> Any:
-     """Return a normalized skeleton payload with canonical keys."""
- 
-     if not isinstance(payload, dict):
-         return payload
- 
-     normalized: Dict[str, Any] = dict(payload)
- 
-     conclusion_value = None
-     for key in _CANONICAL_CONCLUSION_KEYS:
-         if key in normalized:
-             value = normalized.get(key)
-             if value is not None and str(value).strip():
-                 conclusion_value = value
-                 break
-     if conclusion_value is not None:
-         normalized["conclusion"] = conclusion_value
-     for legacy_key in ("outro", "ending", "final", "summary"):
-         normalized.pop(legacy_key, None)
- 
-     normalized_main = [
-         str(item or "").strip() for item in _as_list(normalized.get("main")) if str(item or "").strip()
-     ]
--    if len(normalized_main) > 6:
--        LOGGER.info("LOG:SKELETON_MAIN_TRIM normalize from=%d to=6", len(normalized_main))
--        normalized_main = normalized_main[:6]
-+    if len(normalized_main) > 4:
-+        LOGGER.info("LOG:SKELETON_MAIN_TRIM normalize from=%d to=4", len(normalized_main))
-+        normalized_main = normalized_main[:4]
-     while len(normalized_main) < 3:
-         normalized_main.append(_DEFAULT_MAIN_PLACEHOLDER)
-     normalized["main"] = normalized_main
-     raw_faq = _as_list(normalized.get("faq"))
-     faq_entries = _deduplicate_entries(filter(None, (_normalize_faq_item(item) for item in raw_faq)))
- 
-     theme = str(normalized.get("theme") or normalized.get("topic") or "").strip().lower() or "finance"
-     keywords = _extract_keywords(normalized)
-     seeds = _deduplicate_entries(get_faq_seeds(theme), seen=(entry["q"] for entry in faq_entries))
- 
-     combined = list(faq_entries)
-     needs_fill = len(faq_entries) < _FAQ_TARGET_COUNT
-     if needs_fill and seeds:
-         combined.extend(seeds)
- 
-     if needs_fill and seeds:
-         missing = _FAQ_TARGET_COUNT - len(faq_entries)
-         LOGGER.info("LOG:SKELETON_FAQ_FILL missing=%d seed_pool=%d", missing, len(seeds))
- 
-     if len(faq_entries) > _FAQ_TARGET_COUNT:
-         LOGGER.info("LOG:SKELETON_FAQ_TRIM from=%d to=%d", len(faq_entries), _FAQ_TARGET_COUNT)
- 
-     if not combined:
-         combined = seeds[:]
- 
-diff --git a/tests/test_skeleton_utils.py b/tests/test_skeleton_utils.py
-index e47935480a971204cc2a8a05f49bcf236ad897a8..3fc3c2ca55073fbf6c5ab4833a61eafa6085dee5 100644
---- a/tests/test_skeleton_utils.py
-+++ b/tests/test_skeleton_utils.py
-@@ -7,51 +7,51 @@ def test_normalize_skeleton_payload_standardizes_keys():
-         "main": "Section",
-         "faq": {"q": "Q?", "a": "A!"},
-         "outro": "Bye",
-     }
- 
-     normalized = normalize_skeleton_payload(raw_payload)
- 
-     assert "outro" not in normalized
-     assert normalized["conclusion"] == "Bye"
-     assert len(normalized["main"]) == 3
-     assert normalized["main"][0] == "Section"
-     assert len(normalized["faq"]) == 5
-     assert normalized["faq"][0] == {"q": "Q?", "a": "A!"}
- 
- 
- def test_normalize_skeleton_payload_enforces_main_range():
-     raw_payload = {
-         "intro": "Intro",
-         "main": [f"Block {idx}" for idx in range(10)],
-         "faq": [],
-         "conclusion": "Bye",
-     }
- 
-     normalized = normalize_skeleton_payload(raw_payload)
- 
--    assert len(normalized["main"]) == 6
-+    assert len(normalized["main"]) == 4
-     assert normalized["main"][0] == "Block 0"
- 
- 
- def test_normalize_skeleton_payload_fills_faq_from_seeds():
-     raw_payload = {
-         "intro": "Intro",
-         "main": ["A", "B", "C"],
-         "faq": [
-             {"q": "Что такое кредитная нагрузка?", "a": "Это доля платежей от дохода."},
-             {"q": "Как выбрать банк?", "a": "Сравните ставки и комиссии."},
+                                     continue
+diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
+index b190bda983fd62ce2e4f5b2fd2e693eb3e0683dc..11b9bf60cfed8d29fbd8170bedb95da57340c6d7 100644
+--- a/tests/test_llm_client.py
++++ b/tests/test_llm_client.py
+@@ -321,51 +321,51 @@ def test_generate_retries_when_incomplete_text_missing_schema_content():
+                 ]
+             }
          ],
-         "conclusion": "Bye",
      }
+     result, client = _generate_with_dummy(
+         responses=[incomplete_payload, final_payload],
+         max_tokens=120,
+     )
+     assert isinstance(result, GenerationResult)
+     assert len(client.requests) == 2
+     continue_payload = client.requests[1]["json"]
+     assert "previous_response_id" not in continue_payload
+     assert continue_payload["max_output_tokens"] > client.requests[0]["json"]["max_output_tokens"]
+     assert json.loads(result.text)["intro"] == "Hello"
  
-     normalized = normalize_skeleton_payload(raw_payload)
  
-     questions = [entry["q"] for entry in normalized["faq"]]
-     assert len(questions) == 5
-     assert any("долговую нагрузку" in question.lower() for question in questions)
+ def test_generate_marks_final_cap_as_degraded():
+     payload = {
+         "id": "resp-cap",
+         "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
+         "output": [],
+     }
+     with patch("llm_client.LOGGER"):
+         with pytest.raises(RuntimeError) as excinfo:
+-            _generate_with_dummy(responses=[payload], max_tokens=3600)
++            _generate_with_dummy(responses=[payload, payload], max_tokens=3600)
+     message = str(excinfo.value)
+     assert message.startswith("skeleton_incomplete: max_output_tokens_exhausted")
+     assert "tried=[" in message
  
  
- def test_normalize_skeleton_payload_trims_to_top_five():
-     raw_payload = {
-         "intro": "Intro",
-         "main": ["A", "B", "C"],
+ def test_responses_continue_includes_model_and_tokens(monkeypatch):
+     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_BASE", 64, raising=False)
+     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP1", 96, raising=False)
+     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP2", 128, raising=False)
+     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 128, raising=False)
+     monkeypatch.setattr("llm_client.G5_ESCALATION_LADDER", (64, 96, 128), raising=False)
+ 
+     incomplete_payload = {
+         "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
+         "id": "resp-1",
+         "output": [],
+     }
+     final_payload = {
+         "status": "completed",
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "Готовый текст"},
+                 ]
+@@ -376,31 +376,31 @@ def test_responses_continue_includes_model_and_tokens(monkeypatch):
+     with patch("llm_client.LOGGER"):
+         result, client = _generate_with_dummy(
+             responses=[incomplete_payload, final_payload],
+             max_tokens=64,
+         )
+ 
+     assert len(client.requests) == 2
+     primary_payload = client.requests[0]["json"]
+     continue_payload = client.requests[1]["json"]
+ 
+     assert "previous_response_id" not in continue_payload
+     assert continue_payload["model"] == primary_payload["model"]
+     assert continue_payload["text"]["format"] == primary_payload["text"]["format"]
+     assert "input" in continue_payload
+     assert isinstance(continue_payload["input"], str)
+     if primary_payload.get("input"):
+         assert continue_payload["input"] in {
+             primary_payload["input"],
+             "Continue generation",
+         }
+     else:
+         assert continue_payload["input"] in {"", "Continue generation"}
+     expected_tokens = min(
+         llm_client_module.G5_MAX_OUTPUT_TOKENS_MAX,
+         llm_client_module.RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA,
+-        max(primary_payload["max_output_tokens"] * 2, 512),
++        max(1024, primary_payload["max_output_tokens"] * 2),
+     )
+     assert continue_payload["max_output_tokens"] == expected_tokens
+ 
+     metadata = result.metadata or {}
+     assert metadata.get("status") == "completed"
 
