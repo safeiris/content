@@ -73,6 +73,23 @@ _HTTP_CLIENT_LIMITS = httpx.Limits(
 _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
 
 
+RESPONSES_MAX_OUTPUT_TOKENS_MIN = 16
+RESPONSES_MAX_OUTPUT_TOKENS_MAX = 256
+
+
+def clamp_responses_max_output_tokens(value: object) -> int:
+    """Clamp max_output_tokens to the supported Responses bounds."""
+
+    try:
+        numeric_value = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        numeric_value = RESPONSES_MAX_OUTPUT_TOKENS_MIN
+    return max(
+        RESPONSES_MAX_OUTPUT_TOKENS_MIN,
+        min(numeric_value, RESPONSES_MAX_OUTPUT_TOKENS_MAX),
+    )
+
+
 def reset_http_client_cache() -> None:
     """Close and clear pooled HTTP clients.
 
@@ -420,7 +437,7 @@ def build_responses_payload(
     payload: Dict[str, object] = {
         "model": str(model).strip(),
         "input": joined_input.strip(),
-        "max_output_tokens": int(max_tokens),
+        "max_output_tokens": clamp_responses_max_output_tokens(max_tokens),
         "text": {"format": format_block},
     }
     if previous_response_id and previous_response_id.strip():
@@ -758,7 +775,7 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
             continue
         if key == "max_output_tokens":
             try:
-                sanitized[key] = int(value)
+                sanitized[key] = clamp_responses_max_output_tokens(value)
             except (TypeError, ValueError):
                 continue
             continue
@@ -1519,6 +1536,11 @@ def _make_request(
             input_candidate = current_payload.get("input", "")
             input_len = len(input_candidate) if isinstance(input_candidate, str) else 0
             LOGGER.info("responses input_len=%d", input_len)
+            if "max_output_tokens" in current_payload:
+                current_payload = dict(current_payload)
+                current_payload["max_output_tokens"] = clamp_responses_max_output_tokens(
+                    current_payload.get("max_output_tokens")
+                )
             response = http_client.post(api_url, headers=headers, json=current_payload)
             response.raise_for_status()
             data = response.json()
@@ -2090,6 +2112,11 @@ def generate(
             _log_payload(current_payload)
             try:
                 _store_responses_request_snapshot(current_payload)
+                if "max_output_tokens" in current_payload:
+                    current_payload = dict(current_payload)
+                    current_payload["max_output_tokens"] = clamp_responses_max_output_tokens(
+                        current_payload.get("max_output_tokens")
+                    )
                 response = http_client.post(
                     RESPONSES_API_URL,
                     headers=headers,

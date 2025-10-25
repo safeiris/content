@@ -31,6 +31,7 @@ from llm_client import (
     DEFAULT_MODEL,
     RESPONSES_API_URL,
     build_responses_payload,
+    clamp_responses_max_output_tokens,
     sanitize_payload_for_responses,
 )
 from keywords import parse_manual_keywords
@@ -45,7 +46,7 @@ HEALTH_MODEL = DEFAULT_MODEL
 HEALTH_PROMPT = "ping"
 LOGGER = logging.getLogger(__name__)
 
-HEALTH_INITIAL_MAX_TOKENS = 8
+HEALTH_INITIAL_MAX_TOKENS = 16
 
 
 @dataclass
@@ -694,7 +695,7 @@ def _mask_openai_key(raw_key: str) -> str:
 def _run_health_ping() -> Dict[str, object]:
     model = HEALTH_MODEL
     prompt = HEALTH_PROMPT
-    max_tokens = HEALTH_INITIAL_MAX_TOKENS
+    max_tokens = clamp_responses_max_output_tokens(HEALTH_INITIAL_MAX_TOKENS)
     text_format = {"type": "text"}
 
     base_payload = build_responses_payload(
@@ -803,18 +804,29 @@ def _run_health_ping() -> Dict[str, object]:
             latency_ms = int((time.perf_counter() - start) * 1000)
 
             if response.status_code != 200:
-                detail = response.text.strip()
-                if len(detail) > 120:
-                    detail = f"{detail[:117]}..."
+                detail = response.text or ""
                 LOGGER.warning(
-                    "health_ping http_error status=%d endpoint=%s",
+                    "health_ping http_error status=%d endpoint=%s body=%s",
                     response.status_code,
                     endpoint,
+                    detail,
                 )
                 _log_health(latency_ms)
+                if response.status_code == 400:
+                    return {
+                        "ok": False,
+                        "message": "LLM degraded: 400 invalid max_output_tokens (raised to >=16)",
+                        "route": route,
+                        "fallback_used": fallback_used,
+                        "latency_ms": latency_ms,
+                        "status": "degraded",
+                    }
+                trimmed_detail = detail.strip()
+                if len(trimmed_detail) > 120:
+                    trimmed_detail = f"{trimmed_detail[:117]}..."
                 return {
                     "ok": False,
-                    "message": f"Responses недоступен: HTTP {response.status_code} — {detail or 'ошибка'}",
+                    "message": f"Responses недоступен: HTTP {response.status_code} — {trimmed_detail or 'ошибка'}",
                     "route": route,
                     "fallback_used": fallback_used,
                     "latency_ms": latency_ms,

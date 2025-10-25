@@ -107,6 +107,29 @@ def test_health_ping_5xx_failure(monkeypatch):
     assert len(client.requests) == 1
 
 
+def test_health_ping_400_invalid_max_tokens(monkeypatch):
+    payload = {
+        "error": {
+            "message": "max_output_tokens too small; expected >= 64",
+        }
+    }
+    responses = [_response(400, payload)]
+    client = DummyHealthClient(responses)
+
+    def _client_factory(timeout=None):
+        client.timeout = timeout
+        return client
+
+    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
+
+    result = orchestrate._run_health_ping()
+
+    assert result["ok"] is False
+    assert result["status"] == "degraded"
+    assert result["message"] == "LLM degraded: 400 invalid max_output_tokens (raised to >=16)"
+    assert len(client.requests) == 1
+
+
 def test_health_ping_timeout_degraded(monkeypatch):
     class TimeoutClient:
         def __init__(self):

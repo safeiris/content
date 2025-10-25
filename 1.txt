@@ -1,16 +1,298 @@
+diff --git a/llm_client.py b/llm_client.py
+index 80f65aa8693229ca4fb845aba45b0fc17e89eb60..8deea936af772c93f9c548c7d7f5bed67854d963 100644
+--- a/llm_client.py
++++ b/llm_client.py
+@@ -51,50 +51,67 @@ RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
+ RESPONSES_MAX_ESCALATIONS = 2
+ MAX_RESPONSES_POLL_ATTEMPTS = (
+     G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
+ )
+ if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
+     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
+ GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
+ LIVING_STYLE_INSTRUCTION = (
+     "Стиль текста: живой, человечный, уверенный.\n"
+     "Пиши так, как будто объясняешь это умному человеку, но без канцелярита.\n"
+     "Избегай сухих определений, добавляй лёгкие переходы и короткие фразы.\n"
+     "Разбивай длинные абзацы, вставляй мини-примеры и пояснения своими словами.\n"
+     "Тон — дружелюбный, экспертный, без лишней официальности."
+ )
+ _PROMPT_CACHE: "OrderedDict[Tuple[Tuple[str, str], ...], List[Dict[str, str]]]" = OrderedDict()
+ _PROMPT_CACHE_LIMIT = 16
+ 
+ _HTTP_CLIENT_LIMITS = httpx.Limits(
+     max_connections=16,
+     max_keepalive_connections=16,
+     keepalive_expiry=120.0,
+ )
+ _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
+ 
+ 
++RESPONSES_MAX_OUTPUT_TOKENS_MIN = 16
++RESPONSES_MAX_OUTPUT_TOKENS_MAX = 256
++
++
++def clamp_responses_max_output_tokens(value: object) -> int:
++    """Clamp max_output_tokens to the supported Responses bounds."""
++
++    try:
++        numeric_value = int(value)  # type: ignore[arg-type]
++    except (TypeError, ValueError):
++        numeric_value = RESPONSES_MAX_OUTPUT_TOKENS_MIN
++    return max(
++        RESPONSES_MAX_OUTPUT_TOKENS_MIN,
++        min(numeric_value, RESPONSES_MAX_OUTPUT_TOKENS_MAX),
++    )
++
++
+ def reset_http_client_cache() -> None:
+     """Close and clear pooled HTTP clients.
+ 
+     Intended for test code to avoid state leaking between invocations when
+     mocked clients keep internal counters (e.g. DummyClient instances)."""
+ 
+     while _HTTP_CLIENTS:
+         _, pooled_client = _HTTP_CLIENTS.popitem(last=False)
+         try:
+             pooled_client.close()
+         except Exception:  # pragma: no cover - best effort cleanup
+             pass
+ 
+ 
+ _JSON_STYLE_GUARD: Set[str] = {"json_schema", "json_object"}
+ 
+ 
+ def _should_apply_living_style(format_type: str) -> bool:
+     normalized = str(format_type or "").strip().lower()
+     return not normalized or normalized not in _JSON_STYLE_GUARD
+ 
+ 
+ def _apply_living_style_instruction(system_text: str, *, format_type: str) -> str:
+     instruction = LIVING_STYLE_INSTRUCTION.strip()
+     if not instruction:
+@@ -398,51 +415,51 @@ def build_responses_payload(
+     """Construct a minimal Responses API payload for GPT-5 models."""
+ 
+     sections: List[str] = []
+ 
+     system_block = (system_text or "").strip()
+     if system_block:
+         sections.append(system_block)
+ 
+     user_block = (user_text or "").strip()
+     if user_block:
+         sections.append(user_block)
+ 
+     joined_input = "\n\n".join(section for section in sections if section)
+     joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
+     joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
+ 
+     format_block, _, _ = _prepare_text_format_for_request(
+         text_format or DEFAULT_RESPONSES_TEXT_FORMAT,
+         context="build_payload",
+         log_on_migration=False,
+     )
+ 
+     payload: Dict[str, object] = {
+         "model": str(model).strip(),
+         "input": joined_input.strip(),
+-        "max_output_tokens": int(max_tokens),
++        "max_output_tokens": clamp_responses_max_output_tokens(max_tokens),
+         "text": {"format": format_block},
+     }
+     if previous_response_id and previous_response_id.strip():
+         payload["previous_response_id"] = previous_response_id.strip()
+     return payload
+ 
+ 
+ def _shrink_responses_input(text_value: str) -> str:
+     """Return a slightly condensed version of the Responses input payload."""
+ 
+     if not text_value:
+         return text_value
+ 
+     normalized_lines: List[str] = []
+     seen: set[str] = set()
+     for raw_line in text_value.splitlines():
+         stripped = raw_line.strip()
+         if not stripped:
+             continue
+         fingerprint = re.sub(r"\s+", " ", stripped.lower())
+         if fingerprint in seen:
+             continue
+         seen.add(fingerprint)
+         normalized_lines.append(stripped)
+ 
+@@ -736,51 +753,51 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
+             continue
+         if isinstance(value, str):
+             trimmed = value.strip()
+             if key == "input":
+                 sanitized[key] = trimmed
+                 continue
+             if not trimmed:
+                 continue
+             if key == "model":
+                 sanitized[key] = trimmed
+                 continue
+             if key == "previous_response_id":
+                 sanitized[key] = trimmed
+                 continue
+         if key == "input" and not isinstance(value, str):
+             if isinstance(value, (list, dict)):
+                 converted = json.dumps(value, ensure_ascii=False)
+             else:
+                 converted = str(value)
+             converted = converted.strip()
+             if converted or "input" not in sanitized:
+                 sanitized[key] = converted
+             continue
+         if key == "max_output_tokens":
+             try:
+-                sanitized[key] = int(value)
++                sanitized[key] = clamp_responses_max_output_tokens(value)
+             except (TypeError, ValueError):
+                 continue
+             continue
+         if key == "text":
+             if isinstance(value, dict):
+                 sanitized_text = _sanitize_text_block(value)
+                 if sanitized_text:
+                     sanitized["text"] = sanitized_text
+             continue
+     if "input" not in sanitized and "input" in payload:
+         raw_input = payload.get("input")
+         if isinstance(raw_input, str):
+             sanitized["input"] = raw_input.strip()
+         elif raw_input is None:
+             sanitized["input"] = ""
+         else:
+             sanitized["input"] = str(raw_input).strip()
+ 
+     input_value = sanitized.get("input", "")
+     input_length = len(input_value) if isinstance(input_value, str) else 0
+     return sanitized, input_length
+ 
+ 
+ def _store_responses_request_snapshot(payload: Dict[str, object]) -> None:
+     """Persist a sanitized snapshot of the latest Responses API request."""
+@@ -1497,50 +1514,55 @@ def _needs_format_name_retry(response: httpx.Response) -> bool:
+         return True
+     if "moved to text.format" in lowered and "name" in lowered:
+         return True
+     return False
+ 
+ 
+ def _make_request(
+     http_client: httpx.Client,
+     *,
+     api_url: str,
+     headers: Dict[str, str],
+     payload: Dict[str, object],
+     schedule: List[float],
+ ) -> Tuple[Dict[str, object], bool]:
+     last_error: Optional[BaseException] = None
+     shimmed_param = False
+     stripped_param: Optional[str] = None
+     current_payload: Dict[str, object] = dict(payload)
+     attempt_index = 0
+     while attempt_index < MAX_RETRIES:
+         attempt_index += 1
+         try:
+             input_candidate = current_payload.get("input", "")
+             input_len = len(input_candidate) if isinstance(input_candidate, str) else 0
+             LOGGER.info("responses input_len=%d", input_len)
++            if "max_output_tokens" in current_payload:
++                current_payload = dict(current_payload)
++                current_payload["max_output_tokens"] = clamp_responses_max_output_tokens(
++                    current_payload.get("max_output_tokens")
++                )
+             response = http_client.post(api_url, headers=headers, json=current_payload)
+             response.raise_for_status()
+             data = response.json()
+             if isinstance(data, dict):
+                 return data, shimmed_param
+             raise RuntimeError("Модель вернула неожиданный формат ответа.")
+         except EmptyCompletionError:
+             raise
+         except httpx.HTTPStatusError as exc:
+             status = exc.response.status_code
+             if (
+                 status == 400
+                 and not shimmed_param
+                 and exc.response is not None
+             ):
+                 param_name = _extract_unknown_parameter_name(exc.response)
+                 if param_name:
+                     if param_name in current_payload:
+                         current_payload = dict(current_payload)
+                         current_payload.pop(param_name, None)
+                     shimmed_param = True
+                     stripped_param = param_name
+                     LOGGER.warning(
+                         "retry=shim_unknown_param: stripped '%s' from payload",
+                         param_name,
+@@ -2068,50 +2090,55 @@ def generate(
+                 has_schema,
+                 suffix,
+             )
+             updated_format: Optional[Dict[str, object]] = None
+             if isinstance(format_block, dict):
+                 try:
+                     updated_format = deepcopy(format_block)
+                 except (TypeError, ValueError):
+                     updated_format = _clone_text_format()
+             if isinstance(updated_format, dict):
+                 sanitized_payload["text"] = {"format": deepcopy(updated_format)}
+                 format_template = deepcopy(updated_format)
+             if isinstance(updated_format, dict):
+                 try:
+                     format_snapshot = json.dumps(updated_format, ensure_ascii=False, sort_keys=True)
+                 except (TypeError, ValueError):
+                     format_snapshot = str(updated_format)
+                 LOGGER.debug("DEBUG:payload.text.format = %s", format_snapshot)
+                 current_payload["text"] = {"format": deepcopy(updated_format)}
+             else:
+                 LOGGER.debug("DEBUG:payload.text.format = null")
+                 current_payload["text"] = {"format": _clone_text_format()}
+             _log_payload(current_payload)
+             try:
+                 _store_responses_request_snapshot(current_payload)
++                if "max_output_tokens" in current_payload:
++                    current_payload = dict(current_payload)
++                    current_payload["max_output_tokens"] = clamp_responses_max_output_tokens(
++                        current_payload.get("max_output_tokens")
++                    )
+                 response = http_client.post(
+                     RESPONSES_API_URL,
+                     headers=headers,
+                     json=current_payload,
+                 )
+                 response.raise_for_status()
+                 data = response.json()
+                 if not isinstance(data, dict):
+                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
+                 _store_responses_response_snapshot(data)
+                 text, parse_flags, schema_label = _extract_responses_text(data)
+                 metadata = _extract_metadata(data)
+                 if isinstance(parse_flags, dict):
+                     parse_flags["metadata"] = metadata
+                 content_lengths = 0
+                 if isinstance(parse_flags, dict):
+                     output_len = int(parse_flags.get("output_text_len", 0) or 0)
+                     content_len = int(parse_flags.get("content_text_len", 0) or 0)
+                     content_lengths = output_len + content_len
+                 if content_lengths > 0 and not content_started:
+                     content_started = True
+                     shrink_applied = False
+                     shrink_next_attempt = False
+                     LOGGER.info("RESP_CONTENT_STARTED len=%d", content_lengths)
+                 status = metadata.get("status") or ""
 diff --git a/orchestrate.py b/orchestrate.py
-index 2e70f83743f54a0fa952a6cd7bb401d0f523757a..afca809273aafb57264dd2a5275cde7be8ae6511 100644
+index afca809273aafb57264dd2a5275cde7be8ae6511..a4b387c2d2a8759c831248e21aea865f6bcbec5c 100644
 --- a/orchestrate.py
 +++ b/orchestrate.py
-@@ -1,74 +1,73 @@
- from __future__ import annotations
- 
- import argparse
- import json
- import logging
- import httpx
- import os
-+import random
+@@ -9,65 +9,66 @@ import random
  import sys
  import time
  from copy import deepcopy
@@ -36,7 +318,7 @@ index 2e70f83743f54a0fa952a6cd7bb401d0f523757a..afca809273aafb57264dd2a5275cde7b
      DEFAULT_MODEL,
      RESPONSES_API_URL,
      build_responses_payload,
--    is_min_tokens_error,
++    clamp_responses_max_output_tokens,
      sanitize_payload_for_responses,
  )
  from keywords import parse_manual_keywords
@@ -48,13 +330,11 @@ index 2e70f83743f54a0fa952a6cd7bb401d0f523757a..afca809273aafb57264dd2a5275cde7b
  LATEST_SCHEMA_VERSION = "2024-06"
  
  HEALTH_MODEL = DEFAULT_MODEL
--HEALTH_PROMPT = "Ответь ровно словом: PONG"
-+HEALTH_PROMPT = "ping"
+ HEALTH_PROMPT = "ping"
  LOGGER = logging.getLogger(__name__)
  
--HEALTH_INITIAL_MAX_TOKENS = 10
--HEALTH_MIN_BUMP_TOKENS = 24
-+HEALTH_INITIAL_MAX_TOKENS = 8
+-HEALTH_INITIAL_MAX_TOKENS = 8
++HEALTH_INITIAL_MAX_TOKENS = 16
  
  
  @dataclass
@@ -80,7 +360,20 @@ index 2e70f83743f54a0fa952a6cd7bb401d0f523757a..afca809273aafb57264dd2a5275cde7b
  
  def _local_now() -> datetime:
      return datetime.now(tz=BELGRADE_TZ)
-@@ -686,233 +685,250 @@ def _mask_openai_key(raw_key: str) -> str:
+@@ -672,51 +673,51 @@ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
+                 }
+             except json.JSONDecodeError as exc:
+                 checks["theme_index"] = {
+                     "ok": False,
+                     "message": f"Индекс повреждён: {exc}",
+                 }
+ 
+     ok = all(check.get("ok") is True for check in checks.values())
+     return {"ok": ok, "checks": checks}
+ 
+ 
+ def _mask_openai_key(raw_key: str) -> str:
+     key = (raw_key or "").strip()
      if not key:
          return "****"
      if key.startswith("sk-") and len(key) > 6:
@@ -93,7 +386,8 @@ index 2e70f83743f54a0fa952a6cd7bb401d0f523757a..afca809273aafb57264dd2a5275cde7b
  def _run_health_ping() -> Dict[str, object]:
      model = HEALTH_MODEL
      prompt = HEALTH_PROMPT
-     max_tokens = HEALTH_INITIAL_MAX_TOKENS
+-    max_tokens = HEALTH_INITIAL_MAX_TOKENS
++    max_tokens = clamp_responses_max_output_tokens(HEALTH_INITIAL_MAX_TOKENS)
      text_format = {"type": "text"}
  
      base_payload = build_responses_payload(
@@ -106,527 +400,174 @@ index 2e70f83743f54a0fa952a6cd7bb401d0f523757a..afca809273aafb57264dd2a5275cde7b
      sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
      sanitized_payload["text"] = {"format": deepcopy(text_format)}
      sanitized_payload["max_output_tokens"] = max_tokens
-+    sanitized_payload.pop("response_format", None)
-+    sanitized_payload.pop("tool_resources", None)
-+
-+    endpoint = RESPONSES_API_URL
-+    start = time.perf_counter()
-+
-+    def _is_direct(url: str) -> bool:
-+        host = url.split("//", 1)[-1].split("/", 1)[0].lower()
-+        return "api.openai.com" in host
-+
-+    via = "direct" if _is_direct(endpoint) else "relay"
-+
-+    def _log_health(duration_ms: int) -> None:
-+        LOGGER.info(
-+            "health_ping endpoint=%s model=%s via=%s duration=%d",
-+            endpoint,
-+            model,
-+            via,
-+            duration_ms,
-+        )
+     sanitized_payload.pop("response_format", None)
+     sanitized_payload.pop("tool_resources", None)
  
-     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
-     if not api_key:
-+        latency_ms = int((time.perf_counter() - start) * 1000)
-+        _log_health(latency_ms)
-         return {
-             "ok": False,
-             "message": "Responses недоступен: ключ не задан",
-             "route": LLM_ROUTE,
-             "fallback_used": LLM_ALLOW_FALLBACK,
-         }
+     endpoint = RESPONSES_API_URL
+     start = time.perf_counter()
  
-     headers = {
-         "Authorization": f"Bearer {api_key}",
-         "Content-Type": "application/json",
-     }
+     def _is_direct(url: str) -> bool:
+         host = url.split("//", 1)[-1].split("/", 1)[0].lower()
+         return "api.openai.com" in host
  
-     route = LLM_ROUTE
-     fallback_used = LLM_ALLOW_FALLBACK
--    model_url = f"https://api.openai.com/v1/models/{model}"
--
--    start = time.perf_counter()
--    attempts = 0
--    max_attempts = 2
--    min_bump_done = False
--    current_max_tokens = max_tokens
--    auto_bump_applied = False
--    data: Optional[Dict[str, object]] = None
--    response: Optional[httpx.Response] = None
-+    timeout = httpx.Timeout(connect=10.0, read=40.0, write=10.0, pool=10.0)
+     via = "direct" if _is_direct(endpoint) else "relay"
  
-     try:
--        with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
--            model_probe = client.get(model_url, headers=headers)
--            if model_probe.status_code != 200:
--                detail = model_probe.text.strip()
--                if len(detail) > 120:
--                    detail = f"{detail[:117]}..."
-+        with httpx.Client(timeout=timeout) as client:
-+            max_attempts = 2
-+            attempt = 0
-+            response: Optional[httpx.Response] = None
-+            while attempt < max_attempts:
-+                attempt += 1
-+                try:
-+                    response = client.post(
-+                        endpoint,
-+                        json=sanitized_payload,
-+                        headers=headers,
-+                    )
-+                    break
-+                except httpx.TimeoutException:
-+                    LOGGER.warning(
-+                        "health_ping timeout attempt=%d read=%.0fs endpoint=%s",
-+                        attempt,
-+                        timeout.read,
-+                        endpoint,
-+                    )
-+                    if attempt >= max_attempts:
-+                        latency_ms = int((time.perf_counter() - start) * 1000)
-+                        LOGGER.warning(
-+                            "health_ping degraded attempts=%d endpoint=%s",
-+                            attempt,
-+                            endpoint,
-+                        )
-+                        _log_health(latency_ms)
-+                        return {
-+                            "ok": False,
-+                            "message": "LLM degraded: timeout on health ping (2 attempts, read=40s).",
-+                            "route": route,
-+                            "fallback_used": fallback_used,
-+                            "latency_ms": latency_ms,
-+                            "status": "degraded",
-+                            "attempts": attempt,
-+                        }
-+                    delay = random.uniform(0.4, 0.8)
-+                    time.sleep(delay)
-+            if response is None:
+     def _log_health(duration_ms: int) -> None:
+@@ -781,62 +782,73 @@ def _run_health_ping() -> Dict[str, object]:
+                             "ok": False,
+                             "message": "LLM degraded: timeout on health ping (2 attempts, read=40s).",
+                             "route": route,
+                             "fallback_used": fallback_used,
+                             "latency_ms": latency_ms,
+                             "status": "degraded",
+                             "attempts": attempt,
+                         }
+                     delay = random.uniform(0.4, 0.8)
+                     time.sleep(delay)
+             if response is None:
                  latency_ms = int((time.perf_counter() - start) * 1000)
-+                LOGGER.warning("health_ping no_response endpoint=%s", endpoint)
-+                _log_health(latency_ms)
+                 LOGGER.warning("health_ping no_response endpoint=%s", endpoint)
+                 _log_health(latency_ms)
                  return {
                      "ok": False,
--                    "message": (
--                        f"Модель {model} недоступна: HTTP {model_probe.status_code}"
--                        + (f" — {detail}" if detail else "")
--                    ),
--                    "route": "models",
--                    "fallback_used": LLM_ALLOW_FALLBACK,
-+                    "message": "Responses недоступен: нет ответа",
-+                    "route": route,
-+                    "fallback_used": fallback_used,
+                     "message": "Responses недоступен: нет ответа",
+                     "route": route,
+                     "fallback_used": fallback_used,
                      "latency_ms": latency_ms,
                  }
  
--            while attempts < max_attempts:
--                attempts += 1
--                payload_snapshot = dict(sanitized_payload)
--                payload_snapshot["text"] = {"format": deepcopy(text_format)}
--                payload_snapshot["max_output_tokens"] = current_max_tokens
--                input_candidate = payload_snapshot.get("input", "")
--                input_len = len(input_candidate) if isinstance(input_candidate, str) else 0
--                LOGGER.info("responses input_len=%d", input_len)
--                response = client.post(
--                    RESPONSES_API_URL,
--                    json=payload_snapshot,
--                    headers=headers,
-+            latency_ms = int((time.perf_counter() - start) * 1000)
-+
-+            if response.status_code != 200:
-+                detail = response.text.strip()
-+                if len(detail) > 120:
-+                    detail = f"{detail[:117]}..."
-+                LOGGER.warning(
-+                    "health_ping http_error status=%d endpoint=%s",
-+                    response.status_code,
-+                    endpoint,
+             latency_ms = int((time.perf_counter() - start) * 1000)
+ 
+             if response.status_code != 200:
+-                detail = response.text.strip()
+-                if len(detail) > 120:
+-                    detail = f"{detail[:117]}..."
++                detail = response.text or ""
+                 LOGGER.warning(
+-                    "health_ping http_error status=%d endpoint=%s",
++                    "health_ping http_error status=%d endpoint=%s body=%s",
+                     response.status_code,
+                     endpoint,
++                    detail,
                  )
--                if (
--                    response.status_code == 400
--                    and not min_bump_done
--                    and is_min_tokens_error(response)
--                ):
--                    current_max_tokens = max(current_max_tokens, HEALTH_MIN_BUMP_TOKENS)
--                    sanitized_payload["max_output_tokens"] = current_max_tokens
--                    min_bump_done = True
--                    auto_bump_applied = True
--                    continue
--                break
-+                _log_health(latency_ms)
-+                return {
-+                    "ok": False,
-+                    "message": f"Responses недоступен: HTTP {response.status_code} — {detail or 'ошибка'}",
-+                    "route": route,
-+                    "fallback_used": fallback_used,
-+                    "latency_ms": latency_ms,
-+                }
-+
-+            try:
-+                data = response.json()
-+            except ValueError:
-+                LOGGER.warning("health_ping invalid_json endpoint=%s", endpoint)
-+                _log_health(latency_ms)
-+                return {
-+                    "ok": False,
-+                    "message": "Responses недоступен: некорректный JSON",
-+                    "route": route,
-+                    "fallback_used": fallback_used,
-+                    "latency_ms": latency_ms,
-+                }
-+
+                 _log_health(latency_ms)
++                if response.status_code == 400:
++                    return {
++                        "ok": False,
++                        "message": "LLM degraded: 400 invalid max_output_tokens (raised to >=16)",
++                        "route": route,
++                        "fallback_used": fallback_used,
++                        "latency_ms": latency_ms,
++                        "status": "degraded",
++                    }
++                trimmed_detail = detail.strip()
++                if len(trimmed_detail) > 120:
++                    trimmed_detail = f"{trimmed_detail[:117]}..."
+                 return {
+                     "ok": False,
+-                    "message": f"Responses недоступен: HTTP {response.status_code} — {detail or 'ошибка'}",
++                    "message": f"Responses недоступен: HTTP {response.status_code} — {trimmed_detail or 'ошибка'}",
+                     "route": route,
+                     "fallback_used": fallback_used,
+                     "latency_ms": latency_ms,
+                 }
+ 
+             try:
+                 data = response.json()
+             except ValueError:
+                 LOGGER.warning("health_ping invalid_json endpoint=%s", endpoint)
+                 _log_health(latency_ms)
+                 return {
+                     "ok": False,
+                     "message": "Responses недоступен: некорректный JSON",
+                     "route": route,
+                     "fallback_used": fallback_used,
+                     "latency_ms": latency_ms,
+                 }
+ 
      except httpx.TimeoutException:
          latency_ms = int((time.perf_counter() - start) * 1000)
-+        LOGGER.warning("health_ping timeout outer endpoint=%s", endpoint)
-+        _log_health(latency_ms)
+         LOGGER.warning("health_ping timeout outer endpoint=%s", endpoint)
+         _log_health(latency_ms)
          return {
              "ok": False,
              "message": "Responses недоступен: таймаут",
-             "route": route,
-             "fallback_used": fallback_used,
-             "latency_ms": latency_ms,
-         }
-     except httpx.HTTPError as exc:
-         latency_ms = int((time.perf_counter() - start) * 1000)
-         reason = str(exc).strip() or exc.__class__.__name__
-+        LOGGER.warning("health_ping http_error exception=%s endpoint=%s", reason, endpoint)
-+        _log_health(latency_ms)
-         return {
-             "ok": False,
-             "message": f"Responses недоступен: {reason}",
-             "route": route,
-             "fallback_used": fallback_used,
-             "latency_ms": latency_ms,
-         }
- 
--    latency_ms = int((time.perf_counter() - start) * 1000)
--
--    if response is None:
--        return {
--            "ok": False,
--            "message": "Responses недоступен: нет ответа",
--            "route": route,
--            "fallback_used": fallback_used,
--            "latency_ms": latency_ms,
--        }
--
--    if response.status_code != 200:
--        detail = response.text.strip()
--        if len(detail) > 120:
--            detail = f"{detail[:117]}..."
--        return {
--            "ok": False,
--            "message": f"Responses недоступен: HTTP {response.status_code} — {detail or 'ошибка'}",
--            "route": route,
--            "fallback_used": fallback_used,
--            "latency_ms": latency_ms,
--        }
--
--    try:
--        data = response.json()
--    except ValueError:
--        return {
--            "ok": False,
--            "message": "Responses недоступен: некорректный JSON",
--            "route": route,
--            "fallback_used": fallback_used,
--            "latency_ms": latency_ms,
--        }
--
-     status = str(data.get("status", "")).strip().lower()
-     incomplete_reason = ""
-     incomplete_details = data.get("incomplete_details")
-     if isinstance(incomplete_details, dict):
-         reason_value = incomplete_details.get("reason")
-         if isinstance(reason_value, str):
-             incomplete_reason = reason_value.strip().lower()
- 
-     got_output = False
-     output_text = data.get("output_text")
-     if isinstance(output_text, str) and output_text.strip():
-         got_output = True
-     elif isinstance(data.get("output"), list) or isinstance(data.get("outputs"), list):
-         got_output = True
- 
--    extras: List[str] = []
--    if auto_bump_applied:
--        extras.append(f"auto-bump до {current_max_tokens}")
--
-     if status == "completed":
--        message = f"Responses OK (gpt-5, {current_max_tokens} токена"
--        ok = True
--    elif status == "incomplete" and incomplete_reason == "max_output_tokens":
--        extras.insert(0, "incomplete по лимиту — норм для health")
--        message = f"Responses OK (gpt-5, {current_max_tokens} токена"
-+        message = f"Responses OK (gpt-5, {max_tokens} токенов)"
-         ok = True
-     else:
-         if not status:
-             reason = "неизвестный статус"
-         else:
-             reason = status
-             if incomplete_reason:
-                 reason = f"{reason} ({incomplete_reason})"
-+        LOGGER.warning("health_ping bad_status status=%s endpoint=%s", status or "", endpoint)
-+        _log_health(latency_ms)
-         return {
-             "ok": False,
-             "message": f"Responses недоступен: статус {reason}",
-             "route": route,
-             "fallback_used": fallback_used,
-             "latency_ms": latency_ms,
-             "status": status or "",
-         }
- 
--    if extras:
--        message = f"{message}; {'; '.join(extras)})"
--    else:
--        message = f"{message})"
--
-     result: Dict[str, object] = {
-         "ok": ok,
-         "message": message,
-         "route": route,
-         "fallback_used": fallback_used,
-         "latency_ms": latency_ms,
--        "tokens": current_max_tokens,
-+        "tokens": max_tokens,
-         "status": status,
-         "incomplete_reason": incomplete_reason or None,
-         "got_output": got_output,
-     }
-+
-+    duration_ms = int((time.perf_counter() - start) * 1000)
-+    _log_health(duration_ms)
-     return result
- 
- 
- def _parse_args() -> argparse.Namespace:
-     parser = argparse.ArgumentParser(description="Deterministic content pipeline")
-     parser.add_argument("--theme", required=True, help="Theme slug (profiles/<theme>)")
-     parser.add_argument("--data", required=True, help="Path to JSON brief")
-     parser.add_argument("--outfile", help="Override output path")
-     parser.add_argument("--k", type=int, default=0, help="Number of exemplar clips")
-     parser.add_argument("--model", help="Optional model label for metadata")
-     parser.add_argument("--max-tokens", type=int, default=0, dest="max_tokens")
-     parser.add_argument("--timeout", type=int, default=60)
-     parser.add_argument("--mode", default="final")
-     parser.add_argument("--retry-backoff", help="Retry schedule (unused)")
-     parser.add_argument("--append-style-profile", action="store_true")
-     parser.add_argument("--context-source")
-     parser.add_argument("--context-text")
-     parser.add_argument("--context-filename")
-     parser.add_argument("--check", action="store_true")
-     return parser.parse_args()
- 
- 
- def _load_input(path: str) -> Dict[str, Any]:
-     payload_path = Path(path)
-     if not payload_path.exists():
 diff --git a/tests/test_health.py b/tests/test_health.py
-index 827ec07f61531f0f5aaeae997789dc9b8f532f6d..cc4a530d46dd4033d03f14a99ef212555764131d 100644
+index cc4a530d46dd4033d03f14a99ef212555764131d..6578065ca451608d6d587e9a4d7e0a4a1783a5a4 100644
 --- a/tests/test_health.py
 +++ b/tests/test_health.py
-@@ -1,144 +1,142 @@
- from pathlib import Path
- from typing import Iterable, List, Optional
+@@ -85,50 +85,73 @@ def test_health_ping_success(monkeypatch):
  
- import httpx
- import pytest
- 
- import sys
- 
- sys.path.append(str(Path(__file__).resolve().parents[1]))
- 
- import orchestrate
- from config import LLM_ALLOW_FALLBACK, LLM_ROUTE
- 
- 
- class DummyHealthClient:
-     def __init__(self, responses: Iterable[httpx.Response]):
-         self._responses = list(responses)
-         self._index = 0
-         self.requests: List[dict] = []
-+        self.timeout: Optional[httpx.Timeout] = None
- 
-     def __enter__(self):
-         return self
- 
-     def __exit__(self, exc_type, exc, tb):
-         return False
- 
-     def _next(self) -> httpx.Response:
-         if self._index >= len(self._responses):
-             return self._responses[-1]
-         response = self._responses[self._index]
-         self._index += 1
-         return response
- 
--    def get(self, url, headers=None, **kwargs):
--        self.requests.append({"method": "GET", "url": url, "headers": headers})
--        return self._next()
--
-     def post(self, url, json=None, headers=None, **kwargs):
-         self.requests.append({"method": "POST", "url": url, "json": json, "headers": headers})
-         return self._next()
- 
- 
- @pytest.fixture(autouse=True)
- def _force_api_key(monkeypatch):
-     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-     yield
-     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
- 
- 
- def _response(
-     status_code: int,
-     payload: Optional[dict] = None,
-     text: str = "",
-     *,
-     method: str = "POST",
-     url: str = orchestrate.RESPONSES_API_URL,
- ) -> httpx.Response:
-     request = httpx.Request(method, url)
-     if payload is not None:
-         return httpx.Response(status_code, request=request, json=payload)
-     return httpx.Response(status_code, request=request, text=text)
- 
- 
- def test_health_ping_success(monkeypatch):
-     payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
--    responses = [
--        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
--        _response(200, payload),
--    ]
-+    responses = [_response(200, payload)]
-     client = DummyHealthClient(responses)
--    monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
-+
-+    def _client_factory(timeout=None):
-+        client.timeout = timeout
-+        return client
-+
-+    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
- 
-     result = orchestrate._run_health_ping()
- 
-     assert result["ok"] is True
-     assert result["route"] == LLM_ROUTE
-     assert result["fallback_used"] is LLM_ALLOW_FALLBACK
--    expected_label = f"Responses OK (gpt-5, {orchestrate.HEALTH_INITIAL_MAX_TOKENS} токена)"
-+    expected_label = f"Responses OK (gpt-5, {orchestrate.HEALTH_INITIAL_MAX_TOKENS} токенов)"
-     assert expected_label in result["message"]
- 
--    assert client.requests[0]["method"] == "GET"
--    request_payload = client.requests[1]["json"]
-+    assert isinstance(client.timeout, httpx.Timeout)
-+    assert client.timeout.read == 40.0
-+    assert client.timeout.connect == 10.0
-+    assert client.timeout.write == 10.0
-+    assert client.timeout.pool == 10.0
-+
-+    assert len(client.requests) == 1
-+    request_payload = client.requests[0]["json"]
+     assert len(client.requests) == 1
+     request_payload = client.requests[0]["json"]
      assert request_payload["max_output_tokens"] == orchestrate.HEALTH_INITIAL_MAX_TOKENS
-+    assert request_payload["input"] == orchestrate.HEALTH_PROMPT
+     assert request_payload["input"] == orchestrate.HEALTH_PROMPT
      assert request_payload["text"]["format"]["type"] == "text"
      assert "temperature" not in request_payload
  
  
--def test_health_ping_incomplete_max_tokens(monkeypatch):
--    payload = {
--        "status": "incomplete",
--        "incomplete_details": {"reason": "max_output_tokens"},
--        "output": [],
--    }
--    responses = [
--        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
--        _response(200, payload),
--    ]
-+def test_health_ping_5xx_failure(monkeypatch):
-+    responses = [_response(502, None, text="Bad gateway")]
+ def test_health_ping_5xx_failure(monkeypatch):
+     responses = [_response(502, None, text="Bad gateway")]
      client = DummyHealthClient(responses)
--    monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
+     def _client_factory(timeout=None):
+         client.timeout = timeout
+         return client
+ 
+     monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
+ 
+     result = orchestrate._run_health_ping()
+ 
+     assert result["ok"] is False
+     assert "HTTP 502" in result["message"]
+     assert len(client.requests) == 1
+ 
+ 
++def test_health_ping_400_invalid_max_tokens(monkeypatch):
++    payload = {
++        "error": {
++            "message": "max_output_tokens too small; expected >= 64",
++        }
++    }
++    responses = [_response(400, payload)]
++    client = DummyHealthClient(responses)
++
 +    def _client_factory(timeout=None):
 +        client.timeout = timeout
 +        return client
 +
 +    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
- 
-     result = orchestrate._run_health_ping()
- 
--    assert result["ok"] is True
--    assert "incomplete по лимиту — норм для health" in result["message"]
--
--
--def test_health_ping_auto_bump(monkeypatch):
--    monkeypatch.setattr(orchestrate, "HEALTH_INITIAL_MAX_TOKENS", 12)
--    error_payload = {
--        "error": {
--            "type": "invalid_request_error",
--            "message": "Invalid 'max_output_tokens': Expected a value >= 16",
--        }
--    }
--    success_payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
--    responses = [
--        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
--        _response(400, error_payload),
--        _response(200, success_payload),
--    ]
--    client = DummyHealthClient(responses)
--    monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
++
++    result = orchestrate._run_health_ping()
++
 +    assert result["ok"] is False
-+    assert "HTTP 502" in result["message"]
-+    assert len(client.requests) == 1
- 
--    result = orchestrate._run_health_ping()
- 
--    assert result["ok"] is True
--    assert f"auto-bump до {orchestrate.HEALTH_MIN_BUMP_TOKENS}" in result["message"]
--    assert len(client.requests) == 3
--    assert client.requests[1]["json"]["max_output_tokens"] == 12
--    assert client.requests[2]["json"]["max_output_tokens"] >= orchestrate.HEALTH_MIN_BUMP_TOKENS
-+def test_health_ping_timeout_degraded(monkeypatch):
-+    class TimeoutClient:
-+        def __init__(self):
-+            self.calls = 0
-+            self.timeout: Optional[httpx.Timeout] = None
- 
-+        def __enter__(self):
-+            return self
- 
--def test_health_ping_5xx_failure(monkeypatch):
--    responses = [
--        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
--        _response(502, None, text="Bad gateway"),
--    ]
--    client = DummyHealthClient(responses)
--    monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
-+        def __exit__(self, exc_type, exc, tb):
-+            return False
-+
-+        def post(self, url, json=None, headers=None, **kwargs):
-+            self.calls += 1
-+            raise httpx.ReadTimeout("timeout", request=httpx.Request("POST", url))
-+
-+    timeout_client = TimeoutClient()
-+
-+    def _client_factory(timeout=None):
-+        timeout_client.timeout = timeout
-+        return timeout_client
-+
-+    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
-+    monkeypatch.setattr(orchestrate.random, "uniform", lambda a, b: 0.4)
-+    monkeypatch.setattr(orchestrate.time, "sleep", lambda _: None)
- 
-     result = orchestrate._run_health_ping()
- 
-     assert result["ok"] is False
--    assert "HTTP 502" in result["message"]
 +    assert result["status"] == "degraded"
-+    assert result["attempts"] == 2
-+    assert result["message"] == "LLM degraded: timeout on health ping (2 attempts, read=40s)."
-+    assert timeout_client.calls == 2
++    assert result["message"] == "LLM degraded: 400 invalid max_output_tokens (raised to >=16)"
++    assert len(client.requests) == 1
++
++
+ def test_health_ping_timeout_degraded(monkeypatch):
+     class TimeoutClient:
+         def __init__(self):
+             self.calls = 0
+             self.timeout: Optional[httpx.Timeout] = None
+ 
+         def __enter__(self):
+             return self
+ 
+         def __exit__(self, exc_type, exc, tb):
+             return False
+ 
+         def post(self, url, json=None, headers=None, **kwargs):
+             self.calls += 1
+             raise httpx.ReadTimeout("timeout", request=httpx.Request("POST", url))
+ 
+     timeout_client = TimeoutClient()
+ 
+     def _client_factory(timeout=None):
+         timeout_client.timeout = timeout
+         return timeout_client
+ 
+     monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
+     monkeypatch.setattr(orchestrate.random, "uniform", lambda a, b: 0.4)
+     monkeypatch.setattr(orchestrate.time, "sleep", lambda _: None)
 
