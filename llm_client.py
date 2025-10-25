@@ -12,7 +12,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from jsonschema import Draft7Validator
@@ -55,6 +55,13 @@ MAX_RESPONSES_POLL_ATTEMPTS = (
 if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
 GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
+LIVING_STYLE_INSTRUCTION = (
+    "Стиль текста: живой, человечный, уверенный.\n"
+    "Пиши так, как будто объясняешь это умному человеку, но без канцелярита.\n"
+    "Избегай сухих определений, добавляй лёгкие переходы и короткие фразы.\n"
+    "Разбивай длинные абзацы, вставляй мини-примеры и пояснения своими словами.\n"
+    "Тон — дружелюбный, экспертный, без лишней официальности."
+)
 _PROMPT_CACHE: "OrderedDict[Tuple[Tuple[str, str], ...], List[Dict[str, str]]]" = OrderedDict()
 _PROMPT_CACHE_LIMIT = 16
 
@@ -78,6 +85,31 @@ def reset_http_client_cache() -> None:
             pooled_client.close()
         except Exception:  # pragma: no cover - best effort cleanup
             pass
+
+
+_JSON_STYLE_GUARD: Set[str] = {"json_schema", "json_object"}
+
+
+def _should_apply_living_style(format_type: str) -> bool:
+    normalized = str(format_type or "").strip().lower()
+    return not normalized or normalized not in _JSON_STYLE_GUARD
+
+
+def _apply_living_style_instruction(system_text: str, *, format_type: str) -> str:
+    instruction = LIVING_STYLE_INSTRUCTION.strip()
+    if not instruction:
+        return system_text
+    if not _should_apply_living_style(format_type):
+        return system_text
+
+    normalized_text = system_text.replace("\r\n", "\n")
+    if instruction in normalized_text:
+        return system_text
+
+    base = system_text.rstrip()
+    if not base:
+        return instruction
+    return f"{base}\n\n{instruction}"
 
 
 def _cache_augmented_messages(messages: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -1607,6 +1639,14 @@ def generate(
         nonlocal retry_used
 
         payload_messages = _messages_for_model(target_model)
+        style_template, _, _ = _prepare_text_format_for_request(
+            text_format_override
+            or responses_text_format
+            or DEFAULT_RESPONSES_TEXT_FORMAT,
+            context="style_probe",
+            log_on_migration=False,
+        )
+        style_format_type = str(style_template.get("type", "")).strip().lower()
         system_segments: List[str] = []
         user_segments: List[str] = []
         for item in payload_messages:
@@ -1622,6 +1662,10 @@ def generate(
                 user_segments.append(f"{role.upper()}:\n{content}")
 
         system_text = "\n\n".join(system_segments)
+        system_text = _apply_living_style_instruction(
+            system_text,
+            format_type=style_format_type,
+        )
         user_text = "\n\n".join(user_segments)
 
         effective_max_tokens = max_tokens_override if max_tokens_override is not None else max_tokens

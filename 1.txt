@@ -1,1224 +1,24 @@
-diff --git a/config.py b/config.py
-index fc4c3e4f193b67b8c2ba0987d19014d767600f3c..75ba327b658249e4e30977a053caf092eb9e75f2 100644
---- a/config.py
-+++ b/config.py
-@@ -16,78 +16,79 @@ def _env_int(name: str, default: int) -> int:
- def _env_float_list(name: str, default: str) -> tuple[float, ...]:
-     raw = str(os.getenv(name, "")).strip()
-     if not raw:
-         raw = default
-     parts = [part.strip() for part in raw.split(",") if part.strip()]
-     delays = []
-     for part in parts:
-         try:
-             delays.append(float(part))
-         except ValueError:
-             continue
-     if not delays:
-         delays = [float(value) for value in default.split(",") if value]
-     return tuple(delays)
- 
- 
- def _env_bool(name: str, default: bool) -> bool:
-     raw = str(os.getenv(name, "")).strip().lower()
-     if not raw:
-         return default
-     return raw not in {"0", "false", "off", "no"}
- 
- OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "")).strip()
- OPENAI_TIMEOUT_S = max(1, _env_int("OPENAI_TIMEOUT_S", 60))
- OPENAI_MAX_RETRIES = max(0, _env_int("OPENAI_MAX_RETRIES", 4))
--OPENAI_RPS = max(1, _env_int("OPENAI_RPS", 2))
--OPENAI_RPM = max(OPENAI_RPS, _env_int("OPENAI_RPM", 60))
-+OPENAI_RPS = max(1, _env_int("OPENAI_RPS", 4))
-+OPENAI_RPM = max(OPENAI_RPS, _env_int("OPENAI_RPM", 120))
- OPENAI_CACHE_TTL_S = max(1, _env_int("OPENAI_CACHE_TTL_S", 30))
- OPENAI_CLIENT_MAX_QUEUE = max(1, _env_int("OPENAI_CLIENT_MAX_QUEUE", 16))
- LLM_MODEL = "gpt-5"
- LLM_ROUTE = "responses"
- LLM_ALLOW_FALLBACK = False
- 
- # Исторически OPENAI_MODEL можно было переопределить через окружение, но после
- # перехода на Responses и GPT-5 фиксируем его жёстко, чтобы не допустить
- # расхождений между фронтом и бэкендом.
- OPENAI_MODEL = LLM_MODEL
- 
- JOB_SOFT_TIMEOUT_S = max(1, _env_int("JOB_SOFT_TIMEOUT_S", 32))
- JOB_STORE_TTL_S = max(JOB_SOFT_TIMEOUT_S, _env_int("JOB_STORE_TTL_S", 900))
- JOB_MAX_RETRIES_PER_STEP = max(0, _env_int("JOB_MAX_RETRIES_PER_STEP", 1))
-+JOB_HARD_TIMEOUT_S = max(JOB_SOFT_TIMEOUT_S, _env_int("JOB_HARD_TIMEOUT_S", JOB_SOFT_TIMEOUT_S * 2))
- 
- USE_MOCK_LLM = _env_bool("USE_MOCK_LLM", False)
- OFFLINE_MODE = _env_bool("OFFLINE_MODE", False)
- PIPELINE_FAST_PATH = _env_bool("PIPELINE_FAST_PATH", False)
- MODEL_PROVIDER = str(os.getenv("MODEL_PROVIDER", "openai")).strip() or "openai"
- 
- _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
- FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
- 
- # GPT-5 Responses tuning
--G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 2280)
--G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 3000)
-+G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 3200)
-+G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 3600)
- G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 3600)
- G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3600)
- G5_ESCALATION_LADDER = (
-     G5_MAX_OUTPUT_TOKENS_BASE,
-     G5_MAX_OUTPUT_TOKENS_STEP1,
-     G5_MAX_OUTPUT_TOKENS_STEP2,
- )
- _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
- G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
- G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
- G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
- 
- SKELETON_BATCH_SIZE_MAIN = max(1, _env_int("SKELETON_BATCH_SIZE_MAIN", 2))
- SKELETON_FAQ_BATCH = max(1, _env_int("SKELETON_FAQ_BATCH", 3))
- TAIL_FILL_MAX_TOKENS = max(200, _env_int("TAIL_FILL_MAX_TOKENS", 700))
- 
- # Дефолтные настройки ядра
- DEFAULT_TONE = "экспертный, дружелюбный"
- DEFAULT_STRUCTURE = [
-     "Введение",
-     "Основная часть с подзаголовками",
-     "FAQ",
-     "Вывод/CTA",
- ]
- 
-diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 0ad1cd41eb156c470836f8c5a50be32809b1492e..307525d80601d7f557c0f5f576bc1495360e6877 100644
---- a/deterministic_pipeline.py
-+++ b/deterministic_pipeline.py
-@@ -1,50 +1,51 @@
- """LLM-driven content pipeline with explicit step-level guarantees."""
- 
+diff --git a/llm_client.py b/llm_client.py
+index 34c587f99db2e09f52641ab77212c297b8a5200f..80f65aa8693229ca4fb845aba45b0fc17e89eb60 100644
+--- a/llm_client.py
++++ b/llm_client.py
+@@ -1,107 +1,139 @@
+ # -*- coding: utf-8 -*-
+ """Simple wrapper around chat completion providers with retries and sane defaults."""
  from __future__ import annotations
  
  import json
  import logging
- import math
+ import os
  import re
- import textwrap
+ import sys
  import time
- from collections import deque
-+from copy import deepcopy
- from dataclasses import dataclass, field
- from enum import Enum
- from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
- 
- from config import (
-     DEFAULT_MAX_LENGTH,
-     DEFAULT_MIN_LENGTH,
-     G5_MAX_OUTPUT_TOKENS_MAX,
-     G5_MAX_OUTPUT_TOKENS_STEP1,
-     SKELETON_BATCH_SIZE_MAIN,
-     SKELETON_FAQ_BATCH,
-     TAIL_FILL_MAX_TOKENS,
- )
--from llm_client import GenerationResult, generate as llm_generate
-+from llm_client import DEFAULT_RESPONSES_TEXT_FORMAT, GenerationResult, generate as llm_generate
- from faq_builder import _normalize_entry
- from keyword_injector import (
-     KeywordCoverage,
-     KeywordInjectionResult,
-     LOCK_END,
-     LOCK_START_TEMPLATE,
-     build_term_pattern,
-     evaluate_keyword_coverage,
-     inject_keywords,
- )
- from length_controller import ensure_article_length
- from length_limits import compute_soft_length_bounds
- from length_trimmer import TrimResult, TrimValidationError, trim_text
- from skeleton_utils import normalize_skeleton_payload
- from validators import (
-     ValidationError,
-     ValidationResult,
-     length_no_spaces,
-     strip_jsonld,
-     validate_article,
- )
- 
- 
- LOGGER = logging.getLogger("content_factory.pipeline")
- 
-@@ -413,50 +414,73 @@ class DeterministicPipeline:
-             remaining_weight = 0.5
-         main_weight = remaining_weight / len(main_titles) if main_titles else 0.0
- 
-         weights: List[float] = [intro_weight]
-         weights.extend([main_weight] * len(main_titles))
-         weights.append(conclusion_weight)
- 
-         sections = [intro, *main_titles, conclusion]
-         budgets: List[SectionBudget] = []
-         allocated = 0
-         for title, weight in zip(sections, weights):
-             portion = max(0, int(round(target_total * weight)))
-             budgets.append(SectionBudget(title=title, target_chars=portion))
-             allocated += portion
- 
-         diff = target_total - allocated
-         idx = 0
-         while diff != 0 and budgets:
-             adjust = 1 if diff > 0 else -1
-             budgets[idx % len(budgets)].target_chars = max(0, budgets[idx % len(budgets)].target_chars + adjust)
-             diff -= adjust
-             idx += 1
- 
-         return budgets
- 
-+    def _fallback_context_hint(self, *, char_limit: int = 240) -> str:
-+        segments: List[str] = []
-+        for message in self.messages:
-+            role = str(message.get("role", "")).strip().lower()
-+            if role not in {"system", "user"}:
-+                continue
-+            content = str(message.get("content", "")).strip()
-+            if not content:
-+                continue
-+            segments.append(content)
-+            joined = " ".join(segments)
-+            if len(joined) >= char_limit:
-+                break
-+        if not segments:
-+            return ""
-+        normalized = re.sub(r"\s+", " ", " ".join(segments)).strip()
-+        if len(normalized) > char_limit:
-+            cutoff = normalized[:char_limit]
-+            if " " in cutoff:
-+                cutoff = cutoff.rsplit(" ", 1)[0]
-+            normalized = cutoff.strip()
-+        return normalized
-+
-     def _validate(self, text: str) -> ValidationResult:
-         return validate_article(
-             text,
-             required_keywords=self.required_keywords,
-             preferred_keywords=self.preferred_keywords,
-         )
- 
-     def _prompt_length(self, messages: Sequence[Dict[str, object]]) -> int:
-         length = 0
-         for message in messages:
-             content = message.get("content")
-             if isinstance(content, str):
-                 length += len(content)
-         return length
- 
-     def _approx_prompt_tokens(self, messages: Sequence[Dict[str, object]]) -> int:
-         """Rough token estimate based on message character count."""
- 
-         total_chars = self._prompt_length(messages)
-         if total_chars <= 0:
-             return 0
-         # Empirical heuristic: ~4 characters per token for mixed Russian text.
-         return max(1, int(math.ceil(total_chars / 4.0)))
- 
-     def _should_force_single_main_batches(
-@@ -652,50 +676,133 @@ class DeterministicPipeline:
-         start_max = int(predicted * 1.25)
-         step1_cap = G5_MAX_OUTPUT_TOKENS_STEP1 if G5_MAX_OUTPUT_TOKENS_STEP1 > 0 else 1200
-         if cap is not None and cap > 0:
-             start_max = min(start_max, cap)
-         start_max = min(start_max, step1_cap)
-         start_max = max(900, start_max)
-         requires_chunking = bool(cap is not None and predicted > cap)
-         LOGGER.info(
-             "SKELETON_ESTIMATE predicted=%d start_max=%d cap=%s → resolved max_output_tokens=%d",
-             predicted,
-             start_max,
-             cap if cap is not None else "-",
-             start_max,
-         )
-         return SkeletonVolumeEstimate(
-             predicted_tokens=predicted,
-             start_max_tokens=start_max,
-             cap_tokens=cap,
-             intro_tokens=intro_tokens,
-             conclusion_tokens=conclusion_tokens,
-             per_main_tokens=per_main_tokens,
-             per_faq_tokens=per_faq_tokens,
-             requires_chunking=requires_chunking,
-         )
- 
-+    def _should_use_one_shot_mode(
-+        self, outline: SkeletonOutline, estimate: SkeletonVolumeEstimate
-+    ) -> bool:
-+        if estimate.requires_chunking:
-+            return False
-+        if self.max_chars and self.max_chars > 6500:
-+            return False
-+        if len(outline.main_headings) > 6:
-+            return False
-+        return True
-+
-+    def _run_skeleton_one_shot(
-+        self, outline: SkeletonOutline, estimate: SkeletonVolumeEstimate
-+    ) -> str:
-+        self._emit_progress("draft", 0.0, payload={"total": 1, "completed": 0})
-+        messages = [dict(message) for message in self.messages]
-+        format_block = deepcopy(DEFAULT_RESPONSES_TEXT_FORMAT)
-+        result = self._call_llm(
-+            step=PipelineStep.SKELETON,
-+            messages=messages,
-+            max_tokens=max(self.max_tokens, estimate.start_max_tokens),
-+            responses_format=format_block,
-+        )
-+        payload_obj = self._extract_response_json(result.text)
-+        if not isinstance(payload_obj, dict):
-+            raise PipelineStepError(
-+                PipelineStep.SKELETON,
-+                "Модель вернула пустой скелет в режиме one-shot.",
-+            )
-+        normalized_payload = normalize_skeleton_payload(payload_obj)
-+        assembly = SkeletonAssembly(outline=outline)
-+        intro_text = str(normalized_payload.get("intro", "")).strip()
-+        assembly.apply_intro(intro_text or None)
-+        main_sections = normalized_payload.get("main")
-+        if isinstance(main_sections, list):
-+            for index, body in enumerate(main_sections):
-+                assembly.apply_main(index, str(body or ""))
-+        faq_entries = normalized_payload.get("faq", [])
-+        if isinstance(faq_entries, list):
-+            for entry in faq_entries:
-+                if isinstance(entry, dict):
-+                    assembly.apply_faq(
-+                        str(entry.get("q", "")),
-+                        str(entry.get("a", "")),
-+                    )
-+        assembly.apply_conclusion(normalized_payload.get("conclusion"))
-+
-+        payload = assembly.build_payload()
-+        if outline.has_faq and self.faq_target > 0:
-+            faq_items = payload.get("faq", [])
-+            if isinstance(faq_items, list) and len(faq_items) > self.faq_target:
-+                payload["faq"] = faq_items[: self.faq_target]
-+
-+        normalized_payload = normalize_skeleton_payload(payload)
-+        normalized_payload = self._finalize_main_sections(
-+            normalized_payload,
-+            outline=outline,
-+            assembly=assembly,
-+            estimate=estimate,
-+        )
-+        markdown, summary = self._render_skeleton_markdown(normalized_payload)
-+        snapshot = dict(normalized_payload)
-+        snapshot["outline"] = summary.get("outline", [])
-+        if "faq" in summary:
-+            snapshot["faq"] = summary.get("faq", [])
-+        self.skeleton_payload = snapshot
-+        self._skeleton_faq_entries = [
-+            {"question": entry.get("q", ""), "answer": entry.get("a", "")}
-+            for entry in normalized_payload.get("faq", [])
-+        ]
-+        self._check_template_text(markdown, PipelineStep.SKELETON)
-+        metadata_snapshot = result.metadata or {}
-+        self._update_log(
-+            PipelineStep.SKELETON,
-+            "ok",
-+            length=len(markdown),
-+            metadata_status=metadata_snapshot.get("status") or "ok",
-+            **self._metrics(markdown),
-+        )
-+        self.checkpoints[PipelineStep.SKELETON] = markdown
-+        self._emit_progress("draft", 1.0, payload={"total": 1, "completed": 1})
-+        return markdown
-+
-     def _build_skeleton_batches(
-         self,
-         outline: SkeletonOutline,
-         estimate: SkeletonVolumeEstimate,
-     ) -> List[SkeletonBatchPlan]:
-         batches: List[SkeletonBatchPlan] = [SkeletonBatchPlan(kind=SkeletonBatchKind.INTRO, label="intro")]
-         main_count = len(outline.main_headings)
-         if main_count > 0:
-             if self._should_force_single_main_batches(outline, estimate):
-                 batch_size = 1
-             else:
-                 batch_size = max(1, min(SKELETON_BATCH_SIZE_MAIN, main_count))
-             start = 0
-             while start < main_count:
-                 end = min(start + batch_size, main_count)
-                 indices = list(range(start, end))
-                 if len(indices) == 1:
-                     label = f"main[{indices[0] + 1}]"
-                 else:
-                     label = f"main[{indices[0] + 1}-{indices[-1] + 1}]"
-                 batches.append(
-                     SkeletonBatchPlan(
-                         kind=SkeletonBatchKind.MAIN,
-                         indices=indices,
-                         label=label,
-@@ -1395,50 +1502,53 @@ class DeterministicPipeline:
-         answer = "\n".join(part for part in answer_parts if part).strip()
-         if not question or not answer:
-             return None
-         return {"faq": [{"q": question, "a": answer}]}
- 
-     def _run_fallback_batch(
-         self,
-         batch: SkeletonBatchPlan,
-         *,
-         outline: SkeletonOutline,
-         assembly: SkeletonAssembly,
-         target_indices: Sequence[int],
-         max_tokens: int,
-         previous_response_id: Optional[str],
-     ) -> Tuple[Optional[object], Optional[GenerationResult]]:
-         if not target_indices:
-             return None, None
-         messages = [dict(message) for message in self.messages]
-         outline_text = ", ".join(outline.all_headings())
-         base_lines = [
-             "Ты создаёшь детерминированный SEO-скелет статьи.",
-             f"Тема: {self.topic}.",
-             f"Общий объём: {self.min_chars}–{self.max_chars} символов без пробелов.",
-             f"План разделов: {outline_text}.",
-         ]
-+        context_hint = self._fallback_context_hint()
-+        if context_hint:
-+            base_lines.append(f"Контекст: {context_hint}.")
-         if self.normalized_keywords:
-             base_lines.append(
-                 "Сохраняй точные упоминания ключевых слов: " + ", ".join(self.normalized_keywords) + "."
-             )
-         lines: List[str] = list(base_lines)
-         lines.append(
-             (
-                 "Выведи ровно одну секцию для статьи, кратко и без JSON. "
-                 "Только текст. Потом парсится и сериализуется в нужный JSON-фрагмент."
-             )
-         )
-         if batch.kind == SkeletonBatchKind.MAIN:
-             target_index = target_indices[0]
-             heading = outline.main_headings[target_index] if target_index < len(outline.main_headings) else "Раздел"
-             ready = [
-                 outline.main_headings[idx]
-                 for idx, body in enumerate(assembly.main_sections)
-                 if body and idx != target_index
-             ]
-             lines.append(
-                 f"Нужно срочно раскрыть раздел №{target_index + 1}: {heading}."
-             )
-             if ready:
-                 lines.append(
-                     "Эти разделы уже готовы, не переписывай их: " + "; ".join(ready) + "."
-@@ -1496,50 +1606,53 @@ class DeterministicPipeline:
-             batch.label,
-         )
-         return payload, result
- 
-     def _run_cap_fallback_batch(
-         self,
-         batch: SkeletonBatchPlan,
-         *,
-         outline: SkeletonOutline,
-         assembly: SkeletonAssembly,
-         target_indices: Sequence[int],
-         max_tokens: int,
-         previous_response_id: Optional[str],
-     ) -> Tuple[Optional[object], Optional[GenerationResult]]:
-         if batch.kind not in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
-             return None, None
-         if not target_indices:
-             return None, None
-         messages = [dict(message) for message in self.messages]
-         outline_text = ", ".join(outline.all_headings())
-         lines: List[str] = [
-             "Аварийный режим: сформируй минимальный JSON-фрагмент.",
-             f"Тема: {self.topic}.",
-             f"План разделов: {outline_text}.",
-         ]
-+        context_hint = self._fallback_context_hint()
-+        if context_hint:
-+            lines.append(f"Контекст: {context_hint}.")
-         if batch.kind == SkeletonBatchKind.MAIN:
-             target_index = target_indices[0]
-             heading = (
-                 outline.main_headings[target_index]
-                 if target_index < len(outline.main_headings)
-                 else f"Раздел {target_index + 1}"
-             )
-             ready_sections = [
-                 outline.main_headings[idx]
-                 for idx, body in enumerate(assembly.main_sections)
-                 if body and idx != target_index
-             ]
-             if ready_sections:
-                 lines.append("Уже готовы: " + "; ".join(ready_sections) + ".")
-             lines.extend(
-                 [
-                     f"Нужен краткий текст для раздела №{target_index + 1}: {heading}.",
-                     "Ответ верни в JSON: {\"sections\": [{\"title\": \"...\", \"body\": \"...\"}]}",
-                     "Минимум два предложения в body.",
-                 ]
-             )
-         else:
-             start_number = target_indices[0] + 1
-             lines.extend(
-                 [
-@@ -2360,112 +2473,98 @@ class DeterministicPipeline:
-             if self._is_intro_heading(title) and intro_terms:
-                 sentence = self._compose_reinforcement_sentence(intro_terms, intro=True)
-                 updated_body = self._inject_sentence_into_paragraph(body, sentence, tail=False)
-                 return f"{header}\n{updated_body}"
-             if self._is_conclusion_heading(title) and conclusion_terms:
-                 sentence = self._compose_reinforcement_sentence(conclusion_terms, intro=False)
-                 updated_body = self._inject_sentence_into_paragraph(body, sentence, tail=True)
-                 return f"{header}\n{updated_body}"
-             return match.group(0)
- 
-         updated_article = pattern.sub(_replace, article)
-         if updated_article == article:
-             return text
-         updated_article = updated_article.rstrip() + "\n"
-         if jsonld:
-             return f"{updated_article}\n{jsonld}\n"
-         return updated_article
- 
-     # ------------------------------------------------------------------
-     # Step implementations
-     # ------------------------------------------------------------------
-     def _run_skeleton(self) -> str:
-         self._log(PipelineStep.SKELETON, "running")
-         outline = self._prepare_outline()
-         estimate = self._predict_skeleton_volume(outline)
-+        if self._should_use_one_shot_mode(outline, estimate):
-+            return self._run_skeleton_one_shot(outline, estimate)
-         batches = self._build_skeleton_batches(outline, estimate)
-         assembly = SkeletonAssembly(outline=outline)
-         metadata_snapshot: Dict[str, object] = {}
-         last_result: Optional[GenerationResult] = None
- 
-         pending_batches = deque(batches)
-         total_batches = len(pending_batches)
-         completed_batches = 0
- 
-         def _schedule(plan: SkeletonBatchPlan, *, left: bool = False, count: bool = True) -> None:
-             nonlocal total_batches
-             if left:
-                 pending_batches.appendleft(plan)
-             else:
-                 pending_batches.append(plan)
-             if count:
-                 total_batches += 1
- 
-         def _notify_draft_progress(label: str = "", *, partial: bool = False) -> None:
-             if total_batches <= 0:
-                 return
-             fraction = completed_batches / total_batches if total_batches else 0.0
-             payload: Dict[str, object] = {"total": total_batches, "completed": completed_batches}
-             if label:
-                 payload["batch"] = label
-             if partial:
-                 payload["partial"] = True
-             self._emit_progress("draft", max(0.0, min(1.0, fraction)), payload=payload)
- 
-         if total_batches:
-             self._emit_progress(
-                 "draft",
-                 0.0,
-                 payload={"total": total_batches, "completed": completed_batches},
-             )
- 
-         scheduled_main_indices: Set[int] = set()
-         parse_none_streaks: Dict[str, int] = {}
-         for plan in pending_batches:
-             if plan.kind == SkeletonBatchKind.MAIN:
-                 scheduled_main_indices.update(plan.indices)
-         split_serial = 0
-         tail_fill_allowed = False
- 
-         while pending_batches:
-             batch = pending_batches.popleft()
--            if batch.kind in (SkeletonBatchKind.FAQ, SkeletonBatchKind.CONCLUSION):
--                filled_main = sum(
--                    1
--                    for body in assembly.main_sections
--                    if isinstance(body, str) and body.strip()
--                )
--                has_pending_main = any(
--                    plan.kind == SkeletonBatchKind.MAIN for plan in pending_batches
--                )
--                if filled_main < 3 and has_pending_main:
--                    LOGGER.info(
--                        "LOG:SCHEDULER_BLOCK main underflow=%d target_min=3 → continue_main",
--                        filled_main,
--                    )
--                    _schedule(batch, count=False)
--                    continue
-             if not batch.label:
-                 batch.label = self._format_batch_label(batch.kind, batch.indices)
-             active_indices = list(batch.indices)
-             limit_override: Optional[int] = None
-             override_to_cap = False
-             retries = 0
-             consecutive_empty_incomplete = 0
-             payload_obj: Optional[object] = None
-             metadata_snapshot = {}
-             result: Optional[GenerationResult] = None
-             last_max_tokens = estimate.start_max_tokens
-             continuation_id: Optional[str] = None
-             batch_partial = False
-             first_attempt_for_batch = True
-             best_payload_obj: Optional[object] = None
-             best_result: Optional[GenerationResult] = None
-             best_metadata_snapshot: Dict[str, object] = {}
-             last_reason_lower = ""
-             forced_tail_indices: List[int] = []
-             empty_payload_retries = 0
- 
-             while True:
-                 messages, format_block = self._build_batch_messages(
-                     batch,
-                     outline=outline,
-@@ -2511,50 +2610,67 @@ class DeterministicPipeline:
-                 if payload_obj is not None and has_payload:
-                     best_payload_obj = payload_obj
-                     best_result = result
-                     best_metadata_snapshot = dict(metadata_snapshot)
-                 metadata_prev_id = str(
-                     metadata_snapshot.get("previous_response_id")
-                     or request_prev_id
-                     or ""
-                 )
-                 schema_label = str(result.schema or "")
-                 schema_is_none = schema_label.endswith(".none")
-                 parse_none_count = 0
-                 if metadata_prev_id:
-                     if schema_is_none and is_incomplete and not has_payload:
-                         parse_none_count = parse_none_streaks.get(metadata_prev_id, 0) + 1
-                         parse_none_streaks[metadata_prev_id] = parse_none_count
-                     else:
-                         parse_none_streaks.pop(metadata_prev_id, None)
-                 if not is_incomplete or has_payload:
-                     batch_partial = bool(is_incomplete and has_payload)
-                     if metadata_prev_id:
-                         parse_none_streaks.pop(metadata_prev_id, None)
-                     if request_prev_id and request_prev_id != metadata_prev_id:
-                         parse_none_streaks.pop(request_prev_id, None)
-                     break
-+                if (
-+                    reason_lower == "max_output_tokens"
-+                    and total_batches
-+                    and total_batches > 0
-+                ):
-+                    ratio = completed_batches / float(total_batches)
-+                    continue_payload = {
-+                        "total": total_batches,
-+                        "completed": completed_batches,
-+                        "status": "continuing",
-+                    }
-+                    self._emit_progress(
-+                        "draft",
-+                        max(0.0, min(1.0, ratio)),
-+                        message="Догенерация (1/1)",
-+                        payload=continue_payload,
-+                    )
-                 consecutive_empty_incomplete += 1
-                 should_autosplit = False
-                 if self._can_split_batch(batch.kind, active_indices) and len(active_indices) > 1:
-                     if reason_lower == "max_output_tokens" and consecutive_empty_incomplete >= 1:
-                         should_autosplit = True
-                     elif consecutive_empty_incomplete >= 2 and parse_none_count >= 2:
-                         should_autosplit = True
-                 if should_autosplit:
-                     keep, remainder = self._split_batch_indices(active_indices)
-                     original_size = len(active_indices)
-                     if remainder:
-                         split_serial += 1
-                         remainder_label = self._format_batch_label(
-                             batch.kind,
-                             remainder,
-                             suffix=f"#split{split_serial}",
-                         )
-                         _schedule(
-                             SkeletonBatchPlan(
-                                 kind=batch.kind,
-                                 indices=list(remainder),
-                                 label=remainder_label,
-                                 tail_fill=batch.tail_fill,
-                             ),
-                             left=True,
-@@ -3228,56 +3344,76 @@ class DeterministicPipeline:
-                     result = TrimResult(
-                         text=fail_safe_article,
-                         removed_paragraphs=result.removed_paragraphs,
-                         length_relaxed=getattr(result, "length_relaxed", False),
-                         relaxed_limit=getattr(result, "relaxed_limit", None),
-                     )
-                     current_length = length_no_spaces(result.text)
-                     length_notes["length_controller_fallback"] = True
- 
-         missing_locks = [
-             term
-             for term in self.required_keywords
-             if LOCK_START_TEMPLATE.format(term=term) not in result.text
-         ]
-         if missing_locks:
-             raise PipelineStepError(
-                 PipelineStep.TRIM,
-                 "После тримминга потеряны ключевые фразы: " + ", ".join(sorted(missing_locks)),
-             )
- 
-         coverage_post = evaluate_keyword_coverage(
-             result.text,
-             self.required_keywords,
-             preferred=self.preferred_keywords,
-         )
-+        restored_required = False
-+        if coverage_post.missing_required:
-+            reinforced_text = self._reinforce_keywords(
-+                result.text, coverage_post.missing_required
-+            )
-+            if reinforced_text != result.text:
-+                restored_required = True
-+                result = TrimResult(
-+                    text=reinforced_text,
-+                    removed_paragraphs=result.removed_paragraphs,
-+                    length_relaxed=getattr(result, "length_relaxed", False),
-+                    relaxed_limit=getattr(result, "relaxed_limit", None),
-+                )
-+                coverage_post = evaluate_keyword_coverage(
-+                    result.text,
-+                    self.required_keywords,
-+                    preferred=self.preferred_keywords,
-+                )
-         if coverage_post.missing_required:
-             raise PipelineStepError(
-                 PipelineStep.TRIM,
-                 "После тримминга отсутствуют обязательные ключевые слова: "
-                 + ", ".join(sorted(coverage_post.missing_required)),
-             )
-+        if restored_required:
-+            length_notes["required_keywords_reinforced"] = True
- 
-         reinforcement_applied = False
-         if (
-             coverage_post.missing_preferred
-             and coverage_post.overall_percent < 100.0
-         ):
-             reinforced_text = self._reinforce_keywords(
-                 result.text, coverage_post.missing_preferred
-             )
-             if reinforced_text != result.text:
-                 reinforcement_applied = True
-                 result = TrimResult(
-                     text=reinforced_text,
-                     removed_paragraphs=result.removed_paragraphs,
-                     length_relaxed=getattr(result, "length_relaxed", False),
-                     relaxed_limit=getattr(result, "relaxed_limit", None),
-                 )
-                 current_length = length_no_spaces(result.text)
-                 coverage_post = evaluate_keyword_coverage(
-                     result.text,
-                     self.required_keywords,
-                     preferred=self.preferred_keywords,
-                 )
-                 if coverage_post.missing_required:
-                     raise PipelineStepError(
-diff --git a/frontend_demo/script.js b/frontend_demo/script.js
-index 2bb94c83149f99ad3320c2ab5329f56a66464170..a3e4e34174abf26ba8c448eb1c26ac051cadca27 100644
---- a/frontend_demo/script.js
-+++ b/frontend_demo/script.js
-@@ -76,73 +76,66 @@ const previewSystem = document.getElementById("preview-system");
- const previewUser = document.getElementById("preview-user");
- const contextList = document.getElementById("context-list");
- const contextSummary = document.getElementById("context-summary");
- const contextBadge = document.getElementById("context-badge");
- const customContextBlock = document.getElementById("custom-context-block");
- const customContextTextarea = document.getElementById("customContext");
- const customContextCounter = document.getElementById("customContextCounter");
- const customContextFileInput = document.getElementById("customContextFile");
- const customContextClearBtn = document.getElementById("customContextClear");
- const generateBtn = briefForm.querySelector("button[type='submit']");
- const advancedSettings = document.getElementById("advanced-settings");
- const advancedSupportSection = document.querySelector("[data-section='support']");
- const usedKeywordsSection = document.getElementById("used-keywords");
- const usedKeywordsList = document.getElementById("used-keywords-list");
- const usedKeywordsEmpty = document.getElementById("used-keywords-empty");
- 
- const ADVANCED_SETTINGS_STORAGE_KEY = "content-demo:advanced-settings-open";
- 
- const LOG_STATUS_LABELS = {
-   info: "INFO",
-   success: "SUCCESS",
-   warn: "WARN",
-   error: "ERROR",
- };
- 
--const STEP_LABELS = {
--  draft: "Черновик",
--  refine: "Уточнение",
--  jsonld: "JSON-LD",
--  post_analysis: "Пост-анализ",
--};
--
- const PROGRESS_STAGE_LABELS = {
--  draft: "Черновик",
--  refine: "Доработка",
--  trim: "Нормализация",
--  validate: "Проверка",
--  done: "Готово",
--  error: "Ошибка",
-+  draft: "working",
-+  refine: "continuing",
-+  trim: "trimming",
-+  validate: "refining",
-+  done: "done",
-+  error: "error",
- };
- 
- const PROGRESS_STAGE_MESSAGES = {
--  draft: "Генерируем черновик",
--  refine: "Дорабатываем черновик",
--  trim: "Нормализуем объём",
--  validate: "Проверяем результат",
--  done: "Готово",
--  error: "Завершено с ошибкой",
-+  draft: "working",
-+  refine: "continuing",
-+  trim: "trimming",
-+  validate: "refining",
-+  done: "done",
-+  error: "error",
- };
- 
- const DEGRADATION_LABELS = {
-   draft_failed: "Черновик по запасному сценарию",
-   draft_max_tokens: "Лимит токенов — результат неполный",
-   refine_skipped: "Доработка пропущена",
-   jsonld_missing: "JSON-LD не сформирован",
-   jsonld_repaired: "JSON-LD восстановлен вручную",
-   post_analysis_skipped: "Отчёт о качестве недоступен",
-   soft_timeout: "Мягкий таймаут — результат сохранён",
-   cap_reached_final: "Лимит продолжений — результат сохранён",
-   skeleton_restore_previous: "Использована последняя валидная версия скелета",
- };
- 
- const DEFAULT_PROGRESS_MESSAGE =
-   progressMessage?.textContent?.trim() || PROGRESS_STAGE_MESSAGES.draft;
- const MAX_TOASTS = 3;
- const MAX_CUSTOM_CONTEXT_CHARS = 20000;
- const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
- 
- const PROGRESS_DEGRADED_BADGE_MESSAGE = "Получен неполный ответ, пробуем догенерировать";
- 
- const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 3500, max: 6000, hard: 6500 });
- 
- const HEALTH_STATUS_MESSAGES = {
-@@ -1624,51 +1617,51 @@ async function handleGenerate(event) {
-       const finalPromise = refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
-       pendingDownloadRefresh = finalPromise;
-       try {
-         const finalDownloads = await finalPromise;
-         if (hasDownloadFiles(finalDownloads)) {
-           downloadsResolved = true;
-         }
-       } catch (error) {
-         console.warn("Не удалось заранее получить ссылки на артефакты", error);
-       } finally {
-         if (pendingDownloadRefresh === finalPromise) {
-           pendingDownloadRefresh = null;
-         }
-       }
-     }
-     renderGenerationResult(snapshot, { payload });
-     try {
-       const pendingFiles = state.pendingArtifactFiles;
-       await loadArtifacts(pendingFiles);
-     } catch (refreshError) {
-       console.error(refreshError);
-       showToast({ message: `Не удалось обновить список материалов: ${getErrorMessage(refreshError)}`, type: "warn" });
-     }
-     state.pendingArtifactFiles = null;
-     switchTab("result");
--    showToast({ message: "Готово", type: "success" });
-+    showToast({ message: "done", type: "success" });
-   } catch (error) {
-     console.error(error);
-     showToast({ message: `Не удалось выполнить генерацию: ${getErrorMessage(error)}`, type: "error" });
-     setButtonLoading(downloadMdBtn, false);
-     setButtonLoading(downloadReportBtn, false);
-     setActiveArtifactDownloads(null);
-     hideProgressOverlay({ immediate: true });
-   } finally {
-     setButtonLoading(generateBtn, false);
-     setInteractiveBusy(false);
-     hideProgressOverlay();
-     state.pendingArtifactFiles = null;
-   }
- }
- 
- function normalizeJobResponse(response) {
-   if (!response || typeof response !== "object") {
-     return { status: "pending", result: null, steps: [], degradation_flags: [], job_id: null };
-   }
-   if (typeof response.markdown === "string" || typeof response.meta_json === "object") {
-     return {
-       status: "succeeded",
-       job_id: response.job_id || null,
-       steps: Array.isArray(response.steps) ? response.steps : [],
-       degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
-diff --git a/jobs/models.py b/jobs/models.py
-index e1b1e59a09845c1d385af0878f4a17625a00b75d..e631a7dbb9c6491df0a88b245cd25e2ca1920ee4 100644
---- a/jobs/models.py
-+++ b/jobs/models.py
-@@ -158,56 +158,56 @@ class Job:
-             except (TypeError, ValueError):
-                 value = self.progress_value or 0.0
-             self.progress_value = max(0.0, min(1.0, value))
-         if message is not None:
-             self.progress_message = message
-         if payload is not None:
-             try:
-                 self.progress_payload = dict(payload)
-             except Exception:  # pragma: no cover - defensive
-                 self.progress_payload = {}
-         self.last_event_at = utcnow()
- 
- 
- def summarize_job(job: "Job") -> Dict[str, Any]:
-     status_map = {
-         JobStatus.PENDING: "queued",
-         JobStatus.RUNNING: "running",
-         JobStatus.SUCCEEDED: "succeeded",
-         JobStatus.FAILED: "failed",
-     }
-     step_alias = {
-         "jsonld": "finalize",
-         "post_analysis": "finalize",
-     }
-     step_labels = {
--        "draft": "Черновик",
--        "refine": "Полировка",
--        "finalize": "Финализация",
--        "jsonld": "JSON-LD",
--        "post_analysis": "Пост-анализ",
--        "done": "Готово",
-+        "draft": "working",
-+        "refine": "continuing",
-+        "finalize": "refining",
-+        "jsonld": "refining",
-+        "post_analysis": "refining",
-+        "done": "done",
-     }
- 
-     status = status_map.get(job.status, job.status.value)
- 
-     total_steps = len(job.steps)
-     completed = sum(
-         1
-         for step in job.steps
-         if step.status in {JobStepStatus.SUCCEEDED, JobStepStatus.DEGRADED, JobStepStatus.SKIPPED}
-     )
-     running_step = next((step for step in job.steps if step.status == JobStepStatus.RUNNING), None)
-     pending_step = next((step for step in job.steps if step.status == JobStepStatus.PENDING), None)
- 
-     stage_to_steps = {
-         "draft": {"draft"},
-         "trim": {"refine"},
-         "refine": {"refine"},
-         "finalize": {"jsonld", "post_analysis"},
-         "validate": {"jsonld", "post_analysis"},
-         "jsonld": {"jsonld"},
-         "post_analysis": {"post_analysis"},
-         "done": {"post_analysis"},
-     }
- 
-     if status in {"succeeded", "failed"}:
-@@ -218,51 +218,51 @@ def summarize_job(job: "Job") -> Dict[str, Any]:
-             step_name = step_alias.get(running_step.name, running_step.name)
-         elif pending_step:
-             step_name = step_alias.get(pending_step.name, pending_step.name)
-         elif job.steps:
-             step_name = step_alias.get(job.steps[-1].name, job.steps[-1].name)
-         else:
-             step_name = "draft"
-         if total_steps:
-             progress = completed / total_steps
-             if running_step:
-                 progress += 0.5 / total_steps
-             progress = min(1.0, max(0.0, progress))
-         else:
-             progress = 0.0
- 
-     if job.progress_value is not None:
-         progress = max(0.0, min(1.0, float(job.progress_value)))
-     if job.progress_stage:
-         step_name = job.progress_stage
- 
-     if status == "queued":
-         message = "Задание в очереди"
-     elif status == "running":
-         message = job.progress_message or f"Шаг: {step_labels.get(step_name, step_name)}"
-     elif status == "succeeded":
--        message = job.progress_message or "Готово"
-+        message = job.progress_message or "done"
-     else:
-         error_message = ""
-         if isinstance(job.error, dict):
-             error_message = str(job.error.get("message") or "").strip()
-         message = error_message or "Завершено с ошибкой"
- 
-     timestamps = [job.created_at, job.started_at, job.finished_at, job.last_event_at]
-     for step in job.steps:
-         timestamps.extend([step.started_at, step.finished_at])
-     last_event_candidates = [ts for ts in timestamps if ts]
-     last_event = max(last_event_candidates) if last_event_candidates else utcnow()
- 
-     if job.progress_message and status in {"running", "succeeded"}:
-         message = job.progress_message
- 
-     stage_lookup = stage_to_steps.get(step_name, {step_name})
-     relevant_steps = [step for step in job.steps if step.name in stage_lookup]
-     if not relevant_steps and job.steps:
-         relevant_steps = [job.steps[-1]]
- 
-     if status == "succeeded":
-         step_status_value = "completed"
-     elif status == "failed":
-         step_status_value = "failed"
-     elif relevant_steps:
-diff --git a/jobs/runner.py b/jobs/runner.py
-index a28e10952864885c6556f01630f4df9974906715..fd4e043e9886540ebe0db3cb742bbcb9649d2ee2 100644
---- a/jobs/runner.py
-+++ b/jobs/runner.py
-@@ -1,104 +1,111 @@
- """Background execution engine for generation jobs with soft degradation."""
- from __future__ import annotations
- 
- import queue
- import re
- import threading
- import time
- import uuid
- from dataclasses import dataclass, field
- from typing import Any, Callable, Dict, List, Optional
- 
--from config import JOB_MAX_RETRIES_PER_STEP, JOB_SOFT_TIMEOUT_S
-+from config import JOB_HARD_TIMEOUT_S, JOB_MAX_RETRIES_PER_STEP, JOB_SOFT_TIMEOUT_S
- from observability.logger import get_logger, log_step
- from observability.metrics import get_registry
- from orchestrate import generate_article_from_payload
- from services.guardrails import GuardrailResult, parse_and_repair_jsonld
- 
- from .models import Job, JobStep, JobStepStatus
- from .store import JobStore
- 
- LOGGER = get_logger("content_factory.jobs.runner")
- REGISTRY = get_registry()
- QUEUE_GAUGE = REGISTRY.gauge("jobs.queue_length")
- JOB_COUNTER = REGISTRY.counter("jobs.processed_total")
- 
- PROGRESS_STAGE_WEIGHTS = {
-     "draft": (0.0, 0.82),
-     "trim": (0.82, 0.1),
-     "validate": (0.92, 0.06),
-     "done": (1.0, 0.0),
- }
- 
- PROGRESS_STAGE_MESSAGES = {
--    "draft": "Генерируем черновик",
--    "trim": "Нормализуем объём",
--    "validate": "Проверяем результат",
--    "done": "Готово",
-+    "draft": "working",
-+    "trim": "trimming",
-+    "validate": "refining",
-+    "done": "done",
- }
- 
- 
- @dataclass
- class RunnerTask:
-     job_id: str
-     payload: Dict[str, Any]
-     trace_id: Optional[str] = None
- 
- 
- @dataclass
- class PipelineContext:
-     markdown: str = ""
-     meta_json: Dict[str, Any] = field(default_factory=dict)
-     faq_entries: List[Dict[str, str]] = field(default_factory=list)
-     degradation_flags: List[str] = field(default_factory=list)
-     errors: List[str] = field(default_factory=list)
-     trace_id: Optional[str] = None
-     artifact_paths: Optional[Dict[str, Any]] = None
-     skeleton_batches_total: int = 0
-     skeleton_batches_completed: int = 0
- 
-     def ensure_markdown(self, fallback: str) -> None:
-         if not self.markdown.strip():
-             self.markdown = fallback
- 
- 
- @dataclass
- class StepResult:
-     status: JobStepStatus
-     payload: Dict[str, Any] = field(default_factory=dict)
-     degradation_flags: List[str] = field(default_factory=list)
-     error: Optional[str] = None
-     continue_pipeline: bool = True
- 
- 
- class JobRunner:
-     """Serial job runner executing pipeline tasks in a background thread."""
- 
--    def __init__(self, store: JobStore, *, soft_timeout_s: int = JOB_SOFT_TIMEOUT_S) -> None:
-+    def __init__(
-+        self,
-+        store: JobStore,
-+        *,
-+        soft_timeout_s: int = JOB_SOFT_TIMEOUT_S,
-+        hard_timeout_s: int = JOB_HARD_TIMEOUT_S,
-+    ) -> None:
-         self._store = store
-         self._soft_timeout_s = soft_timeout_s
-+        self._hard_timeout_s = max(hard_timeout_s, soft_timeout_s)
-         self._tasks: "queue.Queue[RunnerTask]" = queue.Queue()
-         self._events: Dict[str, threading.Event] = {}
-         self._events_lock = threading.Lock()
-         self._thread = threading.Thread(target=self._worker, name="job-runner", daemon=True)
-         self._started = False
-         self._shutdown = False
- 
-     def start(self) -> None:
-         if not self._started:
-             self._thread.start()
-             self._started = True
- 
-     def stop(self) -> None:
-         self._shutdown = True
-         self._tasks.put(RunnerTask(job_id="__shutdown__", payload={}))
-         if self._started:
-             self._thread.join(timeout=1.0)
- 
-     def submit(self, payload: Dict[str, Any], *, trace_id: Optional[str] = None) -> Job:
-         job_id = uuid.uuid4().hex
-         steps = [
-             JobStep(name="draft"),
-             JobStep(name="refine"),
-             JobStep(name="jsonld"),
-             JobStep(name="post_analysis"),
-@@ -140,76 +147,103 @@ class JobRunner:
-             if task.job_id == "__shutdown__":
-                 break
-             try:
-                 self._run_job(task)
-             except Exception as exc:  # noqa: BLE001
-                 LOGGER.exception("job_failed", extra={"job_id": task.job_id, "error": str(exc)})
-             finally:
-                 with self._events_lock:
-                     event = self._events.pop(task.job_id, None)
-                 if event:
-                     event.set()
- 
-     def _run_job(self, task: RunnerTask) -> None:
-         job = self._store.get(task.job_id)
-         if not job:
-             LOGGER.warning("job_missing", extra={"job_id": task.job_id})
-             return
- 
-         job.trace_id = job.trace_id or task.trace_id
-         job.mark_running()
-         self._store.touch(job.id)
- 
-         ctx = PipelineContext(trace_id=job.trace_id)
-         start_time = time.monotonic()
-         deadline = start_time + self._soft_timeout_s
-+        hard_deadline = start_time + self._hard_timeout_s
-         refine_extension = max(5.0, self._soft_timeout_s * 0.35)
-         refine_extension_applied = False
-+        soft_timeout_grace_used = False
- 
-         for step in job.steps:
-             if step.name == "refine" and not refine_extension_applied:
-                 batches_hint = max(0, ctx.skeleton_batches_total)
-                 if batches_hint > 0:
-                     dynamic_extension = max(32.0, 8.0 * batches_hint)
-                     refine_extension = max(refine_extension, dynamic_extension)
--                deadline += refine_extension
-+                deadline = min(hard_deadline, deadline + refine_extension)
-                 refine_extension_applied = True
-                 LOGGER.info(
-                     "job_soft_timeout_extend",
-                     extra={"step": step.name, "extra_seconds": round(refine_extension, 2)},
-                 )
--            if time.monotonic() >= deadline:
--                ctx.degradation_flags.append("soft_timeout")
--                step.mark_degraded("soft_timeout")
-+            now = time.monotonic()
-+            if now >= hard_deadline:
-+                ctx.degradation_flags.append("hard_timeout")
-+                step.mark_degraded("hard_timeout")
-                 log_step(
-                     LOGGER,
-                     job_id=job.id,
-                     step=step.name,
-                     status=step.status.value,
--                    reason="soft_timeout",
-+                    reason="hard_timeout",
-                 )
-                 break
-+            if now >= deadline:
-+                if step.name == "refine" and not soft_timeout_grace_used:
-+                    extra = max(5.0, self._soft_timeout_s * 0.25)
-+                    slack = hard_deadline - deadline
-+                    if slack > 0:
-+                        extra = min(extra, slack)
-+                        deadline = min(hard_deadline, deadline + extra)
-+                        soft_timeout_grace_used = True
-+                        LOGGER.info(
-+                            "job_soft_timeout_grace",
-+                            extra={"step": step.name, "extra_seconds": round(extra, 2)},
-+                        )
-+                        now = time.monotonic()
-+                if now >= deadline:
-+                    ctx.degradation_flags.append("soft_timeout")
-+                    step.mark_degraded("soft_timeout")
-+                    log_step(
-+                        LOGGER,
-+                        job_id=job.id,
-+                        step=step.name,
-+                        status=step.status.value,
-+                        reason="soft_timeout",
-+                    )
-+                    break
- 
-             step.mark_running()
-             self._store.touch(job.id)
-             result = self._execute_step(step.name, task.payload, ctx, job)
-             if result.status == JobStepStatus.SUCCEEDED:
-                 step.mark_succeeded(**result.payload)
-             elif result.status == JobStepStatus.DEGRADED:
-                 step.mark_degraded(result.error, **result.payload)
-             else:
-                 step.mark_failed(result.error, **result.payload)
-             log_step(
-                 LOGGER,
-                 job_id=job.id,
-                 step=step.name,
-                 status=step.status.value,
-                 error=result.error,
-                 payload=result.payload or None,
-             )
-             ctx.degradation_flags.extend(result.degradation_flags)
-             self._store.touch(job.id)
-             if not result.continue_pipeline:
-                 break
- 
-         ctx.ensure_markdown(_build_fallback_text(task.payload))
-         if ctx.degradation_flags:
-diff --git a/llm_client.py b/llm_client.py
-index e4eb661e8722a416ebcdfbab81905a35dfb87be3..34c587f99db2e09f52641ab77212c297b8a5200f 100644
---- a/llm_client.py
-+++ b/llm_client.py
-@@ -15,130 +15,135 @@ from pathlib import Path
- from typing import Any, Dict, List, Optional, Tuple
+ from collections import OrderedDict
+ from copy import deepcopy
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Dict, List, Optional, Tuple
++from typing import Any, Dict, List, Optional, Set, Tuple
  
  import httpx
  from jsonschema import Draft7Validator
@@ -1243,10 +43,8 @@ index e4eb661e8722a416ebcdfbab81905a35dfb87be3..34c587f99db2e09f52641ab77212c297
  
  
  DEFAULT_MODEL = LLM_MODEL
--MAX_RETRIES = 5
--BACKOFF_SCHEDULE = [1.0, 2.0, 4.0, 6.0, 8.0]
-+MAX_RETRIES = 2
-+BACKOFF_SCHEDULE = [0.75, 1.5]
+ MAX_RETRIES = 2
+ BACKOFF_SCHEDULE = [0.75, 1.5]
  RESPONSES_API_URL = "https://api.openai.com/v1/responses"
  RESPONSES_ALLOWED_KEYS = (
      "model",
@@ -1256,24 +54,27 @@ index e4eb661e8722a416ebcdfbab81905a35dfb87be3..34c587f99db2e09f52641ab77212c297
      "previous_response_id",
  )
  RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
--RESPONSES_MAX_ESCALATIONS = 6
-+RESPONSES_MAX_ESCALATIONS = 2
+ RESPONSES_MAX_ESCALATIONS = 2
  MAX_RESPONSES_POLL_ATTEMPTS = (
      G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
  )
  if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
      MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
  GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
++LIVING_STYLE_INSTRUCTION = (
++    "Стиль текста: живой, человечный, уверенный.\n"
++    "Пиши так, как будто объясняешь это умному человеку, но без канцелярита.\n"
++    "Избегай сухих определений, добавляй лёгкие переходы и короткие фразы.\n"
++    "Разбивай длинные абзацы, вставляй мини-примеры и пояснения своими словами.\n"
++    "Тон — дружелюбный, экспертный, без лишней официальности."
++)
  _PROMPT_CACHE: "OrderedDict[Tuple[Tuple[str, str], ...], List[Dict[str, str]]]" = OrderedDict()
  _PROMPT_CACHE_LIMIT = 16
  
  _HTTP_CLIENT_LIMITS = httpx.Limits(
--    max_connections=8,
--    max_keepalive_connections=8,
--    keepalive_expiry=60.0,
-+    max_connections=16,
-+    max_keepalive_connections=16,
-+    keepalive_expiry=120.0,
+     max_connections=16,
+     max_keepalive_connections=16,
+     keepalive_expiry=120.0,
  )
  _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
  
@@ -1292,6 +93,31 @@ index e4eb661e8722a416ebcdfbab81905a35dfb87be3..34c587f99db2e09f52641ab77212c297
              pass
  
  
++_JSON_STYLE_GUARD: Set[str] = {"json_schema", "json_object"}
++
++
++def _should_apply_living_style(format_type: str) -> bool:
++    normalized = str(format_type or "").strip().lower()
++    return not normalized or normalized not in _JSON_STYLE_GUARD
++
++
++def _apply_living_style_instruction(system_text: str, *, format_type: str) -> str:
++    instruction = LIVING_STYLE_INSTRUCTION.strip()
++    if not instruction:
++        return system_text
++    if not _should_apply_living_style(format_type):
++        return system_text
++
++    normalized_text = system_text.replace("\r\n", "\n")
++    if instruction in normalized_text:
++        return system_text
++
++    base = system_text.rstrip()
++    if not base:
++        return instruction
++    return f"{base}\n\n{instruction}"
++
++
  def _cache_augmented_messages(messages: List[Dict[str, object]]) -> List[Dict[str, object]]:
      key = tuple((str(item.get("role", "")), str(item.get("content", ""))) for item in messages)
      cached = _PROMPT_CACHE.get(key)
@@ -1317,85 +143,7 @@ index e4eb661e8722a416ebcdfbab81905a35dfb87be3..34c587f99db2e09f52641ab77212c297
  
  def _acquire_http_client(timeout_value: float) -> httpx.Client:
      key = round(timeout_value, 1)
-     client = _HTTP_CLIENTS.get(key)
-     if client is not None:
-         _HTTP_CLIENTS.move_to_end(key)
-         return client
- 
-     timeout = httpx.Timeout(
-         timeout=timeout_value,
--        connect=min(15.0, timeout_value),
-+        connect=min(20.0, timeout_value),
-         read=timeout_value,
-         write=timeout_value,
-     )
--    client = httpx.Client(timeout=timeout, limits=_HTTP_CLIENT_LIMITS)
-+    client = httpx.Client(
-+        timeout=timeout,
-+        limits=_HTTP_CLIENT_LIMITS,
-+        headers={"Connection": "keep-alive"},
-+        http2=True,
-+    )
-     _HTTP_CLIENTS[key] = client
-     while len(_HTTP_CLIENTS) > 4:
-         _, old_client = _HTTP_CLIENTS.popitem(last=False)
-         try:
-             old_client.close()
-         except Exception:  # pragma: no cover - best effort cleanup
-             pass
-     return client
- def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
-     """Detect the specific 400 error about max_output_tokens being too small."""
- 
-     if response is None:
-         return False
- 
-     message = ""
-     try:
-         payload = response.json()
-     except ValueError:
-         payload = None
- 
-     if isinstance(payload, dict):
-         error_block = payload.get("error")
-         if isinstance(error_block, dict):
-             message = str(error_block.get("message", ""))
-     if not message:
-@@ -1547,51 +1552,51 @@ def generate(
-     *,
-     model: Optional[str] = None,
-     max_tokens: int = 1400,
-     timeout_s: int = 60,
-     backoff_schedule: Optional[List[float]] = None,
-     responses_text_format: Optional[Dict[str, object]] = None,
-     previous_response_id: Optional[str] = None,
- ) -> GenerationResult:
-     """Call the configured LLM and return a structured generation result."""
- 
-     if not messages:
-         raise ValueError("messages must not be empty")
- 
-     model_name = _resolve_model_name(model)
-     provider = _resolve_provider(model_name)
-     api_key = _resolve_api_key(provider)
-     api_url = PROVIDER_API_URLS.get(provider)
-     if not api_url:
-         raise RuntimeError(f"Неизвестный провайдер для модели '{model_name}'")
- 
-     raw_timeout = timeout_s if timeout_s is not None else 60
-     try:
-         timeout_value = float(raw_timeout)
-     except (TypeError, ValueError):
-         timeout_value = 60.0
--    effective_timeout = min(max(timeout_value, 1.0), 90.0)
-+    effective_timeout = min(max(timeout_value, 1.0), 120.0)
-     http_client = _acquire_http_client(effective_timeout)
- 
-     schedule = _resolve_backoff_schedule(backoff_schedule)
-     headers = {
-         "Authorization": f"Bearer {api_key}",
-         "Content-Type": "application/json",
-     }
+@@ -1585,65 +1617,77 @@ def generate(
  
      gpt5_messages_cache: Optional[List[Dict[str, object]]] = None
  
@@ -1414,134 +162,255 @@ index e4eb661e8722a416ebcdfbab81905a35dfb87be3..34c587f99db2e09f52641ab77212c297
          *,
          max_tokens_override: Optional[int] = None,
          text_format_override: Optional[Dict[str, object]] = None,
-@@ -2003,51 +2008,51 @@ def generate(
-                                 len(shrunken_input),
-                             )
-                 else:
-                     if shrink_applied:
-                         LOGGER.info("RESP_PROMPT_SHRINK_DISABLED after_content_started")
-                     shrink_applied = False
-                     shrink_next_attempt = False
-                 current_payload["max_output_tokens"] = max(min_token_floor, int(current_max))
-             if attempts > 1:
-                 retry_used = True
-             format_block, fmt_type, fmt_name, has_schema, fixed_name = _ensure_format_name(current_payload)
-             suffix = " (fixed=name)" if fixed_name else ""
-             LOGGER.info(
-                 "LOG:RESP_PAYLOAD_FORMAT type=%s name=%s has_schema=%s%s",
-                 fmt_type,
-                 fmt_name or "-",
-                 has_schema,
-                 suffix,
-             )
-             updated_format: Optional[Dict[str, object]] = None
-             if isinstance(format_block, dict):
-                 try:
-                     updated_format = deepcopy(format_block)
-                 except (TypeError, ValueError):
-                     updated_format = _clone_text_format()
--            if not resume_from_response_id and isinstance(updated_format, dict):
-+            if isinstance(updated_format, dict):
-                 sanitized_payload["text"] = {"format": deepcopy(updated_format)}
-                 format_template = deepcopy(updated_format)
-             if isinstance(updated_format, dict):
-                 try:
-                     format_snapshot = json.dumps(updated_format, ensure_ascii=False, sort_keys=True)
-                 except (TypeError, ValueError):
-                     format_snapshot = str(updated_format)
-                 LOGGER.debug("DEBUG:payload.text.format = %s", format_snapshot)
-                 current_payload["text"] = {"format": deepcopy(updated_format)}
+         previous_id_override: object = _PREVIOUS_ID_SENTINEL,
+         max_attempts_override: Optional[int] = None,
+         allow_empty_retry: bool = True,
+     ) -> Tuple[str, Dict[str, object], Dict[str, object], str]:
+         nonlocal retry_used
+ 
+         payload_messages = _messages_for_model(target_model)
++        style_template, _, _ = _prepare_text_format_for_request(
++            text_format_override
++            or responses_text_format
++            or DEFAULT_RESPONSES_TEXT_FORMAT,
++            context="style_probe",
++            log_on_migration=False,
++        )
++        style_format_type = str(style_template.get("type", "")).strip().lower()
+         system_segments: List[str] = []
+         user_segments: List[str] = []
+         for item in payload_messages:
+             role = str(item.get("role", "")).strip().lower()
+             content = str(item.get("content", "")).strip()
+             if not content:
+                 continue
+             if role == "system":
+                 system_segments.append(content)
+             elif role == "user":
+                 user_segments.append(content)
              else:
-                 LOGGER.debug("DEBUG:payload.text.format = null")
-                 current_payload["text"] = {"format": _clone_text_format()}
-             _log_payload(current_payload)
-             try:
-                 _store_responses_request_snapshot(current_payload)
-                 response = http_client.post(
-                     RESPONSES_API_URL,
-                     headers=headers,
-                     json=current_payload,
-                 )
-                 response.raise_for_status()
-                 data = response.json()
-                 if not isinstance(data, dict):
-                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
-                 _store_responses_response_snapshot(data)
-diff --git a/tests/test_job_runner.py b/tests/test_job_runner.py
-index 4d52c0bf3600f8d7bc2041b64235047395819553..d4416745b2d334c5b70751d90a56e31fe74532d6 100644
---- a/tests/test_job_runner.py
-+++ b/tests/test_job_runner.py
-@@ -12,70 +12,70 @@ def job_store() -> JobStore:
-     return JobStore(ttl_seconds=30)
+                 user_segments.append(f"{role.upper()}:\n{content}")
+ 
+         system_text = "\n\n".join(system_segments)
++        system_text = _apply_living_style_instruction(
++            system_text,
++            format_type=style_format_type,
++        )
+         user_text = "\n\n".join(user_segments)
+ 
+         effective_max_tokens = max_tokens_override if max_tokens_override is not None else max_tokens
+         effective_previous_id: Optional[str]
+         if previous_id_override is _PREVIOUS_ID_SENTINEL:
+             effective_previous_id = previous_response_id
+         else:
+             effective_previous_id = previous_id_override if isinstance(previous_id_override, str) else None
+         base_payload = build_responses_payload(
+             target_model,
+             system_text,
+             user_text,
+             effective_max_tokens,
+             text_format=text_format_override or responses_text_format,
+             previous_response_id=effective_previous_id,
+         )
+         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
+         base_model_name = str(sanitized_payload.get("model") or target_model).strip()
+         if not base_model_name:
+             base_model_name = target_model
+ 
+         text_section = sanitized_payload.get("text")
+         if not isinstance(text_section, dict):
+             text_section = {}
+         format_template_source = text_section.get("format")
+diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
+index 0cdefc22dfc8467e0898314e9a96e22245750e84..a7826a2ea73f058310be49d5360e15f4a7417bd0 100644
+--- a/tests/test_llm_client.py
++++ b/tests/test_llm_client.py
+@@ -1,42 +1,43 @@
+ import sys
+ from pathlib import Path
+ from unittest.mock import patch
+ 
+ import json
+ import httpx
+ import pytest
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+ import llm_client as llm_client_module  # noqa: E402
+ 
+ from config import LLM_ALLOW_FALLBACK, LLM_MODEL, LLM_ROUTE
+ from llm_client import (  # noqa: E402
+     DEFAULT_RESPONSES_TEXT_FORMAT,
+     FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT,
+     G5_ESCALATION_LADDER,
++    LIVING_STYLE_INSTRUCTION,
+     GenerationResult,
+     generate,
+     reset_http_client_cache,
+ )
  
  
- def test_job_runner_success(monkeypatch, job_store):
-     def _fake_generate(**_kwargs):
-         return {
-             "text": "Hello world",
-             "metadata": {
-                 "jsonld": {
-                     "faq": [
-                         {"question": "What?", "answer": "Answer"},
-                     ]
-                 }
-             },
-         }
- 
-     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
-     runner = JobRunner(job_store, soft_timeout_s=2)
-     job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-1")
-     assert runner.wait(job.id, timeout=5) is True
-     snapshot = runner.get_job(job.id)
-     assert snapshot["status"] == "succeeded"
-     assert snapshot.get("step") == "done"
-     assert snapshot.get("step_status") == "completed"
-     assert snapshot.get("progress") == 1.0
--    assert snapshot.get("message") == "Готово"
-+    assert snapshot.get("message") == "done"
-     assert snapshot.get("last_event_at")
-     assert snapshot["result"]["markdown"].startswith("Hello")
-     assert snapshot["degradation_flags"] in (None, [])
-     assert snapshot["trace_id"] == "trace-1"
+ @pytest.fixture(autouse=True)
+ def _force_api_key(monkeypatch):
+     monkeypatch.setenv("OPENAI_API_KEY", "test")
+     yield
+     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
  
  
- def test_job_runner_degradation(monkeypatch, job_store):
-     def _raise_generate(**_kwargs):
-         raise RuntimeError("boom")
- 
-     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _raise_generate)
-     runner = JobRunner(job_store, soft_timeout_s=1)
-     job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-2")
-     runner.wait(job.id, timeout=3)
-     snapshot = runner.get_job(job.id)
-     assert snapshot["status"] == "succeeded"
-     assert snapshot.get("step") == "done"
-     assert snapshot.get("progress") == 1.0
--    assert snapshot.get("message") == "Готово"
-+    assert snapshot.get("message") == "done"
-     assert "draft_failed" in (snapshot.get("degradation_flags") or [])
-     assert "markdown" in snapshot["result"]
-     assert "demo" in snapshot["result"]["markdown"]
+ @pytest.fixture(autouse=True)
+ def _reset_http_clients():
+     reset_http_client_cache()
+     yield
+     reset_http_client_cache()
  
  
- def test_job_runner_draft_degraded_on_max_tokens(monkeypatch, job_store):
-     artifact_paths = {
-         "markdown": "artifacts/demo.md",
-         "metadata": "artifacts/demo.json",
+ class DummyResponse:
+     def __init__(self, payload=None, *, status_code=200, text="", raise_for_status_exc=None):
+         self._payload = payload if payload is not None else {}
+         self.status_code = status_code
+         self.text = text
+@@ -87,92 +88,142 @@ class DummyClient:
+             self._poll_index += 1
+             self.poll_requests.append({"url": url, "headers": headers})
+             return DummyResponse(entry)
+         entry = self.availability[self._probe_index] if self._probe_index < len(self.availability) else {"status": 200}
+         self._probe_index += 1
+         self.probes.append({"url": url, "headers": headers})
+         if isinstance(entry, dict):
+             status = entry.get("status", 200)
+             text = entry.get("text", "")
+         else:
+             status = int(entry)
+             text = ""
+         return DummyResponse({"object": "model"}, status_code=status, text=text)
+ 
+     def close(self):
+         return None
+ 
+ 
+ def _generate_with_dummy(
+     *,
+     responses=None,
+     polls=None,
+     availability=None,
+     model="gpt-5",
+     max_tokens=64,
++    messages=None,
++    responses_text_format=None,
+ ):
+     dummy_client = DummyClient(responses=responses, polls=polls, availability=availability)
+     with patch("llm_client.httpx.Client", return_value=dummy_client):
+         result = generate(
+-            messages=[{"role": "user", "content": "ping"}],
++            messages=messages or [{"role": "user", "content": "ping"}],
+             model=model,
+             max_tokens=max_tokens,
++            responses_text_format=responses_text_format,
+         )
+     return result, dummy_client
+ 
+ 
+ def test_generate_rejects_non_gpt5_model():
+     with pytest.raises(RuntimeError):
+         _generate_with_dummy(model="gpt-4o")
+ 
+ 
+ def test_generate_uses_responses_payload_for_gpt5():
+     payload = {
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "ok"},
+                 ]
+             }
+         ]
      }
+     result, client = _generate_with_dummy(responses=[payload])
+     request_payload = client.requests[-1]["json"]
+     assert request_payload["model"] == "gpt-5"
+     assert request_payload["input"] == "ping"
+     assert request_payload["max_output_tokens"] == 64
+     assert request_payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
+     assert "temperature" not in request_payload
+     metadata = result.metadata or {}
+     assert metadata.get("model_effective") == LLM_MODEL
+     assert metadata.get("api_route") == LLM_ROUTE
+     assert metadata.get("allow_fallback") is LLM_ALLOW_FALLBACK
+     assert metadata.get("temperature_applied") is False
+     assert metadata.get("escalation_caps") == list(G5_ESCALATION_LADDER)
+     assert metadata.get("max_output_tokens_applied") == 64
  
-     def _fake_generate(**_kwargs):
-         return {
-             "text": "Частичный черновик",
-             "metadata": {
-                 "degradation_flags": ["draft_max_tokens"],
-                 "completion_warning": "max_output_tokens",
-             },
-             "artifact_paths": artifact_paths,
-         }
  
-     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
-     runner = JobRunner(job_store, soft_timeout_s=2)
-     job = runner.submit({"theme": "demo", "data": {}, "k": 0})
-     runner.wait(job.id, timeout=5)
++def test_generate_appends_living_style_instruction_for_text_format():
++    payload = {
++        "output": [
++            {
++                "content": [
++                    {"type": "text", "text": "готово"},
++                ]
++            }
++        ]
++    }
++    system_message = {"role": "system", "content": "Системный промпт"}
++    user_message = {"role": "user", "content": "Собери черновик"}
++    _, client = _generate_with_dummy(
++        responses=[payload],
++        messages=[system_message, user_message],
++        responses_text_format={"type": "text"},
++    )
++    request_payload = client.requests[-1]["json"]
++    input_text = request_payload["input"]
++    style_block = LIVING_STYLE_INSTRUCTION.strip()
++    assert style_block in input_text
++    assert input_text.count(style_block) == 1
++    assert input_text.startswith(system_message["content"])
++    assert input_text.find(style_block) < input_text.rfind(user_message["content"])
++
++
++def test_generate_skips_living_style_instruction_for_json_format():
++    payload = {
++        "output": [
++            {
++                "content": [
++                    {"type": "text", "text": "готово"},
++                ]
++            }
++        ]
++    }
++    system_message = {"role": "system", "content": "Системный промпт"}
++    user_message = {"role": "user", "content": "Собери черновик"}
++    _, client = _generate_with_dummy(
++        responses=[payload],
++        messages=[system_message, user_message],
++    )
++    request_payload = client.requests[-1]["json"]
++    input_text = request_payload["input"]
++    assert LIVING_STYLE_INSTRUCTION.strip() not in input_text
++
++
+ def test_generate_polls_until_completion():
+     in_progress = {"status": "in_progress", "id": "resp-1", "output": []}
+     final_payload = {
+         "status": "completed",
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "done"},
+                 ]
+             }
+         ],
+     }
+     with patch("llm_client.time.sleep", return_value=None):
+         result, client = _generate_with_dummy(responses=[in_progress], polls=[final_payload])
+     assert result.text == "done"
+     assert client.poll_requests
+     assert client.poll_requests[0]["url"].endswith("/responses/resp-1")
+ 
+ 
+ def test_generate_retries_unknown_parameter():
+     error_entry = {"__error__": "http", "status": 400, "payload": {"error": {"message": "Unknown parameter: 'modalities'"}}}
+     success_entry = {
+         "output": [
+             {
+                 "content": [
 

@@ -15,6 +15,7 @@ from llm_client import (  # noqa: E402
     DEFAULT_RESPONSES_TEXT_FORMAT,
     FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT,
     G5_ESCALATION_LADDER,
+    LIVING_STYLE_INSTRUCTION,
     GenerationResult,
     generate,
     reset_http_client_cache,
@@ -109,13 +110,16 @@ def _generate_with_dummy(
     availability=None,
     model="gpt-5",
     max_tokens=64,
+    messages=None,
+    responses_text_format=None,
 ):
     dummy_client = DummyClient(responses=responses, polls=polls, availability=availability)
     with patch("llm_client.httpx.Client", return_value=dummy_client):
         result = generate(
-            messages=[{"role": "user", "content": "ping"}],
+            messages=messages or [{"role": "user", "content": "ping"}],
             model=model,
             max_tokens=max_tokens,
+            responses_text_format=responses_text_format,
         )
     return result, dummy_client
 
@@ -149,6 +153,53 @@ def test_generate_uses_responses_payload_for_gpt5():
     assert metadata.get("temperature_applied") is False
     assert metadata.get("escalation_caps") == list(G5_ESCALATION_LADDER)
     assert metadata.get("max_output_tokens_applied") == 64
+
+
+def test_generate_appends_living_style_instruction_for_text_format():
+    payload = {
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "готово"},
+                ]
+            }
+        ]
+    }
+    system_message = {"role": "system", "content": "Системный промпт"}
+    user_message = {"role": "user", "content": "Собери черновик"}
+    _, client = _generate_with_dummy(
+        responses=[payload],
+        messages=[system_message, user_message],
+        responses_text_format={"type": "text"},
+    )
+    request_payload = client.requests[-1]["json"]
+    input_text = request_payload["input"]
+    style_block = LIVING_STYLE_INSTRUCTION.strip()
+    assert style_block in input_text
+    assert input_text.count(style_block) == 1
+    assert input_text.startswith(system_message["content"])
+    assert input_text.find(style_block) < input_text.rfind(user_message["content"])
+
+
+def test_generate_skips_living_style_instruction_for_json_format():
+    payload = {
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "готово"},
+                ]
+            }
+        ]
+    }
+    system_message = {"role": "system", "content": "Системный промпт"}
+    user_message = {"role": "user", "content": "Собери черновик"}
+    _, client = _generate_with_dummy(
+        responses=[payload],
+        messages=[system_message, user_message],
+    )
+    request_payload = client.requests[-1]["json"]
+    input_text = request_payload["input"]
+    assert LIVING_STYLE_INSTRUCTION.strip() not in input_text
 
 
 def test_generate_polls_until_completion():
