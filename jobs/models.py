@@ -199,6 +199,17 @@ def summarize_job(job: "Job") -> Dict[str, Any]:
     running_step = next((step for step in job.steps if step.status == JobStepStatus.RUNNING), None)
     pending_step = next((step for step in job.steps if step.status == JobStepStatus.PENDING), None)
 
+    stage_to_steps = {
+        "draft": {"draft"},
+        "trim": {"refine"},
+        "refine": {"refine"},
+        "finalize": {"jsonld", "post_analysis"},
+        "validate": {"jsonld", "post_analysis"},
+        "jsonld": {"jsonld"},
+        "post_analysis": {"post_analysis"},
+        "done": {"post_analysis"},
+    }
+
     if status in {"succeeded", "failed"}:
         step_name = "done"
         progress = 1.0
@@ -236,19 +247,67 @@ def summarize_job(job: "Job") -> Dict[str, Any]:
             error_message = str(job.error.get("message") or "").strip()
         message = error_message or "Завершено с ошибкой"
 
-    if job.progress_message and status in {"running", "succeeded"}:
-        message = job.progress_message
-
     timestamps = [job.created_at, job.started_at, job.finished_at, job.last_event_at]
     for step in job.steps:
         timestamps.extend([step.started_at, step.finished_at])
     last_event_candidates = [ts for ts in timestamps if ts]
     last_event = max(last_event_candidates) if last_event_candidates else utcnow()
 
-    return {
+    if job.progress_message and status in {"running", "succeeded"}:
+        message = job.progress_message
+
+    stage_lookup = stage_to_steps.get(step_name, {step_name})
+    relevant_steps = [step for step in job.steps if step.name in stage_lookup]
+    if not relevant_steps and job.steps:
+        relevant_steps = [job.steps[-1]]
+
+    if status == "succeeded":
+        step_status_value = "completed"
+    elif status == "failed":
+        step_status_value = "failed"
+    elif relevant_steps:
+        order = (
+            ("running", lambda s: s.status == JobStepStatus.RUNNING),
+            ("failed", lambda s: s.status == JobStepStatus.FAILED),
+            ("degraded", lambda s: s.status == JobStepStatus.DEGRADED),
+            ("completed", lambda s: s.status == JobStepStatus.SUCCEEDED),
+            ("skipped", lambda s: s.status == JobStepStatus.SKIPPED),
+            ("pending", lambda s: s.status == JobStepStatus.PENDING),
+        )
+        step_status_value = "pending"
+        for label, predicate in order:
+            if any(predicate(step) for step in relevant_steps):
+                step_status_value = label
+                break
+    else:
+        step_status_value = "pending"
+
+    if running_step and step_alias.get(running_step.name, running_step.name) == step_name:
+        step_status_value = "running"
+
+    batches_done = None
+    batches_total = None
+    if job.progress_payload:
+        try:
+            batches_done = int(job.progress_payload.get("completed"))
+        except Exception:  # pragma: no cover - defensive
+            batches_done = None
+        try:
+            batches_total = int(job.progress_payload.get("total"))
+        except Exception:  # pragma: no cover - defensive
+            batches_total = None
+        if batches_done is not None and batches_total is not None and batches_total < 0:
+            batches_total = None
+    result = {
         "status": status,
         "step": step_name,
         "progress": round(progress, 4),
         "last_event_at": last_event.strftime(ISO_FORMAT),
         "message": message,
+        "step_status": step_status_value,
     }
+    if batches_done is not None:
+        result["batches_completed"] = batches_done
+    if batches_total is not None:
+        result["batches_total"] = batches_total
+    return result

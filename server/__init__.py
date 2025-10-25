@@ -479,12 +479,21 @@ def create_app() -> Flask:
                     }
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                     break
+                progress_payload = snapshot.get("progress_payload")
+                payload_signature = None
+                if progress_payload and isinstance(progress_payload, dict):
+                    try:
+                        payload_signature = json.dumps(progress_payload, ensure_ascii=False, sort_keys=True)
+                    except (TypeError, ValueError):
+                        payload_signature = str(progress_payload)
                 signature = (
                     snapshot.get("status"),
                     snapshot.get("step"),
                     snapshot.get("progress"),
                     snapshot.get("progress_stage"),
                     snapshot.get("progress_message"),
+                    snapshot.get("step_status"),
+                    payload_signature,
                     snapshot.get("last_event_at"),
                 )
                 if signature != last_signature:
@@ -939,10 +948,13 @@ def _load_pipeline_config(theme_dir: Path) -> Dict[str, Any]:
 
 
 def _format_generation_success(result: Dict[str, Any]) -> Dict[str, Any]:
+    artifact_saved_raw = result.get("artifact_saved")
+    artifact_saved = bool(artifact_saved_raw) if artifact_saved_raw is not None else bool(result.get("artifact_paths"))
     payload: Dict[str, Any] = {
         "markdown": result.get("text"),
         "meta_json": result.get("metadata"),
         "artifact_paths": result.get("artifact_paths"),
+        "artifact_saved": artifact_saved,
     }
     metadata = result.get("metadata") or {}
     if isinstance(metadata, dict):

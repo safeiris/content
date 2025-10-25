@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from jobs.models import Job, JobStep
 from jobs.runner import JobRunner
 from jobs.store import JobStore
 
@@ -31,6 +32,7 @@ def test_job_runner_success(monkeypatch, job_store):
     snapshot = runner.get_job(job.id)
     assert snapshot["status"] == "succeeded"
     assert snapshot.get("step") == "done"
+    assert snapshot.get("step_status") == "completed"
     assert snapshot.get("progress") == 1.0
     assert snapshot.get("message") == "Готово"
     assert snapshot.get("last_event_at")
@@ -83,4 +85,16 @@ def test_job_runner_draft_degraded_on_max_tokens(monkeypatch, job_store):
     assert draft_step["error"] == "max_output_tokens"
     assert draft_step["payload"]["artifact_paths"] == artifact_paths
     assert snapshot["result"]["artifact_paths"] == artifact_paths
+    assert snapshot["result"].get("artifact_saved") is True
     assert "draft_max_tokens" in (snapshot.get("degradation_flags") or [])
+
+
+def test_job_snapshot_includes_batch_counters(job_store):
+    job = Job(id="demo-job", steps=[JobStep(name="draft")])
+    job_store.create(job)
+
+    job.update_progress(stage="draft", progress=0.25, payload={"total": 8, "completed": 2})
+
+    snapshot = job_store.snapshot(job.id)
+    assert snapshot["batches_total"] == 8
+    assert snapshot["batches_completed"] == 2

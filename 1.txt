@@ -1,380 +1,1590 @@
+diff --git a/frontend_demo/script.js b/frontend_demo/script.js
+index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633caf225704 100644
+--- a/frontend_demo/script.js
++++ b/frontend_demo/script.js
+@@ -108,50 +108,51 @@ const PROGRESS_STAGE_LABELS = {
+   draft: "Черновик",
+   refine: "Доработка",
+   trim: "Нормализация",
+   validate: "Проверка",
+   done: "Готово",
+   error: "Ошибка",
+ };
+ 
+ const PROGRESS_STAGE_MESSAGES = {
+   draft: "Генерируем черновик",
+   refine: "Дорабатываем черновик",
+   trim: "Нормализуем объём",
+   validate: "Проверяем результат",
+   done: "Готово",
+   error: "Завершено с ошибкой",
+ };
+ 
+ const DEGRADATION_LABELS = {
+   draft_failed: "Черновик по запасному сценарию",
+   draft_max_tokens: "Лимит токенов — результат неполный",
+   refine_skipped: "Доработка пропущена",
+   jsonld_missing: "JSON-LD не сформирован",
+   jsonld_repaired: "JSON-LD восстановлен вручную",
+   post_analysis_skipped: "Отчёт о качестве недоступен",
+   soft_timeout: "Мягкий таймаут — результат сохранён",
++  cap_reached_final: "Лимит продолжений — результат сохранён",
+ };
+ 
+ const DEFAULT_PROGRESS_MESSAGE =
+   progressMessage?.textContent?.trim() || PROGRESS_STAGE_MESSAGES.draft;
+ const MAX_TOASTS = 3;
+ const MAX_CUSTOM_CONTEXT_CHARS = 20000;
+ const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
+ 
+ const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 3500, max: 6000, hard: 6500 });
+ 
+ const HEALTH_STATUS_MESSAGES = {
+   openai_key: {
+     label: "OpenAI",
+     ok: "активен",
+     fail: "не найден",
+   },
+   llm_ping: {
+     label: "LLM",
+     ok: "отвечает",
+     fail: "нет ответа",
+   },
+   retrieval_index: {
+     label: "Retrieval index",
+     ok: "найден",
+     fail: "не найден",
+@@ -179,52 +180,72 @@ const state = {
+   pipes: new Map(),
+   artifacts: [],
+   artifactFiles: [],
+   pendingArtifactFiles: null,
+   hasMissingArtifacts: false,
+   currentResult: null,
+   currentDownloads: { markdown: null, report: null },
+ };
+ 
+ const featureState = {
+   hideModelSelector: true,
+   hideTokenSliders: true,
+ };
+ 
+ const customContextState = {
+   textareaText: "",
+   fileText: "",
+   fileName: "",
+   noticeShown: false,
+ };
+ 
+ const progressState = {
+   currentPercent: 0,
+   lastStage: "draft",
+   hideTimer: null,
++  heartbeatTimer: null,
++  lastUpdateAt: 0,
++  latestSnapshot: null,
++  heartbeatNotified: false,
++  overlaySuppressed: false,
+ };
+ 
++const STEP_STATUS_DONE_VALUES = new Set(["completed", "degraded", "skipped"]);
++const STEP_STATUS_RUNNING_VALUES = new Set(["running"]);
++const PROGRESS_HEARTBEAT_TIMEOUT_MS = 35000;
++const PROGRESS_NOTICE_PRIORITY = ["soft_timeout", "draft_max_tokens", "cap_reached_final"];
++const PROGRESS_STAGE_TO_STEP_NAMES = Object.freeze({
++  draft: ["draft"],
++  trim: ["refine"],
++  refine: ["refine"],
++  validate: ["jsonld", "post_analysis"],
++  finalize: ["jsonld", "post_analysis"],
++  jsonld: ["jsonld"],
++  post_analysis: ["post_analysis"],
++  done: ["post_analysis"],
++});
++
+ function resolveApiPath(path) {
+   if (typeof path !== "string" || !path) {
+     return API_BASE || "";
+   }
+   if (/^https?:\/\//i.test(path)) {
+     return path;
+   }
+   const base = API_BASE || "";
+   const normalizedBase = base.endsWith("/") ? base.slice(0, -1) : base;
+   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+   if (/^https?:\/\//i.test(normalizedBase)) {
+     return `${normalizedBase}${normalizedPath}`;
+   }
+   return `${normalizedBase}${normalizedPath}`;
+ }
+ 
+ function escapeHtml(value) {
+   if (typeof value !== "string") {
+     return "";
+   }
+   const map = {
+     "&": "&amp;",
+     "<": "&lt;",
+     ">": "&gt;",
+     '"': "&quot;",
+@@ -979,50 +1000,55 @@ function setDownloadLinkAvailability(link, downloadInfo) {
+   }
+   const fallbackName = link.dataset.fallbackName || (link.id === "download-md" ? "draft.md" : "report.json");
+   if (downloadInfo && (downloadInfo.url || downloadInfo.path)) {
+     const targetUrl = downloadInfo.url || `/api/artifacts/download?path=${encodeURIComponent(downloadInfo.path)}`;
+     const resolvedUrl = resolveApiPath(targetUrl);
+     link.href = resolvedUrl;
+     link.dataset.downloadUrl = resolvedUrl;
+     link.setAttribute("download", downloadInfo.name || fallbackName);
+     link.classList.remove("is-disabled");
+     link.removeAttribute("aria-disabled");
+     return;
+   }
+   link.removeAttribute("href");
+   link.removeAttribute("download");
+   link.classList.add("is-disabled");
+   link.setAttribute("aria-disabled", "true");
+   delete link.dataset.downloadUrl;
+ }
+ 
+ function setActiveArtifactDownloads(downloads) {
+   const normalized = downloads && typeof downloads === "object" ? downloads : {};
+   state.currentDownloads = {
+     markdown: normalized.markdown || normalized.article || null,
+     report: normalized.report || normalized.json || normalized.metadata || null,
+   };
++  if (!isArtifactDownloadReady()) {
++    setDownloadLinkAvailability(downloadMdBtn, null);
++    setDownloadLinkAvailability(downloadReportBtn, null);
++    return;
++  }
+   setDownloadLinkAvailability(downloadMdBtn, state.currentDownloads.markdown);
+   setDownloadLinkAvailability(downloadReportBtn, state.currentDownloads.report);
+ }
+ 
+ function hasDownloadFiles(downloads) {
+   if (!downloads || typeof downloads !== "object") {
+     return false;
+   }
+   const markdown = downloads.markdown || downloads.article || null;
+   const report = downloads.report || downloads.json || downloads.metadata || null;
+   return Boolean(markdown || report);
+ }
+ 
+ function resetDownloadButtonsForNewJob() {
+   state.currentDownloads = { markdown: null, report: null };
+   setDownloadLinkAvailability(downloadMdBtn, null);
+   setDownloadLinkAvailability(downloadReportBtn, null);
+   setButtonLoading(downloadMdBtn, true);
+   setButtonLoading(downloadReportBtn, true);
+ }
+ 
+ function handleDownloadClick(event, type) {
+   const link = type === "markdown" ? downloadMdBtn : downloadReportBtn;
+   if (!link) {
+     return;
+@@ -1631,74 +1657,88 @@ async function handleGenerate(event) {
+ }
+ 
+ function normalizeJobResponse(response) {
+   if (!response || typeof response !== "object") {
+     return { status: "pending", result: null, steps: [], degradation_flags: [], job_id: null };
+   }
+   if (typeof response.markdown === "string" || typeof response.meta_json === "object") {
+     return {
+       status: "succeeded",
+       job_id: response.job_id || null,
+       steps: Array.isArray(response.steps) ? response.steps : [],
+       degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
+       trace_id: response.trace_id || null,
+       message: typeof response.message === "string" ? response.message : null,
+       progress: typeof response.progress === "number" ? response.progress : null,
+       step: typeof response.step === "string" ? response.step : null,
+       last_event_at: response.last_event_at || null,
+       progress_stage:
+         typeof response.progress_stage === "string" ? response.progress_stage : null,
+       progress_message:
+         typeof response.progress_message === "string" ? response.progress_message : null,
+       progress_payload:
+         response.progress_payload && typeof response.progress_payload === "object"
+           ? response.progress_payload
+           : null,
++      step_status: typeof response.step_status === "string" ? response.step_status : null,
++      batches_completed:
++        typeof response.batches_completed === "number" ? response.batches_completed : null,
++      batches_total:
++        typeof response.batches_total === "number" ? response.batches_total : null,
+       result: {
+         markdown: typeof response.markdown === "string" ? response.markdown : "",
+         meta_json: (response.meta_json && typeof response.meta_json === "object") ? response.meta_json : {},
+         faq_entries: Array.isArray(response.faq_entries) ? response.faq_entries : [],
++        artifact_saved:
++          typeof response.artifact_saved === "boolean"
++            ? response.artifact_saved
++            : Boolean(response.artifact_paths),
+       },
+     };
+   }
+   return {
+     status: typeof response.status === "string" ? response.status : "pending",
+     job_id: response.job_id || null,
+     steps: Array.isArray(response.steps) ? response.steps : [],
+     degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
+     trace_id: response.trace_id || null,
+     message: typeof response.message === "string" ? response.message : null,
+     progress: typeof response.progress === "number" ? response.progress : null,
+     step: typeof response.step === "string" ? response.step : null,
+     last_event_at: response.last_event_at || null,
+     progress_stage: typeof response.progress_stage === "string" ? response.progress_stage : null,
+     progress_message:
+       typeof response.progress_message === "string" ? response.progress_message : null,
+     progress_payload:
+       response.progress_payload && typeof response.progress_payload === "object"
+         ? response.progress_payload
+         : null,
++    step_status: typeof response.step_status === "string" ? response.step_status : null,
++    batches_completed:
++      typeof response.batches_completed === "number" ? response.batches_completed : null,
++    batches_total:
++      typeof response.batches_total === "number" ? response.batches_total : null,
+     result: response.result && typeof response.result === "object" ? response.result : null,
+   };
+ }
+ 
+ function applyProgressiveResult(snapshot) {
+   const result = snapshot?.result;
+   if (!result || typeof result !== "object") {
+     return 0;
+   }
+   const markdown = typeof result.markdown === "string" ? result.markdown : "";
+   if (markdown) {
+     draftView.innerHTML = markdownToHtml(markdown);
+   }
+   const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
+   updateResultBadges(meta, Array.isArray(snapshot?.degradation_flags) ? snapshot.degradation_flags : []);
+   const characters = typeof meta.characters === "number"
+     ? meta.characters
+     : markdown.replace(/\s+/g, "").length;
+   return characters;
+ }
+ 
+ async function pollJobUntilDone(jobId, { onUpdate } = {}) {
+   if (typeof EventSource === "function") {
+     try {
+       return await watchJobViaSse(jobId, { onUpdate });
+@@ -1812,105 +1852,106 @@ async function watchJobViaPolling(jobId, { onUpdate } = {}) {
+       onUpdate(snapshot);
+     }
+     if (snapshot?.status === "failed") {
+       const message = snapshot?.error?.message || snapshot?.message || "Генерация завершилась с ошибкой.";
+       const error = new Error(message);
+       if (snapshot?.trace_id) {
+         error.traceId = snapshot.trace_id;
+       }
+       throw error;
+     }
+     if (snapshot?.status === "succeeded" && snapshot.result) {
+       return snapshot;
+     }
+     delayMs = Math.min(delayMs + 200, 1500);
+   }
+ }
+ 
+ function renderGenerationResult(snapshot, { payload }) {
+   const normalized = normalizeJobResponse(snapshot);
+   const result = normalized.result || {};
+   const markdown = typeof result.markdown === "string" ? result.markdown : "";
+   const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
+   const degradationFlags = Array.isArray(normalized.degradation_flags) ? normalized.degradation_flags : [];
+   const characters = typeof meta.characters === "number" ? meta.characters : markdown.replace(/\s+/g, "").length;
+   const hasContent = markdown.trim().length > 0;
++  const artifactSaved =
++    typeof result.artifact_saved === "boolean" ? result.artifact_saved : Boolean(result.artifact_paths);
+   state.currentResult = {
+     markdown,
+     meta,
+     artifactPaths: result.artifact_paths ?? null,
+     characters,
+     hasContent,
+     degradationFlags,
++    artifactSaved,
+     downloads:
+       state.currentDownloads && (state.currentDownloads.markdown || state.currentDownloads.report)
+         ? { ...state.currentDownloads }
+         : null,
+   };
+   draftView.innerHTML = markdownToHtml(markdown);
+   const requestedLabel =
+     payload?.data?.title
+       || payload?.data?.theme
+       || payload?.data?.goal
+       || payload?.theme
+       || "";
+   resultTitle.textContent = requestedLabel || "Результат генерации";
+   const metaParts = [];
+   if (hasContent) {
+     metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
+     metaParts.push(
+       `Ориентир: ${DEFAULT_LENGTH_RANGE.min.toLocaleString("ru-RU")}` +
+         `–${DEFAULT_LENGTH_RANGE.max.toLocaleString("ru-RU")}` +
+         ` (≤ ${DEFAULT_LENGTH_RANGE.hard.toLocaleString("ru-RU")})`,
+     );
+   }
+   if (degradationFlags.length) {
+     metaParts.push(`Деградации: ${degradationFlags.length}`);
+   }
+   if (meta.model_used) {
+     metaParts.push(`Модель: ${meta.model_used}`);
+   }
+   resultMeta.textContent = metaParts.join(" · ") || "Деградаций нет";
+   renderMetadata(meta);
+   renderUsedKeywords(meta);
+   updateResultBadges(meta, degradationFlags);
+   toggleRetryButton(!hasContent);
+   updatePromptPreview({
+     system: meta.system_prompt_preview,
+     context: Array.isArray(meta.clips) ? meta.clips : [],
+     user: meta.user_prompt_preview,
+     context_used: meta.context_used,
+     context_index_missing: meta.context_index_missing,
+     context_budget_tokens_est: meta.context_budget_tokens_est,
+     context_budget_tokens_limit: meta.context_budget_tokens_limit,
+     k: payload?.k,
+   });
+-  if (state.currentResult.downloads) {
+-    setButtonLoading(downloadMdBtn, false);
+-    setButtonLoading(downloadReportBtn, false);
+-    setActiveArtifactDownloads(state.currentResult.downloads);
+-  }
++  setButtonLoading(downloadMdBtn, false);
++  setButtonLoading(downloadReportBtn, false);
++  setActiveArtifactDownloads(state.currentResult.downloads || state.currentDownloads);
+   if (degradationFlags.length) {
+     const label = degradationFlags.map(describeDegradationFlag).join(", ");
+     showToast({ message: `Частичная деградация: ${label}`, type: "warn", duration: 6000 });
+   }
+ }
+ 
+ function describeDegradationFlag(flag) {
+   if (!flag) {
+     return "unknown";
+   }
+   return DEGRADATION_LABELS[flag] || flag;
+ }
+ 
+ const delay = (ms) => new Promise((resolve) => {
+   setTimeout(resolve, ms);
+ });
+ 
+ function handleRetryClick(event) {
+   event.preventDefault();
+   if (briefForm && typeof briefForm.requestSubmit === "function") {
+     briefForm.requestSubmit(generateBtn);
+     return;
+   }
+   if (generateBtn) {
+     generateBtn.click();
+@@ -2940,109 +2981,366 @@ function setupAdvancedSettings() {
+ 
+ function resetProgressIndicator(message = DEFAULT_PROGRESS_MESSAGE) {
+   if (progressStage) {
+     const fallbackStage = progressStage.dataset.defaultLabel
+       || progressStage.textContent
+       || "Подготовка…";
+     progressStage.textContent = fallbackStage;
+   }
+   if (progressPercent) {
+     progressPercent.textContent = "0%";
+   }
+   if (progressBarFill) {
+     progressBarFill.style.width = "0%";
+   }
+   if (progressBar) {
+     progressBar.setAttribute("aria-valuenow", "0");
+   }
+   if (progressMessage) {
+     progressMessage.textContent = message;
+   }
+   if (progressDetails) {
+     progressDetails.textContent = "";
+   }
+   progressState.currentPercent = 0;
+   progressState.lastStage = "draft";
++  progressState.lastUpdateAt = Date.now();
++  progressState.latestSnapshot = null;
++  progressState.heartbeatNotified = false;
+ }
+ 
+ function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
+   if (!progressOverlay) {
+     return;
+   }
+   if (visible) {
+     if (progressState.hideTimer) {
+       window.clearTimeout(progressState.hideTimer);
+       progressState.hideTimer = null;
+     }
++    progressState.overlaySuppressed = false;
++    progressState.heartbeatNotified = false;
++    progressState.latestSnapshot = null;
++    progressState.lastUpdateAt = Date.now();
+     progressOverlay.classList.remove("hidden");
+     resetProgressIndicator(message);
++    clearProgressHeartbeat();
+   } else {
+     hideProgressOverlay({ immediate: true });
+   }
+ }
+ 
+-function hideProgressOverlay({ immediate = false } = {}) {
++function hideProgressOverlay({ immediate = false, suppress = false } = {}) {
+   if (!progressOverlay) {
+     return;
+   }
+   if (!immediate && progressState.hideTimer) {
+     return;
+   }
+   if (progressState.hideTimer) {
+     window.clearTimeout(progressState.hideTimer);
+     progressState.hideTimer = null;
+   }
+   progressOverlay.classList.add("hidden");
+   resetProgressIndicator(DEFAULT_PROGRESS_MESSAGE);
++  if (suppress) {
++    progressState.overlaySuppressed = true;
++  } else {
++    progressState.overlaySuppressed = false;
++  }
++  clearProgressHeartbeat();
+ }
+ 
+ function scheduleProgressHide(delay = 1200) {
+   if (!progressOverlay) {
+     return;
+   }
+   if (progressState.hideTimer) {
+     window.clearTimeout(progressState.hideTimer);
+   }
+   progressState.hideTimer = window.setTimeout(() => {
+     progressState.hideTimer = null;
+     hideProgressOverlay({ immediate: true });
+   }, Math.max(0, delay));
+ }
+ 
+ function clamp01(value) {
+   if (typeof value !== "number" || Number.isNaN(value)) {
+     return 0;
+   }
+   if (value <= 0) {
+     return 0;
+   }
+   if (value >= 1) {
+     return 1;
+   }
+   return value;
+ }
+ 
++function normalizeStageName(value) {
++  if (typeof value !== "string") {
++    return "";
++  }
++  const normalized = value.trim().toLowerCase();
++  if (!normalized) {
++    return "";
++  }
++  if (normalized === "trim") {
++    return "refine";
++  }
++  if (normalized === "finalize") {
++    return "validate";
++  }
++  return normalized;
++}
++
++function normalizeStepStatus(value) {
++  if (typeof value !== "string") {
++    return "";
++  }
++  const normalized = value.trim().toLowerCase();
++  if (!normalized) {
++    return "";
++  }
++  if (normalized === "succeeded") {
++    return "completed";
++  }
++  return normalized;
++}
++
++function inferStepStatusFromSteps(snapshot, stageName) {
++  if (!snapshot || typeof snapshot !== "object") {
++    return "";
++  }
++  const targetNames = PROGRESS_STAGE_TO_STEP_NAMES[stageName] || [stageName];
++  const steps = Array.isArray(snapshot.steps) ? snapshot.steps : [];
++  const relevant = steps
++    .map((step) => (step && typeof step === "object" ? step : null))
++    .filter((step) => {
++      if (!step || typeof step.name !== "string") {
++        return false;
++      }
++      return targetNames.includes(step.name.trim().toLowerCase());
++    });
++  if (!relevant.length) {
++    return "";
++  }
++  const statuses = relevant.map((step) => normalizeStepStatus(step.status));
++  if (statuses.some((value) => value === "failed")) {
++    return "failed";
++  }
++  if (statuses.some((value) => value === "degraded")) {
++    return "degraded";
++  }
++  if (statuses.some((value) => STEP_STATUS_RUNNING_VALUES.has(value))) {
++    return "running";
++  }
++  if (statuses.some((value) => value === "completed")) {
++    return "completed";
++  }
++  if (statuses.some((value) => value === "skipped")) {
++    return "skipped";
++  }
++  if (statuses.every((value) => value === "pending")) {
++    return "pending";
++  }
++  return statuses.find(Boolean) || "";
++}
++
++function resolveStepStatus(snapshot, stageOverride = null) {
++  const direct = normalizeStepStatus(snapshot?.step_status);
++  const stageSource = stageOverride
++    || snapshot?.progress_stage
++    || snapshot?.step
++    || "";
++  const normalizedStage = normalizeStageName(stageSource);
++  const inferred = normalizedStage ? inferStepStatusFromSteps(snapshot, normalizedStage) : "";
++  return direct || inferred || "";
++}
++
++function collectDegradationFlags(snapshot) {
++  const flags = new Set();
++  if (!snapshot || typeof snapshot !== "object") {
++    return flags;
++  }
++  const append = (value) => {
++    if (typeof value === "string" && value.trim()) {
++      const normalized = value.trim().toLowerCase();
++      if (normalized === "max_output_tokens" || normalized === "max_output_tokens_final") {
++        flags.add("draft_max_tokens");
++        if (normalized === "max_output_tokens_final") {
++          flags.add("cap_reached_final");
++        }
++        return;
++      }
++      flags.add(normalized);
++    }
++  };
++  const appendArray = (values) => {
++    if (Array.isArray(values)) {
++      values.forEach(append);
++    }
++  };
++  appendArray(snapshot.degradation_flags);
++  const payload = snapshot.progress_payload;
++  if (payload && typeof payload === "object") {
++    appendArray(payload.flags);
++    if (payload.cap_reached_final) {
++      flags.add("cap_reached_final");
++    }
++    if (payload.soft_timeout) {
++      flags.add("soft_timeout");
++    }
++  }
++  const result = snapshot.result && typeof snapshot.result === "object" ? snapshot.result : null;
++  if (result) {
++    const meta = result.meta_json && typeof result.meta_json === "object" ? result.meta_json : null;
++    if (meta) {
++      appendArray(meta.degradation_flags);
++      if (meta.cap_reached_final) {
++        flags.add("cap_reached_final");
++      }
++      if (meta.soft_timeout) {
++        flags.add("soft_timeout");
++      }
++    }
++  }
++  const steps = Array.isArray(snapshot.steps) ? snapshot.steps : [];
++  steps.forEach((step) => {
++    if (!step || typeof step !== "object") {
++      return;
++    }
++    const status = normalizeStepStatus(step.status);
++    if (status === "degraded") {
++      append(step.error);
++      if (step.payload && typeof step.payload === "object") {
++        appendArray(step.payload.degradation_flags);
++      }
++    }
++  });
++  return flags;
++}
++
++function deriveProgressNotice(snapshot) {
++  const flags = collectDegradationFlags(snapshot);
++  for (const key of PROGRESS_NOTICE_PRIORITY) {
++    if (flags.has(key) && DEGRADATION_LABELS[key]) {
++      return DEGRADATION_LABELS[key];
++    }
++  }
++  return null;
++}
++
++function maybeAutoHideProgress(stageName, stepStatus, snapshot) {
++  const effectiveStatus = stepStatus || resolveStepStatus(snapshot, stageName);
++  const stage = stageName || normalizeStageName(snapshot?.progress_stage || snapshot?.step || "");
++  if (!stage) {
++    return false;
++  }
++  if (stage !== "draft" && stage !== "refine") {
++    return false;
++  }
++  if (!effectiveStatus || !STEP_STATUS_DONE_VALUES.has(effectiveStatus)) {
++    return false;
++  }
++  hideProgressOverlay({ immediate: true, suppress: true });
++  return true;
++}
++
++function clearProgressHeartbeat() {
++  if (progressState.heartbeatTimer) {
++    window.clearTimeout(progressState.heartbeatTimer);
++    progressState.heartbeatTimer = null;
++  }
++}
++
++function scheduleProgressHeartbeat() {
++  if (!progressOverlay || progressOverlay.classList.contains("hidden")) {
++    clearProgressHeartbeat();
++    return;
++  }
++  clearProgressHeartbeat();
++  progressState.heartbeatTimer = window.setTimeout(
++    handleProgressHeartbeatTimeout,
++    PROGRESS_HEARTBEAT_TIMEOUT_MS,
++  );
++}
++
++function handleProgressHeartbeatTimeout() {
++  progressState.heartbeatTimer = null;
++  if (progressState.heartbeatNotified) {
++    return;
++  }
++  const snapshot = progressState.latestSnapshot;
++  if (!snapshot || typeof snapshot !== "object") {
++    return;
++  }
++  const overallStatus = typeof snapshot.status === "string" ? snapshot.status.trim().toLowerCase() : "";
++  const stage = normalizeStageName(snapshot.progress_stage || snapshot.step || "");
++  const stepStatus = resolveStepStatus(snapshot, stage);
++  if (
++    overallStatus === "running"
++    && (!stepStatus || STEP_STATUS_RUNNING_VALUES.has(stepStatus) || stepStatus === "pending")
++  ) {
++    scheduleProgressHeartbeat();
++    return;
++  }
++  progressState.heartbeatNotified = true;
++  hideProgressOverlay({ immediate: true, suppress: true });
++  const notice = deriveProgressNotice(snapshot)
++    || "Мягкий таймаут — результат сохранён / частичная деградация";
++  showToast({ message: notice, type: "warn" });
++}
++
++function getSnapshotArtifactSaved(snapshot) {
++  if (!snapshot || typeof snapshot !== "object") {
++    return null;
++  }
++  const result = snapshot.result && typeof snapshot.result === "object" ? snapshot.result : null;
++  if (!result) {
++    return null;
++  }
++  if (typeof result.artifact_saved === "boolean") {
++    return result.artifact_saved;
++  }
++  if (result.artifact_paths && typeof result.artifact_paths === "object") {
++    return true;
++  }
++  return null;
++}
++
++function isArtifactDownloadReady() {
++  if (state.currentResult && typeof state.currentResult.artifactSaved === "boolean") {
++    return state.currentResult.artifactSaved;
++  }
++  const snapshotSaved = getSnapshotArtifactSaved(progressState.latestSnapshot);
++  if (typeof snapshotSaved === "boolean") {
++    return snapshotSaved;
++  }
++  return false;
++}
++
+ function toNumber(value) {
+   if (typeof value === "number" && Number.isFinite(value)) {
+     return value;
+   }
+   if (typeof value === "string" && value.trim()) {
+     const parsed = Number(value);
+     if (Number.isFinite(parsed)) {
+       return parsed;
+     }
+   }
+   return null;
+ }
+ 
+ function formatProgressDetails(stage, payload) {
+   if (!payload || typeof payload !== "object") {
+     return "";
+   }
+   const parts = [];
+   if (stage === "draft") {
+     const completed = toNumber(payload.completed);
+     const total = toNumber(payload.total);
+     if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
+       const safeCompleted = Math.max(0, Math.min(total, completed));
+       parts.push(`Батчи: ${safeCompleted}/${total}`);
+     }
+@@ -3073,148 +3371,198 @@ function formatProgressDetails(stage, payload) {
+ function extractErrorMessage(snapshot) {
+   if (!snapshot || typeof snapshot !== "object") {
+     return "";
+   }
+   const errorPayload = snapshot.error;
+   if (errorPayload && typeof errorPayload === "object") {
+     if (typeof errorPayload.message === "string" && errorPayload.message.trim()) {
+       return errorPayload.message.trim();
+     }
+     if (typeof errorPayload.error === "string" && errorPayload.error.trim()) {
+       return errorPayload.error.trim();
+     }
+   } else if (typeof errorPayload === "string" && errorPayload.trim()) {
+     return errorPayload.trim();
+   }
+   if (typeof snapshot.message === "string" && snapshot.message.trim()) {
+     return snapshot.message.trim();
+   }
+   return "";
+ }
+ 
+ function updateProgressFromSnapshot(snapshot) {
+   if (!progressOverlay || !snapshot || typeof snapshot !== "object") {
+     return;
+   }
++  progressState.latestSnapshot = snapshot;
++  progressState.lastUpdateAt = Date.now();
++  progressState.heartbeatNotified = false;
++  setActiveArtifactDownloads(state.currentDownloads);
++
+   if (progressState.hideTimer) {
+     window.clearTimeout(progressState.hideTimer);
+     progressState.hideTimer = null;
+   }
+ 
+-  progressOverlay.classList.remove("hidden");
+-
+-  const status = typeof snapshot.status === "string" ? snapshot.status : "running";
+-  let stage = typeof snapshot.progress_stage === "string" && snapshot.progress_stage.trim()
++  const statusRaw = typeof snapshot.status === "string" ? snapshot.status.trim().toLowerCase() : "running";
++  let stageCandidate = typeof snapshot.progress_stage === "string" && snapshot.progress_stage.trim()
+     ? snapshot.progress_stage.trim().toLowerCase()
+     : "";
+-  if (!stage && typeof snapshot.step === "string" && snapshot.step.trim()) {
+-    stage = snapshot.step.trim().toLowerCase();
++  if (!stageCandidate && typeof snapshot.step === "string" && snapshot.step.trim()) {
++    stageCandidate = snapshot.step.trim().toLowerCase();
++  }
++  const stageForDetails = stageCandidate || "";
++  let stageSource = stageCandidate;
++  if (statusRaw === "succeeded") {
++    stageSource = "done";
++  } else if (statusRaw === "failed") {
++    stageSource = "error";
++  }
++  let normalizedStage = normalizeStageName(stageSource || "");
++  if (statusRaw === "succeeded") {
++    normalizedStage = "done";
++  } else if (statusRaw === "failed") {
++    normalizedStage = "error";
+   }
+-  if (status === "succeeded") {
+-    stage = "done";
+-  } else if (status === "failed") {
+-    stage = "error";
++  if (!normalizedStage) {
++    normalizedStage = progressState.lastStage || "draft";
++  }
++  if (!PROGRESS_STAGE_LABELS[normalizedStage] && normalizedStage !== "error") {
++    normalizedStage = progressState.lastStage || "draft";
++  }
++  progressState.lastStage = normalizedStage;
++
++  const stepStatus = resolveStepStatus(snapshot, normalizedStage);
++
++  if (maybeAutoHideProgress(normalizedStage, stepStatus, snapshot)) {
++    clearProgressHeartbeat();
++    return;
+   }
+-  if (!PROGRESS_STAGE_LABELS[stage]) {
+-    stage = progressState.lastStage || "draft";
++
++  if (progressState.overlaySuppressed) {
++    return;
+   }
+-  progressState.lastStage = stage;
++
++  progressOverlay.classList.remove("hidden");
++
++  const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
++    ? snapshot.progress_payload
++    : {};
++  const totalBatches = toNumber(payload.total ?? snapshot.batches_total);
++  const completedBatches = toNumber(payload.completed ?? snapshot.batches_completed);
+ 
+   let percentValue = null;
+-  if (typeof snapshot.progress === "number") {
++  let allowDecrease = false;
++  if (
++    normalizedStage === "draft"
++    && Number.isFinite(totalBatches)
++    && totalBatches > 0
++    && Number.isFinite(completedBatches)
++  ) {
++    const safeTotal = Math.max(1, totalBatches);
++    const safeCompleted = Math.max(0, Math.min(safeTotal, completedBatches));
++    percentValue = Math.round((safeCompleted / safeTotal) * 1000) / 10;
++    allowDecrease = true;
++  }
++  if (percentValue === null && typeof snapshot.progress === "number") {
+     percentValue = Math.round(clamp01(snapshot.progress) * 1000) / 10;
+   }
+   if (percentValue === null || Number.isNaN(percentValue)) {
+     percentValue = progressState.currentPercent || 0;
+   }
+-  percentValue = Math.max(progressState.currentPercent || 0, percentValue);
+-  percentValue = Math.min(100, percentValue);
++  if (!allowDecrease) {
++    percentValue = Math.max(progressState.currentPercent || 0, percentValue);
++  }
++  percentValue = Math.max(0, Math.min(100, percentValue));
+   progressState.currentPercent = percentValue;
+ 
+   if (progressBarFill) {
+     progressBarFill.style.width = `${percentValue}%`;
+   }
+   if (progressPercent) {
+     progressPercent.textContent = `${Math.round(percentValue)}%`;
+   }
+   if (progressBar) {
+     progressBar.setAttribute("aria-valuenow", String(Math.round(percentValue)));
+   }
+ 
+   let message = "";
+   if (typeof snapshot.progress_message === "string" && snapshot.progress_message.trim()) {
+     message = snapshot.progress_message.trim();
+-  } else if (status === "succeeded") {
++  } else if (statusRaw === "succeeded") {
+     message = PROGRESS_STAGE_MESSAGES.done;
+-  } else if (status === "failed") {
++  } else if (statusRaw === "failed") {
+     message = extractErrorMessage(snapshot) || PROGRESS_STAGE_MESSAGES.error;
+   } else if (typeof snapshot.message === "string" && snapshot.message.trim()) {
+     message = snapshot.message.trim();
+   } else {
+-    message = PROGRESS_STAGE_MESSAGES[stage] || DEFAULT_PROGRESS_MESSAGE;
++    const stageKey = normalizedStage === "error" ? "error" : normalizedStage;
++    message = PROGRESS_STAGE_MESSAGES[stageKey] || DEFAULT_PROGRESS_MESSAGE;
++  }
++  const notice = deriveProgressNotice(snapshot);
++  if (notice) {
++    message = notice;
+   }
+   if (progressMessage) {
+     progressMessage.textContent = message;
+   }
+ 
+   if (progressStage) {
+-    const label = PROGRESS_STAGE_LABELS[stage] || PROGRESS_STAGE_LABELS.draft;
++    const preferredStage = stageForDetails || normalizedStage;
++    const labelKey = PROGRESS_STAGE_LABELS[preferredStage]
++      ? preferredStage
++      : PROGRESS_STAGE_LABELS[normalizedStage]
++        ? normalizedStage
++        : progressState.lastStage || "draft";
++    const label = PROGRESS_STAGE_LABELS[labelKey] || PROGRESS_STAGE_LABELS.draft;
+     progressStage.textContent = `Шаг: ${label} 0→100%`;
+   }
+ 
+-  const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
+-    ? snapshot.progress_payload
+-    : null;
+   if (progressDetails) {
+-    progressDetails.textContent = formatProgressDetails(stage, payload);
++    const detailsStage = stageForDetails || normalizedStage;
++    progressDetails.textContent = formatProgressDetails(detailsStage, payload);
+   }
+ 
+-  if (status === "succeeded") {
+-    progressState.currentPercent = 100;
+-    if (progressPercent) {
+-      progressPercent.textContent = "100%";
+-    }
+-    if (progressBarFill) {
+-      progressBarFill.style.width = "100%";
+-    }
+-    if (progressBar) {
+-      progressBar.setAttribute("aria-valuenow", "100");
+-    }
+-    scheduleProgressHide(1200);
+-  } else if (status === "failed") {
++  setActiveArtifactDownloads(state.currentDownloads);
++
++  if (statusRaw === "succeeded" || statusRaw === "failed") {
+     progressState.currentPercent = 100;
+     if (progressPercent) {
+       progressPercent.textContent = "100%";
+     }
+     if (progressBarFill) {
+       progressBarFill.style.width = "100%";
+     }
+     if (progressBar) {
+       progressBar.setAttribute("aria-valuenow", "100");
+     }
+-    scheduleProgressHide(2500);
++    scheduleProgressHide(statusRaw === "succeeded" ? 1200 : 2500);
++    clearProgressHeartbeat();
++    return;
+   }
++
++  scheduleProgressHeartbeat();
+ }
+ 
+ function setInteractiveBusy(isBusy) {
+   interactiveElements.forEach((element) => {
+     if (!element) {
+       return;
+     }
+     if (isBusy) {
+       if (typeof element.dataset.interactiveLocked === "undefined") {
+         element.dataset.interactiveLocked = element.disabled ? "true" : "false";
+       }
+       element.disabled = true;
+     } else if (typeof element.dataset.interactiveLocked !== "undefined") {
+       const shouldRemainDisabled = element.dataset.interactiveLocked === "true";
+       if (!shouldRemainDisabled) {
+         element.disabled = false;
+       }
+       delete element.dataset.interactiveLocked;
+     }
+   });
+ 
+   if (advancedSettings) {
+     advancedSettings.classList.toggle("is-disabled", isBusy);
+   }
+ }
+diff --git a/jobs/models.py b/jobs/models.py
+index 11b237dd3844379e88d200ff1a3eb2436639f673..e1b1e59a09845c1d385af0878f4a17625a00b75d 100644
+--- a/jobs/models.py
++++ b/jobs/models.py
+@@ -177,78 +177,137 @@ def summarize_job(job: "Job") -> Dict[str, Any]:
+     }
+     step_alias = {
+         "jsonld": "finalize",
+         "post_analysis": "finalize",
+     }
+     step_labels = {
+         "draft": "Черновик",
+         "refine": "Полировка",
+         "finalize": "Финализация",
+         "jsonld": "JSON-LD",
+         "post_analysis": "Пост-анализ",
+         "done": "Готово",
+     }
+ 
+     status = status_map.get(job.status, job.status.value)
+ 
+     total_steps = len(job.steps)
+     completed = sum(
+         1
+         for step in job.steps
+         if step.status in {JobStepStatus.SUCCEEDED, JobStepStatus.DEGRADED, JobStepStatus.SKIPPED}
+     )
+     running_step = next((step for step in job.steps if step.status == JobStepStatus.RUNNING), None)
+     pending_step = next((step for step in job.steps if step.status == JobStepStatus.PENDING), None)
+ 
++    stage_to_steps = {
++        "draft": {"draft"},
++        "trim": {"refine"},
++        "refine": {"refine"},
++        "finalize": {"jsonld", "post_analysis"},
++        "validate": {"jsonld", "post_analysis"},
++        "jsonld": {"jsonld"},
++        "post_analysis": {"post_analysis"},
++        "done": {"post_analysis"},
++    }
++
+     if status in {"succeeded", "failed"}:
+         step_name = "done"
+         progress = 1.0
+     else:
+         if running_step:
+             step_name = step_alias.get(running_step.name, running_step.name)
+         elif pending_step:
+             step_name = step_alias.get(pending_step.name, pending_step.name)
+         elif job.steps:
+             step_name = step_alias.get(job.steps[-1].name, job.steps[-1].name)
+         else:
+             step_name = "draft"
+         if total_steps:
+             progress = completed / total_steps
+             if running_step:
+                 progress += 0.5 / total_steps
+             progress = min(1.0, max(0.0, progress))
+         else:
+             progress = 0.0
+ 
+     if job.progress_value is not None:
+         progress = max(0.0, min(1.0, float(job.progress_value)))
+     if job.progress_stage:
+         step_name = job.progress_stage
+ 
+     if status == "queued":
+         message = "Задание в очереди"
+     elif status == "running":
+         message = job.progress_message or f"Шаг: {step_labels.get(step_name, step_name)}"
+     elif status == "succeeded":
+         message = job.progress_message or "Готово"
+     else:
+         error_message = ""
+         if isinstance(job.error, dict):
+             error_message = str(job.error.get("message") or "").strip()
+         message = error_message or "Завершено с ошибкой"
+ 
+-    if job.progress_message and status in {"running", "succeeded"}:
+-        message = job.progress_message
+-
+     timestamps = [job.created_at, job.started_at, job.finished_at, job.last_event_at]
+     for step in job.steps:
+         timestamps.extend([step.started_at, step.finished_at])
+     last_event_candidates = [ts for ts in timestamps if ts]
+     last_event = max(last_event_candidates) if last_event_candidates else utcnow()
+ 
+-    return {
++    if job.progress_message and status in {"running", "succeeded"}:
++        message = job.progress_message
++
++    stage_lookup = stage_to_steps.get(step_name, {step_name})
++    relevant_steps = [step for step in job.steps if step.name in stage_lookup]
++    if not relevant_steps and job.steps:
++        relevant_steps = [job.steps[-1]]
++
++    if status == "succeeded":
++        step_status_value = "completed"
++    elif status == "failed":
++        step_status_value = "failed"
++    elif relevant_steps:
++        order = (
++            ("running", lambda s: s.status == JobStepStatus.RUNNING),
++            ("failed", lambda s: s.status == JobStepStatus.FAILED),
++            ("degraded", lambda s: s.status == JobStepStatus.DEGRADED),
++            ("completed", lambda s: s.status == JobStepStatus.SUCCEEDED),
++            ("skipped", lambda s: s.status == JobStepStatus.SKIPPED),
++            ("pending", lambda s: s.status == JobStepStatus.PENDING),
++        )
++        step_status_value = "pending"
++        for label, predicate in order:
++            if any(predicate(step) for step in relevant_steps):
++                step_status_value = label
++                break
++    else:
++        step_status_value = "pending"
++
++    if running_step and step_alias.get(running_step.name, running_step.name) == step_name:
++        step_status_value = "running"
++
++    batches_done = None
++    batches_total = None
++    if job.progress_payload:
++        try:
++            batches_done = int(job.progress_payload.get("completed"))
++        except Exception:  # pragma: no cover - defensive
++            batches_done = None
++        try:
++            batches_total = int(job.progress_payload.get("total"))
++        except Exception:  # pragma: no cover - defensive
++            batches_total = None
++        if batches_done is not None and batches_total is not None and batches_total < 0:
++            batches_total = None
++    result = {
+         "status": status,
+         "step": step_name,
+         "progress": round(progress, 4),
+         "last_event_at": last_event.strftime(ISO_FORMAT),
+         "message": message,
++        "step_status": step_status_value,
+     }
++    if batches_done is not None:
++        result["batches_completed"] = batches_done
++    if batches_total is not None:
++        result["batches_total"] = batches_total
++    return result
+diff --git a/jobs/runner.py b/jobs/runner.py
+index 594c9164636c2fa3edb5b503c17008ab7dfc2703..05ab631e8a0b2d3af7baf7f50bf7353cad84ab47 100644
+--- a/jobs/runner.py
++++ b/jobs/runner.py
+@@ -194,50 +194,51 @@ class JobRunner:
+                 step.mark_failed(result.error, **result.payload)
+             log_step(
+                 LOGGER,
+                 job_id=job.id,
+                 step=step.name,
+                 status=step.status.value,
+                 error=result.error,
+                 payload=result.payload or None,
+             )
+             ctx.degradation_flags.extend(result.degradation_flags)
+             self._store.touch(job.id)
+             if not result.continue_pipeline:
+                 break
+ 
+         ctx.ensure_markdown(_build_fallback_text(task.payload))
+         if ctx.degradation_flags:
+             ctx.degradation_flags = list(dict.fromkeys(ctx.degradation_flags))
+         result_payload = {
+             "markdown": ctx.markdown,
+             "meta_json": ctx.meta_json,
+             "faq_entries": ctx.faq_entries,
+             "errors": ctx.errors or None,
+         }
+         if ctx.artifact_paths:
+             result_payload["artifact_paths"] = ctx.artifact_paths
++        result_payload["artifact_saved"] = bool(ctx.artifact_paths)
+         job.mark_succeeded(result_payload, degradation_flags=ctx.degradation_flags)
+         self._record_progress(job, "done", 1.0, message=PROGRESS_STAGE_MESSAGES.get("done"))
+         self._store.touch(job.id)
+         JOB_COUNTER.inc()
+ 
+     def _execute_step(
+         self,
+         step_name: str,
+         payload: Dict[str, Any],
+         ctx: PipelineContext,
+         job: Optional[Job],
+     ) -> StepResult:
+         if step_name == "draft":
+             return self._run_draft_step(payload, ctx, job)
+         if step_name == "refine":
+             return self._run_refine_step(ctx, job)
+         if step_name == "jsonld":
+             return self._run_jsonld_step(ctx, job)
+         if step_name == "post_analysis":
+             return self._run_post_analysis_step(ctx, job)
+         return StepResult(JobStepStatus.SUCCEEDED, payload={"skipped": True})
+ 
+     def _record_progress(
+         self,
+         job: Optional[Job],
 diff --git a/llm_client.py b/llm_client.py
-index 1b0d3c295ad2cdcd425b173bb46d45e10055bcda..b2181462840c29e501e8059618ec2d70344a8b8c 100644
+index b2181462840c29e501e8059618ec2d70344a8b8c..83012f165f90e9d85179525acaab9874e76ac3b0 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -662,82 +662,91 @@ def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, ob
-         context="sanitize_payload.text",
-     )
-     if not sanitized_format:
-         return None
-     return {"format": sanitized_format}
- 
- 
- def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str, object], int]:
-     """Restrict Responses payload to the documented whitelist and types."""
- 
-     sanitized: Dict[str, object] = {}
-     unexpected_keys = [key for key in payload.keys() if key not in RESPONSES_ALLOWED_KEYS]
-     if unexpected_keys:
-         LOGGER.warning(
-             "RESP_PAYLOAD_TRIMMED unknown_keys=%s",
-             sorted(str(key) for key in unexpected_keys),
-         )
-     for key in RESPONSES_ALLOWED_KEYS:
-         if key not in payload:
-             continue
-         value = payload.get(key)
-         if value is None:
-             continue
-         if isinstance(value, str):
-             trimmed = value.strip()
-+            if key == "input":
-+                sanitized[key] = trimmed
-+                continue
-             if not trimmed:
-                 continue
-             if key == "model":
-                 sanitized[key] = trimmed
-                 continue
--            if key == "input":
--                sanitized[key] = trimmed
--                continue
-             if key == "previous_response_id":
-                 sanitized[key] = trimmed
-                 continue
-         if key == "input" and not isinstance(value, str):
-             if isinstance(value, (list, dict)):
-                 converted = json.dumps(value, ensure_ascii=False)
-             else:
-                 converted = str(value)
-             converted = converted.strip()
--            if converted:
-+            if converted or "input" not in sanitized:
-                 sanitized[key] = converted
-             continue
-         if key == "max_output_tokens":
-             try:
-                 sanitized[key] = int(value)
-             except (TypeError, ValueError):
-                 continue
-             continue
-         if key == "text":
-             if isinstance(value, dict):
-                 sanitized_text = _sanitize_text_block(value)
-                 if sanitized_text:
-                     sanitized["text"] = sanitized_text
-             continue
-+    if "input" not in sanitized and "input" in payload:
-+        raw_input = payload.get("input")
-+        if isinstance(raw_input, str):
-+            sanitized["input"] = raw_input.strip()
-+        elif raw_input is None:
-+            sanitized["input"] = ""
-+        else:
-+            sanitized["input"] = str(raw_input).strip()
-+
-     input_value = sanitized.get("input", "")
-     input_length = len(input_value) if isinstance(input_value, str) else 0
-     return sanitized, input_length
- 
- 
- def _store_responses_request_snapshot(payload: Dict[str, object]) -> None:
-     """Persist a sanitized snapshot of the latest Responses API request."""
- 
-     try:
-         RESPONSES_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-         snapshot = dict(payload)
-         input_value = snapshot.pop("input", "")
-         if isinstance(input_value, str):
-             preview = input_value[:200]
-         else:
-             preview = str(input_value)[:200]
-         snapshot["input_preview"] = preview
-         RESPONSES_REQUEST_PATH.write_text(
-             json.dumps(snapshot, ensure_ascii=False, indent=2),
-             encoding="utf-8",
-         )
-     except Exception as exc:  # pragma: no cover - diagnostics only
-         LOGGER.debug("failed to persist Responses request snapshot: %s", exc)
- 
- 
-@@ -1433,50 +1442,53 @@ def _needs_format_name_retry(response: httpx.Response) -> bool:
-     if "text.format" in lowered and "missing" in lowered and "name" in lowered:
-         return True
-     if "unsupported parameter" in lowered and "text.format" in lowered:
-         return True
-     if "moved to text.format" in lowered and "name" in lowered:
-         return True
-     return False
- 
- 
- def _make_request(
-     http_client: httpx.Client,
-     *,
-     api_url: str,
-     headers: Dict[str, str],
-     payload: Dict[str, object],
-     schedule: List[float],
- ) -> Tuple[Dict[str, object], bool]:
-     last_error: Optional[BaseException] = None
-     shimmed_param = False
-     stripped_param: Optional[str] = None
-     current_payload: Dict[str, object] = dict(payload)
-     attempt_index = 0
-     while attempt_index < MAX_RETRIES:
-         attempt_index += 1
-         try:
-+            input_candidate = current_payload.get("input", "")
-+            input_len = len(input_candidate) if isinstance(input_candidate, str) else 0
-+            LOGGER.info("responses input_len=%d", input_len)
-             response = http_client.post(api_url, headers=headers, json=current_payload)
-             response.raise_for_status()
-             data = response.json()
-             if isinstance(data, dict):
-                 return data, shimmed_param
-             raise RuntimeError("Модель вернула неожиданный формат ответа.")
-         except EmptyCompletionError:
-             raise
-         except httpx.HTTPStatusError as exc:
-             status = exc.response.status_code
-             if (
-                 status == 400
-                 and not shimmed_param
-                 and exc.response is not None
-             ):
-                 param_name = _extract_unknown_parameter_name(exc.response)
-                 if param_name:
-                     if param_name in current_payload:
-                         current_payload = dict(current_payload)
-                         current_payload.pop(param_name, None)
-                     shimmed_param = True
-                     stripped_param = param_name
-                     LOGGER.warning(
-                         "retry=shim_unknown_param: stripped '%s' from payload",
-                         param_name,
-@@ -1928,84 +1940,84 @@ def generate(
-                 segments = int(poll_parse_flags.get("segments", 0) or 0)
-                 LOGGER.info("RESP_POLL_STATUS=%s|%s", poll_status or "ok", poll_reason or "-")
-                 if poll_status == "completed" and (text or segments > 0):
-                     return payload
-                 if poll_status == "incomplete" and poll_reason == "max_output_tokens":
-                     LOGGER.info(
-                         "RESP_STATUS=incomplete|max_output_tokens=%s",
-                         sanitized_payload.get("max_output_tokens"),
-                     )
-                     break
-                 if poll_attempt >= MAX_RESPONSES_POLL_ATTEMPTS:
-                     break
-                 sleep_for = schedule[min(poll_attempt - 1, len(schedule) - 1)] if schedule else 0.5
-                 LOGGER.info("responses poll sleep=%.2f", sleep_for)
-                 time.sleep(sleep_for)
-             return None
- 
-         while attempts < max_attempts:
-             attempts += 1
-             if resume_from_response_id:
-                 current_payload = {
-                     "model": base_model_name,
-                     "previous_response_id": resume_from_response_id,
-                     "max_output_tokens": max(min_token_floor, int(current_max)),
-                 }
-+                continue_prompt = base_input_text if base_input_text else "Continue generation"
-+                current_payload["input"] = continue_prompt
-                 _apply_text_format(current_payload)
-                 LOGGER.info(
-                     "RESP_CONTINUE previous_response_id=%s model=%s max_output_tokens=%s",
-                     resume_from_response_id,
-                     base_model_name,
-                     current_payload.get("max_output_tokens"),
-                 )
-             else:
-                 current_payload = dict(sanitized_payload)
-                 _apply_text_format(current_payload)
-                 if not content_started:
-                     if shrink_applied and shrunken_input:
-                         current_payload["input"] = shrunken_input
-                     elif shrink_next_attempt:
-                         shrink_next_attempt = False
-                         if shrunken_input and shrunken_input != base_input_text:
-                             current_payload["input"] = shrunken_input
-                             shrink_applied = True
-                             LOGGER.info(
-                                 "RESP_PROMPT_SHRINK original_len=%d shrunk_len=%d",
-                                 len(base_input_text),
-                                 len(shrunken_input),
+@@ -2197,50 +2197,94 @@ def generate(
+                                 sanitized_payload["max_output_tokens"] = max(
+                                     min_token_floor, int(current_max)
+                                 )
+                                 shrink_next_attempt = False
+                                 continue
+                         if cap_exhausted:
+                             output_length = 0
+                             content_length = 0
+                             if isinstance(parse_flags, dict):
+                                 output_length = int(
+                                     parse_flags.get("output_text_len", 0) or 0
+                                 )
+                                 content_length = int(
+                                     parse_flags.get("content_text_len", 0) or 0
+                                 )
+                             LOGGER.warning(
+                                 "LLM_WARN cap_reached limit=%s output_len=%d content_len=%d status=%s reason=%s",
+                                 upper_cap,
+                                 output_length,
+                                 content_length,
+                                 status or "",
+                                 reason or "",
                              )
-                 else:
-                     if shrink_applied:
-                         LOGGER.info("RESP_PROMPT_SHRINK_DISABLED after_content_started")
-                     shrink_applied = False
-                     shrink_next_attempt = False
-                 current_payload["max_output_tokens"] = max(min_token_floor, int(current_max))
-             if attempts > 1:
-                 retry_used = True
-             format_block, fmt_type, fmt_name, has_schema, fixed_name = _ensure_format_name(current_payload)
--            if resume_from_response_id:
--                current_payload.pop("input", None)
-             suffix = " (fixed=name)" if fixed_name else ""
-             LOGGER.info(
-                 "LOG:RESP_PAYLOAD_FORMAT type=%s name=%s has_schema=%s%s",
-                 fmt_type,
-                 fmt_name or "-",
-                 has_schema,
-                 suffix,
+                             cap_retry_performed = True
+                             shrink_next_attempt = False
++                            current_max_tokens = int(current_max)
++                            final_cap_reached = cap_exhausted and (
++                                reason == "max_output_tokens_final"
++                                or (
++                                    reason == "max_output_tokens"
++                                    and upper_cap is not None
++                                    and current_max_tokens >= int(upper_cap)
++                                )
++                                or current_max_tokens >= 3600
++                            )
++                            if final_cap_reached and output_length <= 0:
++                                _record_pending_degradation("max_output_tokens")
++                                metadata = dict(metadata)
++                                metadata["cap_reached_final"] = True
++                                metadata["step_status"] = "degraded"
++                                terminal_reason = (
++                                    reason or "max_output_tokens"
++                                )
++                                if (
++                                    terminal_reason != "max_output_tokens_final"
++                                    and current_max_tokens >= 3600
++                                ):
++                                    terminal_reason = "max_output_tokens_final"
++                                metadata["incomplete_reason"] = terminal_reason
++                                metadata["degradation_reason"] = terminal_reason
++                                existing_flags: List[str] = []
++                                raw_flags = metadata.get("degradation_flags")
++                                if isinstance(raw_flags, list):
++                                    existing_flags = [
++                                        str(flag).strip()
++                                        for flag in raw_flags
++                                        if isinstance(flag, str) and str(flag).strip()
++                                    ]
++                                if "draft_max_tokens" not in existing_flags:
++                                    existing_flags.append("draft_max_tokens")
++                                metadata["degradation_flags"] = existing_flags
++                                if not metadata.get("completion_warning"):
++                                    metadata["completion_warning"] = "max_output_tokens"
++                                metadata = _apply_pending_degradation(metadata)
++                                parse_flags["metadata"] = metadata
++                                updated_data = dict(data)
++                                updated_data["metadata"] = metadata
++                                _persist_raw_response(updated_data)
++                                return text or "", parse_flags, updated_data, schema_label
+                     last_error = RuntimeError("responses_incomplete")
+                     incomplete_retry_count += 1
+                     if incomplete_retry_count >= 2:
+                         break
+                     shrink_next_attempt = True
+                     continue
+                 if not text:
+                     if (
+                         status == "incomplete"
+                         and reason == "soft_timeout"
+                         and schema_label == "responses.none"
+                         and segments == 0
+                     ):
+                         _record_pending_degradation(reason)
+                     if (
+                         allow_empty_retry
+                         and status == "incomplete"
+                         and segments == 0
+                         and not empty_direct_retry_attempted
+                     ):
+                         empty_direct_retry_attempted = True
+                         resume_from_response_id = None
+                         shrink_next_attempt = False
+                         reduced = int(round(int(current_max) * 0.85)) if current_max else 0
+                         if reduced <= 0 or reduced >= int(current_max):
+diff --git a/server/__init__.py b/server/__init__.py
+index 5ebf8db6cba261e1f907b2eebebeac58163973cc..af88c098fbbedf357399c79bc50853e6d5301d49 100644
+--- a/server/__init__.py
++++ b/server/__init__.py
+@@ -457,56 +457,65 @@ def create_app() -> Flask:
+                     {
+                         "error": {
+                             "message": "Job not found",
+                             "trace_id": trace_id,
+                         }
+                     }
+                 ),
+                 404,
              )
-             updated_format: Optional[Dict[str, object]] = None
-             if isinstance(format_block, dict):
-                 try:
-                     updated_format = deepcopy(format_block)
-                 except (TypeError, ValueError):
-                     updated_format = _clone_text_format()
-             if not resume_from_response_id and isinstance(updated_format, dict):
-                 sanitized_payload["text"] = {"format": deepcopy(updated_format)}
-                 format_template = deepcopy(updated_format)
-             if isinstance(updated_format, dict):
-                 try:
-                     format_snapshot = json.dumps(updated_format, ensure_ascii=False, sort_keys=True)
-                 except (TypeError, ValueError):
-                     format_snapshot = str(updated_format)
-                 LOGGER.debug("DEBUG:payload.text.format = %s", format_snapshot)
-                 current_payload["text"] = {"format": deepcopy(updated_format)}
-             else:
-diff --git a/orchestrate.py b/orchestrate.py
-index 544d611531bd8d128a88358ef2b24da4d1190da6..2e70f83743f54a0fa952a6cd7bb401d0f523757a 100644
---- a/orchestrate.py
-+++ b/orchestrate.py
-@@ -1,69 +1,72 @@
+         return jsonify(snapshot)
+ 
+     @app.get("/api/jobs/<job_id>/stream")
+     def job_stream(job_id: str):
+         def _event_stream():
+             last_signature = None
+             while True:
+                 snapshot = JOB_RUNNER.get_job(job_id)
+                 if not snapshot:
+                     payload = {
+                         "status": "failed",
+                         "message": "Задание не найдено",
+                         "job_id": job_id,
+                     }
+                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                     break
++                progress_payload = snapshot.get("progress_payload")
++                payload_signature = None
++                if progress_payload and isinstance(progress_payload, dict):
++                    try:
++                        payload_signature = json.dumps(progress_payload, ensure_ascii=False, sort_keys=True)
++                    except (TypeError, ValueError):
++                        payload_signature = str(progress_payload)
+                 signature = (
+                     snapshot.get("status"),
+                     snapshot.get("step"),
+                     snapshot.get("progress"),
+                     snapshot.get("progress_stage"),
+                     snapshot.get("progress_message"),
++                    snapshot.get("step_status"),
++                    payload_signature,
+                     snapshot.get("last_event_at"),
+                 )
+                 if signature != last_signature:
+                     yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                     last_signature = signature
+                 if snapshot.get("status") in {"succeeded", "failed"}:
+                     break
+                 time.sleep(1.0)
+ 
+         response = Response(stream_with_context(_event_stream()), mimetype="text/event-stream")
+         response.headers["Cache-Control"] = "no-cache"
+         response.headers["X-Accel-Buffering"] = "no"
+         return response
+ 
+     @app.post("/api/reindex")
+     def reindex():
+         payload = _require_json(request)
+         theme = str(payload.get("theme", "")).strip()
+         if not theme:
+             raise ApiError("Не указана тема (theme)")
+ 
+         try:
+             stats = build_index(theme)
+         except FileNotFoundError as exc:
+             raise ApiError(str(exc), status_code=404) from exc
+@@ -917,54 +926,57 @@ def _extract_keywords(glossary_path: Path) -> List[str]:
+     for line in glossary_path.read_text(encoding="utf-8").splitlines():
+         cleaned = line.strip()
+         if not cleaned:
+             continue
+         keyword = cleaned.split("—", 1)[0].strip()
+         if keyword:
+             keywords.append(keyword)
+         if len(keywords) >= 6:
+             break
+     return keywords
+ 
+ 
+ def _load_pipeline_config(theme_dir: Path) -> Dict[str, Any]:
+     config_path = theme_dir / PIPELINE_CONFIG_FILENAME
+     if not config_path.exists():
+         return {}
+     try:
+         payload = json.loads(config_path.read_text(encoding="utf-8"))
+     except json.JSONDecodeError:
+         LOGGER.warning("Повреждён pipeline config: %s", config_path)
+         return {}
+     return payload if isinstance(payload, dict) else {}
+ 
+ 
+ def _format_generation_success(result: Dict[str, Any]) -> Dict[str, Any]:
++    artifact_saved_raw = result.get("artifact_saved")
++    artifact_saved = bool(artifact_saved_raw) if artifact_saved_raw is not None else bool(result.get("artifact_paths"))
+     payload: Dict[str, Any] = {
+         "markdown": result.get("text"),
+         "meta_json": result.get("metadata"),
+         "artifact_paths": result.get("artifact_paths"),
++        "artifact_saved": artifact_saved,
+     }
+     metadata = result.get("metadata") or {}
+     if isinstance(metadata, dict):
+         if metadata.get("style_profile_applied"):
+             payload["style_profile_applied"] = True
+             if metadata.get("style_profile_source"):
+                 payload["style_profile_source"] = metadata["style_profile_source"]
+             if metadata.get("style_profile_variant"):
+                 payload["style_profile_variant"] = metadata["style_profile_variant"]
+         if metadata.get("keywords_manual") is not None:
+             payload["keywords_manual"] = metadata.get("keywords_manual")
+         payload["model_used"] = metadata.get("model_used")
+         payload["fallback_used"] = metadata.get("fallback_used")
+         payload["fallback_reason"] = metadata.get("fallback_reason")
+         payload["api_route"] = metadata.get("api_route")
+     return payload
+ 
+ 
+ def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[str, Any]:
+     topic = str(data.get("theme") or data.get("goal") or theme).strip() or "Тема не указана"
+     markdown = (
+         f"# Черновик (dry run)\n\n"
+         f"Тематика: {theme}\n\n"
+         f"Запрошенная тема: {topic}\n\n"
+         "Этот ответ сформирован без обращения к модели."
+diff --git a/tests/test_job_runner.py b/tests/test_job_runner.py
+index d810bab6774a1dcd0d4a96b6d46c919e01c828ea..4d52c0bf3600f8d7bc2041b64235047395819553 100644
+--- a/tests/test_job_runner.py
++++ b/tests/test_job_runner.py
+@@ -1,58 +1,60 @@
  from __future__ import annotations
  
- import argparse
- import json
-+import logging
- import httpx
- import os
- import sys
- import time
- from copy import deepcopy
- from dataclasses import dataclass, field
- from datetime import datetime
- from pathlib import Path
- from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+ import pytest
  
- from zoneinfo import ZoneInfo
- 
- from assemble_messages import ContextBundle, assemble_messages, retrieve_context
- from artifacts_store import _atomic_write_text as store_atomic_write_text, register_artifact
- from config import (
-     DEFAULT_MAX_LENGTH,
-     DEFAULT_MIN_LENGTH,
-     LLM_ALLOW_FALLBACK,
-     LLM_ROUTE,
-     MAX_CUSTOM_CONTEXT_CHARS,
-     OPENAI_API_KEY,
- )
- from deterministic_pipeline import DeterministicPipeline, PipelineStep, PipelineStepError
- from llm_client import (
-     DEFAULT_MODEL,
-     RESPONSES_API_URL,
-     build_responses_payload,
-     is_min_tokens_error,
-     sanitize_payload_for_responses,
- )
- from keywords import parse_manual_keywords
- from length_limits import ResolvedLengthLimits, resolve_length_limits
- from validators import ValidationResult, length_no_spaces
- 
- BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
- TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
- LATEST_SCHEMA_VERSION = "2024-06"
- 
- HEALTH_MODEL = DEFAULT_MODEL
- HEALTH_PROMPT = "Ответь ровно словом: PONG"
-+LOGGER = logging.getLogger(__name__)
-+
- HEALTH_INITIAL_MAX_TOKENS = 10
- HEALTH_MIN_BUMP_TOKENS = 24
++from jobs.models import Job, JobStep
+ from jobs.runner import JobRunner
+ from jobs.store import JobStore
  
  
- @dataclass
- class GenerationContext:
-     data: Dict[str, Any]
-     context_bundle: ContextBundle
-     messages: List[Dict[str, Any]]
-     clip_texts: List[str]
-     style_profile_applied: bool = False
-     style_profile_source: Optional[str] = None
-     style_profile_variant: Optional[str] = None
-     keywords_manual: List[str] = field(default_factory=list)
-     context_source: str = "index.json"
-     custom_context_text: Optional[str] = None
-     custom_context_len: int = 0
-     custom_context_filename: Optional[str] = None
-     custom_context_hash: Optional[str] = None
-     custom_context_truncated: bool = False
-     jsonld_requested: bool = False
-     length_limits: Optional[ResolvedLengthLimits] = None
-     faq_questions: int = 0
+ @pytest.fixture
+ def job_store() -> JobStore:
+     return JobStore(ttl_seconds=30)
  
  
-@@ -735,50 +738,53 @@ def _run_health_ping() -> Dict[str, object]:
- 
-     try:
-         with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
-             model_probe = client.get(model_url, headers=headers)
-             if model_probe.status_code != 200:
-                 detail = model_probe.text.strip()
-                 if len(detail) > 120:
-                     detail = f"{detail[:117]}..."
-                 latency_ms = int((time.perf_counter() - start) * 1000)
-                 return {
-                     "ok": False,
-                     "message": (
-                         f"Модель {model} недоступна: HTTP {model_probe.status_code}"
-                         + (f" — {detail}" if detail else "")
-                     ),
-                     "route": "models",
-                     "fallback_used": LLM_ALLOW_FALLBACK,
-                     "latency_ms": latency_ms,
-                 }
- 
-             while attempts < max_attempts:
-                 attempts += 1
-                 payload_snapshot = dict(sanitized_payload)
-                 payload_snapshot["text"] = {"format": deepcopy(text_format)}
-                 payload_snapshot["max_output_tokens"] = current_max_tokens
-+                input_candidate = payload_snapshot.get("input", "")
-+                input_len = len(input_candidate) if isinstance(input_candidate, str) else 0
-+                LOGGER.info("responses input_len=%d", input_len)
-                 response = client.post(
-                     RESPONSES_API_URL,
-                     json=payload_snapshot,
-                     headers=headers,
-                 )
-                 if (
-                     response.status_code == 400
-                     and not min_bump_done
-                     and is_min_tokens_error(response)
-                 ):
-                     current_max_tokens = max(current_max_tokens, HEALTH_MIN_BUMP_TOKENS)
-                     sanitized_payload["max_output_tokens"] = current_max_tokens
-                     min_bump_done = True
-                     auto_bump_applied = True
-                     continue
-                 break
-     except httpx.TimeoutException:
-         latency_ms = int((time.perf_counter() - start) * 1000)
+ def test_job_runner_success(monkeypatch, job_store):
+     def _fake_generate(**_kwargs):
          return {
-             "ok": False,
-             "message": "Responses недоступен: таймаут",
-             "route": route,
-             "fallback_used": fallback_used,
-             "latency_ms": latency_ms,
+             "text": "Hello world",
+             "metadata": {
+                 "jsonld": {
+                     "faq": [
+                         {"question": "What?", "answer": "Answer"},
+                     ]
+                 }
+             },
          }
+ 
+     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
+     runner = JobRunner(job_store, soft_timeout_s=2)
+     job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-1")
+     assert runner.wait(job.id, timeout=5) is True
+     snapshot = runner.get_job(job.id)
+     assert snapshot["status"] == "succeeded"
+     assert snapshot.get("step") == "done"
++    assert snapshot.get("step_status") == "completed"
+     assert snapshot.get("progress") == 1.0
+     assert snapshot.get("message") == "Готово"
+     assert snapshot.get("last_event_at")
+     assert snapshot["result"]["markdown"].startswith("Hello")
+     assert snapshot["degradation_flags"] in (None, [])
+     assert snapshot["trace_id"] == "trace-1"
+ 
+ 
+ def test_job_runner_degradation(monkeypatch, job_store):
+     def _raise_generate(**_kwargs):
+         raise RuntimeError("boom")
+ 
+     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _raise_generate)
+     runner = JobRunner(job_store, soft_timeout_s=1)
+     job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-2")
+     runner.wait(job.id, timeout=3)
+     snapshot = runner.get_job(job.id)
+     assert snapshot["status"] == "succeeded"
+     assert snapshot.get("step") == "done"
+     assert snapshot.get("progress") == 1.0
+     assert snapshot.get("message") == "Готово"
+     assert "draft_failed" in (snapshot.get("degradation_flags") or [])
+     assert "markdown" in snapshot["result"]
+     assert "demo" in snapshot["result"]["markdown"]
+ 
+@@ -61,26 +63,38 @@ def test_job_runner_draft_degraded_on_max_tokens(monkeypatch, job_store):
+     artifact_paths = {
+         "markdown": "artifacts/demo.md",
+         "metadata": "artifacts/demo.json",
+     }
+ 
+     def _fake_generate(**_kwargs):
+         return {
+             "text": "Частичный черновик",
+             "metadata": {
+                 "degradation_flags": ["draft_max_tokens"],
+                 "completion_warning": "max_output_tokens",
+             },
+             "artifact_paths": artifact_paths,
+         }
+ 
+     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
+     runner = JobRunner(job_store, soft_timeout_s=2)
+     job = runner.submit({"theme": "demo", "data": {}, "k": 0})
+     runner.wait(job.id, timeout=5)
+     snapshot = runner.get_job(job.id)
+     draft_step = next(step for step in snapshot["steps"] if step["name"] == "draft")
+     assert draft_step["status"] == "degraded"
+     assert draft_step["error"] == "max_output_tokens"
+     assert draft_step["payload"]["artifact_paths"] == artifact_paths
+     assert snapshot["result"]["artifact_paths"] == artifact_paths
++    assert snapshot["result"].get("artifact_saved") is True
+     assert "draft_max_tokens" in (snapshot.get("degradation_flags") or [])
++
++
++def test_job_snapshot_includes_batch_counters(job_store):
++    job = Job(id="demo-job", steps=[JobStep(name="draft")])
++    job_store.create(job)
++
++    job.update_progress(stage="draft", progress=0.25, payload={"total": 8, "completed": 2})
++
++    snapshot = job_store.snapshot(job.id)
++    assert snapshot["batches_total"] == 8
++    assert snapshot["batches_completed"] == 2
 diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index e727a2cbcefac3333cfd3dc64976a0ffea5d6556..b0672e54c03fdc68570f2448fb1cc57c7f5b46b9 100644
+index b0672e54c03fdc68570f2448fb1cc57c7f5b46b9..6df9c2def0dd76c860a6abd4b227e45241cc962f 100644
 --- a/tests/test_llm_client.py
 +++ b/tests/test_llm_client.py
-@@ -266,32 +266,41 @@ def test_responses_continue_includes_model_and_tokens(monkeypatch):
+@@ -229,50 +229,71 @@ def test_generate_retries_empty_completion_with_fallback():
+ 
+ def test_generate_accepts_incomplete_with_text():
+     payload = {
+         "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "{\"intro\": \"Hello\"}"},
+                 ]
+             }
+         ],
+     }
+     result, client = _generate_with_dummy(responses=[payload], max_tokens=120)
+     assert isinstance(result, GenerationResult)
+     assert result.text.strip() == '{"intro": "Hello"}'
+     metadata = result.metadata or {}
+     assert metadata.get("status") == "completed"
+     assert metadata.get("incomplete_reason") in (None, "")
+     assert metadata.get("completion_warning") == "max_output_tokens"
+     flags = metadata.get("degradation_flags") or []
+     assert "draft_max_tokens" in flags
+     assert len(client.requests) == 1
+ 
+ 
++def test_generate_marks_final_cap_as_degraded():
++    payload = {
++        "id": "resp-cap",
++        "status": "incomplete",
++        "incomplete_details": {"reason": "max_output_tokens"},
++        "output": [],
++    }
++    with patch("llm_client.LOGGER"):
++        result, client = _generate_with_dummy(responses=[payload], max_tokens=3600)
++    assert isinstance(result, GenerationResult)
++    metadata = result.metadata or {}
++    assert metadata.get("step_status") == "degraded"
++    assert metadata.get("cap_reached_final") is True
++    assert metadata.get("degradation_reason") == "max_output_tokens_final"
++    assert metadata.get("incomplete_reason") == "max_output_tokens_final"
++    flags = metadata.get("degradation_flags") or []
++    assert "draft_max_tokens" in flags
++    assert result.text == ""
++    assert len(client.requests) == 1
++
++
+ def test_responses_continue_includes_model_and_tokens(monkeypatch):
+     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_BASE", 64, raising=False)
+     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP1", 96, raising=False)
+     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP2", 128, raising=False)
+     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 128, raising=False)
+     monkeypatch.setattr("llm_client.G5_ESCALATION_LADDER", (64, 96, 128), raising=False)
+ 
+     incomplete_payload = {
+         "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
+         "id": "resp-1",
+         "output": [],
      }
      final_payload = {
          "status": "completed",
@@ -388,102 +1598,4 @@ index e727a2cbcefac3333cfd3dc64976a0ffea5d6556..b0672e54c03fdc68570f2448fb1cc57c
      }
  
      with patch("llm_client.LOGGER"):
-         result, client = _generate_with_dummy(
-             responses=[incomplete_payload, final_payload],
-             max_tokens=64,
-         )
- 
-     assert len(client.requests) == 2
-     primary_payload = client.requests[0]["json"]
-     continue_payload = client.requests[1]["json"]
- 
-     assert continue_payload["previous_response_id"] == "resp-1"
-     assert continue_payload["model"] == primary_payload["model"]
-     assert continue_payload["text"]["format"] == primary_payload["text"]["format"]
-+    assert "input" in continue_payload
-+    assert isinstance(continue_payload["input"], str)
-+    if primary_payload.get("input"):
-+        assert continue_payload["input"] in {
-+            primary_payload["input"],
-+            "Continue generation",
-+        }
-+    else:
-+        assert continue_payload["input"] in {"", "Continue generation"}
-     expected_tokens = llm_client_module.G5_ESCALATION_LADDER[1]
-     assert continue_payload["max_output_tokens"] == expected_tokens
- 
-     metadata = result.metadata or {}
-     flags = metadata.get("degradation_flags") or []
-     assert "draft_max_tokens" in flags
-     assert metadata.get("completion_warning") == "max_output_tokens"
-diff --git a/tests/test_responses_client.py b/tests/test_responses_client.py
-index 7df96a7f392eb3a175866320fd5f30a38ee33299..d9a4a5a92eacb1f6ba785b30f1b6221ec45e9d8a 100644
---- a/tests/test_responses_client.py
-+++ b/tests/test_responses_client.py
-@@ -129,50 +129,65 @@ def test_sanitize_payload_converts_legacy_json_schema():
-     payload = {
-         "model": "gpt-5",
-         "input": "hello",
-         "max_output_tokens": 256,
-         "text": {
-             "format": {
-                 "type": "json_schema",
-                 "name": "legacy",
-                 "json_schema": {"schema": legacy_schema, "strict": True},
-             }
-         },
-     }
- 
-     sanitized, _ = sanitize_payload_for_responses(payload)
-     format_block = sanitized["text"]["format"]
- 
-     assert "json_schema" not in format_block
-     sanitized_schema = format_block["schema"]
-     assert sanitized_schema is not legacy_schema
-     assert sanitized_schema["additionalProperties"] is False
-     assert sanitized_schema["properties"] == legacy_schema["properties"]
-     assert legacy_schema.get("additionalProperties") is None
-     assert format_block["strict"] is True
- 
- 
-+def test_sanitize_payload_preserves_empty_input():
-+    payload = {
-+        "model": "gpt-5",
-+        "input": "   ",
-+        "max_output_tokens": 128,
-+    }
-+
-+    sanitized, length = sanitize_payload_for_responses(payload)
-+
-+    assert sanitized["model"] == "gpt-5"
-+    assert "input" in sanitized
-+    assert sanitized["input"] == ""
-+    assert length == 0
-+
-+
- def test_generate_retries_with_min_token_bump(monkeypatch):
-     error_payload = {
-         "__error__": "http",
-         "status": 400,
-         "payload": {
-             "error": {
-                 "message": "Invalid 'max_output_tokens': Expected a value >= 16",
-                 "type": "invalid_request_error",
-             }
-         },
-     }
-     success_payload = {
-         "output": [
-             {
-                 "content": [
-                     {"type": "text", "text": "ok"},
-                 ]
-             }
-         ]
-     }
-     dummy_client = DummyClient(payloads=[error_payload, success_payload])
- 
-     with patch("llm_client.httpx.Client", return_value=dummy_client), patch("llm_client.LOGGER") as mock_logger:
-         result = generate(
-             messages=[{"role": "user", "content": "ping"}],
 

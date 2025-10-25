@@ -251,6 +251,27 @@ def test_generate_accepts_incomplete_with_text():
     assert len(client.requests) == 1
 
 
+def test_generate_marks_final_cap_as_degraded():
+    payload = {
+        "id": "resp-cap",
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [],
+    }
+    with patch("llm_client.LOGGER"):
+        result, client = _generate_with_dummy(responses=[payload], max_tokens=3600)
+    assert isinstance(result, GenerationResult)
+    metadata = result.metadata or {}
+    assert metadata.get("step_status") == "degraded"
+    assert metadata.get("cap_reached_final") is True
+    assert metadata.get("degradation_reason") == "max_output_tokens_final"
+    assert metadata.get("incomplete_reason") == "max_output_tokens_final"
+    flags = metadata.get("degradation_flags") or []
+    assert "draft_max_tokens" in flags
+    assert result.text == ""
+    assert len(client.requests) == 1
+
+
 def test_responses_continue_includes_model_and_tokens(monkeypatch):
     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_BASE", 64, raising=False)
     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP1", 96, raising=False)

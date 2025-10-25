@@ -130,6 +130,7 @@ const DEGRADATION_LABELS = {
   jsonld_repaired: "JSON-LD восстановлен вручную",
   post_analysis_skipped: "Отчёт о качестве недоступен",
   soft_timeout: "Мягкий таймаут — результат сохранён",
+  cap_reached_final: "Лимит продолжений — результат сохранён",
 };
 
 const DEFAULT_PROGRESS_MESSAGE =
@@ -201,7 +202,27 @@ const progressState = {
   currentPercent: 0,
   lastStage: "draft",
   hideTimer: null,
+  heartbeatTimer: null,
+  lastUpdateAt: 0,
+  latestSnapshot: null,
+  heartbeatNotified: false,
+  overlaySuppressed: false,
 };
+
+const STEP_STATUS_DONE_VALUES = new Set(["completed", "degraded", "skipped"]);
+const STEP_STATUS_RUNNING_VALUES = new Set(["running"]);
+const PROGRESS_HEARTBEAT_TIMEOUT_MS = 35000;
+const PROGRESS_NOTICE_PRIORITY = ["soft_timeout", "draft_max_tokens", "cap_reached_final"];
+const PROGRESS_STAGE_TO_STEP_NAMES = Object.freeze({
+  draft: ["draft"],
+  trim: ["refine"],
+  refine: ["refine"],
+  validate: ["jsonld", "post_analysis"],
+  finalize: ["jsonld", "post_analysis"],
+  jsonld: ["jsonld"],
+  post_analysis: ["post_analysis"],
+  done: ["post_analysis"],
+});
 
 function resolveApiPath(path) {
   if (typeof path !== "string" || !path) {
@@ -1001,6 +1022,11 @@ function setActiveArtifactDownloads(downloads) {
     markdown: normalized.markdown || normalized.article || null,
     report: normalized.report || normalized.json || normalized.metadata || null,
   };
+  if (!isArtifactDownloadReady()) {
+    setDownloadLinkAvailability(downloadMdBtn, null);
+    setDownloadLinkAvailability(downloadReportBtn, null);
+    return;
+  }
   setDownloadLinkAvailability(downloadMdBtn, state.currentDownloads.markdown);
   setDownloadLinkAvailability(downloadReportBtn, state.currentDownloads.report);
 }
@@ -1653,10 +1679,19 @@ function normalizeJobResponse(response) {
         response.progress_payload && typeof response.progress_payload === "object"
           ? response.progress_payload
           : null,
+      step_status: typeof response.step_status === "string" ? response.step_status : null,
+      batches_completed:
+        typeof response.batches_completed === "number" ? response.batches_completed : null,
+      batches_total:
+        typeof response.batches_total === "number" ? response.batches_total : null,
       result: {
         markdown: typeof response.markdown === "string" ? response.markdown : "",
         meta_json: (response.meta_json && typeof response.meta_json === "object") ? response.meta_json : {},
         faq_entries: Array.isArray(response.faq_entries) ? response.faq_entries : [],
+        artifact_saved:
+          typeof response.artifact_saved === "boolean"
+            ? response.artifact_saved
+            : Boolean(response.artifact_paths),
       },
     };
   }
@@ -1677,6 +1712,11 @@ function normalizeJobResponse(response) {
       response.progress_payload && typeof response.progress_payload === "object"
         ? response.progress_payload
         : null,
+    step_status: typeof response.step_status === "string" ? response.step_status : null,
+    batches_completed:
+      typeof response.batches_completed === "number" ? response.batches_completed : null,
+    batches_total:
+      typeof response.batches_total === "number" ? response.batches_total : null,
     result: response.result && typeof response.result === "object" ? response.result : null,
   };
 }
@@ -1834,6 +1874,8 @@ function renderGenerationResult(snapshot, { payload }) {
   const degradationFlags = Array.isArray(normalized.degradation_flags) ? normalized.degradation_flags : [];
   const characters = typeof meta.characters === "number" ? meta.characters : markdown.replace(/\s+/g, "").length;
   const hasContent = markdown.trim().length > 0;
+  const artifactSaved =
+    typeof result.artifact_saved === "boolean" ? result.artifact_saved : Boolean(result.artifact_paths);
   state.currentResult = {
     markdown,
     meta,
@@ -1841,6 +1883,7 @@ function renderGenerationResult(snapshot, { payload }) {
     characters,
     hasContent,
     degradationFlags,
+    artifactSaved,
     downloads:
       state.currentDownloads && (state.currentDownloads.markdown || state.currentDownloads.report)
         ? { ...state.currentDownloads }
@@ -1884,11 +1927,9 @@ function renderGenerationResult(snapshot, { payload }) {
     context_budget_tokens_limit: meta.context_budget_tokens_limit,
     k: payload?.k,
   });
-  if (state.currentResult.downloads) {
-    setButtonLoading(downloadMdBtn, false);
-    setButtonLoading(downloadReportBtn, false);
-    setActiveArtifactDownloads(state.currentResult.downloads);
-  }
+  setButtonLoading(downloadMdBtn, false);
+  setButtonLoading(downloadReportBtn, false);
+  setActiveArtifactDownloads(state.currentResult.downloads || state.currentDownloads);
   if (degradationFlags.length) {
     const label = degradationFlags.map(describeDegradationFlag).join(", ");
     showToast({ message: `Частичная деградация: ${label}`, type: "warn", duration: 6000 });
@@ -2962,6 +3003,9 @@ function resetProgressIndicator(message = DEFAULT_PROGRESS_MESSAGE) {
   }
   progressState.currentPercent = 0;
   progressState.lastStage = "draft";
+  progressState.lastUpdateAt = Date.now();
+  progressState.latestSnapshot = null;
+  progressState.heartbeatNotified = false;
 }
 
 function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
@@ -2973,14 +3017,19 @@ function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
       window.clearTimeout(progressState.hideTimer);
       progressState.hideTimer = null;
     }
+    progressState.overlaySuppressed = false;
+    progressState.heartbeatNotified = false;
+    progressState.latestSnapshot = null;
+    progressState.lastUpdateAt = Date.now();
     progressOverlay.classList.remove("hidden");
     resetProgressIndicator(message);
+    clearProgressHeartbeat();
   } else {
     hideProgressOverlay({ immediate: true });
   }
 }
 
-function hideProgressOverlay({ immediate = false } = {}) {
+function hideProgressOverlay({ immediate = false, suppress = false } = {}) {
   if (!progressOverlay) {
     return;
   }
@@ -2993,6 +3042,12 @@ function hideProgressOverlay({ immediate = false } = {}) {
   }
   progressOverlay.classList.add("hidden");
   resetProgressIndicator(DEFAULT_PROGRESS_MESSAGE);
+  if (suppress) {
+    progressState.overlaySuppressed = true;
+  } else {
+    progressState.overlaySuppressed = false;
+  }
+  clearProgressHeartbeat();
 }
 
 function scheduleProgressHide(delay = 1200) {
@@ -3019,6 +3074,249 @@ function clamp01(value) {
     return 1;
   }
   return value;
+}
+
+function normalizeStageName(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized === "trim") {
+    return "refine";
+  }
+  if (normalized === "finalize") {
+    return "validate";
+  }
+  return normalized;
+}
+
+function normalizeStepStatus(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized === "succeeded") {
+    return "completed";
+  }
+  return normalized;
+}
+
+function inferStepStatusFromSteps(snapshot, stageName) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return "";
+  }
+  const targetNames = PROGRESS_STAGE_TO_STEP_NAMES[stageName] || [stageName];
+  const steps = Array.isArray(snapshot.steps) ? snapshot.steps : [];
+  const relevant = steps
+    .map((step) => (step && typeof step === "object" ? step : null))
+    .filter((step) => {
+      if (!step || typeof step.name !== "string") {
+        return false;
+      }
+      return targetNames.includes(step.name.trim().toLowerCase());
+    });
+  if (!relevant.length) {
+    return "";
+  }
+  const statuses = relevant.map((step) => normalizeStepStatus(step.status));
+  if (statuses.some((value) => value === "failed")) {
+    return "failed";
+  }
+  if (statuses.some((value) => value === "degraded")) {
+    return "degraded";
+  }
+  if (statuses.some((value) => STEP_STATUS_RUNNING_VALUES.has(value))) {
+    return "running";
+  }
+  if (statuses.some((value) => value === "completed")) {
+    return "completed";
+  }
+  if (statuses.some((value) => value === "skipped")) {
+    return "skipped";
+  }
+  if (statuses.every((value) => value === "pending")) {
+    return "pending";
+  }
+  return statuses.find(Boolean) || "";
+}
+
+function resolveStepStatus(snapshot, stageOverride = null) {
+  const direct = normalizeStepStatus(snapshot?.step_status);
+  const stageSource = stageOverride
+    || snapshot?.progress_stage
+    || snapshot?.step
+    || "";
+  const normalizedStage = normalizeStageName(stageSource);
+  const inferred = normalizedStage ? inferStepStatusFromSteps(snapshot, normalizedStage) : "";
+  return direct || inferred || "";
+}
+
+function collectDegradationFlags(snapshot) {
+  const flags = new Set();
+  if (!snapshot || typeof snapshot !== "object") {
+    return flags;
+  }
+  const append = (value) => {
+    if (typeof value === "string" && value.trim()) {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === "max_output_tokens" || normalized === "max_output_tokens_final") {
+        flags.add("draft_max_tokens");
+        if (normalized === "max_output_tokens_final") {
+          flags.add("cap_reached_final");
+        }
+        return;
+      }
+      flags.add(normalized);
+    }
+  };
+  const appendArray = (values) => {
+    if (Array.isArray(values)) {
+      values.forEach(append);
+    }
+  };
+  appendArray(snapshot.degradation_flags);
+  const payload = snapshot.progress_payload;
+  if (payload && typeof payload === "object") {
+    appendArray(payload.flags);
+    if (payload.cap_reached_final) {
+      flags.add("cap_reached_final");
+    }
+    if (payload.soft_timeout) {
+      flags.add("soft_timeout");
+    }
+  }
+  const result = snapshot.result && typeof snapshot.result === "object" ? snapshot.result : null;
+  if (result) {
+    const meta = result.meta_json && typeof result.meta_json === "object" ? result.meta_json : null;
+    if (meta) {
+      appendArray(meta.degradation_flags);
+      if (meta.cap_reached_final) {
+        flags.add("cap_reached_final");
+      }
+      if (meta.soft_timeout) {
+        flags.add("soft_timeout");
+      }
+    }
+  }
+  const steps = Array.isArray(snapshot.steps) ? snapshot.steps : [];
+  steps.forEach((step) => {
+    if (!step || typeof step !== "object") {
+      return;
+    }
+    const status = normalizeStepStatus(step.status);
+    if (status === "degraded") {
+      append(step.error);
+      if (step.payload && typeof step.payload === "object") {
+        appendArray(step.payload.degradation_flags);
+      }
+    }
+  });
+  return flags;
+}
+
+function deriveProgressNotice(snapshot) {
+  const flags = collectDegradationFlags(snapshot);
+  for (const key of PROGRESS_NOTICE_PRIORITY) {
+    if (flags.has(key) && DEGRADATION_LABELS[key]) {
+      return DEGRADATION_LABELS[key];
+    }
+  }
+  return null;
+}
+
+function maybeAutoHideProgress(stageName, stepStatus, snapshot) {
+  const effectiveStatus = stepStatus || resolveStepStatus(snapshot, stageName);
+  const stage = stageName || normalizeStageName(snapshot?.progress_stage || snapshot?.step || "");
+  if (!stage) {
+    return false;
+  }
+  if (stage !== "draft" && stage !== "refine") {
+    return false;
+  }
+  if (!effectiveStatus || !STEP_STATUS_DONE_VALUES.has(effectiveStatus)) {
+    return false;
+  }
+  hideProgressOverlay({ immediate: true, suppress: true });
+  return true;
+}
+
+function clearProgressHeartbeat() {
+  if (progressState.heartbeatTimer) {
+    window.clearTimeout(progressState.heartbeatTimer);
+    progressState.heartbeatTimer = null;
+  }
+}
+
+function scheduleProgressHeartbeat() {
+  if (!progressOverlay || progressOverlay.classList.contains("hidden")) {
+    clearProgressHeartbeat();
+    return;
+  }
+  clearProgressHeartbeat();
+  progressState.heartbeatTimer = window.setTimeout(
+    handleProgressHeartbeatTimeout,
+    PROGRESS_HEARTBEAT_TIMEOUT_MS,
+  );
+}
+
+function handleProgressHeartbeatTimeout() {
+  progressState.heartbeatTimer = null;
+  if (progressState.heartbeatNotified) {
+    return;
+  }
+  const snapshot = progressState.latestSnapshot;
+  if (!snapshot || typeof snapshot !== "object") {
+    return;
+  }
+  const overallStatus = typeof snapshot.status === "string" ? snapshot.status.trim().toLowerCase() : "";
+  const stage = normalizeStageName(snapshot.progress_stage || snapshot.step || "");
+  const stepStatus = resolveStepStatus(snapshot, stage);
+  if (
+    overallStatus === "running"
+    && (!stepStatus || STEP_STATUS_RUNNING_VALUES.has(stepStatus) || stepStatus === "pending")
+  ) {
+    scheduleProgressHeartbeat();
+    return;
+  }
+  progressState.heartbeatNotified = true;
+  hideProgressOverlay({ immediate: true, suppress: true });
+  const notice = deriveProgressNotice(snapshot)
+    || "Мягкий таймаут — результат сохранён / частичная деградация";
+  showToast({ message: notice, type: "warn" });
+}
+
+function getSnapshotArtifactSaved(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return null;
+  }
+  const result = snapshot.result && typeof snapshot.result === "object" ? snapshot.result : null;
+  if (!result) {
+    return null;
+  }
+  if (typeof result.artifact_saved === "boolean") {
+    return result.artifact_saved;
+  }
+  if (result.artifact_paths && typeof result.artifact_paths === "object") {
+    return true;
+  }
+  return null;
+}
+
+function isArtifactDownloadReady() {
+  if (state.currentResult && typeof state.currentResult.artifactSaved === "boolean") {
+    return state.currentResult.artifactSaved;
+  }
+  const snapshotSaved = getSnapshotArtifactSaved(progressState.latestSnapshot);
+  if (typeof snapshotSaved === "boolean") {
+    return snapshotSaved;
+  }
+  return false;
 }
 
 function toNumber(value) {
@@ -3095,39 +3393,86 @@ function updateProgressFromSnapshot(snapshot) {
   if (!progressOverlay || !snapshot || typeof snapshot !== "object") {
     return;
   }
+  progressState.latestSnapshot = snapshot;
+  progressState.lastUpdateAt = Date.now();
+  progressState.heartbeatNotified = false;
+  setActiveArtifactDownloads(state.currentDownloads);
+
   if (progressState.hideTimer) {
     window.clearTimeout(progressState.hideTimer);
     progressState.hideTimer = null;
   }
 
-  progressOverlay.classList.remove("hidden");
-
-  const status = typeof snapshot.status === "string" ? snapshot.status : "running";
-  let stage = typeof snapshot.progress_stage === "string" && snapshot.progress_stage.trim()
+  const statusRaw = typeof snapshot.status === "string" ? snapshot.status.trim().toLowerCase() : "running";
+  let stageCandidate = typeof snapshot.progress_stage === "string" && snapshot.progress_stage.trim()
     ? snapshot.progress_stage.trim().toLowerCase()
     : "";
-  if (!stage && typeof snapshot.step === "string" && snapshot.step.trim()) {
-    stage = snapshot.step.trim().toLowerCase();
+  if (!stageCandidate && typeof snapshot.step === "string" && snapshot.step.trim()) {
+    stageCandidate = snapshot.step.trim().toLowerCase();
   }
-  if (status === "succeeded") {
-    stage = "done";
-  } else if (status === "failed") {
-    stage = "error";
+  const stageForDetails = stageCandidate || "";
+  let stageSource = stageCandidate;
+  if (statusRaw === "succeeded") {
+    stageSource = "done";
+  } else if (statusRaw === "failed") {
+    stageSource = "error";
   }
-  if (!PROGRESS_STAGE_LABELS[stage]) {
-    stage = progressState.lastStage || "draft";
+  let normalizedStage = normalizeStageName(stageSource || "");
+  if (statusRaw === "succeeded") {
+    normalizedStage = "done";
+  } else if (statusRaw === "failed") {
+    normalizedStage = "error";
   }
-  progressState.lastStage = stage;
+  if (!normalizedStage) {
+    normalizedStage = progressState.lastStage || "draft";
+  }
+  if (!PROGRESS_STAGE_LABELS[normalizedStage] && normalizedStage !== "error") {
+    normalizedStage = progressState.lastStage || "draft";
+  }
+  progressState.lastStage = normalizedStage;
+
+  const stepStatus = resolveStepStatus(snapshot, normalizedStage);
+
+  if (maybeAutoHideProgress(normalizedStage, stepStatus, snapshot)) {
+    clearProgressHeartbeat();
+    return;
+  }
+
+  if (progressState.overlaySuppressed) {
+    return;
+  }
+
+  progressOverlay.classList.remove("hidden");
+
+  const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
+    ? snapshot.progress_payload
+    : {};
+  const totalBatches = toNumber(payload.total ?? snapshot.batches_total);
+  const completedBatches = toNumber(payload.completed ?? snapshot.batches_completed);
 
   let percentValue = null;
-  if (typeof snapshot.progress === "number") {
+  let allowDecrease = false;
+  if (
+    normalizedStage === "draft"
+    && Number.isFinite(totalBatches)
+    && totalBatches > 0
+    && Number.isFinite(completedBatches)
+  ) {
+    const safeTotal = Math.max(1, totalBatches);
+    const safeCompleted = Math.max(0, Math.min(safeTotal, completedBatches));
+    percentValue = Math.round((safeCompleted / safeTotal) * 1000) / 10;
+    allowDecrease = true;
+  }
+  if (percentValue === null && typeof snapshot.progress === "number") {
     percentValue = Math.round(clamp01(snapshot.progress) * 1000) / 10;
   }
   if (percentValue === null || Number.isNaN(percentValue)) {
     percentValue = progressState.currentPercent || 0;
   }
-  percentValue = Math.max(progressState.currentPercent || 0, percentValue);
-  percentValue = Math.min(100, percentValue);
+  if (!allowDecrease) {
+    percentValue = Math.max(progressState.currentPercent || 0, percentValue);
+  }
+  percentValue = Math.max(0, Math.min(100, percentValue));
   progressState.currentPercent = percentValue;
 
   if (progressBarFill) {
@@ -3143,32 +3488,43 @@ function updateProgressFromSnapshot(snapshot) {
   let message = "";
   if (typeof snapshot.progress_message === "string" && snapshot.progress_message.trim()) {
     message = snapshot.progress_message.trim();
-  } else if (status === "succeeded") {
+  } else if (statusRaw === "succeeded") {
     message = PROGRESS_STAGE_MESSAGES.done;
-  } else if (status === "failed") {
+  } else if (statusRaw === "failed") {
     message = extractErrorMessage(snapshot) || PROGRESS_STAGE_MESSAGES.error;
   } else if (typeof snapshot.message === "string" && snapshot.message.trim()) {
     message = snapshot.message.trim();
   } else {
-    message = PROGRESS_STAGE_MESSAGES[stage] || DEFAULT_PROGRESS_MESSAGE;
+    const stageKey = normalizedStage === "error" ? "error" : normalizedStage;
+    message = PROGRESS_STAGE_MESSAGES[stageKey] || DEFAULT_PROGRESS_MESSAGE;
+  }
+  const notice = deriveProgressNotice(snapshot);
+  if (notice) {
+    message = notice;
   }
   if (progressMessage) {
     progressMessage.textContent = message;
   }
 
   if (progressStage) {
-    const label = PROGRESS_STAGE_LABELS[stage] || PROGRESS_STAGE_LABELS.draft;
+    const preferredStage = stageForDetails || normalizedStage;
+    const labelKey = PROGRESS_STAGE_LABELS[preferredStage]
+      ? preferredStage
+      : PROGRESS_STAGE_LABELS[normalizedStage]
+        ? normalizedStage
+        : progressState.lastStage || "draft";
+    const label = PROGRESS_STAGE_LABELS[labelKey] || PROGRESS_STAGE_LABELS.draft;
     progressStage.textContent = `Шаг: ${label} 0→100%`;
   }
 
-  const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
-    ? snapshot.progress_payload
-    : null;
   if (progressDetails) {
-    progressDetails.textContent = formatProgressDetails(stage, payload);
+    const detailsStage = stageForDetails || normalizedStage;
+    progressDetails.textContent = formatProgressDetails(detailsStage, payload);
   }
 
-  if (status === "succeeded") {
+  setActiveArtifactDownloads(state.currentDownloads);
+
+  if (statusRaw === "succeeded" || statusRaw === "failed") {
     progressState.currentPercent = 100;
     if (progressPercent) {
       progressPercent.textContent = "100%";
@@ -3179,20 +3535,12 @@ function updateProgressFromSnapshot(snapshot) {
     if (progressBar) {
       progressBar.setAttribute("aria-valuenow", "100");
     }
-    scheduleProgressHide(1200);
-  } else if (status === "failed") {
-    progressState.currentPercent = 100;
-    if (progressPercent) {
-      progressPercent.textContent = "100%";
-    }
-    if (progressBarFill) {
-      progressBarFill.style.width = "100%";
-    }
-    if (progressBar) {
-      progressBar.setAttribute("aria-valuenow", "100");
-    }
-    scheduleProgressHide(2500);
+    scheduleProgressHide(statusRaw === "succeeded" ? 1200 : 2500);
+    clearProgressHeartbeat();
+    return;
   }
+
+  scheduleProgressHeartbeat();
 }
 
 function setInteractiveBusy(isBusy) {

@@ -2219,6 +2219,50 @@ def generate(
                             )
                             cap_retry_performed = True
                             shrink_next_attempt = False
+                            current_max_tokens = int(current_max)
+                            final_cap_reached = cap_exhausted and (
+                                reason == "max_output_tokens_final"
+                                or (
+                                    reason == "max_output_tokens"
+                                    and upper_cap is not None
+                                    and current_max_tokens >= int(upper_cap)
+                                )
+                                or current_max_tokens >= 3600
+                            )
+                            if final_cap_reached and output_length <= 0:
+                                _record_pending_degradation("max_output_tokens")
+                                metadata = dict(metadata)
+                                metadata["cap_reached_final"] = True
+                                metadata["step_status"] = "degraded"
+                                terminal_reason = (
+                                    reason or "max_output_tokens"
+                                )
+                                if (
+                                    terminal_reason != "max_output_tokens_final"
+                                    and current_max_tokens >= 3600
+                                ):
+                                    terminal_reason = "max_output_tokens_final"
+                                metadata["incomplete_reason"] = terminal_reason
+                                metadata["degradation_reason"] = terminal_reason
+                                existing_flags: List[str] = []
+                                raw_flags = metadata.get("degradation_flags")
+                                if isinstance(raw_flags, list):
+                                    existing_flags = [
+                                        str(flag).strip()
+                                        for flag in raw_flags
+                                        if isinstance(flag, str) and str(flag).strip()
+                                    ]
+                                if "draft_max_tokens" not in existing_flags:
+                                    existing_flags.append("draft_max_tokens")
+                                metadata["degradation_flags"] = existing_flags
+                                if not metadata.get("completion_warning"):
+                                    metadata["completion_warning"] = "max_output_tokens"
+                                metadata = _apply_pending_degradation(metadata)
+                                parse_flags["metadata"] = metadata
+                                updated_data = dict(data)
+                                updated_data["metadata"] = metadata
+                                _persist_raw_response(updated_data)
+                                return text or "", parse_flags, updated_data, schema_label
                     last_error = RuntimeError("responses_incomplete")
                     incomplete_retry_count += 1
                     if incomplete_retry_count >= 2:

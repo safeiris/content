@@ -216,6 +216,7 @@ class JobRunner:
         }
         if ctx.artifact_paths:
             result_payload["artifact_paths"] = ctx.artifact_paths
+        result_payload["artifact_saved"] = bool(ctx.artifact_paths)
         job.mark_succeeded(result_payload, degradation_flags=ctx.degradation_flags)
         self._record_progress(job, "done", 1.0, message=PROGRESS_STAGE_MESSAGES.get("done"))
         self._store.touch(job.id)
