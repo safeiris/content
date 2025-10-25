@@ -137,7 +137,7 @@ def test_generate_uses_responses_payload_for_gpt5():
     assert request_payload["model"] == "gpt-5"
     assert request_payload["input"] == "ping"
     assert request_payload["max_output_tokens"] == 64
-    assert request_payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
+    assert request_payload["response_format"] == DEFAULT_RESPONSES_TEXT_FORMAT
     assert "temperature" not in request_payload
     metadata = result.metadata or {}
     assert metadata.get("model_effective") == LLM_MODEL
@@ -222,7 +222,7 @@ def test_generate_retries_empty_completion_with_fallback():
     assert retry_request["max_output_tokens"] == 85
     assert fallback_request["max_output_tokens"] == 76
     assert "previous_response_id" not in retry_request
-    assert fallback_request["text"]["format"] == FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT
+    assert fallback_request["response_format"] == FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT
 
 
 def test_generate_accepts_incomplete_with_text():

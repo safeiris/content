@@ -1468,7 +1468,7 @@ class DeterministicPipeline:
         lines.append("Ответ дай без JSON и без тегов <response_json>.")
         user_payload = textwrap.dedent("\n".join(lines)).strip()
         messages.append({"role": "user", "content": user_payload})
-        format_block = {"type": "text", "name": "output_text"}
+        format_block = {"type": "text"}
         result = self._call_llm(
             step=PipelineStep.SKELETON,
             messages=messages,
