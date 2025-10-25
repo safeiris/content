@@ -124,6 +124,7 @@ const PROGRESS_STAGE_MESSAGES = {
 
 const DEGRADATION_LABELS = {
   draft_failed: "Черновик по запасному сценарию",
+  draft_max_tokens: "Лимит токенов — результат неполный",
   refine_skipped: "Доработка пропущена",
   jsonld_missing: "JSON-LD не сформирован",
   jsonld_repaired: "JSON-LD восстановлен вручную",
@@ -1146,11 +1147,17 @@ function findLatestArtifactPair(files, { jobId = null, artifactPaths = null } = 
   return { markdown, report };
 }
 
-function hasDraftStepSucceeded(snapshot) {
+function hasDraftStepCompleted(snapshot) {
   if (!snapshot || !Array.isArray(snapshot.steps)) {
     return false;
   }
-  return snapshot.steps.some((step) => step && step.name === "draft" && step.status === "succeeded");
+  return snapshot.steps.some((step) => {
+    if (!step || step.name !== "draft") {
+      return false;
+    }
+    const status = typeof step.status === "string" ? step.status.trim().toLowerCase() : "";
+    return status === "succeeded" || status === "degraded";
+  });
 }
 
 async function refreshDownloadLinksForJob({ jobId = null, artifactPaths = null } = {}) {
@@ -1496,7 +1503,7 @@ async function handleGenerate(event) {
     }
     applyProgressiveResult(snapshot);
     updateProgressFromSnapshot(snapshot);
-    if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
+    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
       downloadsRequested = true;
       refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
         console.warn("Не удалось заранее получить ссылки на артефакты", error);
@@ -1510,7 +1517,7 @@ async function handleGenerate(event) {
         onUpdate: (update) => {
           applyProgressiveResult(update);
           updateProgressFromSnapshot(update);
-          if (!downloadsRequested && hasDraftStepSucceeded(update)) {
+            if (!downloadsRequested && hasDraftStepCompleted(update)) {
             downloadsRequested = true;
             activeJobId = update?.id || update?.job_id || activeJobId;
             if (update?.result && typeof update.result === "object" && update.result.artifact_paths) {
@@ -1528,7 +1535,7 @@ async function handleGenerate(event) {
       artifactPathsHint = snapshot.result.artifact_paths;
     }
     updateProgressFromSnapshot(snapshot);
-    if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
+    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
       downloadsRequested = true;
       await refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
     }

@@ -1,293 +1,135 @@
-diff --git a/base_prompt.txt b/base_prompt.txt
-index 737b0705d441dbb141048f59d68b6aeb4f1a08df..5c307b88915086e5c5158794842c25bf87ea0a5e 100644
---- a/base_prompt.txt
-+++ b/base_prompt.txt
-@@ -1,31 +1,32 @@
--Ты — SEO-редактор, создающий экспертный материал по теме {theme}.
-+Ты — SEO-редактор, создающий экспертный материал{theme_line}.
- {style_line}
- Цель: {goal}
- {audience_line}{title_line}Тон: {tone}
-+{tone_style_line}
+diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
+index 509740ce49ec9b42cfc62749a6a2626b1fd72e16..d05378c0ea8bf42d724e26888a0871c6357c2900 100644
+--- a/deterministic_pipeline.py
++++ b/deterministic_pipeline.py
+@@ -288,97 +288,122 @@ class DeterministicPipeline:
+         self.provided_faq = provided_faq or []
+         self.jsonld_requested = bool(jsonld_requested)
+         try:
+             faq_target = int(faq_questions) if faq_questions is not None else 5
+         except (TypeError, ValueError):
+             faq_target = 5
+         if faq_target < 0:
+             faq_target = 0
+         self.faq_target = faq_target
  
- Объём: {length_line}.
- {length_strict_line}
- Если текст короче — добавь полезные уточнения, не повторяй.
- Если длиннее — сократи, сохрани смысл.
+         self.logs: List[PipelineLogEntry] = []
+         self.checkpoints: Dict[PipelineStep, str] = {}
+         self.jsonld: Optional[str] = None
+         self.locked_terms: List[str] = []
+         self.jsonld_reserve: int = 0
+         self.skeleton_payload: Optional[Dict[str, object]] = None
+         self._skeleton_faq_entries: List[Dict[str, str]] = []
+         self.keywords_coverage_percent: float = 0.0
+         self.keywords_required_coverage_percent: float = 0.0
  
- Обязательные условия SEO:
- - Используй каждое ключевое слово из списка минимум один раз в точной форме, без изменений порядка слов.
- - В конце добавь блок FAQ с 3–5 вопросами и развёрнутыми ответами.
+         self._model_used: Optional[str] = None
+         self._fallback_used: Optional[str] = None
+         self._fallback_reason: Optional[str] = None
+         self._api_route: Optional[str] = None
+         self._token_usage: Optional[float] = None
++        self._degradation_flags: List[str] = []
+         self._progress_callback = progress_callback
  
- Структура:
- {structure_block}
-+{structure_hint_line}
+         self.section_budgets: List[SectionBudget] = self._compute_section_budgets()
  
- Бюджет объёма:
- - Введение — до 450 слов.
- - Каждый раздел основной части — не больше 4 абзацев по 3–4 предложения.
- - FAQ — ответы по 2–3 предложения.
- - Заключение — до 180 слов.
--
- {keywords_block}{keywords_mode_line}{sources_block}{faq_line}{jsonld_line}Требования к качеству:
- - Пиши экспертно, избегай воды и общих фраз.
- - Поддерживай читабельные абзацы (2–5 предложений).
- - Проверяй факты и указывай источники, если они заданы.
- - Добавь чёткий вывод и CTA.
+     # ------------------------------------------------------------------
+     # Internal helpers
+     # ------------------------------------------------------------------
++    @property
++    def degradation_flags(self) -> List[str]:
++        if not self._degradation_flags:
++            return []
++        return list(dict.fromkeys(self._degradation_flags))
++
+     def _emit_progress(
+         self,
+         stage: str,
+         progress: float,
+         *,
+         message: Optional[str] = None,
+         payload: Optional[Mapping[str, object]] = None,
+     ) -> None:
+         if not self._progress_callback:
+             return
+         event_payload = dict(payload) if payload else {}
+         try:
+             if event_payload:
+                 self._progress_callback(
+                     stage=stage,
+                     progress=progress,
+                     message=message,
+                     payload=event_payload,
+                 )
+             else:
+                 self._progress_callback(stage=stage, progress=progress, message=message)
+         except Exception:  # pragma: no cover - defensive logging
+             LOGGER.debug("progress_callback_failed", exc_info=True)
  
- Если предоставлен блок CONTEXT с выдержками из качественных материалов, используй их стиль и фактуру без дословного копирования; если CONTEXT отсутствует или фрагменты не покрывают запрос, пиши универсально, сохраняя заданную структуру.
+     def _log(self, step: PipelineStep, status: str, **notes: object) -> None:
+         entry = PipelineLogEntry(step=step, started_at=time.time(), status=status, notes=dict(notes))
+         self.logs.append(entry)
  
-diff --git a/config.py b/config.py
-index 60fbc6ee530b854813d951b1cffe4427c891ac74..fc4c3e4f193b67b8c2ba0987d19014d767600f3c 100644
---- a/config.py
-+++ b/config.py
-@@ -62,52 +62,57 @@ MODEL_PROVIDER = str(os.getenv("MODEL_PROVIDER", "openai")).strip() or "openai"
+     def _update_log(self, step: PipelineStep, status: str, **notes: object) -> None:
+         for entry in reversed(self.logs):
+             if entry.step == step:
+                 entry.status = status
+                 entry.finished_at = time.time()
+                 entry.notes.update(notes)
+                 return
+         self.logs.append(
+             PipelineLogEntry(step=step, started_at=time.time(), finished_at=time.time(), status=status, notes=dict(notes))
+         )
  
- _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
- FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
+     def _register_llm_result(self, result: GenerationResult, usage: Optional[float]) -> None:
++        metadata_block = result.metadata or {}
++        if isinstance(metadata_block, dict):
++            raw_flags = metadata_block.get("degradation_flags")
++            if isinstance(raw_flags, list):
++                for flag in raw_flags:
++                    if not isinstance(flag, str):
++                        continue
++                    trimmed = flag.strip()
++                    if not trimmed:
++                        continue
++                    if trimmed not in self._degradation_flags:
++                        self._degradation_flags.append(trimmed)
++            completion_warning = metadata_block.get("completion_warning")
++            if (
++                isinstance(completion_warning, str)
++                and completion_warning.strip() == "max_output_tokens"
++            ) and "draft_max_tokens" not in self._degradation_flags:
++                self._degradation_flags.append("draft_max_tokens")
+         if result.model_used:
+             self._model_used = result.model_used
+         elif self._model_used is None:
+             self._model_used = self.model
+         if result.fallback_used:
+             self._fallback_used = result.fallback_used
+         if result.fallback_reason:
+             self._fallback_reason = result.fallback_reason
+         if result.api_route:
+             self._api_route = result.api_route
+         if usage is not None:
+             self._token_usage = usage
  
- # GPT-5 Responses tuning
- G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 2280)
- G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 3000)
- G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 3600)
- G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3600)
- G5_ESCALATION_LADDER = (
-     G5_MAX_OUTPUT_TOKENS_BASE,
-     G5_MAX_OUTPUT_TOKENS_STEP1,
-     G5_MAX_OUTPUT_TOKENS_STEP2,
- )
- _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
- G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
- G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
- G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
+     def _compute_section_budgets(self) -> List[SectionBudget]:
+         titles = [str(item or "").strip() for item in self.base_outline if str(item or "").strip()]
+         if len(titles) < 3:
+             titles = ["Введение", "Основная часть", "Вывод"]
+         intro = titles[0]
+         conclusion = titles[-1]
+         main_titles = titles[1:-1] or ["Основная часть"]
  
- SKELETON_BATCH_SIZE_MAIN = max(1, _env_int("SKELETON_BATCH_SIZE_MAIN", 2))
- SKELETON_FAQ_BATCH = max(1, _env_int("SKELETON_FAQ_BATCH", 3))
- TAIL_FILL_MAX_TOKENS = max(200, _env_int("TAIL_FILL_MAX_TOKENS", 700))
- 
- # Дефолтные настройки ядра
- DEFAULT_TONE = "экспертный, дружелюбный"
--DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "Вывод"]
-+DEFAULT_STRUCTURE = [
-+    "Введение",
-+    "Основная часть с подзаголовками",
-+    "FAQ",
-+    "Вывод/CTA",
-+]
- 
- # Простая «норма» для SEO: ориентир по упоминаниям ключей на ~100 слов
- DEFAULT_SEO_DENSITY = 2
- 
- # Рекомендуемые границы объёма (знаков)
--DEFAULT_MIN_LENGTH = 5200
--DEFAULT_MAX_LENGTH = 6800
-+DEFAULT_MIN_LENGTH = 3500
-+DEFAULT_MAX_LENGTH = 6000
- 
- # Максимальный объём пользовательского контекста (символов)
- MAX_CUSTOM_CONTEXT_CHARS = 20_000
- 
- # Стилевые профили
- STYLE_PROFILE_PATH = "profiles/finance/style_profile.md"
- STYLE_PROFILE_VARIANT = str(os.getenv("STYLE_PROFILE_VARIANT", "full")).strip().lower() or "full"
- if STYLE_PROFILE_VARIANT not in {"full", "light"}:
-     STYLE_PROFILE_VARIANT = "full"
- APPEND_STYLE_PROFILE_DEFAULT = (
-     str(os.getenv("APPEND_STYLE_PROFILE_DEFAULT", "true")).strip().lower() not in {"0", "false", "off", "no"}
- )
- 
- # Ключевые слова
- KEYWORDS_ALLOW_AUTO = _env_bool("KEYWORDS_ALLOW_AUTO", False)
- 
- # Feature flags controlling visibility of advanced UI controls
- FEATURE_HIDE_MODEL_SELECTOR = _env_bool("FEATURE_HIDE_MODEL_SELECTOR", True)
- FEATURE_HIDE_TOKEN_SLIDERS = _env_bool("FEATURE_HIDE_TOKEN_SLIDERS", True)
-diff --git a/frontend_demo/index.html b/frontend_demo/index.html
-index 39a602afe0b0ad81aa932e48adf07ef69052e693..7da0a6736a46cf78400cddefc9d0d39d12f281e2 100644
---- a/frontend_demo/index.html
-+++ b/frontend_demo/index.html
-@@ -15,54 +15,50 @@
-         </div>
-       </div>
-     </header>
- 
-     <main class="app app-shell">
-       <nav class="tabs" role="tablist">
-         <button class="tab active" data-tab="new-request" role="tab">Новый запрос</button>
-         <button class="tab" data-tab="materials" role="tab">Сгенерированные материалы</button>
-         <button class="tab" data-tab="pipes" role="tab">Тематики</button>
-         <button class="tab" data-tab="result" role="tab">Результат</button>
-       </nav>
- 
-       <section class="tab-panel active" id="new-request" role="tabpanel">
-         <div class="request-shell">
-           <div class="request-grid">
-             <form id="brief-form" class="brief-form">
-               <section class="parameters-card">
-                 <header class="parameters-card__header">
-                   <h2 class="parameters-card__title">Параметры текста</h2>
-                 </header>
-                 <div class="parameters-card__body">
-                   <div class="form-row">
-                     <label for="pipe-select">Тематика</label>
-                     <select id="pipe-select" required></select>
-                   </div>
--                  <div class="form-row">
--                    <label for="topic-input">Тема</label>
--                    <input id="topic-input" type="text" placeholder="Например, «Как выбрать дебетовую карту»" required />
--                  </div>
-                   <div class="form-row">
-                     <label for="title-input">Название</label>
-                     <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
-                     <p class="field-hint">Оставьте пустым, чтобы взять название из профиля.</p>
-                   </div>
-                   <div class="form-row">
-                     <label for="goal-input">Цель</label>
-                     <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
-                   </div>
-                   <div class="form-row">
-                     <label for="audience-input">Аудитория</label>
-                     <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
-                   </div>
-                   <div class="form-row">
-                     <label for="tone-select">Тон</label>
-                     <select id="tone-select">
-                       <option value="экспертный" selected>Экспертный</option>
-                       <option value="дружелюбный">Дружелюбный</option>
-                       <option value="строгий">Строгий</option>
-                     </select>
-                   </div>
-                   <div class="form-row">
-                     <label for="style-profile-select">Стиль бренда</label>
-                     <select id="style-profile-select">
-                       <option value="sravni.ru" selected>sravni.ru — экспертно, структурировано</option>
-@@ -259,51 +255,51 @@
-                 id="download-md"
-                 class="secondary"
-                 role="button"
-                 aria-disabled="true"
-                 data-fallback-name="draft.md"
-               >
-                 <span class="btn-label">Скачать .md</span>
-               </a>
-               <a
-                 id="download-report"
-                 class="secondary"
-                 role="button"
-                 aria-disabled="true"
-                 data-fallback-name="report.json"
-               >
-                 <span class="btn-label">Скачать отчёт .json</span>
-               </a>
-             </div>
-           </aside>
-         </div>
-       </section>
-     </main>
- 
-     <div id="progress-overlay" class="progress-overlay hidden" role="alert" aria-live="polite">
-       <div class="progress-card">
--        <p class="progress-stage" data-role="progress-stage">Подготовка…</p>
-+        <p class="progress-stage" data-role="progress-stage">Шаг: Черновик 0→100%</p>
-         <div
-           class="progress-bar"
-           role="progressbar"
-           aria-valuemin="0"
-           aria-valuemax="100"
-           aria-valuenow="0"
-           data-role="progress-bar"
-         >
-           <div class="progress-bar__fill" data-role="progress-bar-fill"></div>
-         </div>
-         <p class="progress-percent" data-role="progress-percent">0%</p>
-         <p class="progress-message" data-role="progress-message">Готовим данные…</p>
-         <p class="progress-details" data-role="progress-details"></p>
-       </div>
-     </div>
- 
-     <template id="source-row-template">
-       <div class="source-row">
-         <input class="source-input" type="text" placeholder="https://example.com" />
-         <select class="source-usage" aria-label="Тип использования источника">
-           <option value="summary" selected>Пересказ</option>
-           <option value="quote">Цитата</option>
-           <option value="inspiration">Вдохновение</option>
-         </select>
-         <button type="button" class="icon-button remove-source" aria-label="Удалить источник">✕</button>
+         target_total = min(self.max_chars, max(self.min_chars, 6000))
+         intro_weight = 0.18
+         conclusion_weight = 0.16
+         remaining_weight = max(0.0, 1.0 - intro_weight - conclusion_weight)
 diff --git a/frontend_demo/script.js b/frontend_demo/script.js
-index ad76927dec4b975ddac02929895344eac165acb0..b2f0d2cb345a99ef8f4efaff93cbc1abe9445462 100644
+index b2f0d2cb345a99ef8f4efaff93cbc1abe9445462..576211b7c311818788ba64dee50359e3bfc04d18 100644
 --- a/frontend_demo/script.js
 +++ b/frontend_demo/script.js
-@@ -34,122 +34,123 @@ const briefForm = document.getElementById("brief-form");
- const previewBtn = document.getElementById("preview-btn");
- let reindexBtn = document.getElementById("reindex-btn");
- let healthBtn = document.getElementById("health-btn");
- const progressOverlay = document.getElementById("progress-overlay");
- const progressMessage = progressOverlay?.querySelector('[data-role="progress-message"]') || null;
- const progressStage = progressOverlay?.querySelector('[data-role="progress-stage"]') || null;
- const progressPercent = progressOverlay?.querySelector('[data-role="progress-percent"]') || null;
- const progressBar = progressOverlay?.querySelector('[data-role="progress-bar"]') || null;
- const progressBarFill = progressOverlay?.querySelector('[data-role="progress-bar-fill"]') || null;
- const progressDetails = progressOverlay?.querySelector('[data-role="progress-details"]') || null;
- if (progressStage && progressStage.textContent) {
-   progressStage.dataset.defaultLabel = progressStage.textContent.trim();
- }
- const toastRoot = document.getElementById("toast-root");
- const draftView = document.getElementById("draft-view");
- const reportView = document.getElementById("report-view");
- const resultTitle = document.getElementById("result-title");
- const resultMeta = document.getElementById("result-meta");
- const resultBadges = document.getElementById("result-badges");
- const retryBtn = document.getElementById("retry-btn");
- const downloadMdBtn = document.getElementById("download-md");
- const downloadReportBtn = document.getElementById("download-report");
- const clearLogBtn = document.getElementById("clear-log");
- const structurePreset = document.getElementById("structure-preset");
- const structureInput = document.getElementById("structure-input");
--const topicInput = document.getElementById("topic-input");
- const keywordsInput = document.getElementById("keywords-input");
- const titleInput = document.getElementById("title-input");
- const audienceInput = document.getElementById("audience-input");
- const goalInput = document.getElementById("goal-input");
- const toneSelect = document.getElementById("tone-select");
- const minCharsInput = document.getElementById("min-chars-input");
- const maxCharsInput = document.getElementById("max-chars-input");
- const keywordModeInputs = document.querySelectorAll("input[name='keywords-mode']");
- const styleProfileSelect = document.getElementById("style-profile-select");
- const styleProfileHint = document.getElementById("style-profile-hint");
- const sourcesList = document.getElementById("sources-list");
- const addSourceBtn = document.getElementById("add-source-btn");
- const contextSourceSelect = document.getElementById("context-source-select");
- const healthStatus = document.getElementById("health-status");
- const reindexLog = document.getElementById("reindex-log");
- const previewSystem = document.getElementById("preview-system");
- const previewUser = document.getElementById("preview-user");
- const contextList = document.getElementById("context-list");
- const contextSummary = document.getElementById("context-summary");
- const contextBadge = document.getElementById("context-badge");
- const customContextBlock = document.getElementById("custom-context-block");
- const customContextTextarea = document.getElementById("customContext");
- const customContextCounter = document.getElementById("customContextCounter");
- const customContextFileInput = document.getElementById("customContextFile");
- const customContextClearBtn = document.getElementById("customContextClear");
- const generateBtn = briefForm.querySelector("button[type='submit']");
- const advancedSettings = document.getElementById("advanced-settings");
- const advancedSupportSection = document.querySelector("[data-section='support']");
- const usedKeywordsSection = document.getElementById("used-keywords");
- const usedKeywordsList = document.getElementById("used-keywords-list");
- const usedKeywordsEmpty = document.getElementById("used-keywords-empty");
- 
- const ADVANCED_SETTINGS_STORAGE_KEY = "content-demo:advanced-settings-open";
- 
- const LOG_STATUS_LABELS = {
-   info: "INFO",
-   success: "SUCCESS",
-   warn: "WARN",
-   error: "ERROR",
- };
- 
- const STEP_LABELS = {
-   draft: "Черновик",
+@@ -102,50 +102,51 @@ const STEP_LABELS = {
    refine: "Уточнение",
    jsonld: "JSON-LD",
    post_analysis: "Пост-анализ",
@@ -295,7 +137,7 @@ index ad76927dec4b975ddac02929895344eac165acb0..b2f0d2cb345a99ef8f4efaff93cbc1ab
  
  const PROGRESS_STAGE_LABELS = {
    draft: "Черновик",
-+  refine: "Доработка",
+   refine: "Доработка",
    trim: "Нормализация",
    validate: "Проверка",
    done: "Готово",
@@ -304,7 +146,7 @@ index ad76927dec4b975ddac02929895344eac165acb0..b2f0d2cb345a99ef8f4efaff93cbc1ab
  
  const PROGRESS_STAGE_MESSAGES = {
    draft: "Генерируем черновик",
-+  refine: "Дорабатываем черновик",
+   refine: "Дорабатываем черновик",
    trim: "Нормализуем объём",
    validate: "Проверяем результат",
    done: "Готово",
@@ -313,16 +155,12 @@ index ad76927dec4b975ddac02929895344eac165acb0..b2f0d2cb345a99ef8f4efaff93cbc1ab
  
  const DEGRADATION_LABELS = {
    draft_failed: "Черновик по запасному сценарию",
--  refine_skipped: "Шаг уточнения пропущен",
--  jsonld_missing: "JSON-LD отсутствует",
--  jsonld_repaired: "JSON-LD восстановлен",
--  post_analysis_skipped: "Проверки пропущены",
--  soft_timeout: "Сработал мягкий таймаут",
-+  refine_skipped: "Доработка пропущена",
-+  jsonld_missing: "JSON-LD не сформирован",
-+  jsonld_repaired: "JSON-LD восстановлен вручную",
-+  post_analysis_skipped: "Отчёт о качестве недоступен",
-+  soft_timeout: "Мягкий таймаут — результат сохранён",
++  draft_max_tokens: "Лимит токенов — результат неполный",
+   refine_skipped: "Доработка пропущена",
+   jsonld_missing: "JSON-LD не сформирован",
+   jsonld_repaired: "JSON-LD восстановлен вручную",
+   post_analysis_skipped: "Отчёт о качестве недоступен",
+   soft_timeout: "Мягкий таймаут — результат сохранён",
  };
  
  const DEFAULT_PROGRESS_MESSAGE =
@@ -343,853 +181,727 @@ index ad76927dec4b975ddac02929895344eac165acb0..b2f0d2cb345a99ef8f4efaff93cbc1ab
      label: "LLM",
      ok: "отвечает",
      fail: "нет ответа",
-   },
-   retrieval_index: {
-     label: "Retrieval index",
-     ok: "найден",
-     fail: "не найден",
-@@ -721,59 +722,67 @@ async function loadArtifacts(prefetched = null) {
-     throw new Error("Некорректный ответ сервера");
-   }
-   state.artifactFiles = files;
-   state.artifacts = normalizeArtifactList(files);
-   state.hasMissingArtifacts = state.artifacts.some((artifact) => artifact.missing);
-   renderArtifacts();
-   updateArtifactsToolbar();
- }
- 
- function renderArtifacts() {
-   state.hasMissingArtifacts = state.artifacts.some((item) => item.missing);
-   if (!state.artifacts.length) {
-     artifactsList.innerHTML = '<div class="empty-state">Пока нет сгенерированных материалов.</div>';
-     updateArtifactsToolbar();
-     return;
+@@ -1124,55 +1125,61 @@ function findLatestArtifactPair(files, { jobId = null, artifactPaths = null } =
+     const markdown = group.files.find(isMarkdownFile) || null;
+     const report = group.files.find(isJsonFile) || null;
+     return { markdown, report };
    }
  
-   artifactsList.innerHTML = "";
-   const template = document.getElementById("artifact-card-template");
- 
-   state.artifacts.forEach((artifact) => {
-     const card = template.content.firstElementChild.cloneNode(true);
-     const metadata = artifact.metadata || {};
-     const title = artifact.name || metadata.name || artifact.id || "Без названия";
-     const themeName = metadata.theme || extractThemeFromName(title);
--    const topic = metadata.input_data?.theme || metadata.data?.theme || metadata.topic || "Без темы";
-+    const topic =
-+      metadata.input_data?.title
-+      || metadata.data?.title
-+      || metadata.title
-+      || metadata.input_data?.goal
-+      || metadata.input_data?.theme
-+      || metadata.data?.theme
-+      || metadata.topic
-+      || "";
-     card.dataset.artifactId = artifact.id || artifact.path || "";
-     card.querySelector(".card-title").textContent = title;
-     const statusInfo = resolveArtifactStatus(artifact);
-     const statusEl = card.querySelector(".status");
-     statusEl.textContent = statusInfo.label;
-     statusEl.dataset.status = statusInfo.value;
--    const topicText = [themeName, topic].filter(Boolean).join(" · ") || topic;
--    card.querySelector(".card-topic").textContent = topicText;
-+    const topicText = [themeName, topic].filter(Boolean).join(" · ");
-+    card.querySelector(".card-topic").textContent = topicText || themeName || "Без темы";
-     const updatedAt = artifact.modified_at ? new Date(artifact.modified_at) : null;
-     card.querySelector(".card-meta").textContent = updatedAt
-       ? `Обновлено ${updatedAt.toLocaleString("ru-RU")}`
-       : "Дата обновления неизвестна";
- 
-     card.addEventListener("click", () => showArtifact(artifact));
- 
-     const openBtn = card.querySelector(".open-btn");
-     const downloadBtn = card.querySelector(".download-btn");
-     const deleteBtn = card.querySelector(".delete-btn");
-     const hasMarkdown = Boolean(artifact.downloads?.markdown);
-     if (openBtn) {
-       openBtn.disabled = !hasMarkdown;
-       openBtn.addEventListener("click", (event) => {
-         event.stopPropagation();
-         showArtifact(artifact);
-       });
-     }
-     if (downloadBtn) {
-       downloadBtn.disabled = !hasMarkdown;
-       downloadBtn.addEventListener("click", async (event) => {
-         event.stopPropagation();
-         await handleArtifactDownload(artifact);
-       });
-     }
-@@ -1744,51 +1753,57 @@ async function watchJobViaPolling(jobId, { onUpdate } = {}) {
-     delayMs = Math.min(delayMs + 200, 1500);
-   }
- }
- 
- function renderGenerationResult(snapshot, { payload }) {
-   const normalized = normalizeJobResponse(snapshot);
-   const result = normalized.result || {};
-   const markdown = typeof result.markdown === "string" ? result.markdown : "";
-   const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
-   const degradationFlags = Array.isArray(normalized.degradation_flags) ? normalized.degradation_flags : [];
-   const characters = typeof meta.characters === "number" ? meta.characters : markdown.replace(/\s+/g, "").length;
-   const hasContent = markdown.trim().length > 0;
-   state.currentResult = {
-     markdown,
-     meta,
-     artifactPaths: result.artifact_paths ?? null,
-     characters,
-     hasContent,
-     degradationFlags,
-     downloads:
-       state.currentDownloads && (state.currentDownloads.markdown || state.currentDownloads.report)
-         ? { ...state.currentDownloads }
-         : null,
-   };
-   draftView.innerHTML = markdownToHtml(markdown);
--  resultTitle.textContent = payload?.data?.theme || "Результат генерации";
-+  const requestedLabel =
-+    payload?.data?.title
-+      || payload?.data?.theme
-+      || payload?.data?.goal
-+      || payload?.theme
-+      || "";
-+  resultTitle.textContent = requestedLabel || "Результат генерации";
-   const metaParts = [];
-   if (hasContent) {
-     metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
-     metaParts.push(
-       `Ориентир: ${DEFAULT_LENGTH_RANGE.min.toLocaleString("ru-RU")}` +
-         `–${DEFAULT_LENGTH_RANGE.max.toLocaleString("ru-RU")}` +
-         ` (≤ ${DEFAULT_LENGTH_RANGE.hard.toLocaleString("ru-RU")})`,
-     );
-   }
-   if (degradationFlags.length) {
-     metaParts.push(`Деградации: ${degradationFlags.length}`);
-   }
-   if (meta.model_used) {
-     metaParts.push(`Модель: ${meta.model_used}`);
-   }
-   resultMeta.textContent = metaParts.join(" · ") || "Деградаций нет";
-   renderMetadata(meta);
-   renderUsedKeywords(meta);
-   updateResultBadges(meta, degradationFlags);
-   toggleRetryButton(!hasContent);
-   updatePromptPreview({
-     system: meta.system_prompt_preview,
-     context: Array.isArray(meta.clips) ? meta.clips : [],
-     user: meta.user_prompt_preview,
-     context_used: meta.context_used,
-@@ -1830,73 +1845,68 @@ function handleRetryClick(event) {
-   }
- }
- 
- function parsePositiveInt(value) {
-   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-     return Math.floor(value);
-   }
-   if (typeof value === "string") {
-     const trimmed = value.trim();
-     if (!trimmed) {
-       return null;
-     }
-     const parsed = Number.parseInt(trimmed, 10);
-     if (Number.isFinite(parsed) && parsed > 0) {
-       return parsed;
-     }
-   }
-   return null;
- }
- 
- function buildRequestPayload() {
-   const theme = pipeSelect.value;
-   if (!theme) {
-     throw new Error("Выберите тематику");
-   }
--  const topic = topicInput?.value?.trim() || "";
--  if (!topic) {
--    throw new Error("Укажите тему материала");
--  }
- 
-   const keywords = keywordsInput.value
-     .split(/\r?\n|,/)
-     .map((item) => item.trim())
-     .filter(Boolean);
-   const structure = structureInput
-     ? structureInput.value
-         .split(/\r?\n/)
-         .map((item) => item.trim())
-         .filter(Boolean)
-     : [];
- 
-   const keywordMode = Array.from(keywordModeInputs).find((input) => input.checked)?.value || "strict";
-   const styleProfile = styleProfileSelect?.value || "sravni.ru";
-   const contextSource = String(contextSourceSelect?.value || "index.json").toLowerCase();
-   const contextPayload = resolveCustomContextPayload(contextSource);
- 
-   const data = {
--    theme: topic,
-     keywords,
-     keywords_mode: keywordMode,
-     include_faq: true,
-     faq_questions: 5,
-     include_jsonld: true,
-     structure,
-     pipe_id: theme,
-     style_profile: styleProfile,
-     context_source: contextSource,
-   };
- 
-   const titleValue = titleInput?.value?.trim();
-   if (titleValue) {
-     data.title = titleValue;
-   }
- 
-   const goalValue = goalInput?.value?.trim();
-   if (goalValue) {
-     data.goal = goalValue;
-   }
- 
-   const audienceValue = audienceInput?.value?.trim();
-   if (audienceValue) {
-     data.target_audience = audienceValue;
-   }
-@@ -1910,50 +1920,55 @@ function buildRequestPayload() {
-   const maxValue = parsePositiveInt(maxCharsInput?.value);
-   const effectiveMin = minValue ?? DEFAULT_LENGTH_RANGE.min;
-   const effectiveMax = maxValue ?? DEFAULT_LENGTH_RANGE.max;
-   if (effectiveMax < effectiveMin) {
-     throw new Error("Максимальный объём должен быть больше или равен минимальному");
-   }
-   data.length_limits = {
-     min_chars: effectiveMin,
-     max_chars: effectiveMax,
-   };
- 
-   const sources = collectSources();
-   if (sources.length) {
-     data.sources = sources;
-   }
- 
-   if (contextSource === "custom") {
-     data.context_source = "custom";
-     if (contextPayload.filename) {
-       data.context_filename = contextPayload.filename;
-     }
-   } else {
-     delete data.context_filename;
-   }
- 
-+  const inferredTopic = titleValue || goalValue || "";
-+  if (inferredTopic) {
-+    data.theme = inferredTopic;
-+  }
-+
-   const payload = {
-     theme,
-     data,
-     k: 0,
-     context_source: contextSource,
-   };
- 
-   if (contextSource === "custom") {
-     payload.context_text = contextPayload.text;
-     if (contextPayload.filename) {
-       payload.context_filename = contextPayload.filename;
-     }
-   }
- 
-   return payload;
- }
- 
- function renderMetadata(meta) {
-   reportView.innerHTML = "";
-   const lengthWarnings = [];
-   if (Array.isArray(meta?.length_limits_warnings)) {
-     meta.length_limits_warnings.forEach((note) => {
-       if (typeof note === "string" && note.trim()) {
-         lengthWarnings.push(note.trim());
-       }
-@@ -3049,51 +3064,51 @@ function updateProgressFromSnapshot(snapshot) {
-   if (progressPercent) {
-     progressPercent.textContent = `${Math.round(percentValue)}%`;
-   }
-   if (progressBar) {
-     progressBar.setAttribute("aria-valuenow", String(Math.round(percentValue)));
-   }
- 
-   let message = "";
-   if (typeof snapshot.progress_message === "string" && snapshot.progress_message.trim()) {
-     message = snapshot.progress_message.trim();
-   } else if (status === "succeeded") {
-     message = PROGRESS_STAGE_MESSAGES.done;
-   } else if (status === "failed") {
-     message = extractErrorMessage(snapshot) || PROGRESS_STAGE_MESSAGES.error;
-   } else if (typeof snapshot.message === "string" && snapshot.message.trim()) {
-     message = snapshot.message.trim();
-   } else {
-     message = PROGRESS_STAGE_MESSAGES[stage] || DEFAULT_PROGRESS_MESSAGE;
-   }
-   if (progressMessage) {
-     progressMessage.textContent = message;
-   }
- 
-   if (progressStage) {
-     const label = PROGRESS_STAGE_LABELS[stage] || PROGRESS_STAGE_LABELS.draft;
--    progressStage.textContent = label;
-+    progressStage.textContent = `Шаг: ${label} 0→100%`;
-   }
- 
-   const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
-     ? snapshot.progress_payload
+   const selectByHint = hints.size
+     ? availableGroups.find(([key, group]) => hints.has(group.baseName) || hints.has(key))
      : null;
-   if (progressDetails) {
-     progressDetails.textContent = formatProgressDetails(stage, payload);
+   if (selectByHint) {
+     const group = selectByHint[1];
+     const markdown = group.files.find(isMarkdownFile) || null;
+     const report = group.files.find(isJsonFile) || null;
+     return { markdown, report };
    }
  
-   if (status === "succeeded") {
-     progressState.currentPercent = 100;
-     if (progressPercent) {
-       progressPercent.textContent = "100%";
+   availableGroups.sort((a, b) => (b[1].createdTs || 0) - (a[1].createdTs || 0));
+   const latest = availableGroups[0]?.[1];
+   if (!latest) {
+     return null;
+   }
+   const markdown = latest.files.find(isMarkdownFile) || null;
+   const report = latest.files.find(isJsonFile) || null;
+   return { markdown, report };
+ }
+ 
+-function hasDraftStepSucceeded(snapshot) {
++function hasDraftStepCompleted(snapshot) {
+   if (!snapshot || !Array.isArray(snapshot.steps)) {
+     return false;
+   }
+-  return snapshot.steps.some((step) => step && step.name === "draft" && step.status === "succeeded");
++  return snapshot.steps.some((step) => {
++    if (!step || step.name !== "draft") {
++      return false;
++    }
++    const status = typeof step.status === "string" ? step.status.trim().toLowerCase() : "";
++    return status === "succeeded" || status === "degraded";
++  });
+ }
+ 
+ async function refreshDownloadLinksForJob({ jobId = null, artifactPaths = null } = {}) {
+   if (!downloadMdBtn || !downloadReportBtn) {
+     return null;
+   }
+   try {
+     const files = await fetchArtifactFiles();
+     state.pendingArtifactFiles = files;
+     const pair = findLatestArtifactPair(files, { jobId, artifactPaths });
+     const downloads = pair
+       ? {
+           markdown: pair.markdown ? createDownloadInfoFromFile(pair.markdown) : null,
+           report: pair.report ? createDownloadInfoFromFile(pair.report) : null,
+         }
+       : { markdown: null, report: null };
+     setButtonLoading(downloadMdBtn, false);
+     setButtonLoading(downloadReportBtn, false);
+     setActiveArtifactDownloads(downloads);
+     if (state.currentResult && typeof state.currentResult === "object") {
+       state.currentResult.downloads = downloads;
      }
-     if (progressBarFill) {
-       progressBarFill.style.width = "100%";
+     return downloads;
+   } catch (error) {
+     console.warn("Не удалось обновить ссылки на артефакты", error);
+@@ -1474,83 +1481,83 @@ async function handleGenerate(event) {
+       k: payload.k,
+       context_source: payload.context_source,
+     };
+     if (Array.isArray(payload.data?.keywords)) {
+       requestBody.keywords = payload.data.keywords;
      }
-     if (progressBar) {
-       progressBar.setAttribute("aria-valuenow", "100");
+     requestBody.faq_required = true;
+     requestBody.faq_count = payload.data?.faq_questions || 5;
+     if (payload.context_source === "custom") {
+       requestBody.context_text = payload.context_text;
+       if (payload.context_filename) {
+         requestBody.context_filename = payload.context_filename;
+       }
      }
-     scheduleProgressHide(1200);
-   } else if (status === "failed") {
-     progressState.currentPercent = 100;
-     if (progressPercent) {
-       progressPercent.textContent = "100%";
-diff --git a/helpers.py b/helpers.py
-index def3ea3edafc9a36a069480f5683d51b822a1359..dc903317f8205dc52b2007f7c4e15ce35f7284d6 100644
---- a/helpers.py
-+++ b/helpers.py
-@@ -1,12 +1,17 @@
- # -*- coding: utf-8 -*-
- from typing import List
+     const initialResponse = await fetchJson("/api/generate", {
+       method: "POST",
+       body: JSON.stringify(requestBody),
+     });
+     let snapshot = normalizeJobResponse(initialResponse);
+     activeJobId = snapshot.job_id || snapshot.id || activeJobId;
+     if (snapshot.result && typeof snapshot.result === "object" && snapshot.result.artifact_paths) {
+       artifactPathsHint = snapshot.result.artifact_paths;
+     }
+     applyProgressiveResult(snapshot);
+     updateProgressFromSnapshot(snapshot);
+-    if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
++    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
+       downloadsRequested = true;
+       refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
+         console.warn("Не удалось заранее получить ссылки на артефакты", error);
+       });
+     }
+     if (snapshot.status !== "succeeded" || !snapshot.result) {
+       if (!snapshot.job_id) {
+         throw new Error("Сервер вернул пустой ответ без идентификатора задания.");
+       }
+       snapshot = await pollJobUntilDone(snapshot.job_id, {
+         onUpdate: (update) => {
+           applyProgressiveResult(update);
+           updateProgressFromSnapshot(update);
+-          if (!downloadsRequested && hasDraftStepSucceeded(update)) {
++            if (!downloadsRequested && hasDraftStepCompleted(update)) {
+             downloadsRequested = true;
+             activeJobId = update?.id || update?.job_id || activeJobId;
+             if (update?.result && typeof update.result === "object" && update.result.artifact_paths) {
+               artifactPathsHint = update.result.artifact_paths;
+             }
+             refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
+               console.warn("Не удалось заранее получить ссылки на артефакты", error);
+             });
+           }
+         },
+       });
+     }
+     activeJobId = snapshot?.id || snapshot?.job_id || activeJobId;
+     if (snapshot?.result && typeof snapshot.result === "object" && snapshot.result.artifact_paths) {
+       artifactPathsHint = snapshot.result.artifact_paths;
+     }
+     updateProgressFromSnapshot(snapshot);
+-    if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
++    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
+       downloadsRequested = true;
+       await refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
+     }
+     renderGenerationResult(snapshot, { payload });
+     try {
+       const pendingFiles = state.pendingArtifactFiles;
+       await loadArtifacts(pendingFiles);
+     } catch (refreshError) {
+       console.error(refreshError);
+       showToast({ message: `Не удалось обновить список материалов: ${getErrorMessage(refreshError)}`, type: "warn" });
+     }
+     state.pendingArtifactFiles = null;
+     switchTab("result");
+     showToast({ message: "Готово", type: "success" });
+   } catch (error) {
+     console.error(error);
+     showToast({ message: `Не удалось выполнить генерацию: ${getErrorMessage(error)}`, type: "error" });
+     setButtonLoading(downloadMdBtn, false);
+     setButtonLoading(downloadReportBtn, false);
+     setActiveArtifactDownloads(null);
+     hideProgressOverlay({ immediate: true });
+   } finally {
+     setButtonLoading(generateBtn, false);
+     setInteractiveBusy(false);
+     hideProgressOverlay();
+diff --git a/jobs/runner.py b/jobs/runner.py
+index 397a02db7233e384572a5c3427821f38acea1be1..594c9164636c2fa3edb5b503c17008ab7dfc2703 100644
+--- a/jobs/runner.py
++++ b/jobs/runner.py
+@@ -31,50 +31,51 @@ PROGRESS_STAGE_WEIGHTS = {
+ }
+ 
+ PROGRESS_STAGE_MESSAGES = {
+     "draft": "Генерируем черновик",
+     "trim": "Нормализуем объём",
+     "validate": "Проверяем результат",
+     "done": "Готово",
+ }
  
  
- def list_to_block(items: List[str]) -> str:
-     """
-     Превращает список секций в маркированный блок для промпта.
-     """
-     if not items:
--        items = ["Введение", "Основная часть", "Вывод"]
-+        items = [
-+            "Введение",
-+            "Основная часть с подзаголовками",
-+            "FAQ",
-+            "Вывод/CTA",
-+        ]
-     return "\n".join(f"- {x}" for x in items)
+ @dataclass
+ class RunnerTask:
+     job_id: str
+     payload: Dict[str, Any]
+     trace_id: Optional[str] = None
  
-diff --git a/keywords.py b/keywords.py
-index d7a4829ffa24f04cebc1680bf0449fedc4b0570a..55c3a836b2d292cb061d6e5db1d3ad6259d6044a 100644
---- a/keywords.py
-+++ b/keywords.py
-@@ -199,31 +199,32 @@ def merge_keywords(
-         final.append(display)
-         seen.add(normalized)
  
-     auto_budget = limit if limit > 0 else 0
-     if auto_budget and auto_candidates:
-         for kw in auto_candidates:
-             normalized = _cleanup_keyword(kw, allow_digits=False)
-             if not normalized or normalized in seen:
-                 continue
-             auto_used.append(normalized)
-             final.append(normalized)
-             seen.add(normalized)
-             if len(auto_used) >= auto_budget:
+ @dataclass
+ class PipelineContext:
+     markdown: str = ""
+     meta_json: Dict[str, Any] = field(default_factory=dict)
+     faq_entries: List[Dict[str, str]] = field(default_factory=list)
+     degradation_flags: List[str] = field(default_factory=list)
+     errors: List[str] = field(default_factory=list)
+     trace_id: Optional[str] = None
++    artifact_paths: Optional[Dict[str, Any]] = None
+ 
+     def ensure_markdown(self, fallback: str) -> None:
+         if not self.markdown.strip():
+             self.markdown = fallback
+ 
+ 
+ @dataclass
+ class StepResult:
+     status: JobStepStatus
+     payload: Dict[str, Any] = field(default_factory=dict)
+     degradation_flags: List[str] = field(default_factory=list)
+     error: Optional[str] = None
+     continue_pipeline: bool = True
+ 
+ 
+ class JobRunner:
+     """Serial job runner executing pipeline tasks in a background thread."""
+ 
+     def __init__(self, store: JobStore, *, soft_timeout_s: int = JOB_SOFT_TIMEOUT_S) -> None:
+         self._store = store
+         self._soft_timeout_s = soft_timeout_s
+         self._tasks: "queue.Queue[RunnerTask]" = queue.Queue()
+         self._events: Dict[str, threading.Event] = {}
+         self._events_lock = threading.Lock()
+         self._thread = threading.Thread(target=self._worker, name="job-runner", daemon=True)
+@@ -191,50 +192,52 @@ class JobRunner:
+                 step.mark_degraded(result.error, **result.payload)
+             else:
+                 step.mark_failed(result.error, **result.payload)
+             log_step(
+                 LOGGER,
+                 job_id=job.id,
+                 step=step.name,
+                 status=step.status.value,
+                 error=result.error,
+                 payload=result.payload or None,
+             )
+             ctx.degradation_flags.extend(result.degradation_flags)
+             self._store.touch(job.id)
+             if not result.continue_pipeline:
                  break
  
-     return manual_used, auto_used, final
+         ctx.ensure_markdown(_build_fallback_text(task.payload))
+         if ctx.degradation_flags:
+             ctx.degradation_flags = list(dict.fromkeys(ctx.degradation_flags))
+         result_payload = {
+             "markdown": ctx.markdown,
+             "meta_json": ctx.meta_json,
+             "faq_entries": ctx.faq_entries,
+             "errors": ctx.errors or None,
+         }
++        if ctx.artifact_paths:
++            result_payload["artifact_paths"] = ctx.artifact_paths
+         job.mark_succeeded(result_payload, degradation_flags=ctx.degradation_flags)
+         self._record_progress(job, "done", 1.0, message=PROGRESS_STAGE_MESSAGES.get("done"))
+         self._store.touch(job.id)
+         JOB_COUNTER.inc()
  
+     def _execute_step(
+         self,
+         step_name: str,
+         payload: Dict[str, Any],
+         ctx: PipelineContext,
+         job: Optional[Job],
+     ) -> StepResult:
+         if step_name == "draft":
+             return self._run_draft_step(payload, ctx, job)
+         if step_name == "refine":
+             return self._run_refine_step(ctx, job)
+         if step_name == "jsonld":
+             return self._run_jsonld_step(ctx, job)
+         if step_name == "post_analysis":
+             return self._run_post_analysis_step(ctx, job)
+         return StepResult(JobStepStatus.SUCCEEDED, payload={"skipped": True})
  
- def format_keywords_block(keywords: Sequence[str]) -> str:
-     """Render keywords for prompt inclusion as a multi-line block."""
+     def _record_progress(
+         self,
+         job: Optional[Job],
+@@ -280,54 +283,85 @@ class JobRunner:
+             *,
+             progress: float = 0.0,
+             message: Optional[str] = None,
+             payload: Optional[Dict[str, Any]] = None,
+         ) -> None:
+             self._record_progress(job, stage, progress, message=message, payload=payload)
  
-     items = [kw for kw in keywords if kw]
-     if not items:
-         return ""
-     bullet_list = "\n".join(f"- {kw}" for kw in items)
--    return (
-+    instructions = (
-         "Ключевые слова (используй каждое хотя бы один раз в точной форме, без изменений):\n"
-         + bullet_list
--        + "\n\n"
-+        + "\nРаспредели их по разделам, не собирай все в одном абзаце и избегай переспама.\n\n"
-     )
-+    return instructions
+         attempt = 0
+         last_error: Optional[str] = None
+         while attempt <= JOB_MAX_RETRIES_PER_STEP:
+             attempt += 1
+             try:
+                 result = generate_article_from_payload(
+                     **payload,
+                     progress_callback=_progress_event,
+                 )
+             except Exception as exc:  # noqa: BLE001
+                 last_error = str(exc)
+                 ctx.errors.append(last_error)
+                 continue
  
-diff --git a/length_limits.py b/length_limits.py
-index 88e5d5df89094ba7c96c8f9d6760d25f980fdf98..4c6cd3f0761cce2142c0a51549455182cab1d6d4 100644
---- a/length_limits.py
-+++ b/length_limits.py
-@@ -1,84 +1,76 @@
- from __future__ import annotations
+             markdown = str(result.get("text") or result.get("markdown") or "").strip()
+             metadata = result.get("metadata")
+             if isinstance(metadata, dict):
+                 ctx.meta_json = metadata
++            artifact_paths = result.get("artifact_paths")
++            if isinstance(artifact_paths, dict) and artifact_paths:
++                ctx.artifact_paths = artifact_paths
++            degradation_flags: List[str] = []
++            completion_warning: Optional[str] = None
++            if isinstance(metadata, dict):
++                raw_flags = metadata.get("degradation_flags")
++                if isinstance(raw_flags, list):
++                    degradation_flags = [
++                        str(flag).strip()
++                        for flag in raw_flags
++                        if isinstance(flag, str) and str(flag).strip()
++                    ]
++                if degradation_flags:
++                    for flag in degradation_flags:
++                        if flag not in ctx.degradation_flags:
++                            ctx.degradation_flags.append(flag)
++                warning_candidate = metadata.get("completion_warning")
++                if isinstance(warning_candidate, str) and warning_candidate.strip():
++                    completion_warning = warning_candidate.strip()
+             if markdown:
+                 ctx.markdown = markdown
+                 self._record_progress(job, "draft", 1.0)
+-                return StepResult(JobStepStatus.SUCCEEDED, payload={"attempts": attempt})
++                step_payload = {"attempts": attempt}
++                if ctx.artifact_paths:
++                    step_payload["artifact_paths"] = ctx.artifact_paths
++                if degradation_flags:
++                    error_label = completion_warning or degradation_flags[0]
++                    return StepResult(
++                        JobStepStatus.DEGRADED,
++                        payload=step_payload,
++                        degradation_flags=degradation_flags,
++                        error=error_label,
++                    )
++                return StepResult(JobStepStatus.SUCCEEDED, payload=step_payload)
+             last_error = "empty_response"
+             ctx.errors.append(last_error)
  
- import json
- from dataclasses import dataclass
- from pathlib import Path
- from typing import Any, Dict, Optional, Tuple
- 
- from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
- 
- 
- @dataclass(frozen=True)
- class ResolvedLengthLimits:
-     """Normalized length requirements with provenance metadata."""
- 
-     min_chars: int
-     max_chars: int
-     min_source: str
-     max_source: str
-     swapped: bool = False
-     warnings: Tuple[str, ...] = ()
-     profile_source: Optional[str] = None
- 
- 
- SOFT_RANGE_PERCENT = 0.02
--SOFT_RANGE_MIN_BELOW = 50
--SOFT_RANGE_MIN_ABOVE = 100
- 
- 
- def compute_soft_length_bounds(min_chars: int, max_chars: int) -> Tuple[int, int, int, int]:
-     """Return relaxed length bounds around requested min/max values.
- 
--    The lower tolerance is at least ``SOFT_RANGE_MIN_BELOW`` characters or 2% of the
--    minimum requirement. The upper tolerance is at least
--    ``SOFT_RANGE_MIN_ABOVE`` characters or 2% of the maximum requirement. Both
--    tolerances are additionally capped by zero to avoid negative bounds.
-+    The relaxed bounds extend the requested min and max by ±2% and never below
-+    zero. Values are normalised to ensure ``min_chars`` is less than or equal to
-+    ``max_chars`` before applying the tolerance.
-     """
- 
-     try:
-         min_value = int(min_chars)
-     except (TypeError, ValueError):  # defensive: keep behaviour predictable
-         min_value = 0
-     try:
-         max_value = int(max_chars)
-     except (TypeError, ValueError):
-         max_value = 0
- 
-     if max_value < min_value:
-         min_value, max_value = max_value, min_value
- 
-     min_value = max(0, min_value)
-     max_value = max(0, max_value)
- 
--    lower_tolerance = 0
--    if min_value > 0:
--        lower_tolerance = min(
--            min_value,
--            max(SOFT_RANGE_MIN_BELOW, int(round(min_value * SOFT_RANGE_PERCENT))),
--        )
--    upper_tolerance = max(SOFT_RANGE_MIN_ABOVE, int(round(max_value * SOFT_RANGE_PERCENT)))
-+    lower_tolerance = int(round(min_value * SOFT_RANGE_PERCENT)) if min_value > 0 else 0
-+    upper_tolerance = int(round(max_value * SOFT_RANGE_PERCENT)) if max_value > 0 else 0
- 
-     soft_min = max(0, min_value - lower_tolerance)
-     soft_max = max_value + upper_tolerance
- 
-     return soft_min, soft_max, lower_tolerance, upper_tolerance
- 
- 
- def resolve_length_limits(theme: str, payload: Dict[str, Any]) -> ResolvedLengthLimits:
-     """Determine min/max character limits using brief → profile → defaults."""
- 
-     target_length = _safe_positive_int(payload.get("length_target"))
-     if target_length is not None and target_length > 0:
-         soft_min, soft_max, _tol_below, _tol_above = compute_soft_length_bounds(
-             target_length, target_length
+         ctx.ensure_markdown(_build_fallback_text(payload, error=last_error))
+         flags = ["draft_failed"]
+         self._record_progress(job, "draft", 1.0, message="Черновик по запасному сценарию")
+         return StepResult(
+             JobStepStatus.DEGRADED,
+             payload={"attempts": attempt, "error": last_error},
+             degradation_flags=flags,
+             error=last_error,
          )
-         brief_min = soft_min or target_length
-         brief_max = soft_max or target_length
-         requested = payload.setdefault("_length_limits_requested", {})
-         if isinstance(requested, dict):
-             requested["target"] = target_length
-     else:
-         brief_min, brief_max = _extract_brief_limits(payload)
  
-     profile_min, profile_max, profile_source = _load_profile_limits(theme)
+     def _run_refine_step(self, ctx: PipelineContext, job: Optional[Job]) -> StepResult:
+         if not ctx.markdown.strip():
+             ctx.ensure_markdown("Черновик пока пустой.")
+             return StepResult(
+                 JobStepStatus.DEGRADED,
+                 payload={"action": "fallback_text"},
+                 degradation_flags=["refine_skipped"],
+                 error="empty_markdown",
+             )
+         self._record_progress(job, "trim", 0.0)
+         refined = ctx.markdown.strip()
+         passes = []
+diff --git a/llm_client.py b/llm_client.py
+index 64b0f4c22aec30b36220ba6a4d959c3654b5fa20..b8b23688e92ed3394363685fc9cf279586eecc1f 100644
+--- a/llm_client.py
++++ b/llm_client.py
+@@ -1852,79 +1852,99 @@ def generate(
+                         data = polled_payload
+                         text, parse_flags, schema_label = _extract_responses_text(data)
+                         metadata = _extract_metadata(data)
+                         if isinstance(parse_flags, dict):
+                             parse_flags["metadata"] = metadata
+                         content_lengths = 0
+                         if isinstance(parse_flags, dict):
+                             output_len = int(parse_flags.get("output_text_len", 0) or 0)
+                             content_len = int(parse_flags.get("content_text_len", 0) or 0)
+                             content_lengths = output_len + content_len
+                         if content_lengths > 0 and not content_started:
+                             content_started = True
+                             shrink_applied = False
+                             shrink_next_attempt = False
+                             LOGGER.info("RESP_CONTENT_STARTED len=%d", content_lengths)
+                         status = metadata.get("status") or ""
+                         reason = metadata.get("incomplete_reason") or ""
+                         segments = int(parse_flags.get("segments", 0) or 0)
+                         LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
+                 if status == "incomplete":
+                     if reason == "max_output_tokens":
+                         LOGGER.info(
+                             "RESP_STATUS=incomplete|max_output_tokens=%s",
+                             current_payload.get("max_output_tokens"),
+                         )
+-                        last_error = RuntimeError("responses_incomplete")
+                         response_id_value = metadata.get("response_id") or ""
+                         prev_field_present = "previous_response_id" in data or (
+                             isinstance(metadata.get("previous_response_id"), str)
+                             and metadata.get("previous_response_id")
+                         )
+                         if (
+                             response_id_value
+                             and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
+                         ):
+                             resume_from_response_id = str(response_id_value)
+                         schema_dict: Optional[Dict[str, Any]] = None
+                         if isinstance(format_block, dict):
+                             candidate_schema = format_block.get("schema")
+                             if isinstance(candidate_schema, dict):
+                                 schema_dict = candidate_schema
+-                        if schema_dict and text and _is_valid_json_schema_instance(schema_dict, text):
+-                            LOGGER.info(
+-                                "RESP_INCOMPLETE_ACCEPT schema_valid len=%d",
+-                                len(text),
+-                            )
++                        if text:
+                             metadata = dict(metadata)
+                             metadata["status"] = "completed"
+                             metadata["incomplete_reason"] = ""
++                            metadata["completion_warning"] = "max_output_tokens"
++                            degradation_flags: List[str] = []
++                            raw_flags = metadata.get("degradation_flags")
++                            if isinstance(raw_flags, list):
++                                degradation_flags.extend(
++                                    str(flag).strip()
++                                    for flag in raw_flags
++                                    if isinstance(flag, str) and flag.strip()
++                                )
++                            if "draft_max_tokens" not in degradation_flags:
++                                degradation_flags.append("draft_max_tokens")
++                            metadata["degradation_flags"] = degradation_flags
++                            if schema_dict and _is_valid_json_schema_instance(schema_dict, text):
++                                LOGGER.info(
++                                    "RESP_INCOMPLETE_ACCEPT schema_valid len=%d",
++                                    len(text),
++                                )
++                                metadata["completion_schema_valid"] = True
++                            else:
++                                LOGGER.info(
++                                    "RESP_INCOMPLETE_ACCEPT text len=%d",
++                                    len(text),
++                                )
++                                metadata["completion_schema_valid"] = False
+                             parse_flags["metadata"] = metadata
+                             updated_data = dict(data)
+                             updated_data["metadata"] = metadata
+                             _persist_raw_response(updated_data)
+                             return text, parse_flags, updated_data, schema_label
++                        last_error = RuntimeError("responses_incomplete")
+                         cap_exhausted = (
+                             upper_cap is not None and int(current_max) >= upper_cap
+                         )
+                         if not cap_exhausted and token_escalations >= RESPONSES_MAX_ESCALATIONS:
+                             if (
+                                 upper_cap is not None
+                                 and int(current_max) < upper_cap
+                                 and upper_cap > 0
+                             ):
+                                 LOGGER.info(
+                                     "RESP_ESCALATE_TOKENS reason=max_output_tokens cap_force=%s",
+                                     upper_cap,
+                                 )
+                                 token_escalations += 1
+                                 current_max = upper_cap
+                                 sanitized_payload["max_output_tokens"] = max(
+                                     min_token_floor, int(current_max)
+                                 )
+                                 cap_retry_performed = True
+                                 shrink_next_attempt = False
+                                 continue
+                             break
+                         if not cap_exhausted:
+                             next_max = _compute_next_max_tokens(
+                                 int(current_max), token_escalations, upper_cap
+diff --git a/orchestrate.py b/orchestrate.py
+index 64d4f78c09582ad65448809556fef5ee5e1f033c..544d611531bd8d128a88358ef2b24da4d1190da6 100644
+--- a/orchestrate.py
++++ b/orchestrate.py
+@@ -323,87 +323,96 @@ def _serialize_pipeline_logs(logs: Iterable[Any]) -> List[Dict[str, Any]]:
  
-diff --git a/profiles/finance/settings.json b/profiles/finance/settings.json
-index d21bcb7a45576c992c595276f4f330f12987e04c..03b6a9c0ad05bc8b2ae354cf2602c9786e68bec9 100644
---- a/profiles/finance/settings.json
-+++ b/profiles/finance/settings.json
-@@ -1,8 +1,8 @@
- {
-   "defaults": {
-     "length_limits": {
--      "min_chars": 5200,
--      "max_chars": 6800
-+      "min_chars": 3500,
-+      "max_chars": 6000
+ def _serialize_checkpoints(checkpoints: Dict[PipelineStep, str]) -> Dict[str, Dict[str, int]]:
+     serialized: Dict[str, Dict[str, int]] = {}
+     for step, text in checkpoints.items():
+         serialized[step.value] = {
+             "chars": len(text),
+             "chars_no_spaces": len("".join(text.split())),
+         }
+     return serialized
+ 
+ 
+ def _build_metadata(
+     *,
+     theme: str,
+     generation_context: GenerationContext,
+     pipeline_state_text: str,
+     validation: ValidationResult,
+     pipeline_logs: Iterable[Any],
+     checkpoints: Dict[PipelineStep, str],
+     duration_seconds: float,
+     model_used: Optional[str],
+     fallback_used: Optional[str],
+     fallback_reason: Optional[str],
+     api_route: Optional[str],
+     token_usage: Optional[float],
++    degradation_flags: Optional[Iterable[str]] = None,
+ ) -> Dict[str, Any]:
+     metadata: Dict[str, Any] = {
+         "schema_version": LATEST_SCHEMA_VERSION,
+         "theme": theme,
+         "generated_at": _local_now().isoformat(),
+         "duration_seconds": round(duration_seconds, 3),
+         "context_source": generation_context.context_source,
+         "context_len": generation_context.custom_context_len,
+         "context_filename": generation_context.custom_context_filename,
+         "context_truncated": generation_context.custom_context_truncated,
+         "style_profile_applied": generation_context.style_profile_applied,
+         "style_profile_source": generation_context.style_profile_source,
+         "style_profile_variant": generation_context.style_profile_variant,
+         "keywords_manual": generation_context.keywords_manual,
+         "length_limits": {
+             "min": generation_context.length_limits.min_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[0],
+             "max": generation_context.length_limits.max_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[1],
+         },
+         "faq_questions_requested": generation_context.faq_questions,
+         "pipeline_logs": _serialize_pipeline_logs(pipeline_logs),
+         "pipeline_checkpoints": _serialize_checkpoints(checkpoints),
+         "validation": {
+             "passed": validation.is_valid,
+             "stats": validation.stats,
+         },
+         "length_no_spaces": length_no_spaces(pipeline_state_text),
      }
-   }
- }
-diff --git a/rules_engine.py b/rules_engine.py
-index 8407d26547096f352c1ea6960647fe96a2d43e23..66f9fcdeb2b3b517c74e4d2650cc95f0af58a8e5 100644
---- a/rules_engine.py
-+++ b/rules_engine.py
-@@ -57,155 +57,186 @@ def build_prompt(data: Dict[str, Any]) -> str:
-     keywords_mode = str(data.get("keywords_mode") or "strict").strip().lower() or "strict"
+     if model_used:
+         metadata["model_used"] = model_used
+     if fallback_used:
+         metadata["fallback_used"] = fallback_used
+     if fallback_reason:
+         metadata["fallback_reason"] = fallback_reason
+     if api_route:
+         metadata["api_route"] = api_route
+     if isinstance(token_usage, (int, float)):
+         metadata["token_usage"] = float(token_usage)
++    if degradation_flags:
++        normalized_flags = [
++            str(flag).strip()
++            for flag in degradation_flags
++            if isinstance(flag, str) and str(flag).strip()
++        ]
++        if normalized_flags:
++            metadata["degradation_flags"] = list(dict.fromkeys(normalized_flags))
+     return metadata
  
-     spec = InputSpec(
-         theme=str(data.get("theme", "общая тема")).strip() or "общая тема",
-         goal=str(data.get("goal", "SEO-статья")).strip() or "SEO-статья",
-         keywords=list(data.get("keywords", [])),
-         tone=str(data.get("tone", DEFAULT_TONE)).strip() or DEFAULT_TONE,
-         structure=list(data.get("structure", DEFAULT_STRUCTURE)),
-         min_len=min_len,
-         max_len=max_len,
-         seo_density=int(data.get("seo_density", DEFAULT_SEO_DENSITY)),
-         audience=str(data.get("target_audience", "")).strip(),
-         title=str(data.get("title", "")).strip(),
-         style_profile=str(data.get("style_profile", "sravni.ru")).strip().lower() or "sravni.ru",
-         keywords_mode=keywords_mode,
-         include_faq=bool(data.get("include_faq", True)),
-         faq_questions=_safe_int(data.get("faq_questions")),
-         include_jsonld=bool(data.get("include_jsonld", False)),
-         sources=_normalize_sources(data.get("sources")),
+ 
+ def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> Dict[str, Path]:
+     markdown_path.parent.mkdir(parents=True, exist_ok=True)
+     def _validate_markdown(tmp_path: Path) -> None:
+         if not tmp_path.read_text(encoding="utf-8").strip():
+             raise ValueError("Пустой файл статьи не может быть сохранён.")
+ 
+     def _validate_metadata(tmp_path: Path) -> None:
+         json.loads(tmp_path.read_text(encoding="utf-8"))
+ 
+     store_atomic_write_text(markdown_path, text, validator=_validate_markdown)
+     metadata_path = markdown_path.with_suffix(".json")
+     store_atomic_write_text(
+         metadata_path,
+         json.dumps(metadata, ensure_ascii=False, indent=2),
+         validator=_validate_metadata,
+     )
+     register_artifact(markdown_path, metadata)
+     return {"markdown": markdown_path, "metadata": metadata_path}
+ 
+ 
+ def _extract_keywords(data: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+     raw_keywords = data.get("keywords") or []
+@@ -511,50 +520,51 @@ def _generate_variant(
+         backoff_schedule=backoff_schedule,
+         provided_faq=prepared_data.get("faq_entries") if isinstance(prepared_data.get("faq_entries"), list) else None,
+         jsonld_requested=generation_context.jsonld_requested,
+         faq_questions=generation_context.faq_questions,
+         progress_callback=progress_callback,
+     )
+     state = pipeline.run()
+     if not state.validation or not state.validation.is_valid:
+         raise RuntimeError("Pipeline validation failed; artifact not recorded.")
+ 
+     final_text = state.text
+     duration_seconds = time.time() - start_time
+     metadata = _build_metadata(
+         theme=theme,
+         generation_context=generation_context,
+         pipeline_state_text=final_text,
+         validation=state.validation,
+         pipeline_logs=state.logs,
+         checkpoints=state.checkpoints,
+         duration_seconds=duration_seconds,
+         model_used=state.model_used,
+         fallback_used=state.fallback_used,
+         fallback_reason=state.fallback_reason,
+         api_route=state.api_route,
+         token_usage=state.token_usage,
++        degradation_flags=pipeline.degradation_flags,
      )
  
-     tmpl = PROMPT_PATH.read_text(encoding="utf-8")
-     structure_block = list_to_block(spec.structure)
-     keywords_block = format_keywords_block(spec.keywords)
- 
-+    theme_line = _render_theme_suffix(spec.theme)
-     style_line = _render_style_line(spec.style_profile)
-     audience_line = _render_optional_line("Целевая аудитория", spec.audience)
-     title_line = _render_optional_line("Название", spec.title)
-     length_line = _render_length_line(spec.min_len, spec.max_len)
-     length_strict_line = _render_length_strict_line(spec.min_len, spec.max_len)
-     keywords_mode_line = _render_keywords_mode_line(spec.keywords_mode)
-     sources_block = _render_sources_block(spec.sources)
-     faq_line = _render_faq_line(spec.include_faq, spec.faq_questions)
-     jsonld_line = _render_jsonld_line(spec.include_jsonld)
-+    tone_style_line = _render_tone_style_line()
-+    structure_hint_line = _render_structure_hint()
- 
-     prompt = tmpl.format(
-+        theme_line=theme_line,
-         theme=spec.theme,
-         goal=spec.goal,
-         tone=spec.tone,
-         length_line=length_line,
-         length_strict_line=length_strict_line,
-         style_line=style_line,
-         audience_line=audience_line,
-         title_line=title_line,
-+        tone_style_line=tone_style_line,
-         structure_block=structure_block,
-+        structure_hint_line=structure_hint_line,
-         keywords_block=keywords_block,
-         keywords_mode_line=keywords_mode_line,
-         sources_block=sources_block,
-         faq_line=faq_line,
-         jsonld_line=jsonld_line,
-     )
-     return prompt
- 
- 
- def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
-     try:
-         if value is None:
-             return default
-         return int(value)
-     except (TypeError, ValueError):
-         return default
- 
- 
- def _render_style_line(profile: str) -> str:
-     key = profile or "sravni.ru"
-     description = STYLE_PROFILE_DESCRIPTIONS.get(key, STYLE_PROFILE_DESCRIPTIONS["sravni.ru"])
-     if key == "off":
-         return "Пиши в универсальном деловом стиле без упоминания конкретного портала."
-     return f"Используй стиль портала {key}: {description}."
- 
- 
- def _render_optional_line(label: str, value: str) -> str:
-     if not value:
-         return ""
-     return f"{label}: {value}\n"
- 
- 
-+def _render_theme_suffix(theme: str) -> str:
-+    normalized = str(theme or "").strip()
-+    if not normalized:
-+        return ""
-+    return f" по теме {normalized}"
-+
-+
- def _render_length_line(min_len: int, max_len: int) -> str:
-     return f"{min_len}\u2013{max_len} символов без пробелов"
- 
- 
- def _render_length_strict_line(min_len: int, max_len: int) -> str:
-     return f"Строго соблюдай диапазон {min_len}\u2013{max_len} символов без пробелов."
- 
- 
- def _render_keywords_mode_line(mode: str) -> str:
-     normalized = (mode or "strict").lower()
-     labels = {
-         "soft": "мягкий — допускаются синонимы и естественные формы",
-         "strict": "строгий — используй точные вхождения",
-         "anti_spam": "запрет переспама — не чаще двух повторов на 1000 символов",
+     outputs = _write_outputs(output_path, final_text, metadata)
+     return {
+         "text": final_text,
+         "metadata": metadata,
+         "duration": duration_seconds,
+         "artifact_files": outputs,
      }
-     label = labels.get(normalized, labels["strict"])
-     return f"Режим ключевых слов: {label}.\n\n"
  
  
- def _render_sources_block(sources: List[Dict[str, str]]) -> str:
-     if not sources:
-         return ""
-     lines: List[str] = []
-     usage_labels = {
-         "quote": "цитата с атрибуцией",
-         "summary": "пересказ со ссылкой",
-         "inspiration": "вдохновение без ссылки",
+ def generate_article_from_payload(
+     *,
+     theme: str,
+     data: Dict[str, Any],
+     k: int,
+     model: Optional[str] = None,
+     max_tokens: int = 0,
+     timeout: Optional[int] = None,
+     mode: Optional[str] = None,
+     backoff_schedule: Optional[List[float]] = None,
+     outfile: Optional[str] = None,
+     append_style_profile: Optional[bool] = None,
+     context_source: Optional[str] = None,
+     context_text: Optional[str] = None,
+diff --git a/tests/test_job_runner.py b/tests/test_job_runner.py
+index 8021c727684721446689ce55dfb8bdc404588bbb..d810bab6774a1dcd0d4a96b6d46c919e01c828ea 100644
+--- a/tests/test_job_runner.py
++++ b/tests/test_job_runner.py
+@@ -33,25 +33,54 @@ def test_job_runner_success(monkeypatch, job_store):
+     assert snapshot.get("step") == "done"
+     assert snapshot.get("progress") == 1.0
+     assert snapshot.get("message") == "Готово"
+     assert snapshot.get("last_event_at")
+     assert snapshot["result"]["markdown"].startswith("Hello")
+     assert snapshot["degradation_flags"] in (None, [])
+     assert snapshot["trace_id"] == "trace-1"
+ 
+ 
+ def test_job_runner_degradation(monkeypatch, job_store):
+     def _raise_generate(**_kwargs):
+         raise RuntimeError("boom")
+ 
+     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _raise_generate)
+     runner = JobRunner(job_store, soft_timeout_s=1)
+     job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-2")
+     runner.wait(job.id, timeout=3)
+     snapshot = runner.get_job(job.id)
+     assert snapshot["status"] == "succeeded"
+     assert snapshot.get("step") == "done"
+     assert snapshot.get("progress") == 1.0
+     assert snapshot.get("message") == "Готово"
+     assert "draft_failed" in (snapshot.get("degradation_flags") or [])
+     assert "markdown" in snapshot["result"]
+     assert "demo" in snapshot["result"]["markdown"]
++
++
++def test_job_runner_draft_degraded_on_max_tokens(monkeypatch, job_store):
++    artifact_paths = {
++        "markdown": "artifacts/demo.md",
++        "metadata": "artifacts/demo.json",
++    }
++
++    def _fake_generate(**_kwargs):
++        return {
++            "text": "Частичный черновик",
++            "metadata": {
++                "degradation_flags": ["draft_max_tokens"],
++                "completion_warning": "max_output_tokens",
++            },
++            "artifact_paths": artifact_paths,
++        }
++
++    monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
++    runner = JobRunner(job_store, soft_timeout_s=2)
++    job = runner.submit({"theme": "demo", "data": {}, "k": 0})
++    runner.wait(job.id, timeout=5)
++    snapshot = runner.get_job(job.id)
++    draft_step = next(step for step in snapshot["steps"] if step["name"] == "draft")
++    assert draft_step["status"] == "degraded"
++    assert draft_step["error"] == "max_output_tokens"
++    assert draft_step["payload"]["artifact_paths"] == artifact_paths
++    assert snapshot["result"]["artifact_paths"] == artifact_paths
++    assert "draft_max_tokens" in (snapshot.get("degradation_flags") or [])
+diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
+index 22d2d8a66e2dceb6b3d4e1ac1d891020761ec58d..cb0f147e4f0ec7fbc69a917bd216f3ba885307c6 100644
+--- a/tests/test_llm_client.py
++++ b/tests/test_llm_client.py
+@@ -201,25 +201,49 @@ def test_generate_retries_empty_completion_with_fallback():
+             {
+                 "content": [
+                     {"type": "text", "text": "Готовый текст"},
+                 ]
+             }
+         ],
      }
-     for source in sources:
-         value = str(source.get("value", "")).strip()
-         if not value:
-             continue
-         usage = str(source.get("usage", "")).strip().lower()
-         usage_label = usage_labels.get(usage, usage)
-         if usage_label:
-             lines.append(f"- {value} — {usage_label}")
-         else:
-             lines.append(f"- {value}")
-     if not lines:
-         return ""
--    return "Если указаны источники — используй только их:\n" + "\n".join(lines) + "\n\n"
-+    header = "Если указаны источники — используй только их:\n" + "\n".join(lines)
-+    guidance = (
-+        "\nВсегда проверяй, что данные из источников не противоречат друг другу, и вставляй формулировки"
-+        " вида «по данным …» без прямых ссылок.\n\n"
-+    )
-+    return header + guidance
- 
- 
- def _render_faq_line(include_faq: bool, faq_questions: Optional[int]) -> str:
-     if not include_faq:
-         return ""
-     if faq_questions and faq_questions > 0:
-         return (
-             f"В конце добавь блок FAQ (часто задаваемые вопросы по теме) на {faq_questions} вопросов с ответами.\n"
-         )
-     return "В конце добавь блок FAQ (часто задаваемые вопросы по теме) на 3\u20135 вопросов с ответами.\n"
- 
- 
- def _render_jsonld_line(include_jsonld: bool) -> str:
-     if not include_jsonld:
-         return ""
-     return (
-         "Опция JSON-LD включена, но на этом шаге не добавляй разметку — мы запросим её отдельно после проверки текста.\n\n"
+     responses = [empty_payload, empty_payload, success_payload]
+     result, client = _generate_with_dummy(
+         responses=responses,
+         max_tokens=100,
      )
- 
- 
-+def _render_tone_style_line() -> str:
-+    return (
-+        "Используй тон и стиль бренда, чтобы подобрать глубину раскрытия, формулировки и примеры,"
-+        " соответствующие ожиданиям аудитории.\n"
-+    )
+     assert isinstance(result, GenerationResult)
+     assert result.retry_used is True
+     assert result.fallback_used == "plain_outline"
+     assert result.fallback_reason == "empty_completion_fallback"
+     assert len(client.requests) == 3
+     primary_request = client.requests[0]["json"]
+     retry_request = client.requests[1]["json"]
+     fallback_request = client.requests[2]["json"]
+     assert primary_request["max_output_tokens"] == 100
+     assert retry_request["max_output_tokens"] == 85
+     assert fallback_request["max_output_tokens"] == 76
+     assert "previous_response_id" not in retry_request
+     assert fallback_request["text"]["format"] == FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT
 +
 +
-+def _render_structure_hint() -> str:
-+    return (
-+        "Если структура не задана отдельно, придерживайся рамки: Введение → Основная часть с подзаголовками → FAQ → Вывод/CTA.\n"
-+    )
-+
-+
- def _normalize_sources(raw: Any) -> List[Dict[str, str]]:
-     if not isinstance(raw, list):
-         return []
-     normalized: List[Dict[str, str]] = []
-     for item in raw:
-         if not isinstance(item, dict):
-             continue
-         value = str(item.get("value", "")).strip()
-         usage = str(item.get("usage", "")).strip().lower()
-         if not value:
-             continue
-         normalized.append({"value": value, "usage": usage})
-     return normalized
- 
- 
- __all__ = ["build_prompt"]
- 
-diff --git a/tests/test_length_limits.py b/tests/test_length_limits.py
-index ae5f6c3a1c00b5e8762f821cd984ba7fdf569b00..bca6554b0752780fdf3c3eee42db76ef242fd9df 100644
---- a/tests/test_length_limits.py
-+++ b/tests/test_length_limits.py
-@@ -1,56 +1,56 @@
- from length_limits import compute_soft_length_bounds, resolve_length_limits
- 
- 
- def test_resolve_uses_brief_values():
-     payload = {"length_limits": {"min_chars": 1000, "max_chars": 1200}}
-     result = resolve_length_limits("finance", payload)
-     assert result.min_chars == 1000
-     assert result.max_chars == 1200
-     assert result.min_source == "brief"
-     assert result.max_source == "brief"
-     assert not result.warnings
- 
- 
- def test_resolve_uses_profile_defaults_when_missing():
-     result = resolve_length_limits("finance", {})
--    assert result.min_chars == 5200
--    assert result.max_chars == 6800
-+    assert result.min_chars == 3500
-+    assert result.max_chars == 6000
-     assert result.min_source == "profile"
-     assert result.max_source == "profile"
-     assert result.profile_source.endswith("profiles/finance/settings.json")
- 
- 
- def test_resolve_swaps_when_min_greater_than_max():
--    payload = {"length_limits": {"min_chars": 6800, "max_chars": 5200}}
-+    payload = {"length_limits": {"min_chars": 6000, "max_chars": 3500}}
-     result = resolve_length_limits("finance", payload)
--    assert result.min_chars == 5200
--    assert result.max_chars == 6800
-+    assert result.min_chars == 3500
-+    assert result.max_chars == 6000
-     assert result.swapped
-     assert result.min_source == "brief"
-     assert result.max_source == "brief"
-     assert any("поменяли" in warning.lower() or "перестав" in warning.lower() for warning in result.warnings)
- 
- 
- def test_compute_soft_length_bounds_adds_reasonable_tolerance():
--    soft_min, soft_max, tol_below, tol_above = compute_soft_length_bounds(5200, 6800)
--    assert soft_min == 5096
--    assert soft_max == 6936
--    assert tol_below == 104
--    assert tol_above == 136
-+    soft_min, soft_max, tol_below, tol_above = compute_soft_length_bounds(3500, 6000)
-+    assert soft_min == 3430
-+    assert soft_max == 6120
-+    assert tol_below == 70
-+    assert tol_above == 120
- 
- 
- def test_compute_soft_length_bounds_handles_inverted_values():
--    soft_min, soft_max, _, _ = compute_soft_length_bounds(6800, 5200)
--    assert soft_min == 5096
--    assert soft_max == 6936
-+    soft_min, soft_max, _, _ = compute_soft_length_bounds(6000, 3500)
-+    assert soft_min == 3430
-+    assert soft_max == 6120
- 
- 
- def test_resolve_length_target_translates_to_soft_bounds():
-     payload = {"length_target": 6000}
-     result = resolve_length_limits("finance", payload)
- 
-     assert result.min_chars == 5880
-     assert result.max_chars == 6120
-     assert result.min_source == "brief"
-     assert result.max_source == "brief"
-     assert payload.get("_length_limits_requested", {}).get("target") == 6000
-diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
-index 9ee4c1fb48a2dc7c9c05b0809fe732f096b99e69..779ab070c3c28ac1377a12ab37d0419481cd6832 100644
---- a/tests/test_orchestrate_utils.py
-+++ b/tests/test_orchestrate_utils.py
-@@ -1,84 +1,84 @@
- import json
- import uuid
- from pathlib import Path
- 
- import pytest
- 
- from config import LLM_ALLOW_FALLBACK, LLM_ROUTE
- from deterministic_pipeline import DeterministicPipeline, PipelineStep
--from faq_builder import build_faq_block
-+from faq_builder import FAQ_DEFAULT_LIMIT, build_faq_block
- from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
- from length_limits import compute_soft_length_bounds
- from length_trimmer import trim_text
- from llm_client import GenerationResult
- from orchestrate import generate_article_from_payload, gather_health_status
- from validators import ValidationError, ValidationResult, strip_jsonld, validate_article
- 
--MIN_REQUIRED = 5200
--MAX_REQUIRED = 6800
-+MIN_REQUIRED = 3500
-+MAX_REQUIRED = 6000
- 
- def test_keyword_injection_protects_terms_and_locks_all_occurrences():
-     base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
-     result = inject_keywords(base_text, ["ключевая фраза", "дополнительный термин"])
-     assert result.coverage_report == "2/2"
-     assert result.missing_terms == []
-     main_section = result.text.split("## FAQ", 1)[0]
-     first_phrase = (
-         "Дополнительно рассматривается "
-         + f"{LOCK_START_TEMPLATE.format(term='ключевая фраза')}ключевая фраза<!--LOCK_END-->"
-         + " через прикладные сценарии."
-     )
-     second_phrase = (
-         "Дополнительно рассматривается "
-         + f"{LOCK_START_TEMPLATE.format(term='дополнительный термин')}дополнительный термин<!--LOCK_END-->"
-         + " через прикладные сценарии."
-     )
-     assert first_phrase in main_section
-     assert second_phrase in main_section
-     assert "### Разбираемся в терминах" not in result.text
-     assert not result.inserted_section
- 
- 
- def test_keyword_injection_adds_terms_inset_when_needed():
-     base_text = "# Заголовок\n\nВступление.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
-     result = inject_keywords(base_text, ["редкий термин"])
-     assert result.inserted_section is True
-     assert "### Разбираемся в терминах" in result.text
-     lock_token = LOCK_START_TEMPLATE.format(term="редкий термин")
-     assert lock_token in result.text
-     assert result.coverage_report == "1/1"
- 
- 
- def test_faq_builder_produces_jsonld_block():
-     base_text = "## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
-     faq_result = build_faq_block(base_text=base_text, topic="Долговая нагрузка", keywords=["платёж"])
--    assert faq_result.text.count("**Вопрос") == 5
-+    assert faq_result.text.count("**Вопрос") == FAQ_DEFAULT_LIMIT
-     assert faq_result.jsonld.strip().startswith('<script type="application/ld+json">')
-     payload = json.loads(faq_result.jsonld.split("\n", 1)[1].rsplit("\n", 1)[0])
-     assert payload["@type"] == "FAQPage"
--    assert len(payload["mainEntity"]) == 5
-+    assert len(payload["mainEntity"]) == FAQ_DEFAULT_LIMIT
- 
- 
- def test_trim_preserves_locked_and_faq():
-     intro = " ".join(["Параграф с вводной информацией, который можно сократить." for _ in range(4)])
-     removable = "Дополнительный абзац с примерами, который допустимо удалить."
-     faq_lines = []
-     for idx in range(1, 6):
-         faq_lines.append(f"**Вопрос {idx}.** Что важно?")
-         faq_lines.append("**Ответ.** Ответ с деталями.")
-         faq_lines.append("")
-     faq_block = "\n".join(faq_lines).strip()
-     article = (
-         f"## Введение\n\n{intro}\n\n"
-         f"{LOCK_START_TEMPLATE.format(term='важный термин')}важный термин<!--LOCK_END-->\n\n"
-         f"{removable}\n\n"
-         "## FAQ\n\n<!--FAQ_START-->\n"
-         f"{faq_block}\n"
-         "<!--FAQ_END-->"
-     )
-     trimmed = trim_text(article, min_chars=200, max_chars=400)
-     assert "важный термин" in trimmed.text
-     assert "<!--FAQ_START-->" in trimmed.text
-     assert len("".join(trimmed.text.split())) <= 400
-     assert trimmed.removed_paragraphs
- 
++def test_generate_accepts_incomplete_with_text():
++    payload = {
++        "status": "incomplete",
++        "incomplete_details": {"reason": "max_output_tokens"},
++        "output": [
++            {
++                "content": [
++                    {"type": "text", "text": "{\"intro\": \"Hello\"}"},
++                ]
++            }
++        ],
++    }
++    result, client = _generate_with_dummy(responses=[payload], max_tokens=120)
++    assert isinstance(result, GenerationResult)
++    assert result.text.strip() == '{"intro": "Hello"}'
++    metadata = result.metadata or {}
++    assert metadata.get("status") == "completed"
++    assert metadata.get("incomplete_reason") in (None, "")
++    assert metadata.get("completion_warning") == "max_output_tokens"
++    flags = metadata.get("degradation_flags") or []
++    assert "draft_max_tokens" in flags
++    assert len(client.requests) == 1
 

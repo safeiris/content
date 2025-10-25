@@ -345,6 +345,7 @@ def _build_metadata(
     fallback_reason: Optional[str],
     api_route: Optional[str],
     token_usage: Optional[float],
+    degradation_flags: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {
         "schema_version": LATEST_SCHEMA_VERSION,
@@ -382,6 +383,14 @@ def _build_metadata(
         metadata["api_route"] = api_route
     if isinstance(token_usage, (int, float)):
         metadata["token_usage"] = float(token_usage)
+    if degradation_flags:
+        normalized_flags = [
+            str(flag).strip()
+            for flag in degradation_flags
+            if isinstance(flag, str) and str(flag).strip()
+        ]
+        if normalized_flags:
+            metadata["degradation_flags"] = list(dict.fromkeys(normalized_flags))
     return metadata
 
 
@@ -533,6 +542,7 @@ def _generate_variant(
         fallback_reason=state.fallback_reason,
         api_route=state.api_route,
         token_usage=state.token_usage,
+        degradation_flags=pipeline.degradation_flags,
     )
 
     outputs = _write_outputs(output_path, final_text, metadata)

@@ -55,3 +55,32 @@ def test_job_runner_degradation(monkeypatch, job_store):
     assert "draft_failed" in (snapshot.get("degradation_flags") or [])
     assert "markdown" in snapshot["result"]
     assert "demo" in snapshot["result"]["markdown"]
+
+
+def test_job_runner_draft_degraded_on_max_tokens(monkeypatch, job_store):
+    artifact_paths = {
+        "markdown": "artifacts/demo.md",
+        "metadata": "artifacts/demo.json",
+    }
+
+    def _fake_generate(**_kwargs):
+        return {
+            "text": "Частичный черновик",
+            "metadata": {
+                "degradation_flags": ["draft_max_tokens"],
+                "completion_warning": "max_output_tokens",
+            },
+            "artifact_paths": artifact_paths,
+        }
+
+    monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
+    runner = JobRunner(job_store, soft_timeout_s=2)
+    job = runner.submit({"theme": "demo", "data": {}, "k": 0})
+    runner.wait(job.id, timeout=5)
+    snapshot = runner.get_job(job.id)
+    draft_step = next(step for step in snapshot["steps"] if step["name"] == "draft")
+    assert draft_step["status"] == "degraded"
+    assert draft_step["error"] == "max_output_tokens"
+    assert draft_step["payload"]["artifact_paths"] == artifact_paths
+    assert snapshot["result"]["artifact_paths"] == artifact_paths
+    assert "draft_max_tokens" in (snapshot.get("degradation_flags") or [])

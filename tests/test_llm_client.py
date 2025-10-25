@@ -223,3 +223,27 @@ def test_generate_retries_empty_completion_with_fallback():
     assert fallback_request["max_output_tokens"] == 76
     assert "previous_response_id" not in retry_request
     assert fallback_request["text"]["format"] == FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT
+
+
+def test_generate_accepts_incomplete_with_text():
+    payload = {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "{\"intro\": \"Hello\"}"},
+                ]
+            }
+        ],
+    }
+    result, client = _generate_with_dummy(responses=[payload], max_tokens=120)
+    assert isinstance(result, GenerationResult)
+    assert result.text.strip() == '{"intro": "Hello"}'
+    metadata = result.metadata or {}
+    assert metadata.get("status") == "completed"
+    assert metadata.get("incomplete_reason") in (None, "")
+    assert metadata.get("completion_warning") == "max_output_tokens"
+    flags = metadata.get("degradation_flags") or []
+    assert "draft_max_tokens" in flags
+    assert len(client.requests) == 1

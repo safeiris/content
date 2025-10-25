@@ -53,6 +53,7 @@ class PipelineContext:
     degradation_flags: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     trace_id: Optional[str] = None
+    artifact_paths: Optional[Dict[str, Any]] = None
 
     def ensure_markdown(self, fallback: str) -> None:
         if not self.markdown.strip():
@@ -213,6 +214,8 @@ class JobRunner:
             "faq_entries": ctx.faq_entries,
             "errors": ctx.errors or None,
         }
+        if ctx.artifact_paths:
+            result_payload["artifact_paths"] = ctx.artifact_paths
         job.mark_succeeded(result_payload, degradation_flags=ctx.degradation_flags)
         self._record_progress(job, "done", 1.0, message=PROGRESS_STAGE_MESSAGES.get("done"))
         self._store.touch(job.id)
@@ -302,10 +305,41 @@ class JobRunner:
             metadata = result.get("metadata")
             if isinstance(metadata, dict):
                 ctx.meta_json = metadata
+            artifact_paths = result.get("artifact_paths")
+            if isinstance(artifact_paths, dict) and artifact_paths:
+                ctx.artifact_paths = artifact_paths
+            degradation_flags: List[str] = []
+            completion_warning: Optional[str] = None
+            if isinstance(metadata, dict):
+                raw_flags = metadata.get("degradation_flags")
+                if isinstance(raw_flags, list):
+                    degradation_flags = [
+                        str(flag).strip()
+                        for flag in raw_flags
+                        if isinstance(flag, str) and str(flag).strip()
+                    ]
+                if degradation_flags:
+                    for flag in degradation_flags:
+                        if flag not in ctx.degradation_flags:
+                            ctx.degradation_flags.append(flag)
+                warning_candidate = metadata.get("completion_warning")
+                if isinstance(warning_candidate, str) and warning_candidate.strip():
+                    completion_warning = warning_candidate.strip()
             if markdown:
                 ctx.markdown = markdown
                 self._record_progress(job, "draft", 1.0)
-                return StepResult(JobStepStatus.SUCCEEDED, payload={"attempts": attempt})
+                step_payload = {"attempts": attempt}
+                if ctx.artifact_paths:
+                    step_payload["artifact_paths"] = ctx.artifact_paths
+                if degradation_flags:
+                    error_label = completion_warning or degradation_flags[0]
+                    return StepResult(
+                        JobStepStatus.DEGRADED,
+                        payload=step_payload,
+                        degradation_flags=degradation_flags,
+                        error=error_label,
+                    )
+                return StepResult(JobStepStatus.SUCCEEDED, payload=step_payload)
             last_error = "empty_response"
             ctx.errors.append(last_error)
 

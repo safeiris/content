@@ -310,6 +310,7 @@ class DeterministicPipeline:
         self._fallback_reason: Optional[str] = None
         self._api_route: Optional[str] = None
         self._token_usage: Optional[float] = None
+        self._degradation_flags: List[str] = []
         self._progress_callback = progress_callback
 
         self.section_budgets: List[SectionBudget] = self._compute_section_budgets()
@@ -317,6 +318,12 @@ class DeterministicPipeline:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    @property
+    def degradation_flags(self) -> List[str]:
+        if not self._degradation_flags:
+            return []
+        return list(dict.fromkeys(self._degradation_flags))
+
     def _emit_progress(
         self,
         stage: str,
@@ -357,6 +364,24 @@ class DeterministicPipeline:
         )
 
     def _register_llm_result(self, result: GenerationResult, usage: Optional[float]) -> None:
+        metadata_block = result.metadata or {}
+        if isinstance(metadata_block, dict):
+            raw_flags = metadata_block.get("degradation_flags")
+            if isinstance(raw_flags, list):
+                for flag in raw_flags:
+                    if not isinstance(flag, str):
+                        continue
+                    trimmed = flag.strip()
+                    if not trimmed:
+                        continue
+                    if trimmed not in self._degradation_flags:
+                        self._degradation_flags.append(trimmed)
+            completion_warning = metadata_block.get("completion_warning")
+            if (
+                isinstance(completion_warning, str)
+                and completion_warning.strip() == "max_output_tokens"
+            ) and "draft_max_tokens" not in self._degradation_flags:
+                self._degradation_flags.append("draft_max_tokens")
         if result.model_used:
             self._model_used = result.model_used
         elif self._model_used is None:
