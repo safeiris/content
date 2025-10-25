@@ -91,6 +91,29 @@ def test_health_ping_success(monkeypatch):
     assert "temperature" not in request_payload
 
 
+def test_health_ping_incomplete_max_tokens(monkeypatch):
+    payload = {
+        "status": "incomplete",
+        "output_text": "partial",
+        "incomplete_details": {"reason": "max_output_tokens"},
+    }
+    responses = [_response(200, payload)]
+    client = DummyHealthClient(responses)
+
+    def _client_factory(timeout=None):
+        client.timeout = timeout
+        return client
+
+    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
+
+    result = orchestrate._run_health_ping()
+
+    assert result["ok"] is True
+    assert result["status"] == "incomplete"
+    assert result["incomplete_reason"] == "max_output_tokens"
+    assert "с обрезкой по max_output_tokens" in result["message"]
+
+
 def test_health_ping_5xx_failure(monkeypatch):
     responses = [_response(502, None, text="Bad gateway")]
     client = DummyHealthClient(responses)

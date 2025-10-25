@@ -1,378 +1,142 @@
-diff --git a/llm_client.py b/llm_client.py
-index 6c69e8a9184a3662be8d1256950bd8a0bcafa458..4e170c4140d2f006a93b352862d43188b174e915 100644
---- a/llm_client.py
-+++ b/llm_client.py
-@@ -54,51 +54,52 @@ MAX_RESPONSES_POLL_ATTEMPTS = (
- )
- if MAX_RESPONSES_POLL_ATTEMPTS <= 0:
-     MAX_RESPONSES_POLL_ATTEMPTS = len(RESPONSES_POLL_SCHEDULE)
- GPT5_TEXT_ONLY_SUFFIX = "Ответь обычным текстом, без tool_calls и без структурированных форматов."
- LIVING_STYLE_INSTRUCTION = (
-     "Стиль текста: живой, человечный, уверенный.\n"
-     "Пиши так, как будто объясняешь это умному человеку, но без канцелярита.\n"
-     "Избегай сухих определений, добавляй лёгкие переходы и короткие фразы.\n"
-     "Разбивай длинные абзацы, вставляй мини-примеры и пояснения своими словами.\n"
-     "Тон — дружелюбный, экспертный, без лишней официальности."
- )
- _PROMPT_CACHE: "OrderedDict[Tuple[Tuple[str, str], ...], List[Dict[str, str]]]" = OrderedDict()
- _PROMPT_CACHE_LIMIT = 16
- 
- _HTTP_CLIENT_LIMITS = httpx.Limits(
-     max_connections=16,
-     max_keepalive_connections=16,
-     keepalive_expiry=120.0,
- )
- _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
- 
- 
- RESPONSES_MAX_OUTPUT_TOKENS_MIN = 16
- RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS = 64
- RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT = 256
--RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA = 1200
-+RESPONSES_SCHEMA_PRIMARY_MAX_OUTPUT_TOKENS = 1200
-+RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA = 2048
- 
- 
- def clamp_responses_max_output_tokens(
-     value: object,
-     *,
-     format_type: Optional[str] = None,
- ) -> int:
-     """Clamp max_output_tokens to the supported Responses bounds."""
- 
-     try:
-         numeric_value = int(value)  # type: ignore[arg-type]
-     except (TypeError, ValueError):
-         numeric_value = RESPONSES_MAX_OUTPUT_TOKENS_MIN
-     normalized_type = str(format_type or "").strip().lower()
-     lower_bound = RESPONSES_MAX_OUTPUT_TOKENS_MIN
-     if normalized_type in {"json_schema", "json_object"}:
-         upper_bound = RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA
-         lower_bound = max(lower_bound, RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS)
-     else:
-         upper_bound = RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT
-     return max(lower_bound, min(numeric_value, upper_bound))
- 
- 
- def reset_http_client_cache() -> None:
-     """Close and clear pooled HTTP clients.
-@@ -225,84 +226,84 @@ def extract_min_tokens_requirement(response: Optional[httpx.Response]) -> Option
-             try:
-                 value = int(match.group(1))
-             except (TypeError, ValueError):
-                 continue
-             if value > 0:
-                 return value
- 
-     # Fallback: look for numbers in proximity to the field name.
-     lower = normalized.lower()
-     if "max_output_tokens" in lower:
-         trailing_match = re.search(r"max_output_tokens[^\d]*(\d+)", normalized, re.IGNORECASE)
-         if trailing_match:
-             try:
-                 value = int(trailing_match.group(1))
-             except (TypeError, ValueError):
-                 value = 0
-             if value > 0:
-                 return value
- 
-     return None
- 
- RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
- SKELETON_COMPACT_INSTRUCTION = (
-     "Значения полей — кратко: по 1–2 предложения, без развернутых эссе. "
-     "При нехватке лимита — оставляй пустые строки, но JSON должен быть валиден. "
--    "Краткость обязательна: каждое строковое поле ≤ 220 символов. "
--    "В массивах не более 4 элементов. Если не уверена — поставь \"\" (пустую строку). "
--    "Выводи только валидный JSON по схеме."
-+    "Краткость обязательна: каждое строковое поле ≤ указанного в схеме maxLength. "
-+    "main — не более 4 пунктов, faq — не более 6. "
-+    "Если не уверена — ставь пустую строку \"\". "
-+    "Выводи только валидный JSON по схеме, без текста вокруг."
- )
- 
- 
- DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
-     "type": "json_schema",
-     "name": RESPONSES_FORMAT_DEFAULT_NAME,
-     "schema": {
-         "type": "object",
-         "properties": {
--            "intro": {"type": "string", "maxLength": 220},
-+            "intro": {"type": "string", "minLength": 0, "maxLength": 200},
-             "main": {
-                 "type": "array",
--                "items": {"type": "string", "maxLength": 220},
-+                "items": {"type": "string", "minLength": 0, "maxLength": 200},
-                 "minItems": 3,
-                 "maxItems": 4,
-             },
-             "faq": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
--                        "q": {"type": "string", "maxLength": 220},
--                        "a": {"type": "string", "maxLength": 220},
-+                        "q": {"type": "string", "minLength": 0, "maxLength": 120},
-+                        "a": {"type": "string", "minLength": 0, "maxLength": 220},
-                     },
-                     "required": ["q", "a"],
-                     "additionalProperties": False,
-                 },
--                "minItems": 5,
--                "maxItems": 5,
-+                "maxItems": 6,
-             },
--            "conclusion": {"type": "string", "maxLength": 220},
-+            "conclusion": {"type": "string", "minLength": 0, "maxLength": 200},
-         },
-         "required": ["intro", "main", "faq", "conclusion"],
-         "additionalProperties": False,
-     },
-     "strict": True,
- }
- 
- FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT: Dict[str, object] = {
-     "type": "json_schema",
-     "name": "seo_article_plain_outline",
-     "schema": {
-         "type": "object",
-         "properties": {
-             "plain": {"type": "string"},
-             "outline": {
-                 "type": "array",
-                 "items": {"type": "string"},
-                 "minItems": 3,
-                 "maxItems": 7,
-             },
-         },
-         "required": ["plain"],
-         "additionalProperties": False,
-     },
-     "strict": False,
-@@ -1877,50 +1878,62 @@ def generate(
-                     fixed = True
-             if not fmt_name:
-                 fmt_name = "-"
-             return format_block, fmt_type, fmt_name, has_schema, fixed
- 
-         sanitized_payload["text"] = {"format": deepcopy(format_template)}
- 
-         raw_max_tokens = sanitized_payload.get("max_output_tokens")
-         try:
-             max_tokens_value = int(raw_max_tokens)
-         except (TypeError, ValueError):
-             max_tokens_value = 0
-         if max_tokens_value <= 0:
-             fallback_default = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
-             max_tokens_value = fallback_default
-         format_cap = (
-             RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA
-             if format_is_structured
-             else RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT
-         )
-         env_upper_cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
-         if env_upper_cap is not None and env_upper_cap > 0:
-             upper_cap = min(env_upper_cap, format_cap)
-         else:
-             upper_cap = format_cap
-+        if format_is_structured and RESPONSES_SCHEMA_PRIMARY_MAX_OUTPUT_TOKENS > 0:
-+            primary_cap = min(
-+                RESPONSES_SCHEMA_PRIMARY_MAX_OUTPUT_TOKENS,
-+                RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA,
-+            )
-+            if max_tokens_value > primary_cap:
-+                LOGGER.info(
-+                    "responses max_output_tokens primary_cap applied requested=%s limit=%s",
-+                    raw_max_tokens,
-+                    primary_cap,
-+                )
-+                max_tokens_value = primary_cap
-         if upper_cap is not None and max_tokens_value > upper_cap:
-             LOGGER.info(
-                 "responses max_output_tokens clamped requested=%s limit=%s",
-                 raw_max_tokens,
-                 upper_cap,
-             )
-             max_tokens_value = upper_cap
-         sanitized_payload["max_output_tokens"] = max_tokens_value
-         LOGGER.info(
-             "resolved max_output_tokens=%s (requested=%s, cap=%s)",
-             max_tokens_value,
-             raw_max_tokens if raw_max_tokens is not None else "-",
-             upper_cap if upper_cap is not None else "-",
-         )
- 
-         if "temperature" in sanitized_payload:
-             sanitized_payload.pop("temperature", None)
- 
-         def _log_payload(snapshot: Dict[str, object]) -> None:
-             keys = sorted(snapshot.keys())
-             LOGGER.info("responses payload_keys=%s", keys)
-             input_candidate = snapshot.get("input", "")
-             length = len(input_candidate) if isinstance(input_candidate, str) else 0
-             LOGGER.info("responses input_len=%d", length)
-             LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
-@@ -2288,58 +2301,65 @@ def generate(
-                     if (
-                         response_id_value
-                         and reason in {"max_output_tokens", "soft_timeout"}
-                         and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
-                     ):
-                         resume_from_response_id = str(response_id_value)
-                     if reason == "max_output_tokens":
-                         if schema_mode_active:
-                             allowed_cap = (
-                                 upper_cap
-                                 if upper_cap is not None
-                                 else RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA
-                             )
-                             current_tokens_value = current_payload.get("max_output_tokens")
-                             try:
-                                 current_tokens_int = int(current_tokens_value)
-                             except (TypeError, ValueError):
-                                 current_tokens_int = int(current_max)
-                             max_schema_escalations = max(
-                                 0, min(RESPONSES_MAX_ESCALATIONS, 1)
-                             )
-                             if (
-                                 schema_escalations < max_schema_escalations
-                                 and int(current_max) < int(allowed_cap)
-                             ):
--                                doubled = int(current_max) * 2
--                                next_max_candidate = max(doubled, 1024)
-+                                current_max_int = int(current_max)
-+                                doubled = current_max_int * 2
-+                                next_max_candidate = max(1024, doubled)
-+                                schema_cap = int(RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA)
-                                 next_max = min(
--                                    int(allowed_cap),
--                                    int(RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA),
-+                                    schema_cap,
-                                     next_max_candidate,
-                                 )
--                                if next_max > int(current_max):
-+                                if allowed_cap is not None:
-+                                    try:
-+                                        allowed_cap_int = int(allowed_cap)
-+                                    except (TypeError, ValueError):
-+                                        allowed_cap_int = schema_cap
-+                                    next_max = min(next_max, allowed_cap_int)
-+                                if next_max > current_max_int:
-                                     schema_escalations += 1
-                                     token_escalations += 1
-                                     retry_used = True
-                                     LOGGER.info(
-                                         "RESP_RETRY_REASON=max_tokens_escalate schema from=%s to=%s",
-                                         current_tokens_int,
-                                         next_max,
-                                     )
-                                     current_max = next_max
-                                     sanitized_payload["max_output_tokens"] = max(
-                                         min_token_floor, int(current_max)
-                                     )
-                                     if (
-                                         upper_cap is not None
-                                         and int(current_max) == int(upper_cap)
-                                     ):
-                                         cap_retry_performed = True
-                                     sanitized_payload.pop("previous_response_id", None)
-                                     resume_from_response_id = None
-                                     empty_retry_attempted = False
-                                     empty_direct_retry_attempted = False
-                                     shrink_next_attempt = False
-                                     if attempts > 0:
-                                         attempts -= 1
-                                     continue
-diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index b190bda983fd62ce2e4f5b2fd2e693eb3e0683dc..11b9bf60cfed8d29fbd8170bedb95da57340c6d7 100644
---- a/tests/test_llm_client.py
-+++ b/tests/test_llm_client.py
-@@ -321,51 +321,51 @@ def test_generate_retries_when_incomplete_text_missing_schema_content():
-                 ]
-             }
-         ],
-     }
-     result, client = _generate_with_dummy(
-         responses=[incomplete_payload, final_payload],
-         max_tokens=120,
-     )
-     assert isinstance(result, GenerationResult)
-     assert len(client.requests) == 2
-     continue_payload = client.requests[1]["json"]
-     assert "previous_response_id" not in continue_payload
-     assert continue_payload["max_output_tokens"] > client.requests[0]["json"]["max_output_tokens"]
-     assert json.loads(result.text)["intro"] == "Hello"
- 
- 
- def test_generate_marks_final_cap_as_degraded():
-     payload = {
-         "id": "resp-cap",
-         "status": "incomplete",
-         "incomplete_details": {"reason": "max_output_tokens"},
-         "output": [],
-     }
-     with patch("llm_client.LOGGER"):
-         with pytest.raises(RuntimeError) as excinfo:
--            _generate_with_dummy(responses=[payload], max_tokens=3600)
-+            _generate_with_dummy(responses=[payload, payload], max_tokens=3600)
-     message = str(excinfo.value)
-     assert message.startswith("skeleton_incomplete: max_output_tokens_exhausted")
-     assert "tried=[" in message
- 
- 
- def test_responses_continue_includes_model_and_tokens(monkeypatch):
-     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_BASE", 64, raising=False)
-     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP1", 96, raising=False)
-     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP2", 128, raising=False)
-     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 128, raising=False)
-     monkeypatch.setattr("llm_client.G5_ESCALATION_LADDER", (64, 96, 128), raising=False)
- 
-     incomplete_payload = {
-         "status": "incomplete",
-         "incomplete_details": {"reason": "max_output_tokens"},
-         "id": "resp-1",
-         "output": [],
-     }
-     final_payload = {
-         "status": "completed",
-         "output": [
-             {
-                 "content": [
-                     {"type": "text", "text": "Готовый текст"},
-                 ]
-@@ -376,31 +376,31 @@ def test_responses_continue_includes_model_and_tokens(monkeypatch):
-     with patch("llm_client.LOGGER"):
-         result, client = _generate_with_dummy(
-             responses=[incomplete_payload, final_payload],
-             max_tokens=64,
-         )
- 
-     assert len(client.requests) == 2
-     primary_payload = client.requests[0]["json"]
-     continue_payload = client.requests[1]["json"]
- 
-     assert "previous_response_id" not in continue_payload
-     assert continue_payload["model"] == primary_payload["model"]
-     assert continue_payload["text"]["format"] == primary_payload["text"]["format"]
-     assert "input" in continue_payload
-     assert isinstance(continue_payload["input"], str)
-     if primary_payload.get("input"):
-         assert continue_payload["input"] in {
-             primary_payload["input"],
-             "Continue generation",
+diff --git a/orchestrate.py b/orchestrate.py
+index e83dde4b3f48800d9d2f93b06d089a63107a0c76..26d88f5d7447154f60c7233603ca4bed33d5b47b 100644
+--- a/orchestrate.py
++++ b/orchestrate.py
+@@ -866,53 +866,58 @@ def _run_health_ping() -> Dict[str, object]:
+         LOGGER.warning("health_ping http_error exception=%s endpoint=%s", reason, endpoint)
+         _log_health(latency_ms)
+         return {
+             "ok": False,
+             "message": f"Responses недоступен: {reason}",
+             "route": route,
+             "fallback_used": fallback_used,
+             "latency_ms": latency_ms,
          }
-     else:
-         assert continue_payload["input"] in {"", "Continue generation"}
-     expected_tokens = min(
-         llm_client_module.G5_MAX_OUTPUT_TOKENS_MAX,
-         llm_client_module.RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA,
--        max(primary_payload["max_output_tokens"] * 2, 512),
-+        max(1024, primary_payload["max_output_tokens"] * 2),
-     )
-     assert continue_payload["max_output_tokens"] == expected_tokens
  
-     metadata = result.metadata or {}
-     assert metadata.get("status") == "completed"
+     status = str(data.get("status", "")).strip().lower()
+     incomplete_reason = ""
+     incomplete_details = data.get("incomplete_details")
+     if isinstance(incomplete_details, dict):
+         reason_value = incomplete_details.get("reason")
+         if isinstance(reason_value, str):
+             incomplete_reason = reason_value.strip().lower()
+ 
+     got_output = False
+     output_text = data.get("output_text")
+     if isinstance(output_text, str) and output_text.strip():
+         got_output = True
+     elif isinstance(data.get("output"), list) or isinstance(data.get("outputs"), list):
+         got_output = True
+ 
++    ok = False
+     if status == "completed":
+         message = f"Responses OK (gpt-5, {max_tokens} токенов)"
+         ok = True
++    elif status == "incomplete" and incomplete_reason in {"max_output_tokens", "max_tokens"}:
++        suffix = "с обрезкой по max_output_tokens"
++        message = f"Responses OK (gpt-5, {max_tokens} токенов, {suffix})"
++        ok = True
+     else:
+         if not status:
+             reason = "неизвестный статус"
+         else:
+             reason = status
+             if incomplete_reason:
+                 reason = f"{reason} ({incomplete_reason})"
+         LOGGER.warning("health_ping bad_status status=%s endpoint=%s", status or "", endpoint)
+         _log_health(latency_ms)
+         return {
+             "ok": False,
+             "message": f"Responses недоступен: статус {reason}",
+             "route": route,
+             "fallback_used": fallback_used,
+             "latency_ms": latency_ms,
+             "status": status or "",
+         }
+ 
+     result: Dict[str, object] = {
+         "ok": ok,
+         "message": message,
+         "route": route,
+         "fallback_used": fallback_used,
+         "latency_ms": latency_ms,
+         "tokens": max_tokens,
+diff --git a/tests/test_health.py b/tests/test_health.py
+index 2f12ea280c1b974f3724c27da378f85138be566f..cfa3b284d482838fff7aa0f42a4f1a143a3fed78 100644
+--- a/tests/test_health.py
++++ b/tests/test_health.py
+@@ -69,50 +69,73 @@ def test_health_ping_success(monkeypatch):
+ 
+     monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
+ 
+     result = orchestrate._run_health_ping()
+ 
+     assert result["ok"] is True
+     assert result["route"] == LLM_ROUTE
+     assert result["fallback_used"] is LLM_ALLOW_FALLBACK
+     expected_label = f"Responses OK (gpt-5, {orchestrate.HEALTH_INITIAL_MAX_TOKENS} токенов)"
+     assert expected_label in result["message"]
+ 
+     assert isinstance(client.timeout, httpx.Timeout)
+     assert client.timeout.read == 40.0
+     assert client.timeout.connect == 10.0
+     assert client.timeout.write == 10.0
+     assert client.timeout.pool == 10.0
+ 
+     assert len(client.requests) == 1
+     request_payload = client.requests[0]["json"]
+     assert request_payload["max_output_tokens"] == orchestrate.HEALTH_INITIAL_MAX_TOKENS
+     assert request_payload["input"] == orchestrate.HEALTH_PROMPT
+     assert request_payload["text"]["format"]["type"] == "text"
+     assert "temperature" not in request_payload
+ 
+ 
++def test_health_ping_incomplete_max_tokens(monkeypatch):
++    payload = {
++        "status": "incomplete",
++        "output_text": "partial",
++        "incomplete_details": {"reason": "max_output_tokens"},
++    }
++    responses = [_response(200, payload)]
++    client = DummyHealthClient(responses)
++
++    def _client_factory(timeout=None):
++        client.timeout = timeout
++        return client
++
++    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
++
++    result = orchestrate._run_health_ping()
++
++    assert result["ok"] is True
++    assert result["status"] == "incomplete"
++    assert result["incomplete_reason"] == "max_output_tokens"
++    assert "с обрезкой по max_output_tokens" in result["message"]
++
++
+ def test_health_ping_5xx_failure(monkeypatch):
+     responses = [_response(502, None, text="Bad gateway")]
+     client = DummyHealthClient(responses)
+     def _client_factory(timeout=None):
+         client.timeout = timeout
+         return client
+ 
+     monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
+ 
+     result = orchestrate._run_health_ping()
+ 
+     assert result["ok"] is False
+     assert "HTTP 502" in result["message"]
+     assert len(client.requests) == 1
+ 
+ 
+ def test_health_ping_400_invalid_max_tokens(monkeypatch):
+     payload = {
+         "error": {
+             "message": "max_output_tokens too small; expected >= 64",
+         }
+     }
+     responses = [_response(400, payload)]
+     client = DummyHealthClient(responses)
+ 
 

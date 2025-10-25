@@ -888,8 +888,13 @@ def _run_health_ping() -> Dict[str, object]:
     elif isinstance(data.get("output"), list) or isinstance(data.get("outputs"), list):
         got_output = True
 
+    ok = False
     if status == "completed":
         message = f"Responses OK (gpt-5, {max_tokens} токенов)"
+        ok = True
+    elif status == "incomplete" and incomplete_reason in {"max_output_tokens", "max_tokens"}:
+        suffix = "с обрезкой по max_output_tokens"
+        message = f"Responses OK (gpt-5, {max_tokens} токенов, {suffix})"
         ok = True
     else:
         if not status:
