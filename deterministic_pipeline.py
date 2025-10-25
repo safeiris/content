@@ -2463,6 +2463,7 @@ class DeterministicPipeline:
             best_metadata_snapshot: Dict[str, object] = {}
             last_reason_lower = ""
             forced_tail_indices: List[int] = []
+            empty_payload_retries = 0
 
             while True:
                 messages, format_block = self._build_batch_messages(
@@ -2673,6 +2674,16 @@ class DeterministicPipeline:
                 response_id_candidate = self._metadata_response_id(metadata_snapshot)
                 if response_id_candidate:
                     parse_none_streaks.pop(response_id_candidate, None)
+                if "skeleton_restore_previous" not in self._degradation_flags:
+                    self._degradation_flags.append("skeleton_restore_previous")
+                flags = metadata_snapshot.get("degradation_flags")
+                if isinstance(flags, list):
+                    if "skeleton_restore_previous" not in flags:
+                        flags = list(flags)
+                        flags.append("skeleton_restore_previous")
+                        metadata_snapshot["degradation_flags"] = flags
+                else:
+                    metadata_snapshot["degradation_flags"] = ["skeleton_restore_previous"]
             if (
                 payload_obj is None
                 and best_payload_obj is None
@@ -2713,6 +2724,26 @@ class DeterministicPipeline:
                         parse_none_streaks.pop(response_id_candidate, None)
                     batch_partial = True
             if payload_obj is None:
+                if empty_payload_retries < 2 and continuation_id:
+                    boosted_tokens = int(round(last_max_tokens * 1.3)) if last_max_tokens > 0 else 0
+                    if boosted_tokens <= last_max_tokens:
+                        boosted_tokens = last_max_tokens + max(32, int(last_max_tokens * 0.1))
+                    boosted_tokens = max(last_max_tokens + 1, boosted_tokens)
+                    boosted_tokens = min(3600, boosted_tokens)
+                    empty_payload_retries += 1
+                    limit_override = boosted_tokens
+                    override_to_cap = True
+                    retries = 0
+                    consecutive_empty_incomplete = 0
+                    first_attempt_for_batch = True
+                    LOGGER.warning(
+                        "SKELETON_EMPTY_RETRY kind=%s label=%s attempt=%d tokens=%d",
+                        batch.kind.value,
+                        batch.label or self._format_batch_label(batch.kind, active_indices),
+                        empty_payload_retries,
+                        boosted_tokens,
+                    )
+                    continue
                 raise PipelineStepError(
                     PipelineStep.SKELETON,
                     "Скелет не содержит данных после генерации.",

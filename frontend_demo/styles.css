@@ -1526,6 +1526,21 @@ button.loading {
   text-align: center;
 }
 
+.progress-status-badge {
+  margin: 0;
+  align-self: center;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.15);
+  color: #92400e;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.progress-status-badge.hidden {
+  display: none;
+}
+
 .progress-bar {
   position: relative;
   width: 100%;

@@ -54,6 +54,8 @@ class PipelineContext:
     errors: List[str] = field(default_factory=list)
     trace_id: Optional[str] = None
     artifact_paths: Optional[Dict[str, Any]] = None
+    skeleton_batches_total: int = 0
+    skeleton_batches_completed: int = 0
 
     def ensure_markdown(self, fallback: str) -> None:
         if not self.markdown.strip():
@@ -165,6 +167,10 @@ class JobRunner:
 
         for step in job.steps:
             if step.name == "refine" and not refine_extension_applied:
+                batches_hint = max(0, ctx.skeleton_batches_total)
+                if batches_hint > 0:
+                    dynamic_extension = max(32.0, 8.0 * batches_hint)
+                    refine_extension = max(refine_extension, dynamic_extension)
                 deadline += refine_extension
                 refine_extension_applied = True
                 LOGGER.info(
@@ -279,6 +285,9 @@ class JobRunner:
     ) -> StepResult:
         self._record_progress(job, "draft", 0.0)
 
+        draft_batches_total = 0
+        draft_batches_completed = 0
+
         def _progress_event(
             stage: str,
             *,
@@ -286,6 +295,25 @@ class JobRunner:
             message: Optional[str] = None,
             payload: Optional[Dict[str, Any]] = None,
         ) -> None:
+            nonlocal draft_batches_total, draft_batches_completed
+            if (
+                stage.strip().lower() == "draft"
+                and isinstance(payload, dict)
+            ):
+                total_value = payload.get("total")
+                completed_value = payload.get("completed")
+                try:
+                    total_int = int(total_value)
+                except (TypeError, ValueError):
+                    total_int = None
+                try:
+                    completed_int = int(completed_value)
+                except (TypeError, ValueError):
+                    completed_int = None
+                if isinstance(total_int, int):
+                    draft_batches_total = max(draft_batches_total, total_int)
+                if isinstance(completed_int, int):
+                    draft_batches_completed = max(draft_batches_completed, completed_int)
             self._record_progress(job, stage, progress, message=message, payload=payload)
 
         attempt = 0
@@ -329,6 +357,11 @@ class JobRunner:
             if markdown:
                 ctx.markdown = markdown
                 self._record_progress(job, "draft", 1.0)
+                ctx.skeleton_batches_total = max(ctx.skeleton_batches_total, draft_batches_total)
+                ctx.skeleton_batches_completed = max(
+                    ctx.skeleton_batches_completed,
+                    draft_batches_completed,
+                )
                 step_payload = {"attempts": attempt}
                 if ctx.artifact_paths:
                     step_payload["artifact_paths"] = ctx.artifact_paths

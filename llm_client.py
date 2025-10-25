@@ -416,33 +416,48 @@ def _shrink_responses_input(text_value: str) -> str:
     return text_value[:target]
 
 
-def _is_valid_json_schema_instance(schema: Dict[str, Any], text: str) -> bool:
-    """Validate the provided JSON text against the supplied schema."""
-
+def _parse_schema_instance(schema: Dict[str, Any], text: str) -> Tuple[Optional[object], bool]:
     if not schema or not text:
-        return False
+        return None, False
 
     try:
         instance = json.loads(text)
     except json.JSONDecodeError:
-        return False
+        return None, False
 
     if not isinstance(instance, (dict, list)):
-        return False
+        return None, False
 
     try:
         Draft7Validator.check_schema(schema)
     except JSONSchemaError:
         LOGGER.warning("RESP_INCOMPLETE_SCHEMA_INVALID schema=invalid")
-        return False
+        return None, False
 
     try:
         Draft7Validator(schema).validate(instance)
     except JSONSchemaValidationError as exc:
         LOGGER.warning("RESP_INCOMPLETE_SCHEMA_INVALID message=%s", exc.message)
-        return False
+        return None, False
 
-    return True
+    return instance, True
+
+
+def _has_non_empty_content(node: object) -> bool:
+    if isinstance(node, str):
+        return bool(node.strip())
+    if isinstance(node, list):
+        return any(_has_non_empty_content(item) for item in node)
+    if isinstance(node, dict):
+        return any(_has_non_empty_content(value) for value in node.values())
+    return False
+
+
+def _is_valid_json_schema_instance(schema: Dict[str, Any], text: str) -> bool:
+    """Validate the provided JSON text against the supplied schema."""
+
+    _, valid = _parse_schema_instance(schema, text)
+    return valid
 
 
 def _coerce_bool(value: object) -> Optional[bool]:
@@ -2109,39 +2124,83 @@ def generate(
                         ):
                             _record_pending_degradation(reason)
                         if text:
-                            metadata = dict(metadata)
-                            metadata["status"] = "completed"
-                            metadata["incomplete_reason"] = ""
-                            metadata["completion_warning"] = "max_output_tokens"
-                            degradation_flags: List[str] = []
-                            raw_flags = metadata.get("degradation_flags")
-                            if isinstance(raw_flags, list):
-                                degradation_flags.extend(
-                                    str(flag).strip()
-                                    for flag in raw_flags
-                                    if isinstance(flag, str) and flag.strip()
+                            if schema_dict:
+                                schema_instance: Optional[object] = None
+                                schema_valid = False
+                                schema_has_content = False
+                                schema_instance, schema_valid = _parse_schema_instance(
+                                    schema_dict, text
                                 )
-                            if "draft_max_tokens" not in degradation_flags:
-                                degradation_flags.append("draft_max_tokens")
-                            metadata["degradation_flags"] = degradation_flags
-                            if schema_dict and _is_valid_json_schema_instance(schema_dict, text):
-                                LOGGER.info(
-                                    "RESP_INCOMPLETE_ACCEPT schema_valid len=%d",
-                                    len(text),
-                                )
-                                metadata["completion_schema_valid"] = True
+                                if schema_valid:
+                                    schema_has_content = _has_non_empty_content(schema_instance)
+                                if not (schema_valid and schema_has_content):
+                                    LOGGER.info(
+                                        "RESP_INCOMPLETE_RETRY schema_invalid len=%d content=%s",
+                                        len(text),
+                                        schema_has_content,
+                                    )
+                                    last_error = RuntimeError("responses_incomplete_schema_invalid")
+                                    if response_id_value:
+                                        resume_from_response_id = str(response_id_value)
+                                    shrink_next_attempt = False
+                                    text = ""
+                                else:
+                                    metadata = dict(metadata)
+                                    metadata["status"] = "completed"
+                                    metadata["incomplete_reason"] = ""
+                                    metadata["completion_warning"] = "max_output_tokens"
+                                    degradation_flags: List[str] = []
+                                    raw_flags = metadata.get("degradation_flags")
+                                    if isinstance(raw_flags, list):
+                                        degradation_flags.extend(
+                                            str(flag).strip()
+                                            for flag in raw_flags
+                                            if isinstance(flag, str) and flag.strip()
+                                        )
+                                    if "draft_max_tokens" not in degradation_flags:
+                                        degradation_flags.append("draft_max_tokens")
+                                    metadata["degradation_flags"] = degradation_flags
+                                    metadata["completion_schema_valid"] = True
+                                    metadata["completion_schema_content"] = bool(schema_has_content)
+                                    LOGGER.info(
+                                        "RESP_INCOMPLETE_ACCEPT schema_valid=%s content=%s len=%d",
+                                        schema_valid,
+                                        schema_has_content,
+                                        len(text),
+                                    )
+                                    metadata = _apply_pending_degradation(metadata)
+                                    parse_flags["metadata"] = metadata
+                                    updated_data = dict(data)
+                                    updated_data["metadata"] = metadata
+                                    _persist_raw_response(updated_data)
+                                    return text, parse_flags, updated_data, schema_label
                             else:
+                                metadata = dict(metadata)
+                                metadata["status"] = "completed"
+                                metadata["incomplete_reason"] = ""
+                                metadata["completion_warning"] = "max_output_tokens"
+                                degradation_flags: List[str] = []
+                                raw_flags = metadata.get("degradation_flags")
+                                if isinstance(raw_flags, list):
+                                    degradation_flags.extend(
+                                        str(flag).strip()
+                                        for flag in raw_flags
+                                        if isinstance(flag, str) and flag.strip()
+                                    )
+                                if "draft_max_tokens" not in degradation_flags:
+                                    degradation_flags.append("draft_max_tokens")
+                                metadata["degradation_flags"] = degradation_flags
                                 LOGGER.info(
                                     "RESP_INCOMPLETE_ACCEPT text len=%d",
                                     len(text),
                                 )
                                 metadata["completion_schema_valid"] = False
-                            metadata = _apply_pending_degradation(metadata)
-                            parse_flags["metadata"] = metadata
-                            updated_data = dict(data)
-                            updated_data["metadata"] = metadata
-                            _persist_raw_response(updated_data)
-                            return text, parse_flags, updated_data, schema_label
+                                metadata = _apply_pending_degradation(metadata)
+                                parse_flags["metadata"] = metadata
+                                updated_data = dict(data)
+                                updated_data["metadata"] = metadata
+                                _persist_raw_response(updated_data)
+                                return text, parse_flags, updated_data, schema_label
                         last_error = RuntimeError("responses_incomplete")
                         cap_exhausted = (
                             upper_cap is not None and int(current_max) >= upper_cap

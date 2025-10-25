@@ -1,9 +1,295 @@
+diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
+index b368f4fc8f1b0a9d2b3c8b2ebb1a72d63cfb552b..0ad1cd41eb156c470836f8c5a50be32809b1492e 100644
+--- a/deterministic_pipeline.py
++++ b/deterministic_pipeline.py
+@@ -2441,50 +2441,51 @@ class DeterministicPipeline:
+                     LOGGER.info(
+                         "LOG:SCHEDULER_BLOCK main underflow=%d target_min=3 → continue_main",
+                         filled_main,
+                     )
+                     _schedule(batch, count=False)
+                     continue
+             if not batch.label:
+                 batch.label = self._format_batch_label(batch.kind, batch.indices)
+             active_indices = list(batch.indices)
+             limit_override: Optional[int] = None
+             override_to_cap = False
+             retries = 0
+             consecutive_empty_incomplete = 0
+             payload_obj: Optional[object] = None
+             metadata_snapshot = {}
+             result: Optional[GenerationResult] = None
+             last_max_tokens = estimate.start_max_tokens
+             continuation_id: Optional[str] = None
+             batch_partial = False
+             first_attempt_for_batch = True
+             best_payload_obj: Optional[object] = None
+             best_result: Optional[GenerationResult] = None
+             best_metadata_snapshot: Dict[str, object] = {}
+             last_reason_lower = ""
+             forced_tail_indices: List[int] = []
++            empty_payload_retries = 0
+ 
+             while True:
+                 messages, format_block = self._build_batch_messages(
+                     batch,
+                     outline=outline,
+                     assembly=assembly,
+                     target_indices=active_indices,
+                     tail_fill=batch.tail_fill,
+                 )
+                 base_budget = self._batch_token_budget(batch, estimate, len(active_indices) or 1)
+                 if first_attempt_for_batch:
+                     max_tokens_to_use = estimate.start_max_tokens
+                 else:
+                     max_tokens_to_use = base_budget
+                 if limit_override is not None:
+                     if override_to_cap:
+                         max_tokens_to_use = max(max_tokens_to_use, limit_override)
+                     else:
+                         max_tokens_to_use = min(max_tokens_to_use, limit_override)
+                 last_max_tokens = max_tokens_to_use
+                 first_attempt_for_batch = False
+                 request_prev_id = continuation_id or ""
+                 result = self._call_llm(
+                     step=PipelineStep.SKELETON,
+                     messages=messages,
+@@ -2651,90 +2652,120 @@ class DeterministicPipeline:
+                     batch,
+                     outline=outline,
+                     assembly=assembly,
+                     target_indices=active_indices,
+                     max_tokens=last_max_tokens,
+                     previous_response_id=continuation_id,
+                 )
+                 if cap_payload is not None and cap_result is not None:
+                     payload_obj = cap_payload
+                     result = cap_result
+                     metadata_snapshot = cap_result.metadata or {}
+                     response_id_candidate = self._metadata_response_id(metadata_snapshot)
+                     if response_id_candidate:
+                         continuation_id = response_id_candidate
+                         parse_none_streaks.pop(response_id_candidate, None)
+                     batch_partial = True
+ 
+             if payload_obj is None and best_payload_obj is not None:
+                 payload_obj = best_payload_obj
+                 result = best_result
+                 metadata_snapshot = dict(best_metadata_snapshot)
+                 batch_partial = True
+                 response_id_candidate = self._metadata_response_id(metadata_snapshot)
+                 if response_id_candidate:
+                     parse_none_streaks.pop(response_id_candidate, None)
++                if "skeleton_restore_previous" not in self._degradation_flags:
++                    self._degradation_flags.append("skeleton_restore_previous")
++                flags = metadata_snapshot.get("degradation_flags")
++                if isinstance(flags, list):
++                    if "skeleton_restore_previous" not in flags:
++                        flags = list(flags)
++                        flags.append("skeleton_restore_previous")
++                        metadata_snapshot["degradation_flags"] = flags
++                else:
++                    metadata_snapshot["degradation_flags"] = ["skeleton_restore_previous"]
+             if (
+                 payload_obj is None
+                 and best_payload_obj is None
+                 and last_reason_lower == "max_output_tokens"
+             ):
+                 placeholder = self._build_batch_placeholder(
+                     batch,
+                     outline=outline,
+                     target_indices=active_indices,
+                 )
+                 if placeholder is not None:
+                     payload_obj = placeholder
+                     batch_partial = True
+                     if batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ):
+                         tail_fill_allowed = True
+                         forced_tail_indices = list(active_indices)
+                     LOGGER.warning(
+                         "SKELETON_PLACEHOLDER_APPLIED kind=%s label=%s",
+                         batch.kind.value,
+                         batch.label,
+                     )
+             if payload_obj is None and batch.kind in (SkeletonBatchKind.MAIN, SkeletonBatchKind.FAQ) and active_indices:
+                 fallback_payload, fallback_result = self._run_fallback_batch(
+                     batch,
+                     outline=outline,
+                     assembly=assembly,
+                     target_indices=active_indices,
+                     max_tokens=last_max_tokens,
+                     previous_response_id=continuation_id,
+                 )
+                 if fallback_payload is not None and fallback_result is not None:
+                     payload_obj = fallback_payload
+                     result = fallback_result
+                     metadata_snapshot = fallback_result.metadata or {}
+                     response_id_candidate = self._metadata_response_id(metadata_snapshot)
+                     if response_id_candidate:
+                         continuation_id = response_id_candidate
+                         parse_none_streaks.pop(response_id_candidate, None)
+                     batch_partial = True
+             if payload_obj is None:
++                if empty_payload_retries < 2 and continuation_id:
++                    boosted_tokens = int(round(last_max_tokens * 1.3)) if last_max_tokens > 0 else 0
++                    if boosted_tokens <= last_max_tokens:
++                        boosted_tokens = last_max_tokens + max(32, int(last_max_tokens * 0.1))
++                    boosted_tokens = max(last_max_tokens + 1, boosted_tokens)
++                    boosted_tokens = min(3600, boosted_tokens)
++                    empty_payload_retries += 1
++                    limit_override = boosted_tokens
++                    override_to_cap = True
++                    retries = 0
++                    consecutive_empty_incomplete = 0
++                    first_attempt_for_batch = True
++                    LOGGER.warning(
++                        "SKELETON_EMPTY_RETRY kind=%s label=%s attempt=%d tokens=%d",
++                        batch.kind.value,
++                        batch.label or self._format_batch_label(batch.kind, active_indices),
++                        empty_payload_retries,
++                        boosted_tokens,
++                    )
++                    continue
+                 raise PipelineStepError(
+                     PipelineStep.SKELETON,
+                     "Скелет не содержит данных после генерации.",
+                 )
+ 
+             if batch.kind == SkeletonBatchKind.INTRO:
+                 normalized, missing_fields = self._normalize_intro_batch(payload_obj, outline)
+                 intro_text = normalized.get("intro", "")
+                 headers = normalized.get("main_headers") or []
+                 if len(headers) < len(outline.main_headings):
+                     headers = headers + outline.main_headings[len(headers) :]
+                 assembly.apply_intro(intro_text, headers, normalized.get("conclusion_heading"))
+                 current_total = len(assembly.main_sections)
+                 new_indices = [
+                     idx for idx in range(current_total) if idx not in scheduled_main_indices
+                 ]
+                 if new_indices:
+                     start_pos = 0
+                     if self._should_force_single_main_batches(outline, estimate):
+                         batch_size = 1
+                     else:
+                         batch_size = max(1, SKELETON_BATCH_SIZE_MAIN)
+                     while start_pos < len(new_indices):
+                         chunk = new_indices[start_pos : start_pos + batch_size]
+                         if not chunk:
+diff --git a/frontend_demo/index.html b/frontend_demo/index.html
+index 7da0a6736a46cf78400cddefc9d0d39d12f281e2..2441d84f459d9a436b29f911d0ee579c022dddb7 100644
+--- a/frontend_demo/index.html
++++ b/frontend_demo/index.html
+@@ -256,50 +256,53 @@
+                 class="secondary"
+                 role="button"
+                 aria-disabled="true"
+                 data-fallback-name="draft.md"
+               >
+                 <span class="btn-label">Скачать .md</span>
+               </a>
+               <a
+                 id="download-report"
+                 class="secondary"
+                 role="button"
+                 aria-disabled="true"
+                 data-fallback-name="report.json"
+               >
+                 <span class="btn-label">Скачать отчёт .json</span>
+               </a>
+             </div>
+           </aside>
+         </div>
+       </section>
+     </main>
+ 
+     <div id="progress-overlay" class="progress-overlay hidden" role="alert" aria-live="polite">
+       <div class="progress-card">
+         <p class="progress-stage" data-role="progress-stage">Шаг: Черновик 0→100%</p>
++        <p class="progress-status-badge hidden" data-role="progress-badge">
++          Получен неполный ответ, пробуем догенерировать
++        </p>
+         <div
+           class="progress-bar"
+           role="progressbar"
+           aria-valuemin="0"
+           aria-valuemax="100"
+           aria-valuenow="0"
+           data-role="progress-bar"
+         >
+           <div class="progress-bar__fill" data-role="progress-bar-fill"></div>
+         </div>
+         <p class="progress-percent" data-role="progress-percent">0%</p>
+         <p class="progress-message" data-role="progress-message">Готовим данные…</p>
+         <p class="progress-details" data-role="progress-details"></p>
+       </div>
+     </div>
+ 
+     <template id="source-row-template">
+       <div class="source-row">
+         <input class="source-input" type="text" placeholder="https://example.com" />
+         <select class="source-usage" aria-label="Тип использования источника">
+           <option value="summary" selected>Пересказ</option>
+           <option value="quote">Цитата</option>
+           <option value="inspiration">Вдохновение</option>
+         </select>
+         <button type="button" class="icon-button remove-source" aria-label="Удалить источник">✕</button>
 diff --git a/frontend_demo/script.js b/frontend_demo/script.js
-index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633caf225704 100644
+index 81c516587d4baed1d835a58c4e61633caf225704..2bb94c83149f99ad3320c2ab5329f56a66464170 100644
 --- a/frontend_demo/script.js
 +++ b/frontend_demo/script.js
-@@ -108,50 +108,51 @@ const PROGRESS_STAGE_LABELS = {
-   draft: "Черновик",
+@@ -19,50 +19,51 @@ const STRUCTURE_PRESETS = {
+     "Краткое резюме",
+     "Описание продукта",
+     "Преимущества и ограничения",
+     "Сравнение",
+     "Рекомендации",
+   ],
+ };
+ 
+ const tabs = document.querySelectorAll(".tab");
+ const panels = document.querySelectorAll(".tab-panel");
+ const pipeSelect = document.getElementById("pipe-select");
+ const pipesList = document.getElementById("pipes-list");
+ const artifactsList = document.getElementById("artifacts-list");
+ const cleanupArtifactsBtn = document.getElementById("cleanup-artifacts");
+ const briefForm = document.getElementById("brief-form");
+ const previewBtn = document.getElementById("preview-btn");
+ let reindexBtn = document.getElementById("reindex-btn");
+ let healthBtn = document.getElementById("health-btn");
+ const progressOverlay = document.getElementById("progress-overlay");
+ const progressMessage = progressOverlay?.querySelector('[data-role="progress-message"]') || null;
+ const progressStage = progressOverlay?.querySelector('[data-role="progress-stage"]') || null;
+ const progressPercent = progressOverlay?.querySelector('[data-role="progress-percent"]') || null;
+ const progressBar = progressOverlay?.querySelector('[data-role="progress-bar"]') || null;
+ const progressBarFill = progressOverlay?.querySelector('[data-role="progress-bar-fill"]') || null;
+ const progressDetails = progressOverlay?.querySelector('[data-role="progress-details"]') || null;
++const progressBadge = progressOverlay?.querySelector('[data-role="progress-badge"]') || null;
+ if (progressStage && progressStage.textContent) {
+   progressStage.dataset.defaultLabel = progressStage.textContent.trim();
+ }
+ const toastRoot = document.getElementById("toast-root");
+ const draftView = document.getElementById("draft-view");
+ const reportView = document.getElementById("report-view");
+ const resultTitle = document.getElementById("result-title");
+ const resultMeta = document.getElementById("result-meta");
+ const resultBadges = document.getElementById("result-badges");
+ const retryBtn = document.getElementById("retry-btn");
+ const downloadMdBtn = document.getElementById("download-md");
+ const downloadReportBtn = document.getElementById("download-report");
+ const clearLogBtn = document.getElementById("clear-log");
+ const structurePreset = document.getElementById("structure-preset");
+ const structureInput = document.getElementById("structure-input");
+ const keywordsInput = document.getElementById("keywords-input");
+ const titleInput = document.getElementById("title-input");
+ const audienceInput = document.getElementById("audience-input");
+ const goalInput = document.getElementById("goal-input");
+ const toneSelect = document.getElementById("tone-select");
+ const minCharsInput = document.getElementById("min-chars-input");
+ const maxCharsInput = document.getElementById("max-chars-input");
+ const keywordModeInputs = document.querySelectorAll("input[name='keywords-mode']");
+ const styleProfileSelect = document.getElementById("style-profile-select");
+ const styleProfileHint = document.getElementById("style-profile-hint");
+@@ -109,58 +110,61 @@ const PROGRESS_STAGE_LABELS = {
    refine: "Доработка",
    trim: "Нормализация",
    validate: "Проверка",
@@ -28,7 +314,8 @@ index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633c
    jsonld_repaired: "JSON-LD восстановлен вручную",
    post_analysis_skipped: "Отчёт о качестве недоступен",
    soft_timeout: "Мягкий таймаут — результат сохранён",
-+  cap_reached_final: "Лимит продолжений — результат сохранён",
+   cap_reached_final: "Лимит продолжений — результат сохранён",
++  skeleton_restore_previous: "Использована последняя валидная версия скелета",
  };
  
  const DEFAULT_PROGRESS_MESSAGE =
@@ -37,6 +324,8 @@ index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633c
  const MAX_CUSTOM_CONTEXT_CHARS = 20000;
  const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
  
++const PROGRESS_DEGRADED_BADGE_MESSAGE = "Получен неполный ответ, пробуем догенерировать";
++
  const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 3500, max: 6000, hard: 6500 });
  
  const HEALTH_STATUS_MESSAGES = {
@@ -54,12 +343,15 @@ index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633c
      label: "Retrieval index",
      ok: "найден",
      fail: "не найден",
-@@ -179,52 +180,72 @@ const state = {
-   pipes: new Map(),
-   artifacts: [],
-   artifactFiles: [],
-   pendingArtifactFiles: null,
-   hasMissingArtifacts: false,
+   },
+   artifacts_writable: {
+     label: "Каталог артефактов",
+     ok: "доступен",
+     fail: "недоступен",
+   },
+   theme_index: {
+     label: "Индекс темы",
+@@ -185,50 +189,52 @@ const state = {
    currentResult: null,
    currentDownloads: { markdown: null, report: null },
  };
@@ -80,28 +372,30 @@ index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633c
    currentPercent: 0,
    lastStage: "draft",
    hideTimer: null,
-+  heartbeatTimer: null,
-+  lastUpdateAt: 0,
-+  latestSnapshot: null,
-+  heartbeatNotified: false,
-+  overlaySuppressed: false,
+   heartbeatTimer: null,
+   lastUpdateAt: 0,
+   latestSnapshot: null,
+   heartbeatNotified: false,
+   overlaySuppressed: false,
++  maxDraftTotal: 0,
++  maxDraftCompleted: 0,
  };
  
-+const STEP_STATUS_DONE_VALUES = new Set(["completed", "degraded", "skipped"]);
-+const STEP_STATUS_RUNNING_VALUES = new Set(["running"]);
-+const PROGRESS_HEARTBEAT_TIMEOUT_MS = 35000;
-+const PROGRESS_NOTICE_PRIORITY = ["soft_timeout", "draft_max_tokens", "cap_reached_final"];
-+const PROGRESS_STAGE_TO_STEP_NAMES = Object.freeze({
-+  draft: ["draft"],
-+  trim: ["refine"],
-+  refine: ["refine"],
-+  validate: ["jsonld", "post_analysis"],
-+  finalize: ["jsonld", "post_analysis"],
-+  jsonld: ["jsonld"],
-+  post_analysis: ["post_analysis"],
-+  done: ["post_analysis"],
-+});
-+
+ const STEP_STATUS_DONE_VALUES = new Set(["completed", "degraded", "skipped"]);
+ const STEP_STATUS_RUNNING_VALUES = new Set(["running"]);
+ const PROGRESS_HEARTBEAT_TIMEOUT_MS = 35000;
+ const PROGRESS_NOTICE_PRIORITY = ["soft_timeout", "draft_max_tokens", "cap_reached_final"];
+ const PROGRESS_STAGE_TO_STEP_NAMES = Object.freeze({
+   draft: ["draft"],
+   trim: ["refine"],
+   refine: ["refine"],
+   validate: ["jsonld", "post_analysis"],
+   finalize: ["jsonld", "post_analysis"],
+   jsonld: ["jsonld"],
+   post_analysis: ["post_analysis"],
+   done: ["post_analysis"],
+ });
+ 
  function resolveApiPath(path) {
    if (typeof path !== "string" || !path) {
      return API_BASE || "";
@@ -110,281 +404,9 @@ index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633c
      return path;
    }
    const base = API_BASE || "";
-   const normalizedBase = base.endsWith("/") ? base.slice(0, -1) : base;
-   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-   if (/^https?:\/\//i.test(normalizedBase)) {
-     return `${normalizedBase}${normalizedPath}`;
-   }
-   return `${normalizedBase}${normalizedPath}`;
- }
- 
- function escapeHtml(value) {
-   if (typeof value !== "string") {
-     return "";
-   }
-   const map = {
-     "&": "&amp;",
-     "<": "&lt;",
-     ">": "&gt;",
-     '"': "&quot;",
-@@ -979,50 +1000,55 @@ function setDownloadLinkAvailability(link, downloadInfo) {
-   }
-   const fallbackName = link.dataset.fallbackName || (link.id === "download-md" ? "draft.md" : "report.json");
-   if (downloadInfo && (downloadInfo.url || downloadInfo.path)) {
-     const targetUrl = downloadInfo.url || `/api/artifacts/download?path=${encodeURIComponent(downloadInfo.path)}`;
-     const resolvedUrl = resolveApiPath(targetUrl);
-     link.href = resolvedUrl;
-     link.dataset.downloadUrl = resolvedUrl;
-     link.setAttribute("download", downloadInfo.name || fallbackName);
-     link.classList.remove("is-disabled");
-     link.removeAttribute("aria-disabled");
-     return;
-   }
-   link.removeAttribute("href");
-   link.removeAttribute("download");
-   link.classList.add("is-disabled");
-   link.setAttribute("aria-disabled", "true");
-   delete link.dataset.downloadUrl;
- }
- 
- function setActiveArtifactDownloads(downloads) {
-   const normalized = downloads && typeof downloads === "object" ? downloads : {};
-   state.currentDownloads = {
-     markdown: normalized.markdown || normalized.article || null,
-     report: normalized.report || normalized.json || normalized.metadata || null,
-   };
-+  if (!isArtifactDownloadReady()) {
-+    setDownloadLinkAvailability(downloadMdBtn, null);
-+    setDownloadLinkAvailability(downloadReportBtn, null);
-+    return;
-+  }
-   setDownloadLinkAvailability(downloadMdBtn, state.currentDownloads.markdown);
-   setDownloadLinkAvailability(downloadReportBtn, state.currentDownloads.report);
- }
- 
- function hasDownloadFiles(downloads) {
-   if (!downloads || typeof downloads !== "object") {
-     return false;
-   }
-   const markdown = downloads.markdown || downloads.article || null;
-   const report = downloads.report || downloads.json || downloads.metadata || null;
-   return Boolean(markdown || report);
- }
- 
- function resetDownloadButtonsForNewJob() {
-   state.currentDownloads = { markdown: null, report: null };
-   setDownloadLinkAvailability(downloadMdBtn, null);
-   setDownloadLinkAvailability(downloadReportBtn, null);
-   setButtonLoading(downloadMdBtn, true);
-   setButtonLoading(downloadReportBtn, true);
- }
- 
- function handleDownloadClick(event, type) {
-   const link = type === "markdown" ? downloadMdBtn : downloadReportBtn;
-   if (!link) {
-     return;
-@@ -1631,74 +1657,88 @@ async function handleGenerate(event) {
- }
- 
- function normalizeJobResponse(response) {
-   if (!response || typeof response !== "object") {
-     return { status: "pending", result: null, steps: [], degradation_flags: [], job_id: null };
-   }
-   if (typeof response.markdown === "string" || typeof response.meta_json === "object") {
-     return {
-       status: "succeeded",
-       job_id: response.job_id || null,
-       steps: Array.isArray(response.steps) ? response.steps : [],
-       degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
-       trace_id: response.trace_id || null,
-       message: typeof response.message === "string" ? response.message : null,
-       progress: typeof response.progress === "number" ? response.progress : null,
-       step: typeof response.step === "string" ? response.step : null,
-       last_event_at: response.last_event_at || null,
-       progress_stage:
-         typeof response.progress_stage === "string" ? response.progress_stage : null,
-       progress_message:
-         typeof response.progress_message === "string" ? response.progress_message : null,
-       progress_payload:
-         response.progress_payload && typeof response.progress_payload === "object"
-           ? response.progress_payload
-           : null,
-+      step_status: typeof response.step_status === "string" ? response.step_status : null,
-+      batches_completed:
-+        typeof response.batches_completed === "number" ? response.batches_completed : null,
-+      batches_total:
-+        typeof response.batches_total === "number" ? response.batches_total : null,
-       result: {
-         markdown: typeof response.markdown === "string" ? response.markdown : "",
-         meta_json: (response.meta_json && typeof response.meta_json === "object") ? response.meta_json : {},
-         faq_entries: Array.isArray(response.faq_entries) ? response.faq_entries : [],
-+        artifact_saved:
-+          typeof response.artifact_saved === "boolean"
-+            ? response.artifact_saved
-+            : Boolean(response.artifact_paths),
-       },
-     };
-   }
-   return {
-     status: typeof response.status === "string" ? response.status : "pending",
-     job_id: response.job_id || null,
-     steps: Array.isArray(response.steps) ? response.steps : [],
-     degradation_flags: Array.isArray(response.degradation_flags) ? response.degradation_flags : [],
-     trace_id: response.trace_id || null,
-     message: typeof response.message === "string" ? response.message : null,
-     progress: typeof response.progress === "number" ? response.progress : null,
-     step: typeof response.step === "string" ? response.step : null,
-     last_event_at: response.last_event_at || null,
-     progress_stage: typeof response.progress_stage === "string" ? response.progress_stage : null,
-     progress_message:
-       typeof response.progress_message === "string" ? response.progress_message : null,
-     progress_payload:
-       response.progress_payload && typeof response.progress_payload === "object"
-         ? response.progress_payload
-         : null,
-+    step_status: typeof response.step_status === "string" ? response.step_status : null,
-+    batches_completed:
-+      typeof response.batches_completed === "number" ? response.batches_completed : null,
-+    batches_total:
-+      typeof response.batches_total === "number" ? response.batches_total : null,
-     result: response.result && typeof response.result === "object" ? response.result : null,
-   };
- }
- 
- function applyProgressiveResult(snapshot) {
-   const result = snapshot?.result;
-   if (!result || typeof result !== "object") {
-     return 0;
-   }
-   const markdown = typeof result.markdown === "string" ? result.markdown : "";
-   if (markdown) {
-     draftView.innerHTML = markdownToHtml(markdown);
-   }
-   const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
-   updateResultBadges(meta, Array.isArray(snapshot?.degradation_flags) ? snapshot.degradation_flags : []);
-   const characters = typeof meta.characters === "number"
-     ? meta.characters
-     : markdown.replace(/\s+/g, "").length;
-   return characters;
- }
- 
- async function pollJobUntilDone(jobId, { onUpdate } = {}) {
-   if (typeof EventSource === "function") {
-     try {
-       return await watchJobViaSse(jobId, { onUpdate });
-@@ -1812,105 +1852,106 @@ async function watchJobViaPolling(jobId, { onUpdate } = {}) {
-       onUpdate(snapshot);
-     }
-     if (snapshot?.status === "failed") {
-       const message = snapshot?.error?.message || snapshot?.message || "Генерация завершилась с ошибкой.";
-       const error = new Error(message);
-       if (snapshot?.trace_id) {
-         error.traceId = snapshot.trace_id;
-       }
-       throw error;
-     }
-     if (snapshot?.status === "succeeded" && snapshot.result) {
-       return snapshot;
-     }
-     delayMs = Math.min(delayMs + 200, 1500);
-   }
- }
- 
- function renderGenerationResult(snapshot, { payload }) {
-   const normalized = normalizeJobResponse(snapshot);
-   const result = normalized.result || {};
-   const markdown = typeof result.markdown === "string" ? result.markdown : "";
-   const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
-   const degradationFlags = Array.isArray(normalized.degradation_flags) ? normalized.degradation_flags : [];
-   const characters = typeof meta.characters === "number" ? meta.characters : markdown.replace(/\s+/g, "").length;
-   const hasContent = markdown.trim().length > 0;
-+  const artifactSaved =
-+    typeof result.artifact_saved === "boolean" ? result.artifact_saved : Boolean(result.artifact_paths);
-   state.currentResult = {
-     markdown,
-     meta,
-     artifactPaths: result.artifact_paths ?? null,
-     characters,
-     hasContent,
-     degradationFlags,
-+    artifactSaved,
-     downloads:
-       state.currentDownloads && (state.currentDownloads.markdown || state.currentDownloads.report)
-         ? { ...state.currentDownloads }
-         : null,
-   };
-   draftView.innerHTML = markdownToHtml(markdown);
-   const requestedLabel =
-     payload?.data?.title
-       || payload?.data?.theme
-       || payload?.data?.goal
-       || payload?.theme
-       || "";
-   resultTitle.textContent = requestedLabel || "Результат генерации";
-   const metaParts = [];
-   if (hasContent) {
-     metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
-     metaParts.push(
-       `Ориентир: ${DEFAULT_LENGTH_RANGE.min.toLocaleString("ru-RU")}` +
-         `–${DEFAULT_LENGTH_RANGE.max.toLocaleString("ru-RU")}` +
-         ` (≤ ${DEFAULT_LENGTH_RANGE.hard.toLocaleString("ru-RU")})`,
-     );
-   }
-   if (degradationFlags.length) {
-     metaParts.push(`Деградации: ${degradationFlags.length}`);
-   }
-   if (meta.model_used) {
-     metaParts.push(`Модель: ${meta.model_used}`);
-   }
-   resultMeta.textContent = metaParts.join(" · ") || "Деградаций нет";
-   renderMetadata(meta);
-   renderUsedKeywords(meta);
-   updateResultBadges(meta, degradationFlags);
-   toggleRetryButton(!hasContent);
-   updatePromptPreview({
-     system: meta.system_prompt_preview,
-     context: Array.isArray(meta.clips) ? meta.clips : [],
-     user: meta.user_prompt_preview,
-     context_used: meta.context_used,
-     context_index_missing: meta.context_index_missing,
-     context_budget_tokens_est: meta.context_budget_tokens_est,
-     context_budget_tokens_limit: meta.context_budget_tokens_limit,
-     k: payload?.k,
+@@ -2979,55 +2985,60 @@ function setupAdvancedSettings() {
    });
--  if (state.currentResult.downloads) {
--    setButtonLoading(downloadMdBtn, false);
--    setButtonLoading(downloadReportBtn, false);
--    setActiveArtifactDownloads(state.currentResult.downloads);
--  }
-+  setButtonLoading(downloadMdBtn, false);
-+  setButtonLoading(downloadReportBtn, false);
-+  setActiveArtifactDownloads(state.currentResult.downloads || state.currentDownloads);
-   if (degradationFlags.length) {
-     const label = degradationFlags.map(describeDegradationFlag).join(", ");
-     showToast({ message: `Частичная деградация: ${label}`, type: "warn", duration: 6000 });
-   }
  }
- 
- function describeDegradationFlag(flag) {
-   if (!flag) {
-     return "unknown";
-   }
-   return DEGRADATION_LABELS[flag] || flag;
- }
- 
- const delay = (ms) => new Promise((resolve) => {
-   setTimeout(resolve, ms);
- });
- 
- function handleRetryClick(event) {
-   event.preventDefault();
-   if (briefForm && typeof briefForm.requestSubmit === "function") {
-     briefForm.requestSubmit(generateBtn);
-     return;
-   }
-   if (generateBtn) {
-     generateBtn.click();
-@@ -2940,109 +2981,366 @@ function setupAdvancedSettings() {
  
  function resetProgressIndicator(message = DEFAULT_PROGRESS_MESSAGE) {
    if (progressStage) {
@@ -408,11 +430,16 @@ index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633c
    if (progressDetails) {
      progressDetails.textContent = "";
    }
++  if (progressBadge) {
++    progressBadge.classList.add("hidden");
++  }
    progressState.currentPercent = 0;
    progressState.lastStage = "draft";
-+  progressState.lastUpdateAt = Date.now();
-+  progressState.latestSnapshot = null;
-+  progressState.heartbeatNotified = false;
+   progressState.lastUpdateAt = Date.now();
+   progressState.latestSnapshot = null;
+   progressState.heartbeatNotified = false;
++  progressState.maxDraftTotal = 0;
++  progressState.maxDraftCompleted = 0;
  }
  
  function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
@@ -424,456 +451,121 @@ index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633c
        window.clearTimeout(progressState.hideTimer);
        progressState.hideTimer = null;
      }
-+    progressState.overlaySuppressed = false;
-+    progressState.heartbeatNotified = false;
-+    progressState.latestSnapshot = null;
-+    progressState.lastUpdateAt = Date.now();
+     progressState.overlaySuppressed = false;
+     progressState.heartbeatNotified = false;
+     progressState.latestSnapshot = null;
+     progressState.lastUpdateAt = Date.now();
      progressOverlay.classList.remove("hidden");
      resetProgressIndicator(message);
-+    clearProgressHeartbeat();
+     clearProgressHeartbeat();
    } else {
      hideProgressOverlay({ immediate: true });
    }
  }
  
--function hideProgressOverlay({ immediate = false } = {}) {
-+function hideProgressOverlay({ immediate = false, suppress = false } = {}) {
+ function hideProgressOverlay({ immediate = false, suppress = false } = {}) {
    if (!progressOverlay) {
+@@ -3411,89 +3422,110 @@ function updateProgressFromSnapshot(snapshot) {
+     stageCandidate = snapshot.step.trim().toLowerCase();
+   }
+   const stageForDetails = stageCandidate || "";
+   let stageSource = stageCandidate;
+   if (statusRaw === "succeeded") {
+     stageSource = "done";
+   } else if (statusRaw === "failed") {
+     stageSource = "error";
+   }
+   let normalizedStage = normalizeStageName(stageSource || "");
+   if (statusRaw === "succeeded") {
+     normalizedStage = "done";
+   } else if (statusRaw === "failed") {
+     normalizedStage = "error";
+   }
+   if (!normalizedStage) {
+     normalizedStage = progressState.lastStage || "draft";
+   }
+   if (!PROGRESS_STAGE_LABELS[normalizedStage] && normalizedStage !== "error") {
+     normalizedStage = progressState.lastStage || "draft";
+   }
+   progressState.lastStage = normalizedStage;
+ 
+   const stepStatus = resolveStepStatus(snapshot, normalizedStage);
+ 
++  const isDegraded = stepStatus === "degraded" || statusRaw === "degraded";
++  if (progressBadge) {
++    if (isDegraded) {
++      progressBadge.textContent = PROGRESS_DEGRADED_BADGE_MESSAGE;
++      progressBadge.classList.remove("hidden");
++    } else {
++      progressBadge.classList.add("hidden");
++    }
++  }
++
+   if (maybeAutoHideProgress(normalizedStage, stepStatus, snapshot)) {
+     clearProgressHeartbeat();
      return;
    }
-   if (!immediate && progressState.hideTimer) {
+ 
+   if (progressState.overlaySuppressed) {
      return;
    }
-   if (progressState.hideTimer) {
-     window.clearTimeout(progressState.hideTimer);
-     progressState.hideTimer = null;
-   }
-   progressOverlay.classList.add("hidden");
-   resetProgressIndicator(DEFAULT_PROGRESS_MESSAGE);
-+  if (suppress) {
-+    progressState.overlaySuppressed = true;
-+  } else {
-+    progressState.overlaySuppressed = false;
-+  }
-+  clearProgressHeartbeat();
- }
  
- function scheduleProgressHide(delay = 1200) {
-   if (!progressOverlay) {
-     return;
-   }
-   if (progressState.hideTimer) {
-     window.clearTimeout(progressState.hideTimer);
-   }
-   progressState.hideTimer = window.setTimeout(() => {
-     progressState.hideTimer = null;
-     hideProgressOverlay({ immediate: true });
-   }, Math.max(0, delay));
- }
+   progressOverlay.classList.remove("hidden");
  
- function clamp01(value) {
-   if (typeof value !== "number" || Number.isNaN(value)) {
-     return 0;
-   }
-   if (value <= 0) {
-     return 0;
-   }
-   if (value >= 1) {
-     return 1;
-   }
-   return value;
- }
+   const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
+     ? snapshot.progress_payload
+     : {};
+   const totalBatches = toNumber(payload.total ?? snapshot.batches_total);
+   const completedBatches = toNumber(payload.completed ?? snapshot.batches_completed);
  
-+function normalizeStageName(value) {
-+  if (typeof value !== "string") {
-+    return "";
++  if (Number.isFinite(totalBatches) && totalBatches > 0) {
++    progressState.maxDraftTotal = Math.max(progressState.maxDraftTotal, totalBatches);
 +  }
-+  const normalized = value.trim().toLowerCase();
-+  if (!normalized) {
-+    return "";
++  if (Number.isFinite(completedBatches)) {
++    progressState.maxDraftCompleted = Math.max(
++      progressState.maxDraftCompleted,
++      completedBatches,
++    );
 +  }
-+  if (normalized === "trim") {
-+    return "refine";
-+  }
-+  if (normalized === "finalize") {
-+    return "validate";
-+  }
-+  return normalized;
-+}
 +
-+function normalizeStepStatus(value) {
-+  if (typeof value !== "string") {
-+    return "";
-+  }
-+  const normalized = value.trim().toLowerCase();
-+  if (!normalized) {
-+    return "";
-+  }
-+  if (normalized === "succeeded") {
-+    return "completed";
-+  }
-+  return normalized;
-+}
-+
-+function inferStepStatusFromSteps(snapshot, stageName) {
-+  if (!snapshot || typeof snapshot !== "object") {
-+    return "";
-+  }
-+  const targetNames = PROGRESS_STAGE_TO_STEP_NAMES[stageName] || [stageName];
-+  const steps = Array.isArray(snapshot.steps) ? snapshot.steps : [];
-+  const relevant = steps
-+    .map((step) => (step && typeof step === "object" ? step : null))
-+    .filter((step) => {
-+      if (!step || typeof step.name !== "string") {
-+        return false;
-+      }
-+      return targetNames.includes(step.name.trim().toLowerCase());
-+    });
-+  if (!relevant.length) {
-+    return "";
-+  }
-+  const statuses = relevant.map((step) => normalizeStepStatus(step.status));
-+  if (statuses.some((value) => value === "failed")) {
-+    return "failed";
-+  }
-+  if (statuses.some((value) => value === "degraded")) {
-+    return "degraded";
-+  }
-+  if (statuses.some((value) => STEP_STATUS_RUNNING_VALUES.has(value))) {
-+    return "running";
-+  }
-+  if (statuses.some((value) => value === "completed")) {
-+    return "completed";
-+  }
-+  if (statuses.some((value) => value === "skipped")) {
-+    return "skipped";
-+  }
-+  if (statuses.every((value) => value === "pending")) {
-+    return "pending";
-+  }
-+  return statuses.find(Boolean) || "";
-+}
-+
-+function resolveStepStatus(snapshot, stageOverride = null) {
-+  const direct = normalizeStepStatus(snapshot?.step_status);
-+  const stageSource = stageOverride
-+    || snapshot?.progress_stage
-+    || snapshot?.step
-+    || "";
-+  const normalizedStage = normalizeStageName(stageSource);
-+  const inferred = normalizedStage ? inferStepStatusFromSteps(snapshot, normalizedStage) : "";
-+  return direct || inferred || "";
-+}
-+
-+function collectDegradationFlags(snapshot) {
-+  const flags = new Set();
-+  if (!snapshot || typeof snapshot !== "object") {
-+    return flags;
-+  }
-+  const append = (value) => {
-+    if (typeof value === "string" && value.trim()) {
-+      const normalized = value.trim().toLowerCase();
-+      if (normalized === "max_output_tokens" || normalized === "max_output_tokens_final") {
-+        flags.add("draft_max_tokens");
-+        if (normalized === "max_output_tokens_final") {
-+          flags.add("cap_reached_final");
-+        }
-+        return;
-+      }
-+      flags.add(normalized);
-+    }
-+  };
-+  const appendArray = (values) => {
-+    if (Array.isArray(values)) {
-+      values.forEach(append);
-+    }
-+  };
-+  appendArray(snapshot.degradation_flags);
-+  const payload = snapshot.progress_payload;
-+  if (payload && typeof payload === "object") {
-+    appendArray(payload.flags);
-+    if (payload.cap_reached_final) {
-+      flags.add("cap_reached_final");
-+    }
-+    if (payload.soft_timeout) {
-+      flags.add("soft_timeout");
-+    }
-+  }
-+  const result = snapshot.result && typeof snapshot.result === "object" ? snapshot.result : null;
-+  if (result) {
-+    const meta = result.meta_json && typeof result.meta_json === "object" ? result.meta_json : null;
-+    if (meta) {
-+      appendArray(meta.degradation_flags);
-+      if (meta.cap_reached_final) {
-+        flags.add("cap_reached_final");
-+      }
-+      if (meta.soft_timeout) {
-+        flags.add("soft_timeout");
-+      }
-+    }
-+  }
-+  const steps = Array.isArray(snapshot.steps) ? snapshot.steps : [];
-+  steps.forEach((step) => {
-+    if (!step || typeof step !== "object") {
-+      return;
-+    }
-+    const status = normalizeStepStatus(step.status);
-+    if (status === "degraded") {
-+      append(step.error);
-+      if (step.payload && typeof step.payload === "object") {
-+        appendArray(step.payload.degradation_flags);
-+      }
-+    }
-+  });
-+  return flags;
-+}
-+
-+function deriveProgressNotice(snapshot) {
-+  const flags = collectDegradationFlags(snapshot);
-+  for (const key of PROGRESS_NOTICE_PRIORITY) {
-+    if (flags.has(key) && DEGRADATION_LABELS[key]) {
-+      return DEGRADATION_LABELS[key];
-+    }
-+  }
-+  return null;
-+}
-+
-+function maybeAutoHideProgress(stageName, stepStatus, snapshot) {
-+  const effectiveStatus = stepStatus || resolveStepStatus(snapshot, stageName);
-+  const stage = stageName || normalizeStageName(snapshot?.progress_stage || snapshot?.step || "");
-+  if (!stage) {
-+    return false;
-+  }
-+  if (stage !== "draft" && stage !== "refine") {
-+    return false;
-+  }
-+  if (!effectiveStatus || !STEP_STATUS_DONE_VALUES.has(effectiveStatus)) {
-+    return false;
-+  }
-+  hideProgressOverlay({ immediate: true, suppress: true });
-+  return true;
-+}
-+
-+function clearProgressHeartbeat() {
-+  if (progressState.heartbeatTimer) {
-+    window.clearTimeout(progressState.heartbeatTimer);
-+    progressState.heartbeatTimer = null;
-+  }
-+}
-+
-+function scheduleProgressHeartbeat() {
-+  if (!progressOverlay || progressOverlay.classList.contains("hidden")) {
-+    clearProgressHeartbeat();
-+    return;
-+  }
-+  clearProgressHeartbeat();
-+  progressState.heartbeatTimer = window.setTimeout(
-+    handleProgressHeartbeatTimeout,
-+    PROGRESS_HEARTBEAT_TIMEOUT_MS,
-+  );
-+}
-+
-+function handleProgressHeartbeatTimeout() {
-+  progressState.heartbeatTimer = null;
-+  if (progressState.heartbeatNotified) {
-+    return;
-+  }
-+  const snapshot = progressState.latestSnapshot;
-+  if (!snapshot || typeof snapshot !== "object") {
-+    return;
-+  }
-+  const overallStatus = typeof snapshot.status === "string" ? snapshot.status.trim().toLowerCase() : "";
-+  const stage = normalizeStageName(snapshot.progress_stage || snapshot.step || "");
-+  const stepStatus = resolveStepStatus(snapshot, stage);
-+  if (
-+    overallStatus === "running"
-+    && (!stepStatus || STEP_STATUS_RUNNING_VALUES.has(stepStatus) || stepStatus === "pending")
-+  ) {
-+    scheduleProgressHeartbeat();
-+    return;
-+  }
-+  progressState.heartbeatNotified = true;
-+  hideProgressOverlay({ immediate: true, suppress: true });
-+  const notice = deriveProgressNotice(snapshot)
-+    || "Мягкий таймаут — результат сохранён / частичная деградация";
-+  showToast({ message: notice, type: "warn" });
-+}
-+
-+function getSnapshotArtifactSaved(snapshot) {
-+  if (!snapshot || typeof snapshot !== "object") {
-+    return null;
-+  }
-+  const result = snapshot.result && typeof snapshot.result === "object" ? snapshot.result : null;
-+  if (!result) {
-+    return null;
-+  }
-+  if (typeof result.artifact_saved === "boolean") {
-+    return result.artifact_saved;
-+  }
-+  if (result.artifact_paths && typeof result.artifact_paths === "object") {
-+    return true;
-+  }
-+  return null;
-+}
-+
-+function isArtifactDownloadReady() {
-+  if (state.currentResult && typeof state.currentResult.artifactSaved === "boolean") {
-+    return state.currentResult.artifactSaved;
-+  }
-+  const snapshotSaved = getSnapshotArtifactSaved(progressState.latestSnapshot);
-+  if (typeof snapshotSaved === "boolean") {
-+    return snapshotSaved;
-+  }
-+  return false;
-+}
-+
- function toNumber(value) {
-   if (typeof value === "number" && Number.isFinite(value)) {
-     return value;
-   }
-   if (typeof value === "string" && value.trim()) {
-     const parsed = Number(value);
-     if (Number.isFinite(parsed)) {
-       return parsed;
-     }
-   }
-   return null;
- }
- 
- function formatProgressDetails(stage, payload) {
-   if (!payload || typeof payload !== "object") {
-     return "";
-   }
-   const parts = [];
-   if (stage === "draft") {
-     const completed = toNumber(payload.completed);
-     const total = toNumber(payload.total);
-     if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
-       const safeCompleted = Math.max(0, Math.min(total, completed));
-       parts.push(`Батчи: ${safeCompleted}/${total}`);
-     }
-@@ -3073,148 +3371,198 @@ function formatProgressDetails(stage, payload) {
- function extractErrorMessage(snapshot) {
-   if (!snapshot || typeof snapshot !== "object") {
-     return "";
-   }
-   const errorPayload = snapshot.error;
-   if (errorPayload && typeof errorPayload === "object") {
-     if (typeof errorPayload.message === "string" && errorPayload.message.trim()) {
-       return errorPayload.message.trim();
-     }
-     if (typeof errorPayload.error === "string" && errorPayload.error.trim()) {
-       return errorPayload.error.trim();
-     }
-   } else if (typeof errorPayload === "string" && errorPayload.trim()) {
-     return errorPayload.trim();
-   }
-   if (typeof snapshot.message === "string" && snapshot.message.trim()) {
-     return snapshot.message.trim();
-   }
-   return "";
- }
- 
- function updateProgressFromSnapshot(snapshot) {
-   if (!progressOverlay || !snapshot || typeof snapshot !== "object") {
-     return;
-   }
-+  progressState.latestSnapshot = snapshot;
-+  progressState.lastUpdateAt = Date.now();
-+  progressState.heartbeatNotified = false;
-+  setActiveArtifactDownloads(state.currentDownloads);
-+
-   if (progressState.hideTimer) {
-     window.clearTimeout(progressState.hideTimer);
-     progressState.hideTimer = null;
-   }
- 
--  progressOverlay.classList.remove("hidden");
--
--  const status = typeof snapshot.status === "string" ? snapshot.status : "running";
--  let stage = typeof snapshot.progress_stage === "string" && snapshot.progress_stage.trim()
-+  const statusRaw = typeof snapshot.status === "string" ? snapshot.status.trim().toLowerCase() : "running";
-+  let stageCandidate = typeof snapshot.progress_stage === "string" && snapshot.progress_stage.trim()
-     ? snapshot.progress_stage.trim().toLowerCase()
-     : "";
--  if (!stage && typeof snapshot.step === "string" && snapshot.step.trim()) {
--    stage = snapshot.step.trim().toLowerCase();
-+  if (!stageCandidate && typeof snapshot.step === "string" && snapshot.step.trim()) {
-+    stageCandidate = snapshot.step.trim().toLowerCase();
-+  }
-+  const stageForDetails = stageCandidate || "";
-+  let stageSource = stageCandidate;
-+  if (statusRaw === "succeeded") {
-+    stageSource = "done";
-+  } else if (statusRaw === "failed") {
-+    stageSource = "error";
-+  }
-+  let normalizedStage = normalizeStageName(stageSource || "");
-+  if (statusRaw === "succeeded") {
-+    normalizedStage = "done";
-+  } else if (statusRaw === "failed") {
-+    normalizedStage = "error";
-   }
--  if (status === "succeeded") {
--    stage = "done";
--  } else if (status === "failed") {
--    stage = "error";
-+  if (!normalizedStage) {
-+    normalizedStage = progressState.lastStage || "draft";
-+  }
-+  if (!PROGRESS_STAGE_LABELS[normalizedStage] && normalizedStage !== "error") {
-+    normalizedStage = progressState.lastStage || "draft";
-+  }
-+  progressState.lastStage = normalizedStage;
-+
-+  const stepStatus = resolveStepStatus(snapshot, normalizedStage);
-+
-+  if (maybeAutoHideProgress(normalizedStage, stepStatus, snapshot)) {
-+    clearProgressHeartbeat();
-+    return;
-   }
--  if (!PROGRESS_STAGE_LABELS[stage]) {
--    stage = progressState.lastStage || "draft";
-+
-+  if (progressState.overlaySuppressed) {
-+    return;
-   }
--  progressState.lastStage = stage;
-+
-+  progressOverlay.classList.remove("hidden");
-+
-+  const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
-+    ? snapshot.progress_payload
-+    : {};
-+  const totalBatches = toNumber(payload.total ?? snapshot.batches_total);
-+  const completedBatches = toNumber(payload.completed ?? snapshot.batches_completed);
- 
    let percentValue = null;
--  if (typeof snapshot.progress === "number") {
-+  let allowDecrease = false;
-+  if (
-+    normalizedStage === "draft"
-+    && Number.isFinite(totalBatches)
-+    && totalBatches > 0
-+    && Number.isFinite(completedBatches)
-+  ) {
-+    const safeTotal = Math.max(1, totalBatches);
-+    const safeCompleted = Math.max(0, Math.min(safeTotal, completedBatches));
-+    percentValue = Math.round((safeCompleted / safeTotal) * 1000) / 10;
-+    allowDecrease = true;
-+  }
-+  if (percentValue === null && typeof snapshot.progress === "number") {
+-  let allowDecrease = false;
+-  if (
+-    normalizedStage === "draft"
+-    && Number.isFinite(totalBatches)
+-    && totalBatches > 0
+-    && Number.isFinite(completedBatches)
+-  ) {
+-    const safeTotal = Math.max(1, totalBatches);
+-    const safeCompleted = Math.max(0, Math.min(safeTotal, completedBatches));
+-    percentValue = Math.round((safeCompleted / safeTotal) * 1000) / 10;
+-    allowDecrease = true;
++  if (normalizedStage === "draft") {
++    const trackedTotal = progressState.maxDraftTotal || totalBatches;
++    if (Number.isFinite(trackedTotal) && trackedTotal && trackedTotal > 0) {
++      const safeTotal = Math.max(1, trackedTotal);
++      const trackedCompleted = Number.isFinite(progressState.maxDraftCompleted)
++        ? progressState.maxDraftCompleted
++        : 0;
++      let safeCompleted = trackedCompleted;
++      if (Number.isFinite(completedBatches)) {
++        safeCompleted = Math.max(safeCompleted, completedBatches);
++      }
++      safeCompleted = Math.max(0, Math.min(safeTotal, safeCompleted));
++      percentValue = Math.round((safeCompleted / safeTotal) * 1000) / 10;
++    }
+   }
+   if (percentValue === null && typeof snapshot.progress === "number") {
      percentValue = Math.round(clamp01(snapshot.progress) * 1000) / 10;
    }
    if (percentValue === null || Number.isNaN(percentValue)) {
      percentValue = progressState.currentPercent || 0;
    }
--  percentValue = Math.max(progressState.currentPercent || 0, percentValue);
--  percentValue = Math.min(100, percentValue);
-+  if (!allowDecrease) {
-+    percentValue = Math.max(progressState.currentPercent || 0, percentValue);
-+  }
-+  percentValue = Math.max(0, Math.min(100, percentValue));
+-  if (!allowDecrease) {
+-    percentValue = Math.max(progressState.currentPercent || 0, percentValue);
+-  }
++  percentValue = Math.max(progressState.currentPercent || 0, percentValue);
+   percentValue = Math.max(0, Math.min(100, percentValue));
    progressState.currentPercent = percentValue;
  
    if (progressBarFill) {
@@ -889,647 +581,651 @@ index befb025e5910dc27a875d50a18b33b740792aeab..81c516587d4baed1d835a58c4e61633c
    let message = "";
    if (typeof snapshot.progress_message === "string" && snapshot.progress_message.trim()) {
      message = snapshot.progress_message.trim();
--  } else if (status === "succeeded") {
-+  } else if (statusRaw === "succeeded") {
+   } else if (statusRaw === "succeeded") {
      message = PROGRESS_STAGE_MESSAGES.done;
--  } else if (status === "failed") {
-+  } else if (statusRaw === "failed") {
+   } else if (statusRaw === "failed") {
      message = extractErrorMessage(snapshot) || PROGRESS_STAGE_MESSAGES.error;
    } else if (typeof snapshot.message === "string" && snapshot.message.trim()) {
      message = snapshot.message.trim();
    } else {
--    message = PROGRESS_STAGE_MESSAGES[stage] || DEFAULT_PROGRESS_MESSAGE;
-+    const stageKey = normalizedStage === "error" ? "error" : normalizedStage;
-+    message = PROGRESS_STAGE_MESSAGES[stageKey] || DEFAULT_PROGRESS_MESSAGE;
-+  }
-+  const notice = deriveProgressNotice(snapshot);
-+  if (notice) {
-+    message = notice;
-   }
-   if (progressMessage) {
-     progressMessage.textContent = message;
-   }
+     const stageKey = normalizedStage === "error" ? "error" : normalizedStage;
+     message = PROGRESS_STAGE_MESSAGES[stageKey] || DEFAULT_PROGRESS_MESSAGE;
+diff --git a/frontend_demo/styles.css b/frontend_demo/styles.css
+index 6f905d6f7ed61bf8cef04c646d1b6fe6cc93bc17..825af47993bd50db98f6984c0036db25b73b75a3 100644
+--- a/frontend_demo/styles.css
++++ b/frontend_demo/styles.css
+@@ -1504,50 +1504,65 @@ button.loading {
  
-   if (progressStage) {
--    const label = PROGRESS_STAGE_LABELS[stage] || PROGRESS_STAGE_LABELS.draft;
-+    const preferredStage = stageForDetails || normalizedStage;
-+    const labelKey = PROGRESS_STAGE_LABELS[preferredStage]
-+      ? preferredStage
-+      : PROGRESS_STAGE_LABELS[normalizedStage]
-+        ? normalizedStage
-+        : progressState.lastStage || "draft";
-+    const label = PROGRESS_STAGE_LABELS[labelKey] || PROGRESS_STAGE_LABELS.draft;
-     progressStage.textContent = `Шаг: ${label} 0→100%`;
-   }
- 
--  const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
--    ? snapshot.progress_payload
--    : null;
-   if (progressDetails) {
--    progressDetails.textContent = formatProgressDetails(stage, payload);
-+    const detailsStage = stageForDetails || normalizedStage;
-+    progressDetails.textContent = formatProgressDetails(detailsStage, payload);
-   }
- 
--  if (status === "succeeded") {
--    progressState.currentPercent = 100;
--    if (progressPercent) {
--      progressPercent.textContent = "100%";
--    }
--    if (progressBarFill) {
--      progressBarFill.style.width = "100%";
--    }
--    if (progressBar) {
--      progressBar.setAttribute("aria-valuenow", "100");
--    }
--    scheduleProgressHide(1200);
--  } else if (status === "failed") {
-+  setActiveArtifactDownloads(state.currentDownloads);
-+
-+  if (statusRaw === "succeeded" || statusRaw === "failed") {
-     progressState.currentPercent = 100;
-     if (progressPercent) {
-       progressPercent.textContent = "100%";
-     }
-     if (progressBarFill) {
-       progressBarFill.style.width = "100%";
-     }
-     if (progressBar) {
-       progressBar.setAttribute("aria-valuenow", "100");
-     }
--    scheduleProgressHide(2500);
-+    scheduleProgressHide(statusRaw === "succeeded" ? 1200 : 2500);
-+    clearProgressHeartbeat();
-+    return;
-   }
-+
-+  scheduleProgressHeartbeat();
+ .progress-overlay.hidden {
+   display: none;
  }
  
- function setInteractiveBusy(isBusy) {
-   interactiveElements.forEach((element) => {
-     if (!element) {
-       return;
-     }
-     if (isBusy) {
-       if (typeof element.dataset.interactiveLocked === "undefined") {
-         element.dataset.interactiveLocked = element.disabled ? "true" : "false";
-       }
-       element.disabled = true;
-     } else if (typeof element.dataset.interactiveLocked !== "undefined") {
-       const shouldRemainDisabled = element.dataset.interactiveLocked === "true";
-       if (!shouldRemainDisabled) {
-         element.disabled = false;
-       }
-       delete element.dataset.interactiveLocked;
-     }
-   });
- 
-   if (advancedSettings) {
-     advancedSettings.classList.toggle("is-disabled", isBusy);
-   }
+ .progress-card {
+   background: #ffffff;
+   padding: 32px 40px;
+   border-radius: 16px;
+   box-shadow: 0 20px 60px rgba(15, 23, 42, 0.2);
+   display: flex;
+   flex-direction: column;
+   align-items: stretch;
+   gap: 12px;
+   font-size: 16px;
+   min-width: min(420px, 90vw);
  }
-diff --git a/jobs/models.py b/jobs/models.py
-index 11b237dd3844379e88d200ff1a3eb2436639f673..e1b1e59a09845c1d385af0878f4a17625a00b75d 100644
---- a/jobs/models.py
-+++ b/jobs/models.py
-@@ -177,78 +177,137 @@ def summarize_job(job: "Job") -> Dict[str, Any]:
-     }
-     step_alias = {
-         "jsonld": "finalize",
-         "post_analysis": "finalize",
-     }
-     step_labels = {
-         "draft": "Черновик",
-         "refine": "Полировка",
-         "finalize": "Финализация",
-         "jsonld": "JSON-LD",
-         "post_analysis": "Пост-анализ",
-         "done": "Готово",
-     }
  
-     status = status_map.get(job.status, job.status.value)
+ .progress-stage {
+   margin: 0;
+   font-size: 18px;
+   font-weight: 600;
+   text-align: center;
+ }
  
-     total_steps = len(job.steps)
-     completed = sum(
-         1
-         for step in job.steps
-         if step.status in {JobStepStatus.SUCCEEDED, JobStepStatus.DEGRADED, JobStepStatus.SKIPPED}
-     )
-     running_step = next((step for step in job.steps if step.status == JobStepStatus.RUNNING), None)
-     pending_step = next((step for step in job.steps if step.status == JobStepStatus.PENDING), None)
- 
-+    stage_to_steps = {
-+        "draft": {"draft"},
-+        "trim": {"refine"},
-+        "refine": {"refine"},
-+        "finalize": {"jsonld", "post_analysis"},
-+        "validate": {"jsonld", "post_analysis"},
-+        "jsonld": {"jsonld"},
-+        "post_analysis": {"post_analysis"},
-+        "done": {"post_analysis"},
-+    }
++.progress-status-badge {
++  margin: 0;
++  align-self: center;
++  padding: 4px 12px;
++  border-radius: 999px;
++  background: rgba(245, 158, 11, 0.15);
++  color: #92400e;
++  font-size: 14px;
++  font-weight: 600;
++}
 +
-     if status in {"succeeded", "failed"}:
-         step_name = "done"
-         progress = 1.0
-     else:
-         if running_step:
-             step_name = step_alias.get(running_step.name, running_step.name)
-         elif pending_step:
-             step_name = step_alias.get(pending_step.name, pending_step.name)
-         elif job.steps:
-             step_name = step_alias.get(job.steps[-1].name, job.steps[-1].name)
-         else:
-             step_name = "draft"
-         if total_steps:
-             progress = completed / total_steps
-             if running_step:
-                 progress += 0.5 / total_steps
-             progress = min(1.0, max(0.0, progress))
-         else:
-             progress = 0.0
- 
-     if job.progress_value is not None:
-         progress = max(0.0, min(1.0, float(job.progress_value)))
-     if job.progress_stage:
-         step_name = job.progress_stage
- 
-     if status == "queued":
-         message = "Задание в очереди"
-     elif status == "running":
-         message = job.progress_message or f"Шаг: {step_labels.get(step_name, step_name)}"
-     elif status == "succeeded":
-         message = job.progress_message or "Готово"
-     else:
-         error_message = ""
-         if isinstance(job.error, dict):
-             error_message = str(job.error.get("message") or "").strip()
-         message = error_message or "Завершено с ошибкой"
- 
--    if job.progress_message and status in {"running", "succeeded"}:
--        message = job.progress_message
--
-     timestamps = [job.created_at, job.started_at, job.finished_at, job.last_event_at]
-     for step in job.steps:
-         timestamps.extend([step.started_at, step.finished_at])
-     last_event_candidates = [ts for ts in timestamps if ts]
-     last_event = max(last_event_candidates) if last_event_candidates else utcnow()
- 
--    return {
-+    if job.progress_message and status in {"running", "succeeded"}:
-+        message = job.progress_message
++.progress-status-badge.hidden {
++  display: none;
++}
 +
-+    stage_lookup = stage_to_steps.get(step_name, {step_name})
-+    relevant_steps = [step for step in job.steps if step.name in stage_lookup]
-+    if not relevant_steps and job.steps:
-+        relevant_steps = [job.steps[-1]]
-+
-+    if status == "succeeded":
-+        step_status_value = "completed"
-+    elif status == "failed":
-+        step_status_value = "failed"
-+    elif relevant_steps:
-+        order = (
-+            ("running", lambda s: s.status == JobStepStatus.RUNNING),
-+            ("failed", lambda s: s.status == JobStepStatus.FAILED),
-+            ("degraded", lambda s: s.status == JobStepStatus.DEGRADED),
-+            ("completed", lambda s: s.status == JobStepStatus.SUCCEEDED),
-+            ("skipped", lambda s: s.status == JobStepStatus.SKIPPED),
-+            ("pending", lambda s: s.status == JobStepStatus.PENDING),
-+        )
-+        step_status_value = "pending"
-+        for label, predicate in order:
-+            if any(predicate(step) for step in relevant_steps):
-+                step_status_value = label
-+                break
-+    else:
-+        step_status_value = "pending"
-+
-+    if running_step and step_alias.get(running_step.name, running_step.name) == step_name:
-+        step_status_value = "running"
-+
-+    batches_done = None
-+    batches_total = None
-+    if job.progress_payload:
-+        try:
-+            batches_done = int(job.progress_payload.get("completed"))
-+        except Exception:  # pragma: no cover - defensive
-+            batches_done = None
-+        try:
-+            batches_total = int(job.progress_payload.get("total"))
-+        except Exception:  # pragma: no cover - defensive
-+            batches_total = None
-+        if batches_done is not None and batches_total is not None and batches_total < 0:
-+            batches_total = None
-+    result = {
-         "status": status,
-         "step": step_name,
-         "progress": round(progress, 4),
-         "last_event_at": last_event.strftime(ISO_FORMAT),
-         "message": message,
-+        "step_status": step_status_value,
-     }
-+    if batches_done is not None:
-+        result["batches_completed"] = batches_done
-+    if batches_total is not None:
-+        result["batches_total"] = batches_total
-+    return result
+ .progress-bar {
+   position: relative;
+   width: 100%;
+   height: 12px;
+   border-radius: 999px;
+   background: rgba(79, 70, 229, 0.12);
+   overflow: hidden;
+ }
+ 
+ .progress-bar__fill {
+   position: absolute;
+   inset: 0;
+   width: 0%;
+   background: linear-gradient(90deg, #4f46e5, #6366f1);
+   border-radius: inherit;
+   transition: width 0.4s ease;
+ }
+ 
+ .progress-percent {
+   margin: 0;
+   font-size: 32px;
+   font-weight: 600;
+   text-align: center;
+   color: #111827;
+ }
 diff --git a/jobs/runner.py b/jobs/runner.py
-index 594c9164636c2fa3edb5b503c17008ab7dfc2703..05ab631e8a0b2d3af7baf7f50bf7353cad84ab47 100644
+index 05ab631e8a0b2d3af7baf7f50bf7353cad84ab47..a28e10952864885c6556f01630f4df9974906715 100644
 --- a/jobs/runner.py
 +++ b/jobs/runner.py
-@@ -194,50 +194,51 @@ class JobRunner:
-                 step.mark_failed(result.error, **result.payload)
-             log_step(
-                 LOGGER,
-                 job_id=job.id,
-                 step=step.name,
-                 status=step.status.value,
-                 error=result.error,
-                 payload=result.payload or None,
-             )
-             ctx.degradation_flags.extend(result.degradation_flags)
-             self._store.touch(job.id)
-             if not result.continue_pipeline:
+@@ -32,50 +32,52 @@ PROGRESS_STAGE_WEIGHTS = {
+ 
+ PROGRESS_STAGE_MESSAGES = {
+     "draft": "Генерируем черновик",
+     "trim": "Нормализуем объём",
+     "validate": "Проверяем результат",
+     "done": "Готово",
+ }
+ 
+ 
+ @dataclass
+ class RunnerTask:
+     job_id: str
+     payload: Dict[str, Any]
+     trace_id: Optional[str] = None
+ 
+ 
+ @dataclass
+ class PipelineContext:
+     markdown: str = ""
+     meta_json: Dict[str, Any] = field(default_factory=dict)
+     faq_entries: List[Dict[str, str]] = field(default_factory=list)
+     degradation_flags: List[str] = field(default_factory=list)
+     errors: List[str] = field(default_factory=list)
+     trace_id: Optional[str] = None
+     artifact_paths: Optional[Dict[str, Any]] = None
++    skeleton_batches_total: int = 0
++    skeleton_batches_completed: int = 0
+ 
+     def ensure_markdown(self, fallback: str) -> None:
+         if not self.markdown.strip():
+             self.markdown = fallback
+ 
+ 
+ @dataclass
+ class StepResult:
+     status: JobStepStatus
+     payload: Dict[str, Any] = field(default_factory=dict)
+     degradation_flags: List[str] = field(default_factory=list)
+     error: Optional[str] = None
+     continue_pipeline: bool = True
+ 
+ 
+ class JobRunner:
+     """Serial job runner executing pipeline tasks in a background thread."""
+ 
+     def __init__(self, store: JobStore, *, soft_timeout_s: int = JOB_SOFT_TIMEOUT_S) -> None:
+         self._store = store
+         self._soft_timeout_s = soft_timeout_s
+         self._tasks: "queue.Queue[RunnerTask]" = queue.Queue()
+         self._events: Dict[str, threading.Event] = {}
+         self._events_lock = threading.Lock()
+         self._thread = threading.Thread(target=self._worker, name="job-runner", daemon=True)
+@@ -143,50 +145,54 @@ class JobRunner:
+                 LOGGER.exception("job_failed", extra={"job_id": task.job_id, "error": str(exc)})
+             finally:
+                 with self._events_lock:
+                     event = self._events.pop(task.job_id, None)
+                 if event:
+                     event.set()
+ 
+     def _run_job(self, task: RunnerTask) -> None:
+         job = self._store.get(task.job_id)
+         if not job:
+             LOGGER.warning("job_missing", extra={"job_id": task.job_id})
+             return
+ 
+         job.trace_id = job.trace_id or task.trace_id
+         job.mark_running()
+         self._store.touch(job.id)
+ 
+         ctx = PipelineContext(trace_id=job.trace_id)
+         start_time = time.monotonic()
+         deadline = start_time + self._soft_timeout_s
+         refine_extension = max(5.0, self._soft_timeout_s * 0.35)
+         refine_extension_applied = False
+ 
+         for step in job.steps:
+             if step.name == "refine" and not refine_extension_applied:
++                batches_hint = max(0, ctx.skeleton_batches_total)
++                if batches_hint > 0:
++                    dynamic_extension = max(32.0, 8.0 * batches_hint)
++                    refine_extension = max(refine_extension, dynamic_extension)
+                 deadline += refine_extension
+                 refine_extension_applied = True
+                 LOGGER.info(
+                     "job_soft_timeout_extend",
+                     extra={"step": step.name, "extra_seconds": round(refine_extension, 2)},
+                 )
+             if time.monotonic() >= deadline:
+                 ctx.degradation_flags.append("soft_timeout")
+                 step.mark_degraded("soft_timeout")
+                 log_step(
+                     LOGGER,
+                     job_id=job.id,
+                     step=step.name,
+                     status=step.status.value,
+                     reason="soft_timeout",
+                 )
                  break
  
-         ctx.ensure_markdown(_build_fallback_text(task.payload))
-         if ctx.degradation_flags:
-             ctx.degradation_flags = list(dict.fromkeys(ctx.degradation_flags))
-         result_payload = {
-             "markdown": ctx.markdown,
-             "meta_json": ctx.meta_json,
-             "faq_entries": ctx.faq_entries,
-             "errors": ctx.errors or None,
-         }
-         if ctx.artifact_paths:
-             result_payload["artifact_paths"] = ctx.artifact_paths
-+        result_payload["artifact_saved"] = bool(ctx.artifact_paths)
-         job.mark_succeeded(result_payload, degradation_flags=ctx.degradation_flags)
-         self._record_progress(job, "done", 1.0, message=PROGRESS_STAGE_MESSAGES.get("done"))
+             step.mark_running()
+             self._store.touch(job.id)
+             result = self._execute_step(step.name, task.payload, ctx, job)
+             if result.status == JobStepStatus.SUCCEEDED:
+                 step.mark_succeeded(**result.payload)
+             elif result.status == JobStepStatus.DEGRADED:
+                 step.mark_degraded(result.error, **result.payload)
+@@ -257,100 +263,127 @@ class JobRunner:
+         except (TypeError, ValueError):
+             normalized = 0.0
+         normalized = max(0.0, min(1.0, normalized))
+         progress_value = base + normalized * span
+         if stage_key == "done":
+             progress_value = 1.0
+         if job.progress_value is not None:
+             progress_value = max(float(job.progress_value), progress_value)
+         effective_message = message or PROGRESS_STAGE_MESSAGES.get(stage_key) or "Обработка задания"
+         job.update_progress(
+             stage=stage_key,
+             progress=min(1.0, progress_value),
+             message=effective_message,
+             payload=payload,
+         )
          self._store.touch(job.id)
-         JOB_COUNTER.inc()
  
-     def _execute_step(
+     def _run_draft_step(
          self,
-         step_name: str,
          payload: Dict[str, Any],
          ctx: PipelineContext,
          job: Optional[Job],
      ) -> StepResult:
-         if step_name == "draft":
-             return self._run_draft_step(payload, ctx, job)
-         if step_name == "refine":
-             return self._run_refine_step(ctx, job)
-         if step_name == "jsonld":
-             return self._run_jsonld_step(ctx, job)
-         if step_name == "post_analysis":
-             return self._run_post_analysis_step(ctx, job)
-         return StepResult(JobStepStatus.SUCCEEDED, payload={"skipped": True})
+         self._record_progress(job, "draft", 0.0)
  
-     def _record_progress(
-         self,
-         job: Optional[Job],
++        draft_batches_total = 0
++        draft_batches_completed = 0
++
+         def _progress_event(
+             stage: str,
+             *,
+             progress: float = 0.0,
+             message: Optional[str] = None,
+             payload: Optional[Dict[str, Any]] = None,
+         ) -> None:
++            nonlocal draft_batches_total, draft_batches_completed
++            if (
++                stage.strip().lower() == "draft"
++                and isinstance(payload, dict)
++            ):
++                total_value = payload.get("total")
++                completed_value = payload.get("completed")
++                try:
++                    total_int = int(total_value)
++                except (TypeError, ValueError):
++                    total_int = None
++                try:
++                    completed_int = int(completed_value)
++                except (TypeError, ValueError):
++                    completed_int = None
++                if isinstance(total_int, int):
++                    draft_batches_total = max(draft_batches_total, total_int)
++                if isinstance(completed_int, int):
++                    draft_batches_completed = max(draft_batches_completed, completed_int)
+             self._record_progress(job, stage, progress, message=message, payload=payload)
+ 
+         attempt = 0
+         last_error: Optional[str] = None
+         while attempt <= JOB_MAX_RETRIES_PER_STEP:
+             attempt += 1
+             try:
+                 result = generate_article_from_payload(
+                     **payload,
+                     progress_callback=_progress_event,
+                 )
+             except Exception as exc:  # noqa: BLE001
+                 last_error = str(exc)
+                 ctx.errors.append(last_error)
+                 continue
+ 
+             markdown = str(result.get("text") or result.get("markdown") or "").strip()
+             metadata = result.get("metadata")
+             if isinstance(metadata, dict):
+                 ctx.meta_json = metadata
+             artifact_paths = result.get("artifact_paths")
+             if isinstance(artifact_paths, dict) and artifact_paths:
+                 ctx.artifact_paths = artifact_paths
+             degradation_flags: List[str] = []
+             completion_warning: Optional[str] = None
+             if isinstance(metadata, dict):
+                 raw_flags = metadata.get("degradation_flags")
+                 if isinstance(raw_flags, list):
+                     degradation_flags = [
+                         str(flag).strip()
+                         for flag in raw_flags
+                         if isinstance(flag, str) and str(flag).strip()
+                     ]
+                 if degradation_flags:
+                     for flag in degradation_flags:
+                         if flag not in ctx.degradation_flags:
+                             ctx.degradation_flags.append(flag)
+                 warning_candidate = metadata.get("completion_warning")
+                 if isinstance(warning_candidate, str) and warning_candidate.strip():
+                     completion_warning = warning_candidate.strip()
+             if markdown:
+                 ctx.markdown = markdown
+                 self._record_progress(job, "draft", 1.0)
++                ctx.skeleton_batches_total = max(ctx.skeleton_batches_total, draft_batches_total)
++                ctx.skeleton_batches_completed = max(
++                    ctx.skeleton_batches_completed,
++                    draft_batches_completed,
++                )
+                 step_payload = {"attempts": attempt}
+                 if ctx.artifact_paths:
+                     step_payload["artifact_paths"] = ctx.artifact_paths
+                 if degradation_flags:
+                     error_label = completion_warning or degradation_flags[0]
+                     return StepResult(
+                         JobStepStatus.DEGRADED,
+                         payload=step_payload,
+                         degradation_flags=degradation_flags,
+                         error=error_label,
+                     )
+                 return StepResult(JobStepStatus.SUCCEEDED, payload=step_payload)
+             last_error = "empty_response"
+             ctx.errors.append(last_error)
+ 
+         ctx.ensure_markdown(_build_fallback_text(payload, error=last_error))
+         flags = ["draft_failed"]
+         self._record_progress(job, "draft", 1.0, message="Черновик по запасному сценарию")
+         return StepResult(
+             JobStepStatus.DEGRADED,
+             payload={"attempts": attempt, "error": last_error},
+             degradation_flags=flags,
+             error=last_error,
+         )
+ 
 diff --git a/llm_client.py b/llm_client.py
-index b2181462840c29e501e8059618ec2d70344a8b8c..83012f165f90e9d85179525acaab9874e76ac3b0 100644
+index 83012f165f90e9d85179525acaab9874e76ac3b0..e4eb661e8722a416ebcdfbab81905a35dfb87be3 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -2197,50 +2197,94 @@ def generate(
-                                 sanitized_payload["max_output_tokens"] = max(
-                                     min_token_floor, int(current_max)
+@@ -394,77 +394,92 @@ def build_responses_payload(
+ def _shrink_responses_input(text_value: str) -> str:
+     """Return a slightly condensed version of the Responses input payload."""
+ 
+     if not text_value:
+         return text_value
+ 
+     normalized_lines: List[str] = []
+     seen: set[str] = set()
+     for raw_line in text_value.splitlines():
+         stripped = raw_line.strip()
+         if not stripped:
+             continue
+         fingerprint = re.sub(r"\s+", " ", stripped.lower())
+         if fingerprint in seen:
+             continue
+         seen.add(fingerprint)
+         normalized_lines.append(stripped)
+ 
+     condensed = "\n\n".join(normalized_lines)
+     if len(condensed) < len(text_value):
+         return condensed
+     target = max(1000, int(len(text_value) * 0.9))
+     return text_value[:target]
+ 
+ 
+-def _is_valid_json_schema_instance(schema: Dict[str, Any], text: str) -> bool:
+-    """Validate the provided JSON text against the supplied schema."""
+-
++def _parse_schema_instance(schema: Dict[str, Any], text: str) -> Tuple[Optional[object], bool]:
+     if not schema or not text:
+-        return False
++        return None, False
+ 
+     try:
+         instance = json.loads(text)
+     except json.JSONDecodeError:
+-        return False
++        return None, False
+ 
+     if not isinstance(instance, (dict, list)):
+-        return False
++        return None, False
+ 
+     try:
+         Draft7Validator.check_schema(schema)
+     except JSONSchemaError:
+         LOGGER.warning("RESP_INCOMPLETE_SCHEMA_INVALID schema=invalid")
+-        return False
++        return None, False
+ 
+     try:
+         Draft7Validator(schema).validate(instance)
+     except JSONSchemaValidationError as exc:
+         LOGGER.warning("RESP_INCOMPLETE_SCHEMA_INVALID message=%s", exc.message)
+-        return False
++        return None, False
++
++    return instance, True
++
++
++def _has_non_empty_content(node: object) -> bool:
++    if isinstance(node, str):
++        return bool(node.strip())
++    if isinstance(node, list):
++        return any(_has_non_empty_content(item) for item in node)
++    if isinstance(node, dict):
++        return any(_has_non_empty_content(value) for value in node.values())
++    return False
++
++
++def _is_valid_json_schema_instance(schema: Dict[str, Any], text: str) -> bool:
++    """Validate the provided JSON text against the supplied schema."""
+ 
+-    return True
++    _, valid = _parse_schema_instance(schema, text)
++    return valid
+ 
+ 
+ def _coerce_bool(value: object) -> Optional[bool]:
+     if isinstance(value, bool):
+         return value
+     if isinstance(value, (int, float)):
+         return bool(value)
+     if isinstance(value, str):
+         lowered = value.strip().lower()
+         if lowered in {"1", "true", "yes", "on"}:
+             return True
+         if lowered in {"0", "false", "no", "off"}:
+             return False
+     return None
+ 
+ 
+ def _sanitize_text_format_in_place(
+     format_block: Dict[str, object],
+     *,
+     context: str = "-",
+     log_on_migration: bool = True,
+ ) -> Tuple[bool, bool, int]:
+     migrated = False
+     if not isinstance(format_block, dict):
+         return False, False, 0
+@@ -2087,83 +2102,127 @@ def generate(
+                         and metadata.get("previous_response_id")
+                     )
+                     if (
+                         response_id_value
+                         and reason in {"max_output_tokens", "soft_timeout"}
+                         and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
+                     ):
+                         resume_from_response_id = str(response_id_value)
+                     if reason == "max_output_tokens":
+                         LOGGER.info(
+                             "RESP_STATUS=incomplete|max_output_tokens=%s",
+                             current_payload.get("max_output_tokens"),
+                         )
+                         schema_dict: Optional[Dict[str, Any]] = None
+                         if isinstance(format_block, dict):
+                             candidate_schema = format_block.get("schema")
+                             if isinstance(candidate_schema, dict):
+                                 schema_dict = candidate_schema
+                         if (
+                             not text
+                             and schema_label == "responses.none"
+                             and segments == 0
+                         ):
+                             _record_pending_degradation(reason)
+                         if text:
+-                            metadata = dict(metadata)
+-                            metadata["status"] = "completed"
+-                            metadata["incomplete_reason"] = ""
+-                            metadata["completion_warning"] = "max_output_tokens"
+-                            degradation_flags: List[str] = []
+-                            raw_flags = metadata.get("degradation_flags")
+-                            if isinstance(raw_flags, list):
+-                                degradation_flags.extend(
+-                                    str(flag).strip()
+-                                    for flag in raw_flags
+-                                    if isinstance(flag, str) and flag.strip()
++                            if schema_dict:
++                                schema_instance: Optional[object] = None
++                                schema_valid = False
++                                schema_has_content = False
++                                schema_instance, schema_valid = _parse_schema_instance(
++                                    schema_dict, text
                                  )
-                                 shrink_next_attempt = False
-                                 continue
-                         if cap_exhausted:
-                             output_length = 0
-                             content_length = 0
-                             if isinstance(parse_flags, dict):
-                                 output_length = int(
-                                     parse_flags.get("output_text_len", 0) or 0
-                                 )
-                                 content_length = int(
-                                     parse_flags.get("content_text_len", 0) or 0
-                                 )
-                             LOGGER.warning(
-                                 "LLM_WARN cap_reached limit=%s output_len=%d content_len=%d status=%s reason=%s",
-                                 upper_cap,
-                                 output_length,
-                                 content_length,
-                                 status or "",
-                                 reason or "",
-                             )
-                             cap_retry_performed = True
-                             shrink_next_attempt = False
-+                            current_max_tokens = int(current_max)
-+                            final_cap_reached = cap_exhausted and (
-+                                reason == "max_output_tokens_final"
-+                                or (
-+                                    reason == "max_output_tokens"
-+                                    and upper_cap is not None
-+                                    and current_max_tokens >= int(upper_cap)
-+                                )
-+                                or current_max_tokens >= 3600
-+                            )
-+                            if final_cap_reached and output_length <= 0:
-+                                _record_pending_degradation("max_output_tokens")
+-                            if "draft_max_tokens" not in degradation_flags:
+-                                degradation_flags.append("draft_max_tokens")
+-                            metadata["degradation_flags"] = degradation_flags
+-                            if schema_dict and _is_valid_json_schema_instance(schema_dict, text):
+-                                LOGGER.info(
+-                                    "RESP_INCOMPLETE_ACCEPT schema_valid len=%d",
+-                                    len(text),
+-                                )
+-                                metadata["completion_schema_valid"] = True
++                                if schema_valid:
++                                    schema_has_content = _has_non_empty_content(schema_instance)
++                                if not (schema_valid and schema_has_content):
++                                    LOGGER.info(
++                                        "RESP_INCOMPLETE_RETRY schema_invalid len=%d content=%s",
++                                        len(text),
++                                        schema_has_content,
++                                    )
++                                    last_error = RuntimeError("responses_incomplete_schema_invalid")
++                                    if response_id_value:
++                                        resume_from_response_id = str(response_id_value)
++                                    shrink_next_attempt = False
++                                    text = ""
++                                else:
++                                    metadata = dict(metadata)
++                                    metadata["status"] = "completed"
++                                    metadata["incomplete_reason"] = ""
++                                    metadata["completion_warning"] = "max_output_tokens"
++                                    degradation_flags: List[str] = []
++                                    raw_flags = metadata.get("degradation_flags")
++                                    if isinstance(raw_flags, list):
++                                        degradation_flags.extend(
++                                            str(flag).strip()
++                                            for flag in raw_flags
++                                            if isinstance(flag, str) and flag.strip()
++                                        )
++                                    if "draft_max_tokens" not in degradation_flags:
++                                        degradation_flags.append("draft_max_tokens")
++                                    metadata["degradation_flags"] = degradation_flags
++                                    metadata["completion_schema_valid"] = True
++                                    metadata["completion_schema_content"] = bool(schema_has_content)
++                                    LOGGER.info(
++                                        "RESP_INCOMPLETE_ACCEPT schema_valid=%s content=%s len=%d",
++                                        schema_valid,
++                                        schema_has_content,
++                                        len(text),
++                                    )
++                                    metadata = _apply_pending_degradation(metadata)
++                                    parse_flags["metadata"] = metadata
++                                    updated_data = dict(data)
++                                    updated_data["metadata"] = metadata
++                                    _persist_raw_response(updated_data)
++                                    return text, parse_flags, updated_data, schema_label
+                             else:
 +                                metadata = dict(metadata)
-+                                metadata["cap_reached_final"] = True
-+                                metadata["step_status"] = "degraded"
-+                                terminal_reason = (
-+                                    reason or "max_output_tokens"
-+                                )
-+                                if (
-+                                    terminal_reason != "max_output_tokens_final"
-+                                    and current_max_tokens >= 3600
-+                                ):
-+                                    terminal_reason = "max_output_tokens_final"
-+                                metadata["incomplete_reason"] = terminal_reason
-+                                metadata["degradation_reason"] = terminal_reason
-+                                existing_flags: List[str] = []
++                                metadata["status"] = "completed"
++                                metadata["incomplete_reason"] = ""
++                                metadata["completion_warning"] = "max_output_tokens"
++                                degradation_flags: List[str] = []
 +                                raw_flags = metadata.get("degradation_flags")
 +                                if isinstance(raw_flags, list):
-+                                    existing_flags = [
++                                    degradation_flags.extend(
 +                                        str(flag).strip()
 +                                        for flag in raw_flags
-+                                        if isinstance(flag, str) and str(flag).strip()
-+                                    ]
-+                                if "draft_max_tokens" not in existing_flags:
-+                                    existing_flags.append("draft_max_tokens")
-+                                metadata["degradation_flags"] = existing_flags
-+                                if not metadata.get("completion_warning"):
-+                                    metadata["completion_warning"] = "max_output_tokens"
++                                        if isinstance(flag, str) and flag.strip()
++                                    )
++                                if "draft_max_tokens" not in degradation_flags:
++                                    degradation_flags.append("draft_max_tokens")
++                                metadata["degradation_flags"] = degradation_flags
+                                 LOGGER.info(
+                                     "RESP_INCOMPLETE_ACCEPT text len=%d",
+                                     len(text),
+                                 )
+                                 metadata["completion_schema_valid"] = False
+-                            metadata = _apply_pending_degradation(metadata)
+-                            parse_flags["metadata"] = metadata
+-                            updated_data = dict(data)
+-                            updated_data["metadata"] = metadata
+-                            _persist_raw_response(updated_data)
+-                            return text, parse_flags, updated_data, schema_label
 +                                metadata = _apply_pending_degradation(metadata)
 +                                parse_flags["metadata"] = metadata
 +                                updated_data = dict(data)
 +                                updated_data["metadata"] = metadata
 +                                _persist_raw_response(updated_data)
-+                                return text or "", parse_flags, updated_data, schema_label
-                     last_error = RuntimeError("responses_incomplete")
-                     incomplete_retry_count += 1
-                     if incomplete_retry_count >= 2:
-                         break
-                     shrink_next_attempt = True
-                     continue
-                 if not text:
-                     if (
-                         status == "incomplete"
-                         and reason == "soft_timeout"
-                         and schema_label == "responses.none"
-                         and segments == 0
-                     ):
-                         _record_pending_degradation(reason)
-                     if (
-                         allow_empty_retry
-                         and status == "incomplete"
-                         and segments == 0
-                         and not empty_direct_retry_attempted
-                     ):
-                         empty_direct_retry_attempted = True
-                         resume_from_response_id = None
-                         shrink_next_attempt = False
-                         reduced = int(round(int(current_max) * 0.85)) if current_max else 0
-                         if reduced <= 0 or reduced >= int(current_max):
-diff --git a/server/__init__.py b/server/__init__.py
-index 5ebf8db6cba261e1f907b2eebebeac58163973cc..af88c098fbbedf357399c79bc50853e6d5301d49 100644
---- a/server/__init__.py
-+++ b/server/__init__.py
-@@ -457,56 +457,65 @@ def create_app() -> Flask:
-                     {
-                         "error": {
-                             "message": "Job not found",
-                             "trace_id": trace_id,
-                         }
-                     }
-                 ),
-                 404,
-             )
-         return jsonify(snapshot)
- 
-     @app.get("/api/jobs/<job_id>/stream")
-     def job_stream(job_id: str):
-         def _event_stream():
-             last_signature = None
-             while True:
-                 snapshot = JOB_RUNNER.get_job(job_id)
-                 if not snapshot:
-                     payload = {
-                         "status": "failed",
-                         "message": "Задание не найдено",
-                         "job_id": job_id,
-                     }
-                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                     break
-+                progress_payload = snapshot.get("progress_payload")
-+                payload_signature = None
-+                if progress_payload and isinstance(progress_payload, dict):
-+                    try:
-+                        payload_signature = json.dumps(progress_payload, ensure_ascii=False, sort_keys=True)
-+                    except (TypeError, ValueError):
-+                        payload_signature = str(progress_payload)
-                 signature = (
-                     snapshot.get("status"),
-                     snapshot.get("step"),
-                     snapshot.get("progress"),
-                     snapshot.get("progress_stage"),
-                     snapshot.get("progress_message"),
-+                    snapshot.get("step_status"),
-+                    payload_signature,
-                     snapshot.get("last_event_at"),
-                 )
-                 if signature != last_signature:
-                     yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
-                     last_signature = signature
-                 if snapshot.get("status") in {"succeeded", "failed"}:
-                     break
-                 time.sleep(1.0)
- 
-         response = Response(stream_with_context(_event_stream()), mimetype="text/event-stream")
-         response.headers["Cache-Control"] = "no-cache"
-         response.headers["X-Accel-Buffering"] = "no"
-         return response
- 
-     @app.post("/api/reindex")
-     def reindex():
-         payload = _require_json(request)
-         theme = str(payload.get("theme", "")).strip()
-         if not theme:
-             raise ApiError("Не указана тема (theme)")
- 
-         try:
-             stats = build_index(theme)
-         except FileNotFoundError as exc:
-             raise ApiError(str(exc), status_code=404) from exc
-@@ -917,54 +926,57 @@ def _extract_keywords(glossary_path: Path) -> List[str]:
-     for line in glossary_path.read_text(encoding="utf-8").splitlines():
-         cleaned = line.strip()
-         if not cleaned:
-             continue
-         keyword = cleaned.split("—", 1)[0].strip()
-         if keyword:
-             keywords.append(keyword)
-         if len(keywords) >= 6:
-             break
-     return keywords
- 
- 
- def _load_pipeline_config(theme_dir: Path) -> Dict[str, Any]:
-     config_path = theme_dir / PIPELINE_CONFIG_FILENAME
-     if not config_path.exists():
-         return {}
-     try:
-         payload = json.loads(config_path.read_text(encoding="utf-8"))
-     except json.JSONDecodeError:
-         LOGGER.warning("Повреждён pipeline config: %s", config_path)
-         return {}
-     return payload if isinstance(payload, dict) else {}
- 
- 
- def _format_generation_success(result: Dict[str, Any]) -> Dict[str, Any]:
-+    artifact_saved_raw = result.get("artifact_saved")
-+    artifact_saved = bool(artifact_saved_raw) if artifact_saved_raw is not None else bool(result.get("artifact_paths"))
-     payload: Dict[str, Any] = {
-         "markdown": result.get("text"),
-         "meta_json": result.get("metadata"),
-         "artifact_paths": result.get("artifact_paths"),
-+        "artifact_saved": artifact_saved,
-     }
-     metadata = result.get("metadata") or {}
-     if isinstance(metadata, dict):
-         if metadata.get("style_profile_applied"):
-             payload["style_profile_applied"] = True
-             if metadata.get("style_profile_source"):
-                 payload["style_profile_source"] = metadata["style_profile_source"]
-             if metadata.get("style_profile_variant"):
-                 payload["style_profile_variant"] = metadata["style_profile_variant"]
-         if metadata.get("keywords_manual") is not None:
-             payload["keywords_manual"] = metadata.get("keywords_manual")
-         payload["model_used"] = metadata.get("model_used")
-         payload["fallback_used"] = metadata.get("fallback_used")
-         payload["fallback_reason"] = metadata.get("fallback_reason")
-         payload["api_route"] = metadata.get("api_route")
-     return payload
- 
- 
- def _make_dry_run_response(*, theme: str, data: Dict[str, Any], k: int) -> Dict[str, Any]:
-     topic = str(data.get("theme") or data.get("goal") or theme).strip() or "Тема не указана"
-     markdown = (
-         f"# Черновик (dry run)\n\n"
-         f"Тематика: {theme}\n\n"
-         f"Запрошенная тема: {topic}\n\n"
-         "Этот ответ сформирован без обращения к модели."
-diff --git a/tests/test_job_runner.py b/tests/test_job_runner.py
-index d810bab6774a1dcd0d4a96b6d46c919e01c828ea..4d52c0bf3600f8d7bc2041b64235047395819553 100644
---- a/tests/test_job_runner.py
-+++ b/tests/test_job_runner.py
-@@ -1,58 +1,60 @@
- from __future__ import annotations
- 
- import pytest
- 
-+from jobs.models import Job, JobStep
- from jobs.runner import JobRunner
- from jobs.store import JobStore
- 
- 
- @pytest.fixture
- def job_store() -> JobStore:
-     return JobStore(ttl_seconds=30)
- 
- 
- def test_job_runner_success(monkeypatch, job_store):
-     def _fake_generate(**_kwargs):
-         return {
-             "text": "Hello world",
-             "metadata": {
-                 "jsonld": {
-                     "faq": [
-                         {"question": "What?", "answer": "Answer"},
-                     ]
-                 }
-             },
-         }
- 
-     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
-     runner = JobRunner(job_store, soft_timeout_s=2)
-     job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-1")
-     assert runner.wait(job.id, timeout=5) is True
-     snapshot = runner.get_job(job.id)
-     assert snapshot["status"] == "succeeded"
-     assert snapshot.get("step") == "done"
-+    assert snapshot.get("step_status") == "completed"
-     assert snapshot.get("progress") == 1.0
-     assert snapshot.get("message") == "Готово"
-     assert snapshot.get("last_event_at")
-     assert snapshot["result"]["markdown"].startswith("Hello")
-     assert snapshot["degradation_flags"] in (None, [])
-     assert snapshot["trace_id"] == "trace-1"
- 
- 
- def test_job_runner_degradation(monkeypatch, job_store):
-     def _raise_generate(**_kwargs):
-         raise RuntimeError("boom")
- 
-     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _raise_generate)
-     runner = JobRunner(job_store, soft_timeout_s=1)
-     job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-2")
-     runner.wait(job.id, timeout=3)
-     snapshot = runner.get_job(job.id)
-     assert snapshot["status"] == "succeeded"
-     assert snapshot.get("step") == "done"
-     assert snapshot.get("progress") == 1.0
-     assert snapshot.get("message") == "Готово"
-     assert "draft_failed" in (snapshot.get("degradation_flags") or [])
-     assert "markdown" in snapshot["result"]
-     assert "demo" in snapshot["result"]["markdown"]
- 
-@@ -61,26 +63,38 @@ def test_job_runner_draft_degraded_on_max_tokens(monkeypatch, job_store):
-     artifact_paths = {
-         "markdown": "artifacts/demo.md",
-         "metadata": "artifacts/demo.json",
-     }
- 
-     def _fake_generate(**_kwargs):
-         return {
-             "text": "Частичный черновик",
-             "metadata": {
-                 "degradation_flags": ["draft_max_tokens"],
-                 "completion_warning": "max_output_tokens",
-             },
-             "artifact_paths": artifact_paths,
-         }
- 
-     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
-     runner = JobRunner(job_store, soft_timeout_s=2)
-     job = runner.submit({"theme": "demo", "data": {}, "k": 0})
-     runner.wait(job.id, timeout=5)
-     snapshot = runner.get_job(job.id)
-     draft_step = next(step for step in snapshot["steps"] if step["name"] == "draft")
-     assert draft_step["status"] == "degraded"
-     assert draft_step["error"] == "max_output_tokens"
-     assert draft_step["payload"]["artifact_paths"] == artifact_paths
-     assert snapshot["result"]["artifact_paths"] == artifact_paths
-+    assert snapshot["result"].get("artifact_saved") is True
-     assert "draft_max_tokens" in (snapshot.get("degradation_flags") or [])
-+
-+
-+def test_job_snapshot_includes_batch_counters(job_store):
-+    job = Job(id="demo-job", steps=[JobStep(name="draft")])
-+    job_store.create(job)
-+
-+    job.update_progress(stage="draft", progress=0.25, payload={"total": 8, "completed": 2})
-+
-+    snapshot = job_store.snapshot(job.id)
-+    assert snapshot["batches_total"] == 8
-+    assert snapshot["batches_completed"] == 2
++                                return text, parse_flags, updated_data, schema_label
+                         last_error = RuntimeError("responses_incomplete")
+                         cap_exhausted = (
+                             upper_cap is not None and int(current_max) >= upper_cap
+                         )
+                         if not cap_exhausted and token_escalations >= RESPONSES_MAX_ESCALATIONS:
+                             if (
+                                 upper_cap is not None
+                                 and int(current_max) < upper_cap
+                                 and upper_cap > 0
+                             ):
+                                 LOGGER.info(
+                                     "RESP_ESCALATE_TOKENS reason=max_output_tokens cap_force=%s",
+                                     upper_cap,
+                                 )
+                                 token_escalations += 1
+                                 current_max = upper_cap
+                                 sanitized_payload["max_output_tokens"] = max(
+                                     min_token_floor, int(current_max)
+                                 )
+                                 cap_retry_performed = True
+                                 shrink_next_attempt = False
+                                 continue
+                             break
+                         if not cap_exhausted:
+                             next_max = _compute_next_max_tokens(
 diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index b0672e54c03fdc68570f2448fb1cc57c7f5b46b9..6df9c2def0dd76c860a6abd4b227e45241cc962f 100644
+index 6df9c2def0dd76c860a6abd4b227e45241cc962f..0cdefc22dfc8467e0898314e9a96e22245750e84 100644
 --- a/tests/test_llm_client.py
 +++ b/tests/test_llm_client.py
-@@ -229,50 +229,71 @@ def test_generate_retries_empty_completion_with_fallback():
+@@ -1,29 +1,30 @@
+ import sys
+ from pathlib import Path
+ from unittest.mock import patch
  
- def test_generate_accepts_incomplete_with_text():
-     payload = {
++import json
+ import httpx
+ import pytest
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+ import llm_client as llm_client_module  # noqa: E402
+ 
+ from config import LLM_ALLOW_FALLBACK, LLM_MODEL, LLM_ROUTE
+ from llm_client import (  # noqa: E402
+     DEFAULT_RESPONSES_TEXT_FORMAT,
+     FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT,
+     G5_ESCALATION_LADDER,
+     GenerationResult,
+     generate,
+     reset_http_client_cache,
+ )
+ 
+ 
+ @pytest.fixture(autouse=True)
+ def _force_api_key(monkeypatch):
+     monkeypatch.setenv("OPENAI_API_KEY", "test")
+     yield
+     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+ 
+ 
+@@ -205,72 +206,99 @@ def test_generate_retries_empty_completion_with_fallback():
+                     {"type": "text", "text": "Готовый текст"},
+                 ]
+             }
+         ],
+     }
+     responses = [empty_payload, empty_payload, success_payload]
+     result, client = _generate_with_dummy(
+         responses=responses,
+         max_tokens=100,
+     )
+     assert isinstance(result, GenerationResult)
+     assert result.retry_used is True
+     assert result.fallback_used == "plain_outline"
+     assert result.fallback_reason == "empty_completion_fallback"
+     assert len(client.requests) == 3
+     primary_request = client.requests[0]["json"]
+     retry_request = client.requests[1]["json"]
+     fallback_request = client.requests[2]["json"]
+     assert primary_request["max_output_tokens"] == 100
+     assert retry_request["max_output_tokens"] == 85
+     assert fallback_request["max_output_tokens"] == 76
+     assert "previous_response_id" not in retry_request
+     assert fallback_request["text"]["format"] == FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT
+ 
+ 
+-def test_generate_accepts_incomplete_with_text():
+-    payload = {
++def test_generate_retries_when_incomplete_text_missing_schema_content():
++    incomplete_payload = {
++        "id": "resp-1",
          "status": "incomplete",
          "incomplete_details": {"reason": "max_output_tokens"},
          "output": [
@@ -1540,62 +1236,74 @@ index b0672e54c03fdc68570f2448fb1cc57c7f5b46b9..6df9c2def0dd76c860a6abd4b227e452
              }
          ],
      }
-     result, client = _generate_with_dummy(responses=[payload], max_tokens=120)
+-    result, client = _generate_with_dummy(responses=[payload], max_tokens=120)
++    final_payload = {
++        "status": "completed",
++        "output": [
++            {
++                "content": [
++                    {
++                        "type": "text",
++                        "text": json.dumps(
++                            {
++                                "intro": "Hello",
++                                "main": ["A", "B", "C"],
++                                "faq": [
++                                    {"q": "Q1", "a": "A1"},
++                                    {"q": "Q2", "a": "A2"},
++                                    {"q": "Q3", "a": "A3"},
++                                    {"q": "Q4", "a": "A4"},
++                                    {"q": "Q5", "a": "A5"},
++                                ],
++                                "conclusion": "Bye",
++                            }
++                        ),
++                    }
++                ]
++            }
++        ],
++    }
++    result, client = _generate_with_dummy(
++        responses=[incomplete_payload, final_payload],
++        max_tokens=120,
++    )
      assert isinstance(result, GenerationResult)
-     assert result.text.strip() == '{"intro": "Hello"}'
+-    assert result.text.strip() == '{"intro": "Hello"}'
+-    metadata = result.metadata or {}
+-    assert metadata.get("status") == "completed"
+-    assert metadata.get("incomplete_reason") in (None, "")
+-    assert metadata.get("completion_warning") == "max_output_tokens"
+-    flags = metadata.get("degradation_flags") or []
+-    assert "draft_max_tokens" in flags
+-    assert len(client.requests) == 1
++    assert len(client.requests) == 2
++    continue_payload = client.requests[1]["json"]
++    assert continue_payload.get("previous_response_id") == "resp-1"
++    assert continue_payload["max_output_tokens"] > client.requests[0]["json"]["max_output_tokens"]
++    assert json.loads(result.text)["intro"] == "Hello"
+ 
+ 
+ def test_generate_marks_final_cap_as_degraded():
+     payload = {
+         "id": "resp-cap",
+         "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
+         "output": [],
+     }
+     with patch("llm_client.LOGGER"):
+         result, client = _generate_with_dummy(responses=[payload], max_tokens=3600)
+     assert isinstance(result, GenerationResult)
      metadata = result.metadata or {}
-     assert metadata.get("status") == "completed"
-     assert metadata.get("incomplete_reason") in (None, "")
-     assert metadata.get("completion_warning") == "max_output_tokens"
+     assert metadata.get("step_status") == "degraded"
+     assert metadata.get("cap_reached_final") is True
+     assert metadata.get("degradation_reason") == "max_output_tokens_final"
+     assert metadata.get("incomplete_reason") == "max_output_tokens_final"
      flags = metadata.get("degradation_flags") or []
      assert "draft_max_tokens" in flags
+     assert result.text == ""
      assert len(client.requests) == 1
  
  
-+def test_generate_marks_final_cap_as_degraded():
-+    payload = {
-+        "id": "resp-cap",
-+        "status": "incomplete",
-+        "incomplete_details": {"reason": "max_output_tokens"},
-+        "output": [],
-+    }
-+    with patch("llm_client.LOGGER"):
-+        result, client = _generate_with_dummy(responses=[payload], max_tokens=3600)
-+    assert isinstance(result, GenerationResult)
-+    metadata = result.metadata or {}
-+    assert metadata.get("step_status") == "degraded"
-+    assert metadata.get("cap_reached_final") is True
-+    assert metadata.get("degradation_reason") == "max_output_tokens_final"
-+    assert metadata.get("incomplete_reason") == "max_output_tokens_final"
-+    flags = metadata.get("degradation_flags") or []
-+    assert "draft_max_tokens" in flags
-+    assert result.text == ""
-+    assert len(client.requests) == 1
-+
-+
  def test_responses_continue_includes_model_and_tokens(monkeypatch):
      monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_BASE", 64, raising=False)
-     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP1", 96, raising=False)
-     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP2", 128, raising=False)
-     monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 128, raising=False)
-     monkeypatch.setattr("llm_client.G5_ESCALATION_LADDER", (64, 96, 128), raising=False)
- 
-     incomplete_payload = {
-         "status": "incomplete",
-         "incomplete_details": {"reason": "max_output_tokens"},
-         "id": "resp-1",
-         "output": [],
-     }
-     final_payload = {
-         "status": "completed",
-         "output": [
-             {
-                 "content": [
-                     {"type": "text", "text": "Готовый текст"},
-                 ]
-             }
-         ],
-     }
- 
-     with patch("llm_client.LOGGER"):
 

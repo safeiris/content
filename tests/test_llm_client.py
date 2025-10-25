@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import json
 import httpx
 import pytest
 
@@ -227,8 +228,9 @@ def test_generate_retries_empty_completion_with_fallback():
     assert fallback_request["text"]["format"] == FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT
 
 
-def test_generate_accepts_incomplete_with_text():
-    payload = {
+def test_generate_retries_when_incomplete_text_missing_schema_content():
+    incomplete_payload = {
+        "id": "resp-1",
         "status": "incomplete",
         "incomplete_details": {"reason": "max_output_tokens"},
         "output": [
@@ -239,16 +241,42 @@ def test_generate_accepts_incomplete_with_text():
             }
         ],
     }
-    result, client = _generate_with_dummy(responses=[payload], max_tokens=120)
+    final_payload = {
+        "status": "completed",
+        "output": [
+            {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "intro": "Hello",
+                                "main": ["A", "B", "C"],
+                                "faq": [
+                                    {"q": "Q1", "a": "A1"},
+                                    {"q": "Q2", "a": "A2"},
+                                    {"q": "Q3", "a": "A3"},
+                                    {"q": "Q4", "a": "A4"},
+                                    {"q": "Q5", "a": "A5"},
+                                ],
+                                "conclusion": "Bye",
+                            }
+                        ),
+                    }
+                ]
+            }
+        ],
+    }
+    result, client = _generate_with_dummy(
+        responses=[incomplete_payload, final_payload],
+        max_tokens=120,
+    )
     assert isinstance(result, GenerationResult)
-    assert result.text.strip() == '{"intro": "Hello"}'
-    metadata = result.metadata or {}
-    assert metadata.get("status") == "completed"
-    assert metadata.get("incomplete_reason") in (None, "")
-    assert metadata.get("completion_warning") == "max_output_tokens"
-    flags = metadata.get("degradation_flags") or []
-    assert "draft_max_tokens" in flags
-    assert len(client.requests) == 1
+    assert len(client.requests) == 2
+    continue_payload = client.requests[1]["json"]
+    assert continue_payload.get("previous_response_id") == "resp-1"
+    assert continue_payload["max_output_tokens"] > client.requests[0]["json"]["max_output_tokens"]
+    assert json.loads(result.text)["intro"] == "Hello"
 
 
 def test_generate_marks_final_cap_as_degraded():

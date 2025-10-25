@@ -41,6 +41,7 @@ const progressPercent = progressOverlay?.querySelector('[data-role="progress-per
 const progressBar = progressOverlay?.querySelector('[data-role="progress-bar"]') || null;
 const progressBarFill = progressOverlay?.querySelector('[data-role="progress-bar-fill"]') || null;
 const progressDetails = progressOverlay?.querySelector('[data-role="progress-details"]') || null;
+const progressBadge = progressOverlay?.querySelector('[data-role="progress-badge"]') || null;
 if (progressStage && progressStage.textContent) {
   progressStage.dataset.defaultLabel = progressStage.textContent.trim();
 }
@@ -131,6 +132,7 @@ const DEGRADATION_LABELS = {
   post_analysis_skipped: "Отчёт о качестве недоступен",
   soft_timeout: "Мягкий таймаут — результат сохранён",
   cap_reached_final: "Лимит продолжений — результат сохранён",
+  skeleton_restore_previous: "Использована последняя валидная версия скелета",
 };
 
 const DEFAULT_PROGRESS_MESSAGE =
@@ -138,6 +140,8 @@ const DEFAULT_PROGRESS_MESSAGE =
 const MAX_TOASTS = 3;
 const MAX_CUSTOM_CONTEXT_CHARS = 20000;
 const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
+
+const PROGRESS_DEGRADED_BADGE_MESSAGE = "Получен неполный ответ, пробуем догенерировать";
 
 const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 3500, max: 6000, hard: 6500 });
 
@@ -207,6 +211,8 @@ const progressState = {
   latestSnapshot: null,
   heartbeatNotified: false,
   overlaySuppressed: false,
+  maxDraftTotal: 0,
+  maxDraftCompleted: 0,
 };
 
 const STEP_STATUS_DONE_VALUES = new Set(["completed", "degraded", "skipped"]);
@@ -3001,11 +3007,16 @@ function resetProgressIndicator(message = DEFAULT_PROGRESS_MESSAGE) {
   if (progressDetails) {
     progressDetails.textContent = "";
   }
+  if (progressBadge) {
+    progressBadge.classList.add("hidden");
+  }
   progressState.currentPercent = 0;
   progressState.lastStage = "draft";
   progressState.lastUpdateAt = Date.now();
   progressState.latestSnapshot = null;
   progressState.heartbeatNotified = false;
+  progressState.maxDraftTotal = 0;
+  progressState.maxDraftCompleted = 0;
 }
 
 function showProgress(visible, message = DEFAULT_PROGRESS_MESSAGE) {
@@ -3433,6 +3444,16 @@ function updateProgressFromSnapshot(snapshot) {
 
   const stepStatus = resolveStepStatus(snapshot, normalizedStage);
 
+  const isDegraded = stepStatus === "degraded" || statusRaw === "degraded";
+  if (progressBadge) {
+    if (isDegraded) {
+      progressBadge.textContent = PROGRESS_DEGRADED_BADGE_MESSAGE;
+      progressBadge.classList.remove("hidden");
+    } else {
+      progressBadge.classList.add("hidden");
+    }
+  }
+
   if (maybeAutoHideProgress(normalizedStage, stepStatus, snapshot)) {
     clearProgressHeartbeat();
     return;
@@ -3450,18 +3471,31 @@ function updateProgressFromSnapshot(snapshot) {
   const totalBatches = toNumber(payload.total ?? snapshot.batches_total);
   const completedBatches = toNumber(payload.completed ?? snapshot.batches_completed);
 
+  if (Number.isFinite(totalBatches) && totalBatches > 0) {
+    progressState.maxDraftTotal = Math.max(progressState.maxDraftTotal, totalBatches);
+  }
+  if (Number.isFinite(completedBatches)) {
+    progressState.maxDraftCompleted = Math.max(
+      progressState.maxDraftCompleted,
+      completedBatches,
+    );
+  }
+
   let percentValue = null;
-  let allowDecrease = false;
-  if (
-    normalizedStage === "draft"
-    && Number.isFinite(totalBatches)
-    && totalBatches > 0
-    && Number.isFinite(completedBatches)
-  ) {
-    const safeTotal = Math.max(1, totalBatches);
-    const safeCompleted = Math.max(0, Math.min(safeTotal, completedBatches));
-    percentValue = Math.round((safeCompleted / safeTotal) * 1000) / 10;
-    allowDecrease = true;
+  if (normalizedStage === "draft") {
+    const trackedTotal = progressState.maxDraftTotal || totalBatches;
+    if (Number.isFinite(trackedTotal) && trackedTotal && trackedTotal > 0) {
+      const safeTotal = Math.max(1, trackedTotal);
+      const trackedCompleted = Number.isFinite(progressState.maxDraftCompleted)
+        ? progressState.maxDraftCompleted
+        : 0;
+      let safeCompleted = trackedCompleted;
+      if (Number.isFinite(completedBatches)) {
+        safeCompleted = Math.max(safeCompleted, completedBatches);
+      }
+      safeCompleted = Math.max(0, Math.min(safeTotal, safeCompleted));
+      percentValue = Math.round((safeCompleted / safeTotal) * 1000) / 10;
+    }
   }
   if (percentValue === null && typeof snapshot.progress === "number") {
     percentValue = Math.round(clamp01(snapshot.progress) * 1000) / 10;
@@ -3469,9 +3503,7 @@ function updateProgressFromSnapshot(snapshot) {
   if (percentValue === null || Number.isNaN(percentValue)) {
     percentValue = progressState.currentPercent || 0;
   }
-  if (!allowDecrease) {
-    percentValue = Math.max(progressState.currentPercent || 0, percentValue);
-  }
+  percentValue = Math.max(progressState.currentPercent || 0, percentValue);
   percentValue = Math.max(0, Math.min(100, percentValue));
   progressState.currentPercent = percentValue;
 
