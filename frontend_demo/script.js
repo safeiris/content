@@ -1005,6 +1005,15 @@ function setActiveArtifactDownloads(downloads) {
   setDownloadLinkAvailability(downloadReportBtn, state.currentDownloads.report);
 }
 
+function hasDownloadFiles(downloads) {
+  if (!downloads || typeof downloads !== "object") {
+    return false;
+  }
+  const markdown = downloads.markdown || downloads.article || null;
+  const report = downloads.report || downloads.json || downloads.metadata || null;
+  return Boolean(markdown || report);
+}
+
 function resetDownloadButtonsForNewJob() {
   state.currentDownloads = { markdown: null, report: null };
   setDownloadLinkAvailability(downloadMdBtn, null);
@@ -1468,6 +1477,8 @@ async function handleGenerate(event) {
     resetDownloadButtonsForNewJob();
     state.pendingArtifactFiles = null;
     let downloadsRequested = false;
+    let downloadsResolved = false;
+    let pendingDownloadRefresh = null;
     let activeJobId = null;
     let artifactPathsHint = null;
     toggleRetryButton(false);
@@ -1503,11 +1514,26 @@ async function handleGenerate(event) {
     }
     applyProgressiveResult(snapshot);
     updateProgressFromSnapshot(snapshot);
-    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
+    if ((!downloadsRequested || !downloadsResolved) && hasDraftStepCompleted(snapshot)) {
       downloadsRequested = true;
-      refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
-        console.warn("Не удалось заранее получить ссылки на артефакты", error);
-      });
+      if (!pendingDownloadRefresh) {
+        const refreshPromise = refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
+        pendingDownloadRefresh = refreshPromise;
+        refreshPromise
+          .then((downloads) => {
+            if (hasDownloadFiles(downloads)) {
+              downloadsResolved = true;
+            }
+          })
+          .catch((error) => {
+            console.warn("Не удалось заранее получить ссылки на артефакты", error);
+          })
+          .finally(() => {
+            if (pendingDownloadRefresh === refreshPromise) {
+              pendingDownloadRefresh = null;
+            }
+          });
+      }
     }
     if (snapshot.status !== "succeeded" || !snapshot.result) {
       if (!snapshot.job_id) {
@@ -1517,15 +1543,30 @@ async function handleGenerate(event) {
         onUpdate: (update) => {
           applyProgressiveResult(update);
           updateProgressFromSnapshot(update);
-            if (!downloadsRequested && hasDraftStepCompleted(update)) {
+          if ((!downloadsRequested || !downloadsResolved) && hasDraftStepCompleted(update)) {
             downloadsRequested = true;
             activeJobId = update?.id || update?.job_id || activeJobId;
             if (update?.result && typeof update.result === "object" && update.result.artifact_paths) {
               artifactPathsHint = update.result.artifact_paths;
             }
-            refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
-              console.warn("Не удалось заранее получить ссылки на артефакты", error);
-            });
+            if (!pendingDownloadRefresh) {
+              const refreshPromise = refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
+              pendingDownloadRefresh = refreshPromise;
+              refreshPromise
+                .then((downloads) => {
+                  if (hasDownloadFiles(downloads)) {
+                    downloadsResolved = true;
+                  }
+                })
+                .catch((error) => {
+                  console.warn("Не удалось заранее получить ссылки на артефакты", error);
+                })
+                .finally(() => {
+                  if (pendingDownloadRefresh === refreshPromise) {
+                    pendingDownloadRefresh = null;
+                  }
+                });
+            }
           }
         },
       });
@@ -1535,9 +1576,33 @@ async function handleGenerate(event) {
       artifactPathsHint = snapshot.result.artifact_paths;
     }
     updateProgressFromSnapshot(snapshot);
-    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
+    if (hasDraftStepCompleted(snapshot)) {
       downloadsRequested = true;
-      await refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
+      if (pendingDownloadRefresh) {
+        try {
+          const pendingResult = await pendingDownloadRefresh;
+          if (hasDownloadFiles(pendingResult)) {
+            downloadsResolved = true;
+          }
+        } catch (error) {
+          console.warn("Не удалось заранее получить ссылки на артефакты", error);
+        }
+        pendingDownloadRefresh = null;
+      }
+      const finalPromise = refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
+      pendingDownloadRefresh = finalPromise;
+      try {
+        const finalDownloads = await finalPromise;
+        if (hasDownloadFiles(finalDownloads)) {
+          downloadsResolved = true;
+        }
+      } catch (error) {
+        console.warn("Не удалось заранее получить ссылки на артефакты", error);
+      } finally {
+        if (pendingDownloadRefresh === finalPromise) {
+          pendingDownloadRefresh = null;
+        }
+      }
     }
     renderGenerationResult(snapshot, { payload });
     try {

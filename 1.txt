@@ -1,251 +1,162 @@
 diff --git a/deterministic_pipeline.py b/deterministic_pipeline.py
-index 509740ce49ec9b42cfc62749a6a2626b1fd72e16..d05378c0ea8bf42d724e26888a0871c6357c2900 100644
+index d05378c0ea8bf42d724e26888a0871c6357c2900..5b8f046fdf8402e3b123d7d25f61c10a388f8441 100644
 --- a/deterministic_pipeline.py
 +++ b/deterministic_pipeline.py
-@@ -288,97 +288,122 @@ class DeterministicPipeline:
-         self.provided_faq = provided_faq or []
-         self.jsonld_requested = bool(jsonld_requested)
-         try:
-             faq_target = int(faq_questions) if faq_questions is not None else 5
-         except (TypeError, ValueError):
-             faq_target = 5
-         if faq_target < 0:
-             faq_target = 0
-         self.faq_target = faq_target
- 
-         self.logs: List[PipelineLogEntry] = []
-         self.checkpoints: Dict[PipelineStep, str] = {}
-         self.jsonld: Optional[str] = None
-         self.locked_terms: List[str] = []
-         self.jsonld_reserve: int = 0
-         self.skeleton_payload: Optional[Dict[str, object]] = None
-         self._skeleton_faq_entries: List[Dict[str, str]] = []
-         self.keywords_coverage_percent: float = 0.0
-         self.keywords_required_coverage_percent: float = 0.0
- 
-         self._model_used: Optional[str] = None
-         self._fallback_used: Optional[str] = None
-         self._fallback_reason: Optional[str] = None
-         self._api_route: Optional[str] = None
-         self._token_usage: Optional[float] = None
-+        self._degradation_flags: List[str] = []
-         self._progress_callback = progress_callback
- 
-         self.section_budgets: List[SectionBudget] = self._compute_section_budgets()
- 
-     # ------------------------------------------------------------------
-     # Internal helpers
-     # ------------------------------------------------------------------
-+    @property
-+    def degradation_flags(self) -> List[str]:
-+        if not self._degradation_flags:
-+            return []
-+        return list(dict.fromkeys(self._degradation_flags))
-+
-     def _emit_progress(
-         self,
-         stage: str,
-         progress: float,
-         *,
-         message: Optional[str] = None,
-         payload: Optional[Mapping[str, object]] = None,
-     ) -> None:
-         if not self._progress_callback:
-             return
-         event_payload = dict(payload) if payload else {}
-         try:
-             if event_payload:
-                 self._progress_callback(
-                     stage=stage,
-                     progress=progress,
-                     message=message,
-                     payload=event_payload,
-                 )
-             else:
-                 self._progress_callback(stage=stage, progress=progress, message=message)
-         except Exception:  # pragma: no cover - defensive logging
-             LOGGER.debug("progress_callback_failed", exc_info=True)
- 
-     def _log(self, step: PipelineStep, status: str, **notes: object) -> None:
-         entry = PipelineLogEntry(step=step, started_at=time.time(), status=status, notes=dict(notes))
-         self.logs.append(entry)
- 
-     def _update_log(self, step: PipelineStep, status: str, **notes: object) -> None:
-         for entry in reversed(self.logs):
-             if entry.step == step:
-                 entry.status = status
-                 entry.finished_at = time.time()
-                 entry.notes.update(notes)
-                 return
-         self.logs.append(
-             PipelineLogEntry(step=step, started_at=time.time(), finished_at=time.time(), status=status, notes=dict(notes))
+@@ -1446,51 +1446,51 @@ class DeterministicPipeline:
+             lines.extend(
+                 [
+                     "Сформируй ровно один новый раздел основной части.",
+                     "Верни строго две строки меток:",
+                     "Заголовок: <краткое название раздела>",
+                     "Текст: <развёрнутый текст раздела на 3–5 абзацев>",
+                     "Не добавляй списков и дополнительных пояснений.",
+                 ]
+             )
+         elif batch.kind == SkeletonBatchKind.FAQ:
+             start_number = target_indices[0] + 1
+             lines.extend(
+                 [
+                     f"Нужно дополнить FAQ одним пунктом с номером {start_number}.",
+                     "Верни строго две строки меток:",
+                     "Вопрос: <формулировка вопроса>",
+                     "Ответ: <полный ответ из 2–3 предложений>",
+                     "Не добавляй иных строк и маркеров.",
+                 ]
+             )
+         else:
+             return None, None
+         lines.append("Ответ дай без JSON и без тегов <response_json>.")
+         user_payload = textwrap.dedent("\n".join(lines)).strip()
+         messages.append({"role": "user", "content": user_payload})
+-        format_block = {"type": "output_text", "name": "output_text"}
++        format_block = {"type": "text", "name": "output_text"}
+         result = self._call_llm(
+             step=PipelineStep.SKELETON,
+             messages=messages,
+             max_tokens=max_tokens,
+             previous_response_id=previous_response_id,
+             responses_format=format_block,
+             allow_incomplete=True,
          )
- 
-     def _register_llm_result(self, result: GenerationResult, usage: Optional[float]) -> None:
-+        metadata_block = result.metadata or {}
-+        if isinstance(metadata_block, dict):
-+            raw_flags = metadata_block.get("degradation_flags")
-+            if isinstance(raw_flags, list):
-+                for flag in raw_flags:
-+                    if not isinstance(flag, str):
-+                        continue
-+                    trimmed = flag.strip()
-+                    if not trimmed:
-+                        continue
-+                    if trimmed not in self._degradation_flags:
-+                        self._degradation_flags.append(trimmed)
-+            completion_warning = metadata_block.get("completion_warning")
-+            if (
-+                isinstance(completion_warning, str)
-+                and completion_warning.strip() == "max_output_tokens"
-+            ) and "draft_max_tokens" not in self._degradation_flags:
-+                self._degradation_flags.append("draft_max_tokens")
-         if result.model_used:
-             self._model_used = result.model_used
-         elif self._model_used is None:
-             self._model_used = self.model
-         if result.fallback_used:
-             self._fallback_used = result.fallback_used
-         if result.fallback_reason:
-             self._fallback_reason = result.fallback_reason
-         if result.api_route:
-             self._api_route = result.api_route
-         if usage is not None:
-             self._token_usage = usage
- 
-     def _compute_section_budgets(self) -> List[SectionBudget]:
-         titles = [str(item or "").strip() for item in self.base_outline if str(item or "").strip()]
-         if len(titles) < 3:
-             titles = ["Введение", "Основная часть", "Вывод"]
-         intro = titles[0]
-         conclusion = titles[-1]
-         main_titles = titles[1:-1] or ["Основная часть"]
- 
-         target_total = min(self.max_chars, max(self.min_chars, 6000))
-         intro_weight = 0.18
-         conclusion_weight = 0.16
-         remaining_weight = max(0.0, 1.0 - intro_weight - conclusion_weight)
+         text = result.text.strip()
+         if not text:
+             return None, result
+         if batch.kind == SkeletonBatchKind.MAIN:
+             payload = self._parse_fallback_main(
+                 text,
+                 target_index=target_indices[0],
+                 outline=outline,
+             )
+         else:
+             payload = self._parse_fallback_faq(text)
+         if payload is None:
+             return None, result
+         LOGGER.info(
+             "FALLBACK_ROUTE used=output_text kind=%s label=%s",
+             batch.kind.value,
+             batch.label,
 diff --git a/frontend_demo/script.js b/frontend_demo/script.js
-index b2f0d2cb345a99ef8f4efaff93cbc1abe9445462..576211b7c311818788ba64dee50359e3bfc04d18 100644
+index 576211b7c311818788ba64dee50359e3bfc04d18..befb025e5910dc27a875d50a18b33b740792aeab 100644
 --- a/frontend_demo/script.js
 +++ b/frontend_demo/script.js
-@@ -102,50 +102,51 @@ const STEP_LABELS = {
-   refine: "Уточнение",
-   jsonld: "JSON-LD",
-   post_analysis: "Пост-анализ",
- };
- 
- const PROGRESS_STAGE_LABELS = {
-   draft: "Черновик",
-   refine: "Доработка",
-   trim: "Нормализация",
-   validate: "Проверка",
-   done: "Готово",
-   error: "Ошибка",
- };
- 
- const PROGRESS_STAGE_MESSAGES = {
-   draft: "Генерируем черновик",
-   refine: "Дорабатываем черновик",
-   trim: "Нормализуем объём",
-   validate: "Проверяем результат",
-   done: "Готово",
-   error: "Завершено с ошибкой",
- };
- 
- const DEGRADATION_LABELS = {
-   draft_failed: "Черновик по запасному сценарию",
-+  draft_max_tokens: "Лимит токенов — результат неполный",
-   refine_skipped: "Доработка пропущена",
-   jsonld_missing: "JSON-LD не сформирован",
-   jsonld_repaired: "JSON-LD восстановлен вручную",
-   post_analysis_skipped: "Отчёт о качестве недоступен",
-   soft_timeout: "Мягкий таймаут — результат сохранён",
- };
- 
- const DEFAULT_PROGRESS_MESSAGE =
-   progressMessage?.textContent?.trim() || PROGRESS_STAGE_MESSAGES.draft;
- const MAX_TOASTS = 3;
- const MAX_CUSTOM_CONTEXT_CHARS = 20000;
- const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
- 
- const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 3500, max: 6000, hard: 6500 });
- 
- const HEALTH_STATUS_MESSAGES = {
-   openai_key: {
-     label: "OpenAI",
-     ok: "активен",
-     fail: "не найден",
-   },
-   llm_ping: {
-     label: "LLM",
-     ok: "отвечает",
-     fail: "нет ответа",
-@@ -1124,55 +1125,61 @@ function findLatestArtifactPair(files, { jobId = null, artifactPaths = null } =
-     const markdown = group.files.find(isMarkdownFile) || null;
-     const report = group.files.find(isJsonFile) || null;
-     return { markdown, report };
+@@ -983,50 +983,59 @@ function setDownloadLinkAvailability(link, downloadInfo) {
+     const resolvedUrl = resolveApiPath(targetUrl);
+     link.href = resolvedUrl;
+     link.dataset.downloadUrl = resolvedUrl;
+     link.setAttribute("download", downloadInfo.name || fallbackName);
+     link.classList.remove("is-disabled");
+     link.removeAttribute("aria-disabled");
+     return;
    }
- 
-   const selectByHint = hints.size
-     ? availableGroups.find(([key, group]) => hints.has(group.baseName) || hints.has(key))
-     : null;
-   if (selectByHint) {
-     const group = selectByHint[1];
-     const markdown = group.files.find(isMarkdownFile) || null;
-     const report = group.files.find(isJsonFile) || null;
-     return { markdown, report };
-   }
- 
-   availableGroups.sort((a, b) => (b[1].createdTs || 0) - (a[1].createdTs || 0));
-   const latest = availableGroups[0]?.[1];
-   if (!latest) {
-     return null;
-   }
-   const markdown = latest.files.find(isMarkdownFile) || null;
-   const report = latest.files.find(isJsonFile) || null;
-   return { markdown, report };
+   link.removeAttribute("href");
+   link.removeAttribute("download");
+   link.classList.add("is-disabled");
+   link.setAttribute("aria-disabled", "true");
+   delete link.dataset.downloadUrl;
  }
  
--function hasDraftStepSucceeded(snapshot) {
-+function hasDraftStepCompleted(snapshot) {
-   if (!snapshot || !Array.isArray(snapshot.steps)) {
-     return false;
-   }
--  return snapshot.steps.some((step) => step && step.name === "draft" && step.status === "succeeded");
-+  return snapshot.steps.some((step) => {
-+    if (!step || step.name !== "draft") {
-+      return false;
-+    }
-+    const status = typeof step.status === "string" ? step.status.trim().toLowerCase() : "";
-+    return status === "succeeded" || status === "degraded";
-+  });
+ function setActiveArtifactDownloads(downloads) {
+   const normalized = downloads && typeof downloads === "object" ? downloads : {};
+   state.currentDownloads = {
+     markdown: normalized.markdown || normalized.article || null,
+     report: normalized.report || normalized.json || normalized.metadata || null,
+   };
+   setDownloadLinkAvailability(downloadMdBtn, state.currentDownloads.markdown);
+   setDownloadLinkAvailability(downloadReportBtn, state.currentDownloads.report);
  }
  
- async function refreshDownloadLinksForJob({ jobId = null, artifactPaths = null } = {}) {
-   if (!downloadMdBtn || !downloadReportBtn) {
-     return null;
++function hasDownloadFiles(downloads) {
++  if (!downloads || typeof downloads !== "object") {
++    return false;
++  }
++  const markdown = downloads.markdown || downloads.article || null;
++  const report = downloads.report || downloads.json || downloads.metadata || null;
++  return Boolean(markdown || report);
++}
++
+ function resetDownloadButtonsForNewJob() {
+   state.currentDownloads = { markdown: null, report: null };
+   setDownloadLinkAvailability(downloadMdBtn, null);
+   setDownloadLinkAvailability(downloadReportBtn, null);
+   setButtonLoading(downloadMdBtn, true);
+   setButtonLoading(downloadReportBtn, true);
+ }
+ 
+ function handleDownloadClick(event, type) {
+   const link = type === "markdown" ? downloadMdBtn : downloadReportBtn;
+   if (!link) {
+     return;
    }
-   try {
-     const files = await fetchArtifactFiles();
-     state.pendingArtifactFiles = files;
-     const pair = findLatestArtifactPair(files, { jobId, artifactPaths });
-     const downloads = pair
-       ? {
-           markdown: pair.markdown ? createDownloadInfoFromFile(pair.markdown) : null,
-           report: pair.report ? createDownloadInfoFromFile(pair.report) : null,
-         }
-       : { markdown: null, report: null };
-     setButtonLoading(downloadMdBtn, false);
-     setButtonLoading(downloadReportBtn, false);
-     setActiveArtifactDownloads(downloads);
-     if (state.currentResult && typeof state.currentResult === "object") {
-       state.currentResult.downloads = downloads;
+   if (link.classList.contains("loading") || link.getAttribute("aria-disabled") === "true") {
+     event.preventDefault();
+     if (!link.classList.contains("loading")) {
+       showToast({ message: "Файл недоступен для скачивания", type: "warn" });
      }
-     return downloads;
+     return;
+   }
+   const downloadInfo = type === "markdown" ? state.currentDownloads.markdown : state.currentDownloads.report;
+   if (!downloadInfo) {
+     event.preventDefault();
+     showToast({ message: "Файл недоступен для скачивания", type: "warn" });
+     return;
+@@ -1446,120 +1455,176 @@ async function handlePromptPreview() {
+       }
+     }
+     const preview = await fetchJson("/api/prompt/preview", {
+       method: "POST",
+       body: JSON.stringify(previewRequest),
+     });
+     updatePromptPreview(preview);
+     switchTab("result");
    } catch (error) {
-     console.warn("Не удалось обновить ссылки на артефакты", error);
-@@ -1474,83 +1481,83 @@ async function handleGenerate(event) {
+     console.error(error);
+     showToast({ message: `Не удалось собрать промпт: ${getErrorMessage(error)}`, type: "error" });
+   } finally {
+     setButtonLoading(previewBtn, false);
+     setInteractiveBusy(false);
+     showProgress(false);
+   }
+ }
+ 
+ async function handleGenerate(event) {
+   event.preventDefault();
+   try {
+     const payload = buildRequestPayload();
+     resetDownloadButtonsForNewJob();
+     state.pendingArtifactFiles = null;
+     let downloadsRequested = false;
++    let downloadsResolved = false;
++    let pendingDownloadRefresh = null;
+     let activeJobId = null;
+     let artifactPathsHint = null;
+     toggleRetryButton(false);
+     setInteractiveBusy(true);
+     setButtonLoading(generateBtn, true);
+     showProgress(true, DEFAULT_PROGRESS_MESSAGE);
+     renderUsedKeywords(null);
+     const requestBody = {
+       theme: payload.theme,
+       data: payload.data,
        k: payload.k,
        context_source: payload.context_source,
      };
@@ -271,12 +182,30 @@ index b2f0d2cb345a99ef8f4efaff93cbc1abe9445462..576211b7c311818788ba64dee50359e3
      }
      applyProgressiveResult(snapshot);
      updateProgressFromSnapshot(snapshot);
--    if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
-+    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
+-    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
++    if ((!downloadsRequested || !downloadsResolved) && hasDraftStepCompleted(snapshot)) {
        downloadsRequested = true;
-       refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
-         console.warn("Не удалось заранее получить ссылки на артефакты", error);
-       });
+-      refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
+-        console.warn("Не удалось заранее получить ссылки на артефакты", error);
+-      });
++      if (!pendingDownloadRefresh) {
++        const refreshPromise = refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
++        pendingDownloadRefresh = refreshPromise;
++        refreshPromise
++          .then((downloads) => {
++            if (hasDownloadFiles(downloads)) {
++              downloadsResolved = true;
++            }
++          })
++          .catch((error) => {
++            console.warn("Не удалось заранее получить ссылки на артефакты", error);
++          })
++          .finally(() => {
++            if (pendingDownloadRefresh === refreshPromise) {
++              pendingDownloadRefresh = null;
++            }
++          });
++      }
      }
      if (snapshot.status !== "succeeded" || !snapshot.result) {
        if (!snapshot.job_id) {
@@ -286,16 +215,34 @@ index b2f0d2cb345a99ef8f4efaff93cbc1abe9445462..576211b7c311818788ba64dee50359e3
          onUpdate: (update) => {
            applyProgressiveResult(update);
            updateProgressFromSnapshot(update);
--          if (!downloadsRequested && hasDraftStepSucceeded(update)) {
-+            if (!downloadsRequested && hasDraftStepCompleted(update)) {
+-            if (!downloadsRequested && hasDraftStepCompleted(update)) {
++          if ((!downloadsRequested || !downloadsResolved) && hasDraftStepCompleted(update)) {
              downloadsRequested = true;
              activeJobId = update?.id || update?.job_id || activeJobId;
              if (update?.result && typeof update.result === "object" && update.result.artifact_paths) {
                artifactPathsHint = update.result.artifact_paths;
              }
-             refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
-               console.warn("Не удалось заранее получить ссылки на артефакты", error);
-             });
+-            refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint }).catch((error) => {
+-              console.warn("Не удалось заранее получить ссылки на артефакты", error);
+-            });
++            if (!pendingDownloadRefresh) {
++              const refreshPromise = refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
++              pendingDownloadRefresh = refreshPromise;
++              refreshPromise
++                .then((downloads) => {
++                  if (hasDownloadFiles(downloads)) {
++                    downloadsResolved = true;
++                  }
++                })
++                .catch((error) => {
++                  console.warn("Не удалось заранее получить ссылки на артефакты", error);
++                })
++                .finally(() => {
++                  if (pendingDownloadRefresh === refreshPromise) {
++                    pendingDownloadRefresh = null;
++                  }
++                });
++            }
            }
          },
        });
@@ -305,10 +252,35 @@ index b2f0d2cb345a99ef8f4efaff93cbc1abe9445462..576211b7c311818788ba64dee50359e3
        artifactPathsHint = snapshot.result.artifact_paths;
      }
      updateProgressFromSnapshot(snapshot);
--    if (!downloadsRequested && hasDraftStepSucceeded(snapshot)) {
-+    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
+-    if (!downloadsRequested && hasDraftStepCompleted(snapshot)) {
++    if (hasDraftStepCompleted(snapshot)) {
        downloadsRequested = true;
-       await refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
+-      await refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
++      if (pendingDownloadRefresh) {
++        try {
++          const pendingResult = await pendingDownloadRefresh;
++          if (hasDownloadFiles(pendingResult)) {
++            downloadsResolved = true;
++          }
++        } catch (error) {
++          console.warn("Не удалось заранее получить ссылки на артефакты", error);
++        }
++        pendingDownloadRefresh = null;
++      }
++      const finalPromise = refreshDownloadLinksForJob({ jobId: activeJobId, artifactPaths: artifactPathsHint });
++      pendingDownloadRefresh = finalPromise;
++      try {
++        const finalDownloads = await finalPromise;
++        if (hasDownloadFiles(finalDownloads)) {
++          downloadsResolved = true;
++        }
++      } catch (error) {
++        console.warn("Не удалось заранее получить ссылки на артефакты", error);
++      } finally {
++        if (pendingDownloadRefresh === finalPromise) {
++          pendingDownloadRefresh = null;
++        }
++      }
      }
      renderGenerationResult(snapshot, { payload });
      try {
@@ -332,576 +304,452 @@ index b2f0d2cb345a99ef8f4efaff93cbc1abe9445462..576211b7c311818788ba64dee50359e3
      setButtonLoading(generateBtn, false);
      setInteractiveBusy(false);
      hideProgressOverlay();
-diff --git a/jobs/runner.py b/jobs/runner.py
-index 397a02db7233e384572a5c3427821f38acea1be1..594c9164636c2fa3edb5b503c17008ab7dfc2703 100644
---- a/jobs/runner.py
-+++ b/jobs/runner.py
-@@ -31,50 +31,51 @@ PROGRESS_STAGE_WEIGHTS = {
- }
- 
- PROGRESS_STAGE_MESSAGES = {
-     "draft": "Генерируем черновик",
-     "trim": "Нормализуем объём",
-     "validate": "Проверяем результат",
-     "done": "Готово",
- }
- 
- 
- @dataclass
- class RunnerTask:
-     job_id: str
-     payload: Dict[str, Any]
-     trace_id: Optional[str] = None
- 
- 
- @dataclass
- class PipelineContext:
-     markdown: str = ""
-     meta_json: Dict[str, Any] = field(default_factory=dict)
-     faq_entries: List[Dict[str, str]] = field(default_factory=list)
-     degradation_flags: List[str] = field(default_factory=list)
-     errors: List[str] = field(default_factory=list)
-     trace_id: Optional[str] = None
-+    artifact_paths: Optional[Dict[str, Any]] = None
- 
-     def ensure_markdown(self, fallback: str) -> None:
-         if not self.markdown.strip():
-             self.markdown = fallback
- 
- 
- @dataclass
- class StepResult:
-     status: JobStepStatus
-     payload: Dict[str, Any] = field(default_factory=dict)
-     degradation_flags: List[str] = field(default_factory=list)
-     error: Optional[str] = None
-     continue_pipeline: bool = True
- 
- 
- class JobRunner:
-     """Serial job runner executing pipeline tasks in a background thread."""
- 
-     def __init__(self, store: JobStore, *, soft_timeout_s: int = JOB_SOFT_TIMEOUT_S) -> None:
-         self._store = store
-         self._soft_timeout_s = soft_timeout_s
-         self._tasks: "queue.Queue[RunnerTask]" = queue.Queue()
-         self._events: Dict[str, threading.Event] = {}
-         self._events_lock = threading.Lock()
-         self._thread = threading.Thread(target=self._worker, name="job-runner", daemon=True)
-@@ -191,50 +192,52 @@ class JobRunner:
-                 step.mark_degraded(result.error, **result.payload)
-             else:
-                 step.mark_failed(result.error, **result.payload)
-             log_step(
-                 LOGGER,
-                 job_id=job.id,
-                 step=step.name,
-                 status=step.status.value,
-                 error=result.error,
-                 payload=result.payload or None,
-             )
-             ctx.degradation_flags.extend(result.degradation_flags)
-             self._store.touch(job.id)
-             if not result.continue_pipeline:
-                 break
- 
-         ctx.ensure_markdown(_build_fallback_text(task.payload))
-         if ctx.degradation_flags:
-             ctx.degradation_flags = list(dict.fromkeys(ctx.degradation_flags))
-         result_payload = {
-             "markdown": ctx.markdown,
-             "meta_json": ctx.meta_json,
-             "faq_entries": ctx.faq_entries,
-             "errors": ctx.errors or None,
-         }
-+        if ctx.artifact_paths:
-+            result_payload["artifact_paths"] = ctx.artifact_paths
-         job.mark_succeeded(result_payload, degradation_flags=ctx.degradation_flags)
-         self._record_progress(job, "done", 1.0, message=PROGRESS_STAGE_MESSAGES.get("done"))
-         self._store.touch(job.id)
-         JOB_COUNTER.inc()
- 
-     def _execute_step(
-         self,
-         step_name: str,
-         payload: Dict[str, Any],
-         ctx: PipelineContext,
-         job: Optional[Job],
-     ) -> StepResult:
-         if step_name == "draft":
-             return self._run_draft_step(payload, ctx, job)
-         if step_name == "refine":
-             return self._run_refine_step(ctx, job)
-         if step_name == "jsonld":
-             return self._run_jsonld_step(ctx, job)
-         if step_name == "post_analysis":
-             return self._run_post_analysis_step(ctx, job)
-         return StepResult(JobStepStatus.SUCCEEDED, payload={"skipped": True})
- 
-     def _record_progress(
-         self,
-         job: Optional[Job],
-@@ -280,54 +283,85 @@ class JobRunner:
-             *,
-             progress: float = 0.0,
-             message: Optional[str] = None,
-             payload: Optional[Dict[str, Any]] = None,
-         ) -> None:
-             self._record_progress(job, stage, progress, message=message, payload=payload)
- 
-         attempt = 0
-         last_error: Optional[str] = None
-         while attempt <= JOB_MAX_RETRIES_PER_STEP:
-             attempt += 1
-             try:
-                 result = generate_article_from_payload(
-                     **payload,
-                     progress_callback=_progress_event,
-                 )
-             except Exception as exc:  # noqa: BLE001
-                 last_error = str(exc)
-                 ctx.errors.append(last_error)
-                 continue
- 
-             markdown = str(result.get("text") or result.get("markdown") or "").strip()
-             metadata = result.get("metadata")
-             if isinstance(metadata, dict):
-                 ctx.meta_json = metadata
-+            artifact_paths = result.get("artifact_paths")
-+            if isinstance(artifact_paths, dict) and artifact_paths:
-+                ctx.artifact_paths = artifact_paths
-+            degradation_flags: List[str] = []
-+            completion_warning: Optional[str] = None
-+            if isinstance(metadata, dict):
-+                raw_flags = metadata.get("degradation_flags")
-+                if isinstance(raw_flags, list):
-+                    degradation_flags = [
-+                        str(flag).strip()
-+                        for flag in raw_flags
-+                        if isinstance(flag, str) and str(flag).strip()
-+                    ]
-+                if degradation_flags:
-+                    for flag in degradation_flags:
-+                        if flag not in ctx.degradation_flags:
-+                            ctx.degradation_flags.append(flag)
-+                warning_candidate = metadata.get("completion_warning")
-+                if isinstance(warning_candidate, str) and warning_candidate.strip():
-+                    completion_warning = warning_candidate.strip()
-             if markdown:
-                 ctx.markdown = markdown
-                 self._record_progress(job, "draft", 1.0)
--                return StepResult(JobStepStatus.SUCCEEDED, payload={"attempts": attempt})
-+                step_payload = {"attempts": attempt}
-+                if ctx.artifact_paths:
-+                    step_payload["artifact_paths"] = ctx.artifact_paths
-+                if degradation_flags:
-+                    error_label = completion_warning or degradation_flags[0]
-+                    return StepResult(
-+                        JobStepStatus.DEGRADED,
-+                        payload=step_payload,
-+                        degradation_flags=degradation_flags,
-+                        error=error_label,
-+                    )
-+                return StepResult(JobStepStatus.SUCCEEDED, payload=step_payload)
-             last_error = "empty_response"
-             ctx.errors.append(last_error)
- 
-         ctx.ensure_markdown(_build_fallback_text(payload, error=last_error))
-         flags = ["draft_failed"]
-         self._record_progress(job, "draft", 1.0, message="Черновик по запасному сценарию")
-         return StepResult(
-             JobStepStatus.DEGRADED,
-             payload={"attempts": attempt, "error": last_error},
-             degradation_flags=flags,
-             error=last_error,
-         )
- 
-     def _run_refine_step(self, ctx: PipelineContext, job: Optional[Job]) -> StepResult:
-         if not ctx.markdown.strip():
-             ctx.ensure_markdown("Черновик пока пустой.")
-             return StepResult(
-                 JobStepStatus.DEGRADED,
-                 payload={"action": "fallback_text"},
-                 degradation_flags=["refine_skipped"],
-                 error="empty_markdown",
-             )
-         self._record_progress(job, "trim", 0.0)
-         refined = ctx.markdown.strip()
-         passes = []
+     state.pendingArtifactFiles = null;
+   }
 diff --git a/llm_client.py b/llm_client.py
-index 64b0f4c22aec30b36220ba6a4d959c3654b5fa20..b8b23688e92ed3394363685fc9cf279586eecc1f 100644
+index b8b23688e92ed3394363685fc9cf279586eecc1f..e927647c34a890cf0090c2bbebe53e167f3fed6c 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -1852,79 +1852,99 @@ def generate(
-                         data = polled_payload
-                         text, parse_flags, schema_label = _extract_responses_text(data)
-                         metadata = _extract_metadata(data)
-                         if isinstance(parse_flags, dict):
-                             parse_flags["metadata"] = metadata
-                         content_lengths = 0
-                         if isinstance(parse_flags, dict):
-                             output_len = int(parse_flags.get("output_text_len", 0) or 0)
-                             content_len = int(parse_flags.get("content_text_len", 0) or 0)
-                             content_lengths = output_len + content_len
-                         if content_lengths > 0 and not content_started:
-                             content_started = True
-                             shrink_applied = False
-                             shrink_next_attempt = False
-                             LOGGER.info("RESP_CONTENT_STARTED len=%d", content_lengths)
-                         status = metadata.get("status") or ""
-                         reason = metadata.get("incomplete_reason") or ""
-                         segments = int(parse_flags.get("segments", 0) or 0)
-                         LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
-                 if status == "incomplete":
-                     if reason == "max_output_tokens":
-                         LOGGER.info(
-                             "RESP_STATUS=incomplete|max_output_tokens=%s",
-                             current_payload.get("max_output_tokens"),
-                         )
--                        last_error = RuntimeError("responses_incomplete")
-                         response_id_value = metadata.get("response_id") or ""
-                         prev_field_present = "previous_response_id" in data or (
-                             isinstance(metadata.get("previous_response_id"), str)
-                             and metadata.get("previous_response_id")
-                         )
-                         if (
-                             response_id_value
-                             and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
-                         ):
-                             resume_from_response_id = str(response_id_value)
-                         schema_dict: Optional[Dict[str, Any]] = None
-                         if isinstance(format_block, dict):
-                             candidate_schema = format_block.get("schema")
-                             if isinstance(candidate_schema, dict):
-                                 schema_dict = candidate_schema
--                        if schema_dict and text and _is_valid_json_schema_instance(schema_dict, text):
--                            LOGGER.info(
--                                "RESP_INCOMPLETE_ACCEPT schema_valid len=%d",
--                                len(text),
--                            )
-+                        if text:
-                             metadata = dict(metadata)
-                             metadata["status"] = "completed"
-                             metadata["incomplete_reason"] = ""
-+                            metadata["completion_warning"] = "max_output_tokens"
-+                            degradation_flags: List[str] = []
-+                            raw_flags = metadata.get("degradation_flags")
-+                            if isinstance(raw_flags, list):
-+                                degradation_flags.extend(
-+                                    str(flag).strip()
-+                                    for flag in raw_flags
-+                                    if isinstance(flag, str) and flag.strip()
-+                                )
-+                            if "draft_max_tokens" not in degradation_flags:
-+                                degradation_flags.append("draft_max_tokens")
-+                            metadata["degradation_flags"] = degradation_flags
-+                            if schema_dict and _is_valid_json_schema_instance(schema_dict, text):
-+                                LOGGER.info(
-+                                    "RESP_INCOMPLETE_ACCEPT schema_valid len=%d",
-+                                    len(text),
-+                                )
-+                                metadata["completion_schema_valid"] = True
-+                            else:
-+                                LOGGER.info(
-+                                    "RESP_INCOMPLETE_ACCEPT text len=%d",
-+                                    len(text),
-+                                )
-+                                metadata["completion_schema_valid"] = False
-                             parse_flags["metadata"] = metadata
-                             updated_data = dict(data)
-                             updated_data["metadata"] = metadata
-                             _persist_raw_response(updated_data)
-                             return text, parse_flags, updated_data, schema_label
-+                        last_error = RuntimeError("responses_incomplete")
-                         cap_exhausted = (
-                             upper_cap is not None and int(current_max) >= upper_cap
-                         )
-                         if not cap_exhausted and token_escalations >= RESPONSES_MAX_ESCALATIONS:
-                             if (
-                                 upper_cap is not None
-                                 and int(current_max) < upper_cap
-                                 and upper_cap > 0
-                             ):
-                                 LOGGER.info(
-                                     "RESP_ESCALATE_TOKENS reason=max_output_tokens cap_force=%s",
-                                     upper_cap,
-                                 )
-                                 token_escalations += 1
-                                 current_max = upper_cap
-                                 sanitized_payload["max_output_tokens"] = max(
-                                     min_token_floor, int(current_max)
-                                 )
-                                 cap_retry_performed = True
-                                 shrink_next_attempt = False
-                                 continue
-                             break
-                         if not cap_exhausted:
-                             next_max = _compute_next_max_tokens(
-                                 int(current_max), token_escalations, upper_cap
-diff --git a/orchestrate.py b/orchestrate.py
-index 64d4f78c09582ad65448809556fef5ee5e1f033c..544d611531bd8d128a88358ef2b24da4d1190da6 100644
---- a/orchestrate.py
-+++ b/orchestrate.py
-@@ -323,87 +323,96 @@ def _serialize_pipeline_logs(logs: Iterable[Any]) -> List[Dict[str, Any]]:
+@@ -469,60 +469,65 @@ def _sanitize_text_format_in_place(
+     if not isinstance(format_block, dict):
+         return False, False, 0
  
- def _serialize_checkpoints(checkpoints: Dict[PipelineStep, str]) -> Dict[str, Dict[str, int]]:
-     serialized: Dict[str, Dict[str, int]] = {}
-     for step, text in checkpoints.items():
-         serialized[step.value] = {
-             "chars": len(text),
-             "chars_no_spaces": len("".join(text.split())),
-         }
-     return serialized
+     allowed_keys = {"type", "name", "schema", "strict"}
+ 
+     if not isinstance(format_block.get("schema"), dict):
+         if "schema" in format_block:
+             format_block.pop("schema", None)
+             migrated = True
+ 
+     legacy_block = format_block.pop("json_schema", None)
+     if isinstance(legacy_block, dict):
+         schema_candidate = legacy_block.get("schema")
+         if isinstance(schema_candidate, dict):
+             format_block["schema"] = deepcopy(schema_candidate)
+         strict_candidate = legacy_block.get("strict")
+         strict_value = _coerce_bool(strict_candidate)
+         if strict_value is not None and "strict" not in format_block:
+             format_block["strict"] = strict_value
+         migrated = True
+ 
+     type_value = format_block.get("type")
+     if isinstance(type_value, str):
+         trimmed = type_value.strip()
+         if trimmed:
++            normalized = trimmed.lower()
+             if trimmed != type_value:
+                 format_block["type"] = trimmed
+                 migrated = True
++            if normalized == "output_text":
++                format_block["type"] = "text"
++                migrated = True
+         else:
+             format_block.pop("type", None)
+             migrated = True
+     elif type_value is not None:
+         trimmed = str(type_value).strip()
+         if trimmed:
+-            format_block["type"] = trimmed
++            normalized = trimmed.lower()
++            format_block["type"] = "text" if normalized == "output_text" else trimmed
+             migrated = True
+         else:
+             format_block.pop("type", None)
+             migrated = True
+ 
+     name_value = format_block.get("name")
+     if isinstance(name_value, str):
+         trimmed = name_value.strip()
+         if trimmed:
+             if trimmed != name_value:
+                 format_block["name"] = trimmed
+                 migrated = True
+         else:
+             format_block.pop("name", None)
+             migrated = True
+     elif name_value is not None:
+         trimmed = str(name_value).strip()
+         if trimmed:
+             format_block["name"] = trimmed
+             migrated = True
+         else:
+             format_block.pop("name", None)
+             migrated = True
+ 
+     strict_value = format_block.get("strict")
+@@ -973,123 +978,181 @@ def _extract_choice_content(choice: Dict[str, object]) -> Tuple[str, Dict[str, o
+             parse_flags["schema"] = schema_label
+             return joined, parse_flags, schema_label
+     elif isinstance(exotic_content, dict):
+         extracted, used_parts = _extract_from_dict(exotic_content)
+         if extracted:
+             parse_flags["output_text"] = 1
+             parse_flags["content_dict"] = 1
+             if used_parts:
+                 parse_flags["parts"] = 1
+             parse_flags["schema"] = schema_label
+             return extracted, parse_flags, schema_label
+ 
+     parse_flags["schema"] = schema_label
+     return "", parse_flags, schema_label
  
  
- def _build_metadata(
+ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, object], str]:
+     parse_flags: Dict[str, object] = {}
+ 
+     resp_keys = sorted(str(key) for key in data.keys())
+     filtered_resp_keys = [key for key in resp_keys if key != "temperature"]
+     parse_flags["resp_keys"] = filtered_resp_keys
+ 
+     output_text_raw = data.get("output_text")
+     if isinstance(output_text_raw, str):
+-        output_text_value = output_text_raw.strip()
++        legacy_output_text = output_text_raw.strip()
+     else:
+-        output_text_value = ""
++        legacy_output_text = ""
++
++    def _collect_text_branch(value: object) -> List[str]:
++        collected: List[str] = []
++        if isinstance(value, str):
++            stripped = value.strip()
++            if stripped:
++                collected.append(stripped)
++            return collected
++        if isinstance(value, list):
++            joined = _collect_text_parts(value)
++            if joined:
++                collected.append(joined)
++            else:
++                for item in value:
++                    collected.extend(_collect_text_branch(item))
++            return collected
++        if isinstance(value, dict):
++            for key in ("text", "content", "value"):
++                candidate = value.get(key)
++                if isinstance(candidate, str):
++                    stripped = candidate.strip()
++                    if stripped:
++                        collected.append(stripped)
++                elif isinstance(candidate, list):
++                    joined = _collect_text_parts(candidate)
++                    if joined:
++                        collected.append(joined)
++                    else:
++                        for item in candidate:
++                            collected.extend(_collect_text_branch(item))
++                elif isinstance(candidate, dict):
++                    collected.extend(_collect_text_branch(candidate))
++            for key in ("output", "outputs", "segments", "parts"):
++                nested = value.get(key)
++                if isinstance(nested, list):
++                    joined = _collect_text_parts(nested)
++                    if joined:
++                        collected.append(joined)
++                    else:
++                        for item in nested:
++                            collected.extend(_collect_text_branch(item))
++                elif isinstance(nested, dict):
++                    collected.extend(_collect_text_branch(nested))
++        return [segment for segment in collected if segment]
++
++    text_branch = data.get("text")
++    text_segments = _collect_text_branch(text_branch)
++    text_branch_value = "\n\n".join(text_segments) if text_segments else ""
+ 
+     def _iter_segments(container: object) -> List[str]:
+         collected: List[str] = []
+         if isinstance(container, list):
+             for item in container:
+                 collected.extend(_iter_segments(item))
+         elif isinstance(container, dict):
+             content = container.get("content")
+             if isinstance(content, list):
+                 for part in content:
+                     if not isinstance(part, dict):
+                         continue
+                     part_type = str(part.get("type", "")).strip()
+                     if part_type not in {"text", "output_text"}:
+                         continue
+                     text_value = part.get("text")
+                     if isinstance(text_value, str):
+                         stripped = text_value.strip()
+                         if stripped:
+                             collected.append(stripped)
+             for key in ("output", "outputs"):
+                 nested = container.get(key)
+                 if nested is not None:
+                     collected.extend(_iter_segments(nested))
+         return collected
+ 
+     segments: List[str] = []
+     root_used: Optional[str] = None
+     for root_key in ("output", "outputs"):
+         root_value = data.get(root_key)
+         if root_value is None:
+             continue
+         extracted = _iter_segments(root_value)
+         if extracted:
+             segments.extend(extracted)
+             root_used = root_key
+ 
+     content_text = "\n\n".join(segments) if segments else ""
+-    schema_label = "responses.output_text" if (segments or output_text_value) else "responses.none"
++    primary_text = text_branch_value or legacy_output_text
++    schema_label = (
++        "responses.text"
++        if text_branch_value
++        else ("responses.output_text" if legacy_output_text else "responses.none")
++    )
+     parse_flags["schema"] = schema_label
+     parse_flags["segments"] = len(segments)
+-    parse_flags["output_text_len"] = len(output_text_value)
++    parse_flags["text_segments"] = len(text_segments)
++    parse_flags["text_len"] = len(text_branch_value)
++    parse_flags["output_text_len"] = len(primary_text)
+     parse_flags["content_text_len"] = len(content_text)
+ 
+-    if output_text_value:
++    if text_branch_value:
++        parse_source = "text"
++        parse_length = parse_flags["text_len"]
++    elif legacy_output_text:
+         parse_source = "output_text"
+-        parse_length = parse_flags["output_text_len"]
++        parse_length = len(legacy_output_text)
+     elif content_text:
+         parse_source = "content_text"
+         parse_length = parse_flags["content_text_len"]
+     else:
+         parse_source = "none"
+         parse_length = 0
+ 
+     LOGGER.info(
+         "RESP_PARSE=%s len=%d output_len=%d content_len=%d",
+         parse_source,
+         parse_length,
+         parse_flags["output_text_len"],
+         parse_flags["content_text_len"],
+     )
+     LOGGER.info(
+         "responses parse resp_keys=%s root=%s segments=%d schema=%s",
+         filtered_resp_keys,
+         root_used,
+         parse_flags.get("segments", 0),
+         schema_label,
+     )
+ 
+-    text = output_text_value or content_text
++    text = primary_text or content_text
+     if text:
+         LOGGER.info("RESP_PARSE_OK schema=%s len=%d", schema_label, len(text))
+     return text, parse_flags, schema_label
+ 
+ 
+ def _resolve_model_name(model: Optional[str]) -> str:
+     requested = (model or "").strip()
+     if requested and requested != DEFAULT_MODEL:
+         LOGGER.warning(
+             "model override '%s' ignored; using %s",
+             requested,
+             DEFAULT_MODEL,
+         )
+     return DEFAULT_MODEL
+ 
+ 
+ def _resolve_provider(model_name: str) -> str:
+     return MODEL_PROVIDER_MAP.get(model_name, "openai")
+ 
+ 
+ def _resolve_api_key(provider: str) -> str:
+     api_key = os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY
+     if api_key:
+         api_key = api_key.strip()
+     if not api_key:
+@@ -1269,50 +1332,66 @@ def _extract_unknown_parameter_name(response: httpx.Response) -> Optional[str]:
+ 
+ 
+ def _extract_error_message(response: httpx.Response) -> str:
+     message: str = ""
+     try:
+         payload = response.json()
+     except ValueError:
+         payload = None
+     if isinstance(payload, dict):
+         error_block = payload.get("error")
+         if isinstance(error_block, dict):
+             message = str(error_block.get("message", ""))
+     if not message:
+         message = response.text or ""
+     return (message or "").strip()
+ 
+ 
+ def _has_text_format_migration_hint(response: httpx.Response) -> bool:
+     message: str = ""
+     message = _extract_error_message(response)
+     if not message:
+         return False
+     return "moved to 'text.format'" in message.lower()
+ 
+ 
++def _needs_text_type_retry(response: httpx.Response) -> bool:
++    message = _extract_error_message(response)
++    if not message:
++        return False
++    lowered = message.lower()
++    if "text.format.type" in lowered and "output_text" in lowered:
++        return True
++    if "response_format" in lowered and "output_text" in lowered and "type" in lowered:
++        return True
++    if "unsupported" in lowered and "output_text" in lowered and "type" in lowered:
++        return True
++    if "expected" in lowered and "'text'" in lowered and "output_text" in lowered:
++        return True
++    return False
++
++
+ def _needs_format_name_retry(response: httpx.Response) -> bool:
+     message = _extract_error_message(response)
+     if not message:
+         return False
+     lowered = message.lower()
+     if "text.format.name" in lowered:
+         return True
+     if "text.format" in lowered and "missing" in lowered and "name" in lowered:
+         return True
+     if "unsupported parameter" in lowered and "text.format" in lowered:
+         return True
+     if "moved to text.format" in lowered and "name" in lowered:
+         return True
+     return False
+ 
+ 
+ def _make_request(
+     http_client: httpx.Client,
      *,
-     theme: str,
-     generation_context: GenerationContext,
-     pipeline_state_text: str,
-     validation: ValidationResult,
-     pipeline_logs: Iterable[Any],
-     checkpoints: Dict[PipelineStep, str],
-     duration_seconds: float,
-     model_used: Optional[str],
-     fallback_used: Optional[str],
-     fallback_reason: Optional[str],
-     api_route: Optional[str],
-     token_usage: Optional[float],
-+    degradation_flags: Optional[Iterable[str]] = None,
- ) -> Dict[str, Any]:
-     metadata: Dict[str, Any] = {
-         "schema_version": LATEST_SCHEMA_VERSION,
-         "theme": theme,
-         "generated_at": _local_now().isoformat(),
-         "duration_seconds": round(duration_seconds, 3),
-         "context_source": generation_context.context_source,
-         "context_len": generation_context.custom_context_len,
-         "context_filename": generation_context.custom_context_filename,
-         "context_truncated": generation_context.custom_context_truncated,
-         "style_profile_applied": generation_context.style_profile_applied,
-         "style_profile_source": generation_context.style_profile_source,
-         "style_profile_variant": generation_context.style_profile_variant,
-         "keywords_manual": generation_context.keywords_manual,
-         "length_limits": {
-             "min": generation_context.length_limits.min_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[0],
-             "max": generation_context.length_limits.max_chars if generation_context.length_limits else TARGET_LENGTH_RANGE[1],
-         },
-         "faq_questions_requested": generation_context.faq_questions,
-         "pipeline_logs": _serialize_pipeline_logs(pipeline_logs),
-         "pipeline_checkpoints": _serialize_checkpoints(checkpoints),
-         "validation": {
-             "passed": validation.is_valid,
-             "stats": validation.stats,
-         },
-         "length_no_spaces": length_no_spaces(pipeline_state_text),
-     }
-     if model_used:
-         metadata["model_used"] = model_used
-     if fallback_used:
-         metadata["fallback_used"] = fallback_used
-     if fallback_reason:
-         metadata["fallback_reason"] = fallback_reason
-     if api_route:
-         metadata["api_route"] = api_route
-     if isinstance(token_usage, (int, float)):
-         metadata["token_usage"] = float(token_usage)
-+    if degradation_flags:
-+        normalized_flags = [
-+            str(flag).strip()
-+            for flag in degradation_flags
-+            if isinstance(flag, str) and str(flag).strip()
-+        ]
-+        if normalized_flags:
-+            metadata["degradation_flags"] = list(dict.fromkeys(normalized_flags))
-     return metadata
- 
- 
- def _write_outputs(markdown_path: Path, text: str, metadata: Dict[str, Any]) -> Dict[str, Path]:
-     markdown_path.parent.mkdir(parents=True, exist_ok=True)
-     def _validate_markdown(tmp_path: Path) -> None:
-         if not tmp_path.read_text(encoding="utf-8").strip():
-             raise ValueError("Пустой файл статьи не может быть сохранён.")
- 
-     def _validate_metadata(tmp_path: Path) -> None:
-         json.loads(tmp_path.read_text(encoding="utf-8"))
- 
-     store_atomic_write_text(markdown_path, text, validator=_validate_markdown)
-     metadata_path = markdown_path.with_suffix(".json")
-     store_atomic_write_text(
-         metadata_path,
-         json.dumps(metadata, ensure_ascii=False, indent=2),
-         validator=_validate_metadata,
-     )
-     register_artifact(markdown_path, metadata)
-     return {"markdown": markdown_path, "metadata": metadata_path}
- 
- 
- def _extract_keywords(data: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-     raw_keywords = data.get("keywords") or []
-@@ -511,50 +520,51 @@ def _generate_variant(
-         backoff_schedule=backoff_schedule,
-         provided_faq=prepared_data.get("faq_entries") if isinstance(prepared_data.get("faq_entries"), list) else None,
-         jsonld_requested=generation_context.jsonld_requested,
-         faq_questions=generation_context.faq_questions,
-         progress_callback=progress_callback,
-     )
-     state = pipeline.run()
-     if not state.validation or not state.validation.is_valid:
-         raise RuntimeError("Pipeline validation failed; artifact not recorded.")
- 
-     final_text = state.text
-     duration_seconds = time.time() - start_time
-     metadata = _build_metadata(
-         theme=theme,
-         generation_context=generation_context,
-         pipeline_state_text=final_text,
-         validation=state.validation,
-         pipeline_logs=state.logs,
-         checkpoints=state.checkpoints,
-         duration_seconds=duration_seconds,
-         model_used=state.model_used,
-         fallback_used=state.fallback_used,
-         fallback_reason=state.fallback_reason,
-         api_route=state.api_route,
-         token_usage=state.token_usage,
-+        degradation_flags=pipeline.degradation_flags,
-     )
- 
-     outputs = _write_outputs(output_path, final_text, metadata)
-     return {
-         "text": final_text,
-         "metadata": metadata,
-         "duration": duration_seconds,
-         "artifact_files": outputs,
-     }
- 
- 
- def generate_article_from_payload(
-     *,
-     theme: str,
-     data: Dict[str, Any],
-     k: int,
-     model: Optional[str] = None,
-     max_tokens: int = 0,
-     timeout: Optional[int] = None,
-     mode: Optional[str] = None,
-     backoff_schedule: Optional[List[float]] = None,
-     outfile: Optional[str] = None,
-     append_style_profile: Optional[bool] = None,
-     context_source: Optional[str] = None,
-     context_text: Optional[str] = None,
-diff --git a/tests/test_job_runner.py b/tests/test_job_runner.py
-index 8021c727684721446689ce55dfb8bdc404588bbb..d810bab6774a1dcd0d4a96b6d46c919e01c828ea 100644
---- a/tests/test_job_runner.py
-+++ b/tests/test_job_runner.py
-@@ -33,25 +33,54 @@ def test_job_runner_success(monkeypatch, job_store):
-     assert snapshot.get("step") == "done"
-     assert snapshot.get("progress") == 1.0
-     assert snapshot.get("message") == "Готово"
-     assert snapshot.get("last_event_at")
-     assert snapshot["result"]["markdown"].startswith("Hello")
-     assert snapshot["degradation_flags"] in (None, [])
-     assert snapshot["trace_id"] == "trace-1"
- 
- 
- def test_job_runner_degradation(monkeypatch, job_store):
-     def _raise_generate(**_kwargs):
-         raise RuntimeError("boom")
- 
-     monkeypatch.setattr("jobs.runner.generate_article_from_payload", _raise_generate)
-     runner = JobRunner(job_store, soft_timeout_s=1)
-     job = runner.submit({"theme": "demo", "data": {}, "k": 0}, trace_id="trace-2")
-     runner.wait(job.id, timeout=3)
-     snapshot = runner.get_job(job.id)
-     assert snapshot["status"] == "succeeded"
-     assert snapshot.get("step") == "done"
-     assert snapshot.get("progress") == 1.0
-     assert snapshot.get("message") == "Готово"
-     assert "draft_failed" in (snapshot.get("degradation_flags") or [])
-     assert "markdown" in snapshot["result"]
-     assert "demo" in snapshot["result"]["markdown"]
-+
-+
-+def test_job_runner_draft_degraded_on_max_tokens(monkeypatch, job_store):
-+    artifact_paths = {
-+        "markdown": "artifacts/demo.md",
-+        "metadata": "artifacts/demo.json",
-+    }
-+
-+    def _fake_generate(**_kwargs):
-+        return {
-+            "text": "Частичный черновик",
-+            "metadata": {
-+                "degradation_flags": ["draft_max_tokens"],
-+                "completion_warning": "max_output_tokens",
-+            },
-+            "artifact_paths": artifact_paths,
-+        }
-+
-+    monkeypatch.setattr("jobs.runner.generate_article_from_payload", _fake_generate)
-+    runner = JobRunner(job_store, soft_timeout_s=2)
-+    job = runner.submit({"theme": "demo", "data": {}, "k": 0})
-+    runner.wait(job.id, timeout=5)
-+    snapshot = runner.get_job(job.id)
-+    draft_step = next(step for step in snapshot["steps"] if step["name"] == "draft")
-+    assert draft_step["status"] == "degraded"
-+    assert draft_step["error"] == "max_output_tokens"
-+    assert draft_step["payload"]["artifact_paths"] == artifact_paths
-+    assert snapshot["result"]["artifact_paths"] == artifact_paths
-+    assert "draft_max_tokens" in (snapshot.get("degradation_flags") or [])
-diff --git a/tests/test_llm_client.py b/tests/test_llm_client.py
-index 22d2d8a66e2dceb6b3d4e1ac1d891020761ec58d..cb0f147e4f0ec7fbc69a917bd216f3ba885307c6 100644
---- a/tests/test_llm_client.py
-+++ b/tests/test_llm_client.py
-@@ -201,25 +201,49 @@ def test_generate_retries_empty_completion_with_fallback():
-             {
-                 "content": [
-                     {"type": "text", "text": "Готовый текст"},
-                 ]
+     api_url: str,
+     headers: Dict[str, str],
+     payload: Dict[str, object],
+     schedule: List[float],
+ ) -> Tuple[Dict[str, object], bool]:
+     last_error: Optional[BaseException] = None
+@@ -1661,50 +1740,51 @@ def generate(
+                 "incomplete_reason": incomplete_reason,
+                 "usage_output_tokens": usage_output_tokens,
+                 "response_id": response_id,
+                 "previous_response_id": prev_response_id,
+                 "finish_reason": finish_reason,
              }
-         ],
-     }
-     responses = [empty_payload, empty_payload, success_payload]
-     result, client = _generate_with_dummy(
-         responses=responses,
-         max_tokens=100,
-     )
-     assert isinstance(result, GenerationResult)
-     assert result.retry_used is True
-     assert result.fallback_used == "plain_outline"
-     assert result.fallback_reason == "empty_completion_fallback"
-     assert len(client.requests) == 3
-     primary_request = client.requests[0]["json"]
-     retry_request = client.requests[1]["json"]
-     fallback_request = client.requests[2]["json"]
-     assert primary_request["max_output_tokens"] == 100
-     assert retry_request["max_output_tokens"] == 85
-     assert fallback_request["max_output_tokens"] == 76
-     assert "previous_response_id" not in retry_request
-     assert fallback_request["text"]["format"] == FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT
-+
-+
-+def test_generate_accepts_incomplete_with_text():
-+    payload = {
-+        "status": "incomplete",
-+        "incomplete_details": {"reason": "max_output_tokens"},
-+        "output": [
-+            {
-+                "content": [
-+                    {"type": "text", "text": "{\"intro\": \"Hello\"}"},
-+                ]
-+            }
-+        ],
-+    }
-+    result, client = _generate_with_dummy(responses=[payload], max_tokens=120)
-+    assert isinstance(result, GenerationResult)
-+    assert result.text.strip() == '{"intro": "Hello"}'
-+    metadata = result.metadata or {}
-+    assert metadata.get("status") == "completed"
-+    assert metadata.get("incomplete_reason") in (None, "")
-+    assert metadata.get("completion_warning") == "max_output_tokens"
-+    flags = metadata.get("degradation_flags") or []
-+    assert "draft_max_tokens" in flags
-+    assert len(client.requests) == 1
+             metadata["model_effective"] = target_model
+             metadata["api_route"] = LLM_ROUTE
+             metadata["allow_fallback"] = LLM_ALLOW_FALLBACK
+             metadata["temperature_applied"] = False
+             metadata["escalation_caps"] = list(G5_ESCALATION_LADDER)
+             return metadata
+ 
+         attempts = 0
+         if max_attempts_override is not None:
+             try:
+                 parsed_attempts = int(max_attempts_override)
+             except (TypeError, ValueError):
+                 parsed_attempts = 1
+             max_attempts = max(1, parsed_attempts)
+         else:
+             max_attempts = max(1, RESPONSES_MAX_ESCALATIONS + 1)
+         current_max = max_tokens_value
+         last_error: Optional[BaseException] = None
+         format_retry_done = False
++        format_type_retry_done = False
+         format_name_retry_done = False
+         min_tokens_bump_done = False
+         min_token_floor = 1
+         base_input_text = str(sanitized_payload.get("input", ""))
+         shrunken_input = _shrink_responses_input(base_input_text)
+         shrink_next_attempt = False
+         shrink_applied = False
+         incomplete_retry_count = 0
+         token_escalations = 0
+         resume_from_response_id: Optional[str] = None
+         content_started = False
+         cap_retry_performed = False
+         empty_retry_attempted = False
+         empty_direct_retry_attempted = False
+ 
+         def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
+             ladder: List[int] = []
+             for value in G5_ESCALATION_LADDER:
+                 try:
+                     normalized = int(value)
+                 except (TypeError, ValueError):
+                     continue
+                 if normalized <= 0:
+                     continue
+                 if normalized not in ladder:
+@@ -2053,50 +2133,66 @@ def generate(
+                     if not allow_empty_retry:
+                         raise last_error
+                     continue
+                 _persist_raw_response(data)
+                 return text, parse_flags, data, schema_label
+             except EmptyCompletionError as exc:
+                 last_error = exc
+                 if not allow_empty_retry:
+                     raise
+             except httpx.HTTPStatusError as exc:
+                 response_obj = exc.response
+                 status = response_obj.status_code if response_obj is not None else None
+                 if response_obj is not None and _needs_format_name_retry(response_obj):
+                     setattr(exc, "responses_no_fallback", True)
+                 if (
+                     status == 400
+                     and not format_retry_done
+                     and response_obj is not None
+                     and _has_text_format_migration_hint(response_obj)
+                 ):
+                     format_retry_done = True
+                     retry_used = True
+                     LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
+                     _apply_text_format(sanitized_payload)
+                     continue
++                if (
++                    status == 400
++                    and not format_type_retry_done
++                    and response_obj is not None
++                    and _needs_text_type_retry(response_obj)
++                ):
++                    format_type_retry_done = True
++                    retry_used = True
++                    LOGGER.warning("RESP_RETRY_REASON=text_format_type_migrated")
++                    _apply_text_format(sanitized_payload)
++                    text_block = sanitized_payload.get("text")
++                    if isinstance(text_block, dict):
++                        fmt_block = text_block.get("format")
++                        if isinstance(fmt_block, dict):
++                            fmt_block["type"] = "text"
++                    continue
+                 if (
+                     status == 400
+                     and response_obj is not None
+                     and _needs_format_name_retry(response_obj)
+                 ):
+                     if not format_name_retry_done:
+                         format_name_retry_done = True
+                         retry_used = True
+                         LOGGER.warning(
+                             "RESP_RETRY_REASON=format_name_missing route=responses attempt=%d",
+                             attempts,
+                         )
+                         _apply_text_format(sanitized_payload)
+                         _ensure_format_name(sanitized_payload)
+                         continue
+                 if (
+                     status == 400
+                     and not min_tokens_bump_done
+                     and is_min_tokens_error(response_obj)
+                 ):
+                     min_tokens_bump_done = True
+                     retry_used = True
+                     min_token_floor = max(min_token_floor, 24)
+                     current_max = max(current_max, min_token_floor)
+                     sanitized_payload["max_output_tokens"] = max(current_max, min_token_floor)
 

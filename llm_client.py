@@ -491,8 +491,12 @@ def _sanitize_text_format_in_place(
     if isinstance(type_value, str):
         trimmed = type_value.strip()
         if trimmed:
+            normalized = trimmed.lower()
             if trimmed != type_value:
                 format_block["type"] = trimmed
+                migrated = True
+            if normalized == "output_text":
+                format_block["type"] = "text"
                 migrated = True
         else:
             format_block.pop("type", None)
@@ -500,7 +504,8 @@ def _sanitize_text_format_in_place(
     elif type_value is not None:
         trimmed = str(type_value).strip()
         if trimmed:
-            format_block["type"] = trimmed
+            normalized = trimmed.lower()
+            format_block["type"] = "text" if normalized == "output_text" else trimmed
             migrated = True
         else:
             format_block.pop("type", None)
@@ -995,9 +1000,57 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
 
     output_text_raw = data.get("output_text")
     if isinstance(output_text_raw, str):
-        output_text_value = output_text_raw.strip()
+        legacy_output_text = output_text_raw.strip()
     else:
-        output_text_value = ""
+        legacy_output_text = ""
+
+    def _collect_text_branch(value: object) -> List[str]:
+        collected: List[str] = []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                collected.append(stripped)
+            return collected
+        if isinstance(value, list):
+            joined = _collect_text_parts(value)
+            if joined:
+                collected.append(joined)
+            else:
+                for item in value:
+                    collected.extend(_collect_text_branch(item))
+            return collected
+        if isinstance(value, dict):
+            for key in ("text", "content", "value"):
+                candidate = value.get(key)
+                if isinstance(candidate, str):
+                    stripped = candidate.strip()
+                    if stripped:
+                        collected.append(stripped)
+                elif isinstance(candidate, list):
+                    joined = _collect_text_parts(candidate)
+                    if joined:
+                        collected.append(joined)
+                    else:
+                        for item in candidate:
+                            collected.extend(_collect_text_branch(item))
+                elif isinstance(candidate, dict):
+                    collected.extend(_collect_text_branch(candidate))
+            for key in ("output", "outputs", "segments", "parts"):
+                nested = value.get(key)
+                if isinstance(nested, list):
+                    joined = _collect_text_parts(nested)
+                    if joined:
+                        collected.append(joined)
+                    else:
+                        for item in nested:
+                            collected.extend(_collect_text_branch(item))
+                elif isinstance(nested, dict):
+                    collected.extend(_collect_text_branch(nested))
+        return [segment for segment in collected if segment]
+
+    text_branch = data.get("text")
+    text_segments = _collect_text_branch(text_branch)
+    text_branch_value = "\n\n".join(text_segments) if text_segments else ""
 
     def _iter_segments(container: object) -> List[str]:
         collected: List[str] = []
@@ -1036,15 +1089,25 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
             root_used = root_key
 
     content_text = "\n\n".join(segments) if segments else ""
-    schema_label = "responses.output_text" if (segments or output_text_value) else "responses.none"
+    primary_text = text_branch_value or legacy_output_text
+    schema_label = (
+        "responses.text"
+        if text_branch_value
+        else ("responses.output_text" if legacy_output_text else "responses.none")
+    )
     parse_flags["schema"] = schema_label
     parse_flags["segments"] = len(segments)
-    parse_flags["output_text_len"] = len(output_text_value)
+    parse_flags["text_segments"] = len(text_segments)
+    parse_flags["text_len"] = len(text_branch_value)
+    parse_flags["output_text_len"] = len(primary_text)
     parse_flags["content_text_len"] = len(content_text)
 
-    if output_text_value:
+    if text_branch_value:
+        parse_source = "text"
+        parse_length = parse_flags["text_len"]
+    elif legacy_output_text:
         parse_source = "output_text"
-        parse_length = parse_flags["output_text_len"]
+        parse_length = len(legacy_output_text)
     elif content_text:
         parse_source = "content_text"
         parse_length = parse_flags["content_text_len"]
@@ -1067,7 +1130,7 @@ def _extract_responses_text(data: Dict[str, object]) -> Tuple[str, Dict[str, obj
         schema_label,
     )
 
-    text = output_text_value or content_text
+    text = primary_text or content_text
     if text:
         LOGGER.info("RESP_PARSE_OK schema=%s len=%d", schema_label, len(text))
     return text, parse_flags, schema_label
@@ -1289,6 +1352,22 @@ def _has_text_format_migration_hint(response: httpx.Response) -> bool:
     if not message:
         return False
     return "moved to 'text.format'" in message.lower()
+
+
+def _needs_text_type_retry(response: httpx.Response) -> bool:
+    message = _extract_error_message(response)
+    if not message:
+        return False
+    lowered = message.lower()
+    if "text.format.type" in lowered and "output_text" in lowered:
+        return True
+    if "response_format" in lowered and "output_text" in lowered and "type" in lowered:
+        return True
+    if "unsupported" in lowered and "output_text" in lowered and "type" in lowered:
+        return True
+    if "expected" in lowered and "'text'" in lowered and "output_text" in lowered:
+        return True
+    return False
 
 
 def _needs_format_name_retry(response: httpx.Response) -> bool:
@@ -1683,6 +1762,7 @@ def generate(
         current_max = max_tokens_value
         last_error: Optional[BaseException] = None
         format_retry_done = False
+        format_type_retry_done = False
         format_name_retry_done = False
         min_tokens_bump_done = False
         min_token_floor = 1
@@ -2074,6 +2154,22 @@ def generate(
                     retry_used = True
                     LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
                     _apply_text_format(sanitized_payload)
+                    continue
+                if (
+                    status == 400
+                    and not format_type_retry_done
+                    and response_obj is not None
+                    and _needs_text_type_retry(response_obj)
+                ):
+                    format_type_retry_done = True
+                    retry_used = True
+                    LOGGER.warning("RESP_RETRY_REASON=text_format_type_migrated")
+                    _apply_text_format(sanitized_payload)
+                    text_block = sanitized_payload.get("text")
+                    if isinstance(text_block, dict):
+                        fmt_block = text_block.get("format")
+                        if isinstance(fmt_block, dict):
+                            fmt_block["type"] = "text"
                     continue
                 if (
                     status == 400
