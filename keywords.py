@@ -221,9 +221,10 @@ def format_keywords_block(keywords: Sequence[str]) -> str:
     if not items:
         return ""
     bullet_list = "\n".join(f"- {kw}" for kw in items)
-    return (
+    instructions = (
         "Ключевые слова (используй каждое хотя бы один раз в точной форме, без изменений):\n"
         + bullet_list
-        + "\n\n"
+        + "\nРаспредели их по разделам, не собирай все в одном абзаце и избегай переспама.\n\n"
     )
+    return instructions
 

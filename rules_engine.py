@@ -79,6 +79,7 @@ def build_prompt(data: Dict[str, Any]) -> str:
     structure_block = list_to_block(spec.structure)
     keywords_block = format_keywords_block(spec.keywords)
 
+    theme_line = _render_theme_suffix(spec.theme)
     style_line = _render_style_line(spec.style_profile)
     audience_line = _render_optional_line("Целевая аудитория", spec.audience)
     title_line = _render_optional_line("Название", spec.title)
@@ -88,8 +89,11 @@ def build_prompt(data: Dict[str, Any]) -> str:
     sources_block = _render_sources_block(spec.sources)
     faq_line = _render_faq_line(spec.include_faq, spec.faq_questions)
     jsonld_line = _render_jsonld_line(spec.include_jsonld)
+    tone_style_line = _render_tone_style_line()
+    structure_hint_line = _render_structure_hint()
 
     prompt = tmpl.format(
+        theme_line=theme_line,
         theme=spec.theme,
         goal=spec.goal,
         tone=spec.tone,
@@ -98,7 +102,9 @@ def build_prompt(data: Dict[str, Any]) -> str:
         style_line=style_line,
         audience_line=audience_line,
         title_line=title_line,
+        tone_style_line=tone_style_line,
         structure_block=structure_block,
+        structure_hint_line=structure_hint_line,
         keywords_block=keywords_block,
         keywords_mode_line=keywords_mode_line,
         sources_block=sources_block,
@@ -129,6 +135,13 @@ def _render_optional_line(label: str, value: str) -> str:
     if not value:
         return ""
     return f"{label}: {value}\n"
+
+
+def _render_theme_suffix(theme: str) -> str:
+    normalized = str(theme or "").strip()
+    if not normalized:
+        return ""
+    return f" по теме {normalized}"
 
 
 def _render_length_line(min_len: int, max_len: int) -> str:
@@ -171,7 +184,12 @@ def _render_sources_block(sources: List[Dict[str, str]]) -> str:
             lines.append(f"- {value}")
     if not lines:
         return ""
-    return "Если указаны источники — используй только их:\n" + "\n".join(lines) + "\n\n"
+    header = "Если указаны источники — используй только их:\n" + "\n".join(lines)
+    guidance = (
+        "\nВсегда проверяй, что данные из источников не противоречат друг другу, и вставляй формулировки"
+        " вида «по данным …» без прямых ссылок.\n\n"
+    )
+    return header + guidance
 
 
 def _render_faq_line(include_faq: bool, faq_questions: Optional[int]) -> str:
@@ -189,6 +207,19 @@ def _render_jsonld_line(include_jsonld: bool) -> str:
         return ""
     return (
         "Опция JSON-LD включена, но на этом шаге не добавляй разметку — мы запросим её отдельно после проверки текста.\n\n"
+    )
+
+
+def _render_tone_style_line() -> str:
+    return (
+        "Используй тон и стиль бренда, чтобы подобрать глубину раскрытия, формулировки и примеры,"
+        " соответствующие ожиданиям аудитории.\n"
+    )
+
+
+def _render_structure_hint() -> str:
+    return (
+        "Если структура не задана отдельно, придерживайся рамки: Введение → Основная часть с подзаголовками → FAQ → Вывод/CTA.\n"
     )
 
 

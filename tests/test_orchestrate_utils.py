@@ -6,7 +6,7 @@ import pytest
 
 from config import LLM_ALLOW_FALLBACK, LLM_ROUTE
 from deterministic_pipeline import DeterministicPipeline, PipelineStep
-from faq_builder import build_faq_block
+from faq_builder import FAQ_DEFAULT_LIMIT, build_faq_block
 from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
 from length_limits import compute_soft_length_bounds
 from length_trimmer import trim_text
@@ -14,8 +14,8 @@ from llm_client import GenerationResult
 from orchestrate import generate_article_from_payload, gather_health_status
 from validators import ValidationError, ValidationResult, strip_jsonld, validate_article
 
-MIN_REQUIRED = 5200
-MAX_REQUIRED = 6800
+MIN_REQUIRED = 3500
+MAX_REQUIRED = 6000
 
 def test_keyword_injection_protects_terms_and_locks_all_occurrences():
     base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
@@ -52,11 +52,11 @@ def test_keyword_injection_adds_terms_inset_when_needed():
 def test_faq_builder_produces_jsonld_block():
     base_text = "## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
     faq_result = build_faq_block(base_text=base_text, topic="Долговая нагрузка", keywords=["платёж"])
-    assert faq_result.text.count("**Вопрос") == 5
+    assert faq_result.text.count("**Вопрос") == FAQ_DEFAULT_LIMIT
     assert faq_result.jsonld.strip().startswith('<script type="application/ld+json">')
     payload = json.loads(faq_result.jsonld.split("\n", 1)[1].rsplit("\n", 1)[0])
     assert payload["@type"] == "FAQPage"
-    assert len(payload["mainEntity"]) == 5
+    assert len(payload["mainEntity"]) == FAQ_DEFAULT_LIMIT
 
 
 def test_trim_preserves_locked_and_faq():

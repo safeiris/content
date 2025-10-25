@@ -22,17 +22,14 @@ class ResolvedLengthLimits:
 
 
 SOFT_RANGE_PERCENT = 0.02
-SOFT_RANGE_MIN_BELOW = 50
-SOFT_RANGE_MIN_ABOVE = 100
 
 
 def compute_soft_length_bounds(min_chars: int, max_chars: int) -> Tuple[int, int, int, int]:
     """Return relaxed length bounds around requested min/max values.
 
-    The lower tolerance is at least ``SOFT_RANGE_MIN_BELOW`` characters or 2% of the
-    minimum requirement. The upper tolerance is at least
-    ``SOFT_RANGE_MIN_ABOVE`` characters or 2% of the maximum requirement. Both
-    tolerances are additionally capped by zero to avoid negative bounds.
+    The relaxed bounds extend the requested min and max by ±2% and never below
+    zero. Values are normalised to ensure ``min_chars`` is less than or equal to
+    ``max_chars`` before applying the tolerance.
     """
 
     try:
@@ -50,13 +47,8 @@ def compute_soft_length_bounds(min_chars: int, max_chars: int) -> Tuple[int, int
     min_value = max(0, min_value)
     max_value = max(0, max_value)
 
-    lower_tolerance = 0
-    if min_value > 0:
-        lower_tolerance = min(
-            min_value,
-            max(SOFT_RANGE_MIN_BELOW, int(round(min_value * SOFT_RANGE_PERCENT))),
-        )
-    upper_tolerance = max(SOFT_RANGE_MIN_ABOVE, int(round(max_value * SOFT_RANGE_PERCENT)))
+    lower_tolerance = int(round(min_value * SOFT_RANGE_PERCENT)) if min_value > 0 else 0
+    upper_tolerance = int(round(max_value * SOFT_RANGE_PERCENT)) if max_value > 0 else 0
 
     soft_min = max(0, min_value - lower_tolerance)
     soft_max = max_value + upper_tolerance

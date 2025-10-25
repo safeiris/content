@@ -1,206 +1,1195 @@
-diff --git a/faq_builder.py b/faq_builder.py
-index 9ee6da4705f704083d4fd7cc0f4bef2d5d24d0a4..797e022d12dd33650960082b301568030e9b9686 100644
---- a/faq_builder.py
-+++ b/faq_builder.py
-@@ -1,31 +1,34 @@
+diff --git a/base_prompt.txt b/base_prompt.txt
+index 737b0705d441dbb141048f59d68b6aeb4f1a08df..5c307b88915086e5c5158794842c25bf87ea0a5e 100644
+--- a/base_prompt.txt
++++ b/base_prompt.txt
+@@ -1,31 +1,32 @@
+-Ты — SEO-редактор, создающий экспертный материал по теме {theme}.
++Ты — SEO-редактор, создающий экспертный материал{theme_line}.
+ {style_line}
+ Цель: {goal}
+ {audience_line}{title_line}Тон: {tone}
++{tone_style_line}
+ 
+ Объём: {length_line}.
+ {length_strict_line}
+ Если текст короче — добавь полезные уточнения, не повторяй.
+ Если длиннее — сократи, сохрани смысл.
+ 
+ Обязательные условия SEO:
+ - Используй каждое ключевое слово из списка минимум один раз в точной форме, без изменений порядка слов.
+ - В конце добавь блок FAQ с 3–5 вопросами и развёрнутыми ответами.
+ 
+ Структура:
+ {structure_block}
++{structure_hint_line}
+ 
+ Бюджет объёма:
+ - Введение — до 450 слов.
+ - Каждый раздел основной части — не больше 4 абзацев по 3–4 предложения.
+ - FAQ — ответы по 2–3 предложения.
+ - Заключение — до 180 слов.
+-
+ {keywords_block}{keywords_mode_line}{sources_block}{faq_line}{jsonld_line}Требования к качеству:
+ - Пиши экспертно, избегай воды и общих фраз.
+ - Поддерживай читабельные абзацы (2–5 предложений).
+ - Проверяй факты и указывай источники, если они заданы.
+ - Добавь чёткий вывод и CTA.
+ 
+ Если предоставлен блок CONTEXT с выдержками из качественных материалов, используй их стиль и фактуру без дословного копирования; если CONTEXT отсутствует или фрагменты не покрывают запрос, пиши универсально, сохраняя заданную структуру.
+ 
+diff --git a/config.py b/config.py
+index 60fbc6ee530b854813d951b1cffe4427c891ac74..fc4c3e4f193b67b8c2ba0987d19014d767600f3c 100644
+--- a/config.py
++++ b/config.py
+@@ -62,52 +62,57 @@ MODEL_PROVIDER = str(os.getenv("MODEL_PROVIDER", "openai")).strip() or "openai"
+ 
+ _FORCE_MODEL_RAW = str(os.getenv("FORCE_MODEL", os.getenv("LLM_FORCE_MODEL", "false"))).strip().lower()
+ FORCE_MODEL = _FORCE_MODEL_RAW in {"1", "true", "yes", "on"}
+ 
+ # GPT-5 Responses tuning
+ G5_MAX_OUTPUT_TOKENS_BASE = _env_int("G5_MAX_OUTPUT_TOKENS_BASE", 2280)
+ G5_MAX_OUTPUT_TOKENS_STEP1 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP1", 3000)
+ G5_MAX_OUTPUT_TOKENS_STEP2 = _env_int("G5_MAX_OUTPUT_TOKENS_STEP2", 3600)
+ G5_MAX_OUTPUT_TOKENS_MAX = _env_int("G5_MAX_OUTPUT_TOKENS_MAX", 3600)
+ G5_ESCALATION_LADDER = (
+     G5_MAX_OUTPUT_TOKENS_BASE,
+     G5_MAX_OUTPUT_TOKENS_STEP1,
+     G5_MAX_OUTPUT_TOKENS_STEP2,
+ )
+ _DEFAULT_POLL_DELAYS = "0.3,0.6,1.0,1.5"
+ G5_POLL_INTERVALS = _env_float_list("G5_POLL_INTERVALS", _DEFAULT_POLL_DELAYS)
+ G5_POLL_MAX_ATTEMPTS = _env_int("G5_POLL_MAX_ATTEMPTS", len(G5_POLL_INTERVALS))
+ G5_ENABLE_PREVIOUS_ID_FETCH = _env_bool("G5_ENABLE_PREVIOUS_ID_FETCH", True)
+ 
+ SKELETON_BATCH_SIZE_MAIN = max(1, _env_int("SKELETON_BATCH_SIZE_MAIN", 2))
+ SKELETON_FAQ_BATCH = max(1, _env_int("SKELETON_FAQ_BATCH", 3))
+ TAIL_FILL_MAX_TOKENS = max(200, _env_int("TAIL_FILL_MAX_TOKENS", 700))
+ 
+ # Дефолтные настройки ядра
+ DEFAULT_TONE = "экспертный, дружелюбный"
+-DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "Вывод"]
++DEFAULT_STRUCTURE = [
++    "Введение",
++    "Основная часть с подзаголовками",
++    "FAQ",
++    "Вывод/CTA",
++]
+ 
+ # Простая «норма» для SEO: ориентир по упоминаниям ключей на ~100 слов
+ DEFAULT_SEO_DENSITY = 2
+ 
+ # Рекомендуемые границы объёма (знаков)
+-DEFAULT_MIN_LENGTH = 5200
+-DEFAULT_MAX_LENGTH = 6800
++DEFAULT_MIN_LENGTH = 3500
++DEFAULT_MAX_LENGTH = 6000
+ 
+ # Максимальный объём пользовательского контекста (символов)
+ MAX_CUSTOM_CONTEXT_CHARS = 20_000
+ 
+ # Стилевые профили
+ STYLE_PROFILE_PATH = "profiles/finance/style_profile.md"
+ STYLE_PROFILE_VARIANT = str(os.getenv("STYLE_PROFILE_VARIANT", "full")).strip().lower() or "full"
+ if STYLE_PROFILE_VARIANT not in {"full", "light"}:
+     STYLE_PROFILE_VARIANT = "full"
+ APPEND_STYLE_PROFILE_DEFAULT = (
+     str(os.getenv("APPEND_STYLE_PROFILE_DEFAULT", "true")).strip().lower() not in {"0", "false", "off", "no"}
+ )
+ 
+ # Ключевые слова
+ KEYWORDS_ALLOW_AUTO = _env_bool("KEYWORDS_ALLOW_AUTO", False)
+ 
+ # Feature flags controlling visibility of advanced UI controls
+ FEATURE_HIDE_MODEL_SELECTOR = _env_bool("FEATURE_HIDE_MODEL_SELECTOR", True)
+ FEATURE_HIDE_TOKEN_SLIDERS = _env_bool("FEATURE_HIDE_TOKEN_SLIDERS", True)
+diff --git a/frontend_demo/index.html b/frontend_demo/index.html
+index 39a602afe0b0ad81aa932e48adf07ef69052e693..7da0a6736a46cf78400cddefc9d0d39d12f281e2 100644
+--- a/frontend_demo/index.html
++++ b/frontend_demo/index.html
+@@ -15,54 +15,50 @@
+         </div>
+       </div>
+     </header>
+ 
+     <main class="app app-shell">
+       <nav class="tabs" role="tablist">
+         <button class="tab active" data-tab="new-request" role="tab">Новый запрос</button>
+         <button class="tab" data-tab="materials" role="tab">Сгенерированные материалы</button>
+         <button class="tab" data-tab="pipes" role="tab">Тематики</button>
+         <button class="tab" data-tab="result" role="tab">Результат</button>
+       </nav>
+ 
+       <section class="tab-panel active" id="new-request" role="tabpanel">
+         <div class="request-shell">
+           <div class="request-grid">
+             <form id="brief-form" class="brief-form">
+               <section class="parameters-card">
+                 <header class="parameters-card__header">
+                   <h2 class="parameters-card__title">Параметры текста</h2>
+                 </header>
+                 <div class="parameters-card__body">
+                   <div class="form-row">
+                     <label for="pipe-select">Тематика</label>
+                     <select id="pipe-select" required></select>
+                   </div>
+-                  <div class="form-row">
+-                    <label for="topic-input">Тема</label>
+-                    <input id="topic-input" type="text" placeholder="Например, «Как выбрать дебетовую карту»" required />
+-                  </div>
+                   <div class="form-row">
+                     <label for="title-input">Название</label>
+                     <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
+                     <p class="field-hint">Оставьте пустым, чтобы взять название из профиля.</p>
+                   </div>
+                   <div class="form-row">
+                     <label for="goal-input">Цель</label>
+                     <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
+                   </div>
+                   <div class="form-row">
+                     <label for="audience-input">Аудитория</label>
+                     <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
+                   </div>
+                   <div class="form-row">
+                     <label for="tone-select">Тон</label>
+                     <select id="tone-select">
+                       <option value="экспертный" selected>Экспертный</option>
+                       <option value="дружелюбный">Дружелюбный</option>
+                       <option value="строгий">Строгий</option>
+                     </select>
+                   </div>
+                   <div class="form-row">
+                     <label for="style-profile-select">Стиль бренда</label>
+                     <select id="style-profile-select">
+                       <option value="sravni.ru" selected>sravni.ru — экспертно, структурировано</option>
+@@ -259,51 +255,51 @@
+                 id="download-md"
+                 class="secondary"
+                 role="button"
+                 aria-disabled="true"
+                 data-fallback-name="draft.md"
+               >
+                 <span class="btn-label">Скачать .md</span>
+               </a>
+               <a
+                 id="download-report"
+                 class="secondary"
+                 role="button"
+                 aria-disabled="true"
+                 data-fallback-name="report.json"
+               >
+                 <span class="btn-label">Скачать отчёт .json</span>
+               </a>
+             </div>
+           </aside>
+         </div>
+       </section>
+     </main>
+ 
+     <div id="progress-overlay" class="progress-overlay hidden" role="alert" aria-live="polite">
+       <div class="progress-card">
+-        <p class="progress-stage" data-role="progress-stage">Подготовка…</p>
++        <p class="progress-stage" data-role="progress-stage">Шаг: Черновик 0→100%</p>
+         <div
+           class="progress-bar"
+           role="progressbar"
+           aria-valuemin="0"
+           aria-valuemax="100"
+           aria-valuenow="0"
+           data-role="progress-bar"
+         >
+           <div class="progress-bar__fill" data-role="progress-bar-fill"></div>
+         </div>
+         <p class="progress-percent" data-role="progress-percent">0%</p>
+         <p class="progress-message" data-role="progress-message">Готовим данные…</p>
+         <p class="progress-details" data-role="progress-details"></p>
+       </div>
+     </div>
+ 
+     <template id="source-row-template">
+       <div class="source-row">
+         <input class="source-input" type="text" placeholder="https://example.com" />
+         <select class="source-usage" aria-label="Тип использования источника">
+           <option value="summary" selected>Пересказ</option>
+           <option value="quote">Цитата</option>
+           <option value="inspiration">Вдохновение</option>
+         </select>
+         <button type="button" class="icon-button remove-source" aria-label="Удалить источник">✕</button>
+diff --git a/frontend_demo/script.js b/frontend_demo/script.js
+index ad76927dec4b975ddac02929895344eac165acb0..b2f0d2cb345a99ef8f4efaff93cbc1abe9445462 100644
+--- a/frontend_demo/script.js
++++ b/frontend_demo/script.js
+@@ -34,122 +34,123 @@ const briefForm = document.getElementById("brief-form");
+ const previewBtn = document.getElementById("preview-btn");
+ let reindexBtn = document.getElementById("reindex-btn");
+ let healthBtn = document.getElementById("health-btn");
+ const progressOverlay = document.getElementById("progress-overlay");
+ const progressMessage = progressOverlay?.querySelector('[data-role="progress-message"]') || null;
+ const progressStage = progressOverlay?.querySelector('[data-role="progress-stage"]') || null;
+ const progressPercent = progressOverlay?.querySelector('[data-role="progress-percent"]') || null;
+ const progressBar = progressOverlay?.querySelector('[data-role="progress-bar"]') || null;
+ const progressBarFill = progressOverlay?.querySelector('[data-role="progress-bar-fill"]') || null;
+ const progressDetails = progressOverlay?.querySelector('[data-role="progress-details"]') || null;
+ if (progressStage && progressStage.textContent) {
+   progressStage.dataset.defaultLabel = progressStage.textContent.trim();
+ }
+ const toastRoot = document.getElementById("toast-root");
+ const draftView = document.getElementById("draft-view");
+ const reportView = document.getElementById("report-view");
+ const resultTitle = document.getElementById("result-title");
+ const resultMeta = document.getElementById("result-meta");
+ const resultBadges = document.getElementById("result-badges");
+ const retryBtn = document.getElementById("retry-btn");
+ const downloadMdBtn = document.getElementById("download-md");
+ const downloadReportBtn = document.getElementById("download-report");
+ const clearLogBtn = document.getElementById("clear-log");
+ const structurePreset = document.getElementById("structure-preset");
+ const structureInput = document.getElementById("structure-input");
+-const topicInput = document.getElementById("topic-input");
+ const keywordsInput = document.getElementById("keywords-input");
+ const titleInput = document.getElementById("title-input");
+ const audienceInput = document.getElementById("audience-input");
+ const goalInput = document.getElementById("goal-input");
+ const toneSelect = document.getElementById("tone-select");
+ const minCharsInput = document.getElementById("min-chars-input");
+ const maxCharsInput = document.getElementById("max-chars-input");
+ const keywordModeInputs = document.querySelectorAll("input[name='keywords-mode']");
+ const styleProfileSelect = document.getElementById("style-profile-select");
+ const styleProfileHint = document.getElementById("style-profile-hint");
+ const sourcesList = document.getElementById("sources-list");
+ const addSourceBtn = document.getElementById("add-source-btn");
+ const contextSourceSelect = document.getElementById("context-source-select");
+ const healthStatus = document.getElementById("health-status");
+ const reindexLog = document.getElementById("reindex-log");
+ const previewSystem = document.getElementById("preview-system");
+ const previewUser = document.getElementById("preview-user");
+ const contextList = document.getElementById("context-list");
+ const contextSummary = document.getElementById("context-summary");
+ const contextBadge = document.getElementById("context-badge");
+ const customContextBlock = document.getElementById("custom-context-block");
+ const customContextTextarea = document.getElementById("customContext");
+ const customContextCounter = document.getElementById("customContextCounter");
+ const customContextFileInput = document.getElementById("customContextFile");
+ const customContextClearBtn = document.getElementById("customContextClear");
+ const generateBtn = briefForm.querySelector("button[type='submit']");
+ const advancedSettings = document.getElementById("advanced-settings");
+ const advancedSupportSection = document.querySelector("[data-section='support']");
+ const usedKeywordsSection = document.getElementById("used-keywords");
+ const usedKeywordsList = document.getElementById("used-keywords-list");
+ const usedKeywordsEmpty = document.getElementById("used-keywords-empty");
+ 
+ const ADVANCED_SETTINGS_STORAGE_KEY = "content-demo:advanced-settings-open";
+ 
+ const LOG_STATUS_LABELS = {
+   info: "INFO",
+   success: "SUCCESS",
+   warn: "WARN",
+   error: "ERROR",
+ };
+ 
+ const STEP_LABELS = {
+   draft: "Черновик",
+   refine: "Уточнение",
+   jsonld: "JSON-LD",
+   post_analysis: "Пост-анализ",
+ };
+ 
+ const PROGRESS_STAGE_LABELS = {
+   draft: "Черновик",
++  refine: "Доработка",
+   trim: "Нормализация",
+   validate: "Проверка",
+   done: "Готово",
+   error: "Ошибка",
+ };
+ 
+ const PROGRESS_STAGE_MESSAGES = {
+   draft: "Генерируем черновик",
++  refine: "Дорабатываем черновик",
+   trim: "Нормализуем объём",
+   validate: "Проверяем результат",
+   done: "Готово",
+   error: "Завершено с ошибкой",
+ };
+ 
+ const DEGRADATION_LABELS = {
+   draft_failed: "Черновик по запасному сценарию",
+-  refine_skipped: "Шаг уточнения пропущен",
+-  jsonld_missing: "JSON-LD отсутствует",
+-  jsonld_repaired: "JSON-LD восстановлен",
+-  post_analysis_skipped: "Проверки пропущены",
+-  soft_timeout: "Сработал мягкий таймаут",
++  refine_skipped: "Доработка пропущена",
++  jsonld_missing: "JSON-LD не сформирован",
++  jsonld_repaired: "JSON-LD восстановлен вручную",
++  post_analysis_skipped: "Отчёт о качестве недоступен",
++  soft_timeout: "Мягкий таймаут — результат сохранён",
+ };
+ 
+ const DEFAULT_PROGRESS_MESSAGE =
+   progressMessage?.textContent?.trim() || PROGRESS_STAGE_MESSAGES.draft;
+ const MAX_TOASTS = 3;
+ const MAX_CUSTOM_CONTEXT_CHARS = 20000;
+ const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
+ 
+ const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 3500, max: 6000, hard: 6500 });
+ 
+ const HEALTH_STATUS_MESSAGES = {
+   openai_key: {
+     label: "OpenAI",
+     ok: "активен",
+     fail: "не найден",
+   },
+   llm_ping: {
+     label: "LLM",
+     ok: "отвечает",
+     fail: "нет ответа",
+   },
+   retrieval_index: {
+     label: "Retrieval index",
+     ok: "найден",
+     fail: "не найден",
+@@ -721,59 +722,67 @@ async function loadArtifacts(prefetched = null) {
+     throw new Error("Некорректный ответ сервера");
+   }
+   state.artifactFiles = files;
+   state.artifacts = normalizeArtifactList(files);
+   state.hasMissingArtifacts = state.artifacts.some((artifact) => artifact.missing);
+   renderArtifacts();
+   updateArtifactsToolbar();
+ }
+ 
+ function renderArtifacts() {
+   state.hasMissingArtifacts = state.artifacts.some((item) => item.missing);
+   if (!state.artifacts.length) {
+     artifactsList.innerHTML = '<div class="empty-state">Пока нет сгенерированных материалов.</div>';
+     updateArtifactsToolbar();
+     return;
+   }
+ 
+   artifactsList.innerHTML = "";
+   const template = document.getElementById("artifact-card-template");
+ 
+   state.artifacts.forEach((artifact) => {
+     const card = template.content.firstElementChild.cloneNode(true);
+     const metadata = artifact.metadata || {};
+     const title = artifact.name || metadata.name || artifact.id || "Без названия";
+     const themeName = metadata.theme || extractThemeFromName(title);
+-    const topic = metadata.input_data?.theme || metadata.data?.theme || metadata.topic || "Без темы";
++    const topic =
++      metadata.input_data?.title
++      || metadata.data?.title
++      || metadata.title
++      || metadata.input_data?.goal
++      || metadata.input_data?.theme
++      || metadata.data?.theme
++      || metadata.topic
++      || "";
+     card.dataset.artifactId = artifact.id || artifact.path || "";
+     card.querySelector(".card-title").textContent = title;
+     const statusInfo = resolveArtifactStatus(artifact);
+     const statusEl = card.querySelector(".status");
+     statusEl.textContent = statusInfo.label;
+     statusEl.dataset.status = statusInfo.value;
+-    const topicText = [themeName, topic].filter(Boolean).join(" · ") || topic;
+-    card.querySelector(".card-topic").textContent = topicText;
++    const topicText = [themeName, topic].filter(Boolean).join(" · ");
++    card.querySelector(".card-topic").textContent = topicText || themeName || "Без темы";
+     const updatedAt = artifact.modified_at ? new Date(artifact.modified_at) : null;
+     card.querySelector(".card-meta").textContent = updatedAt
+       ? `Обновлено ${updatedAt.toLocaleString("ru-RU")}`
+       : "Дата обновления неизвестна";
+ 
+     card.addEventListener("click", () => showArtifact(artifact));
+ 
+     const openBtn = card.querySelector(".open-btn");
+     const downloadBtn = card.querySelector(".download-btn");
+     const deleteBtn = card.querySelector(".delete-btn");
+     const hasMarkdown = Boolean(artifact.downloads?.markdown);
+     if (openBtn) {
+       openBtn.disabled = !hasMarkdown;
+       openBtn.addEventListener("click", (event) => {
+         event.stopPropagation();
+         showArtifact(artifact);
+       });
+     }
+     if (downloadBtn) {
+       downloadBtn.disabled = !hasMarkdown;
+       downloadBtn.addEventListener("click", async (event) => {
+         event.stopPropagation();
+         await handleArtifactDownload(artifact);
+       });
+     }
+@@ -1744,51 +1753,57 @@ async function watchJobViaPolling(jobId, { onUpdate } = {}) {
+     delayMs = Math.min(delayMs + 200, 1500);
+   }
+ }
+ 
+ function renderGenerationResult(snapshot, { payload }) {
+   const normalized = normalizeJobResponse(snapshot);
+   const result = normalized.result || {};
+   const markdown = typeof result.markdown === "string" ? result.markdown : "";
+   const meta = (result.meta_json && typeof result.meta_json === "object") ? result.meta_json : {};
+   const degradationFlags = Array.isArray(normalized.degradation_flags) ? normalized.degradation_flags : [];
+   const characters = typeof meta.characters === "number" ? meta.characters : markdown.replace(/\s+/g, "").length;
+   const hasContent = markdown.trim().length > 0;
+   state.currentResult = {
+     markdown,
+     meta,
+     artifactPaths: result.artifact_paths ?? null,
+     characters,
+     hasContent,
+     degradationFlags,
+     downloads:
+       state.currentDownloads && (state.currentDownloads.markdown || state.currentDownloads.report)
+         ? { ...state.currentDownloads }
+         : null,
+   };
+   draftView.innerHTML = markdownToHtml(markdown);
+-  resultTitle.textContent = payload?.data?.theme || "Результат генерации";
++  const requestedLabel =
++    payload?.data?.title
++      || payload?.data?.theme
++      || payload?.data?.goal
++      || payload?.theme
++      || "";
++  resultTitle.textContent = requestedLabel || "Результат генерации";
+   const metaParts = [];
+   if (hasContent) {
+     metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
+     metaParts.push(
+       `Ориентир: ${DEFAULT_LENGTH_RANGE.min.toLocaleString("ru-RU")}` +
+         `–${DEFAULT_LENGTH_RANGE.max.toLocaleString("ru-RU")}` +
+         ` (≤ ${DEFAULT_LENGTH_RANGE.hard.toLocaleString("ru-RU")})`,
+     );
+   }
+   if (degradationFlags.length) {
+     metaParts.push(`Деградации: ${degradationFlags.length}`);
+   }
+   if (meta.model_used) {
+     metaParts.push(`Модель: ${meta.model_used}`);
+   }
+   resultMeta.textContent = metaParts.join(" · ") || "Деградаций нет";
+   renderMetadata(meta);
+   renderUsedKeywords(meta);
+   updateResultBadges(meta, degradationFlags);
+   toggleRetryButton(!hasContent);
+   updatePromptPreview({
+     system: meta.system_prompt_preview,
+     context: Array.isArray(meta.clips) ? meta.clips : [],
+     user: meta.user_prompt_preview,
+     context_used: meta.context_used,
+@@ -1830,73 +1845,68 @@ function handleRetryClick(event) {
+   }
+ }
+ 
+ function parsePositiveInt(value) {
+   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+     return Math.floor(value);
+   }
+   if (typeof value === "string") {
+     const trimmed = value.trim();
+     if (!trimmed) {
+       return null;
+     }
+     const parsed = Number.parseInt(trimmed, 10);
+     if (Number.isFinite(parsed) && parsed > 0) {
+       return parsed;
+     }
+   }
+   return null;
+ }
+ 
+ function buildRequestPayload() {
+   const theme = pipeSelect.value;
+   if (!theme) {
+     throw new Error("Выберите тематику");
+   }
+-  const topic = topicInput?.value?.trim() || "";
+-  if (!topic) {
+-    throw new Error("Укажите тему материала");
+-  }
+ 
+   const keywords = keywordsInput.value
+     .split(/\r?\n|,/)
+     .map((item) => item.trim())
+     .filter(Boolean);
+   const structure = structureInput
+     ? structureInput.value
+         .split(/\r?\n/)
+         .map((item) => item.trim())
+         .filter(Boolean)
+     : [];
+ 
+   const keywordMode = Array.from(keywordModeInputs).find((input) => input.checked)?.value || "strict";
+   const styleProfile = styleProfileSelect?.value || "sravni.ru";
+   const contextSource = String(contextSourceSelect?.value || "index.json").toLowerCase();
+   const contextPayload = resolveCustomContextPayload(contextSource);
+ 
+   const data = {
+-    theme: topic,
+     keywords,
+     keywords_mode: keywordMode,
+     include_faq: true,
+     faq_questions: 5,
+     include_jsonld: true,
+     structure,
+     pipe_id: theme,
+     style_profile: styleProfile,
+     context_source: contextSource,
+   };
+ 
+   const titleValue = titleInput?.value?.trim();
+   if (titleValue) {
+     data.title = titleValue;
+   }
+ 
+   const goalValue = goalInput?.value?.trim();
+   if (goalValue) {
+     data.goal = goalValue;
+   }
+ 
+   const audienceValue = audienceInput?.value?.trim();
+   if (audienceValue) {
+     data.target_audience = audienceValue;
+   }
+@@ -1910,50 +1920,55 @@ function buildRequestPayload() {
+   const maxValue = parsePositiveInt(maxCharsInput?.value);
+   const effectiveMin = minValue ?? DEFAULT_LENGTH_RANGE.min;
+   const effectiveMax = maxValue ?? DEFAULT_LENGTH_RANGE.max;
+   if (effectiveMax < effectiveMin) {
+     throw new Error("Максимальный объём должен быть больше или равен минимальному");
+   }
+   data.length_limits = {
+     min_chars: effectiveMin,
+     max_chars: effectiveMax,
+   };
+ 
+   const sources = collectSources();
+   if (sources.length) {
+     data.sources = sources;
+   }
+ 
+   if (contextSource === "custom") {
+     data.context_source = "custom";
+     if (contextPayload.filename) {
+       data.context_filename = contextPayload.filename;
+     }
+   } else {
+     delete data.context_filename;
+   }
+ 
++  const inferredTopic = titleValue || goalValue || "";
++  if (inferredTopic) {
++    data.theme = inferredTopic;
++  }
++
+   const payload = {
+     theme,
+     data,
+     k: 0,
+     context_source: contextSource,
+   };
+ 
+   if (contextSource === "custom") {
+     payload.context_text = contextPayload.text;
+     if (contextPayload.filename) {
+       payload.context_filename = contextPayload.filename;
+     }
+   }
+ 
+   return payload;
+ }
+ 
+ function renderMetadata(meta) {
+   reportView.innerHTML = "";
+   const lengthWarnings = [];
+   if (Array.isArray(meta?.length_limits_warnings)) {
+     meta.length_limits_warnings.forEach((note) => {
+       if (typeof note === "string" && note.trim()) {
+         lengthWarnings.push(note.trim());
+       }
+@@ -3049,51 +3064,51 @@ function updateProgressFromSnapshot(snapshot) {
+   if (progressPercent) {
+     progressPercent.textContent = `${Math.round(percentValue)}%`;
+   }
+   if (progressBar) {
+     progressBar.setAttribute("aria-valuenow", String(Math.round(percentValue)));
+   }
+ 
+   let message = "";
+   if (typeof snapshot.progress_message === "string" && snapshot.progress_message.trim()) {
+     message = snapshot.progress_message.trim();
+   } else if (status === "succeeded") {
+     message = PROGRESS_STAGE_MESSAGES.done;
+   } else if (status === "failed") {
+     message = extractErrorMessage(snapshot) || PROGRESS_STAGE_MESSAGES.error;
+   } else if (typeof snapshot.message === "string" && snapshot.message.trim()) {
+     message = snapshot.message.trim();
+   } else {
+     message = PROGRESS_STAGE_MESSAGES[stage] || DEFAULT_PROGRESS_MESSAGE;
+   }
+   if (progressMessage) {
+     progressMessage.textContent = message;
+   }
+ 
+   if (progressStage) {
+     const label = PROGRESS_STAGE_LABELS[stage] || PROGRESS_STAGE_LABELS.draft;
+-    progressStage.textContent = label;
++    progressStage.textContent = `Шаг: ${label} 0→100%`;
+   }
+ 
+   const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
+     ? snapshot.progress_payload
+     : null;
+   if (progressDetails) {
+     progressDetails.textContent = formatProgressDetails(stage, payload);
+   }
+ 
+   if (status === "succeeded") {
+     progressState.currentPercent = 100;
+     if (progressPercent) {
+       progressPercent.textContent = "100%";
+     }
+     if (progressBarFill) {
+       progressBarFill.style.width = "100%";
+     }
+     if (progressBar) {
+       progressBar.setAttribute("aria-valuenow", "100");
+     }
+     scheduleProgressHide(1200);
+   } else if (status === "failed") {
+     progressState.currentPercent = 100;
+     if (progressPercent) {
+       progressPercent.textContent = "100%";
+diff --git a/helpers.py b/helpers.py
+index def3ea3edafc9a36a069480f5683d51b822a1359..dc903317f8205dc52b2007f7c4e15ce35f7284d6 100644
+--- a/helpers.py
++++ b/helpers.py
+@@ -1,12 +1,17 @@
+ # -*- coding: utf-8 -*-
+ from typing import List
+ 
+ 
+ def list_to_block(items: List[str]) -> str:
+     """
+     Превращает список секций в маркированный блок для промпта.
+     """
+     if not items:
+-        items = ["Введение", "Основная часть", "Вывод"]
++        items = [
++            "Введение",
++            "Основная часть с подзаголовками",
++            "FAQ",
++            "Вывод/CTA",
++        ]
+     return "\n".join(f"- {x}" for x in items)
+ 
+diff --git a/keywords.py b/keywords.py
+index d7a4829ffa24f04cebc1680bf0449fedc4b0570a..55c3a836b2d292cb061d6e5db1d3ad6259d6044a 100644
+--- a/keywords.py
++++ b/keywords.py
+@@ -199,31 +199,32 @@ def merge_keywords(
+         final.append(display)
+         seen.add(normalized)
+ 
+     auto_budget = limit if limit > 0 else 0
+     if auto_budget and auto_candidates:
+         for kw in auto_candidates:
+             normalized = _cleanup_keyword(kw, allow_digits=False)
+             if not normalized or normalized in seen:
+                 continue
+             auto_used.append(normalized)
+             final.append(normalized)
+             seen.add(normalized)
+             if len(auto_used) >= auto_budget:
+                 break
+ 
+     return manual_used, auto_used, final
+ 
+ 
+ def format_keywords_block(keywords: Sequence[str]) -> str:
+     """Render keywords for prompt inclusion as a multi-line block."""
+ 
+     items = [kw for kw in keywords if kw]
+     if not items:
+         return ""
+     bullet_list = "\n".join(f"- {kw}" for kw in items)
+-    return (
++    instructions = (
+         "Ключевые слова (используй каждое хотя бы один раз в точной форме, без изменений):\n"
+         + bullet_list
+-        + "\n\n"
++        + "\nРаспредели их по разделам, не собирай все в одном абзаце и избегай переспама.\n\n"
+     )
++    return instructions
+ 
+diff --git a/length_limits.py b/length_limits.py
+index 88e5d5df89094ba7c96c8f9d6760d25f980fdf98..4c6cd3f0761cce2142c0a51549455182cab1d6d4 100644
+--- a/length_limits.py
++++ b/length_limits.py
+@@ -1,84 +1,76 @@
  from __future__ import annotations
  
  import json
  from dataclasses import dataclass
- from typing import Dict, Iterable, List, Sequence
+ from pathlib import Path
+ from typing import Any, Dict, Optional, Tuple
  
-+FAQ_MIN_COUNT = 6
-+FAQ_MAX_COUNT = 8
-+FAQ_DEFAULT_LIMIT = 7
- 
- @dataclass
- class FaqEntry:
-     question: str
-     answer: str
-     anchor: str
+ from config import DEFAULT_MAX_LENGTH, DEFAULT_MIN_LENGTH
  
  
- @dataclass
- class FaqBuildResult:
-     text: str
-     entries: List[FaqEntry]
-     jsonld: str
+ @dataclass(frozen=True)
+ class ResolvedLengthLimits:
+     """Normalized length requirements with provenance metadata."""
+ 
+     min_chars: int
+     max_chars: int
+     min_source: str
+     max_source: str
+     swapped: bool = False
+     warnings: Tuple[str, ...] = ()
+     profile_source: Optional[str] = None
  
  
- def _sanitize_anchor(text: str) -> str:
-     return "-" + "-".join(text.lower().split())
+ SOFT_RANGE_PERCENT = 0.02
+-SOFT_RANGE_MIN_BELOW = 50
+-SOFT_RANGE_MIN_ABOVE = 100
  
  
- def _normalize_answer(answer: str) -> str:
-     paragraphs = [part.strip() for part in answer.split("\n\n") if part.strip()]
-     if not paragraphs:
-         raise ValueError("Ответ пустой")
-     if len(paragraphs) > 3:
-         paragraphs = paragraphs[:3]
-@@ -33,73 +36,84 @@ def _normalize_answer(answer: str) -> str:
-         raise ValueError("Ответ слишком короткий")
-     return "\n\n".join(paragraphs)
+ def compute_soft_length_bounds(min_chars: int, max_chars: int) -> Tuple[int, int, int, int]:
+     """Return relaxed length bounds around requested min/max values.
+ 
+-    The lower tolerance is at least ``SOFT_RANGE_MIN_BELOW`` characters or 2% of the
+-    minimum requirement. The upper tolerance is at least
+-    ``SOFT_RANGE_MIN_ABOVE`` characters or 2% of the maximum requirement. Both
+-    tolerances are additionally capped by zero to avoid negative bounds.
++    The relaxed bounds extend the requested min and max by ±2% and never below
++    zero. Values are normalised to ensure ``min_chars`` is less than or equal to
++    ``max_chars`` before applying the tolerance.
+     """
+ 
+     try:
+         min_value = int(min_chars)
+     except (TypeError, ValueError):  # defensive: keep behaviour predictable
+         min_value = 0
+     try:
+         max_value = int(max_chars)
+     except (TypeError, ValueError):
+         max_value = 0
+ 
+     if max_value < min_value:
+         min_value, max_value = max_value, min_value
+ 
+     min_value = max(0, min_value)
+     max_value = max(0, max_value)
+ 
+-    lower_tolerance = 0
+-    if min_value > 0:
+-        lower_tolerance = min(
+-            min_value,
+-            max(SOFT_RANGE_MIN_BELOW, int(round(min_value * SOFT_RANGE_PERCENT))),
+-        )
+-    upper_tolerance = max(SOFT_RANGE_MIN_ABOVE, int(round(max_value * SOFT_RANGE_PERCENT)))
++    lower_tolerance = int(round(min_value * SOFT_RANGE_PERCENT)) if min_value > 0 else 0
++    upper_tolerance = int(round(max_value * SOFT_RANGE_PERCENT)) if max_value > 0 else 0
+ 
+     soft_min = max(0, min_value - lower_tolerance)
+     soft_max = max_value + upper_tolerance
+ 
+     return soft_min, soft_max, lower_tolerance, upper_tolerance
  
  
- def _normalize_question(question: str, seen: set[str]) -> str:
-     normalized = question.strip()
-     if not normalized:
-         raise ValueError("Вопрос пустой")
-     if normalized.lower() in seen:
-         raise ValueError("Дублирующийся вопрос")
-     seen.add(normalized.lower())
+ def resolve_length_limits(theme: str, payload: Dict[str, Any]) -> ResolvedLengthLimits:
+     """Determine min/max character limits using brief → profile → defaults."""
+ 
+     target_length = _safe_positive_int(payload.get("length_target"))
+     if target_length is not None and target_length > 0:
+         soft_min, soft_max, _tol_below, _tol_above = compute_soft_length_bounds(
+             target_length, target_length
+         )
+         brief_min = soft_min or target_length
+         brief_max = soft_max or target_length
+         requested = payload.setdefault("_length_limits_requested", {})
+         if isinstance(requested, dict):
+             requested["target"] = target_length
+     else:
+         brief_min, brief_max = _extract_brief_limits(payload)
+ 
+     profile_min, profile_max, profile_source = _load_profile_limits(theme)
+ 
+diff --git a/profiles/finance/settings.json b/profiles/finance/settings.json
+index d21bcb7a45576c992c595276f4f330f12987e04c..03b6a9c0ad05bc8b2ae354cf2602c9786e68bec9 100644
+--- a/profiles/finance/settings.json
++++ b/profiles/finance/settings.json
+@@ -1,8 +1,8 @@
+ {
+   "defaults": {
+     "length_limits": {
+-      "min_chars": 5200,
+-      "max_chars": 6800
++      "min_chars": 3500,
++      "max_chars": 6000
+     }
+   }
+ }
+diff --git a/rules_engine.py b/rules_engine.py
+index 8407d26547096f352c1ea6960647fe96a2d43e23..66f9fcdeb2b3b517c74e4d2650cc95f0af58a8e5 100644
+--- a/rules_engine.py
++++ b/rules_engine.py
+@@ -57,155 +57,186 @@ def build_prompt(data: Dict[str, Any]) -> str:
+     keywords_mode = str(data.get("keywords_mode") or "strict").strip().lower() or "strict"
+ 
+     spec = InputSpec(
+         theme=str(data.get("theme", "общая тема")).strip() or "общая тема",
+         goal=str(data.get("goal", "SEO-статья")).strip() or "SEO-статья",
+         keywords=list(data.get("keywords", [])),
+         tone=str(data.get("tone", DEFAULT_TONE)).strip() or DEFAULT_TONE,
+         structure=list(data.get("structure", DEFAULT_STRUCTURE)),
+         min_len=min_len,
+         max_len=max_len,
+         seo_density=int(data.get("seo_density", DEFAULT_SEO_DENSITY)),
+         audience=str(data.get("target_audience", "")).strip(),
+         title=str(data.get("title", "")).strip(),
+         style_profile=str(data.get("style_profile", "sravni.ru")).strip().lower() or "sravni.ru",
+         keywords_mode=keywords_mode,
+         include_faq=bool(data.get("include_faq", True)),
+         faq_questions=_safe_int(data.get("faq_questions")),
+         include_jsonld=bool(data.get("include_jsonld", False)),
+         sources=_normalize_sources(data.get("sources")),
+     )
+ 
+     tmpl = PROMPT_PATH.read_text(encoding="utf-8")
+     structure_block = list_to_block(spec.structure)
+     keywords_block = format_keywords_block(spec.keywords)
+ 
++    theme_line = _render_theme_suffix(spec.theme)
+     style_line = _render_style_line(spec.style_profile)
+     audience_line = _render_optional_line("Целевая аудитория", spec.audience)
+     title_line = _render_optional_line("Название", spec.title)
+     length_line = _render_length_line(spec.min_len, spec.max_len)
+     length_strict_line = _render_length_strict_line(spec.min_len, spec.max_len)
+     keywords_mode_line = _render_keywords_mode_line(spec.keywords_mode)
+     sources_block = _render_sources_block(spec.sources)
+     faq_line = _render_faq_line(spec.include_faq, spec.faq_questions)
+     jsonld_line = _render_jsonld_line(spec.include_jsonld)
++    tone_style_line = _render_tone_style_line()
++    structure_hint_line = _render_structure_hint()
+ 
+     prompt = tmpl.format(
++        theme_line=theme_line,
+         theme=spec.theme,
+         goal=spec.goal,
+         tone=spec.tone,
+         length_line=length_line,
+         length_strict_line=length_strict_line,
+         style_line=style_line,
+         audience_line=audience_line,
+         title_line=title_line,
++        tone_style_line=tone_style_line,
+         structure_block=structure_block,
++        structure_hint_line=structure_hint_line,
+         keywords_block=keywords_block,
+         keywords_mode_line=keywords_mode_line,
+         sources_block=sources_block,
+         faq_line=faq_line,
+         jsonld_line=jsonld_line,
+     )
+     return prompt
+ 
+ 
+ def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+     try:
+         if value is None:
+             return default
+         return int(value)
+     except (TypeError, ValueError):
+         return default
+ 
+ 
+ def _render_style_line(profile: str) -> str:
+     key = profile or "sravni.ru"
+     description = STYLE_PROFILE_DESCRIPTIONS.get(key, STYLE_PROFILE_DESCRIPTIONS["sravni.ru"])
+     if key == "off":
+         return "Пиши в универсальном деловом стиле без упоминания конкретного портала."
+     return f"Используй стиль портала {key}: {description}."
+ 
+ 
+ def _render_optional_line(label: str, value: str) -> str:
+     if not value:
+         return ""
+     return f"{label}: {value}\n"
+ 
+ 
++def _render_theme_suffix(theme: str) -> str:
++    normalized = str(theme or "").strip()
++    if not normalized:
++        return ""
++    return f" по теме {normalized}"
++
++
+ def _render_length_line(min_len: int, max_len: int) -> str:
+     return f"{min_len}\u2013{max_len} символов без пробелов"
+ 
+ 
+ def _render_length_strict_line(min_len: int, max_len: int) -> str:
+     return f"Строго соблюдай диапазон {min_len}\u2013{max_len} символов без пробелов."
+ 
+ 
+ def _render_keywords_mode_line(mode: str) -> str:
+     normalized = (mode or "strict").lower()
+     labels = {
+         "soft": "мягкий — допускаются синонимы и естественные формы",
+         "strict": "строгий — используй точные вхождения",
+         "anti_spam": "запрет переспама — не чаще двух повторов на 1000 символов",
+     }
+     label = labels.get(normalized, labels["strict"])
+     return f"Режим ключевых слов: {label}.\n\n"
+ 
+ 
+ def _render_sources_block(sources: List[Dict[str, str]]) -> str:
+     if not sources:
+         return ""
+     lines: List[str] = []
+     usage_labels = {
+         "quote": "цитата с атрибуцией",
+         "summary": "пересказ со ссылкой",
+         "inspiration": "вдохновение без ссылки",
+     }
+     for source in sources:
+         value = str(source.get("value", "")).strip()
+         if not value:
+             continue
+         usage = str(source.get("usage", "")).strip().lower()
+         usage_label = usage_labels.get(usage, usage)
+         if usage_label:
+             lines.append(f"- {value} — {usage_label}")
+         else:
+             lines.append(f"- {value}")
+     if not lines:
+         return ""
+-    return "Если указаны источники — используй только их:\n" + "\n".join(lines) + "\n\n"
++    header = "Если указаны источники — используй только их:\n" + "\n".join(lines)
++    guidance = (
++        "\nВсегда проверяй, что данные из источников не противоречат друг другу, и вставляй формулировки"
++        " вида «по данным …» без прямых ссылок.\n\n"
++    )
++    return header + guidance
+ 
+ 
+ def _render_faq_line(include_faq: bool, faq_questions: Optional[int]) -> str:
+     if not include_faq:
+         return ""
+     if faq_questions and faq_questions > 0:
+         return (
+             f"В конце добавь блок FAQ (часто задаваемые вопросы по теме) на {faq_questions} вопросов с ответами.\n"
+         )
+     return "В конце добавь блок FAQ (часто задаваемые вопросы по теме) на 3\u20135 вопросов с ответами.\n"
+ 
+ 
+ def _render_jsonld_line(include_jsonld: bool) -> str:
+     if not include_jsonld:
+         return ""
+     return (
+         "Опция JSON-LD включена, но на этом шаге не добавляй разметку — мы запросим её отдельно после проверки текста.\n\n"
+     )
+ 
+ 
++def _render_tone_style_line() -> str:
++    return (
++        "Используй тон и стиль бренда, чтобы подобрать глубину раскрытия, формулировки и примеры,"
++        " соответствующие ожиданиям аудитории.\n"
++    )
++
++
++def _render_structure_hint() -> str:
++    return (
++        "Если структура не задана отдельно, придерживайся рамки: Введение → Основная часть с подзаголовками → FAQ → Вывод/CTA.\n"
++    )
++
++
+ def _normalize_sources(raw: Any) -> List[Dict[str, str]]:
+     if not isinstance(raw, list):
+         return []
+     normalized: List[Dict[str, str]] = []
+     for item in raw:
+         if not isinstance(item, dict):
+             continue
+         value = str(item.get("value", "")).strip()
+         usage = str(item.get("usage", "")).strip().lower()
+         if not value:
+             continue
+         normalized.append({"value": value, "usage": usage})
      return normalized
  
  
- def _normalize_entry(raw: Dict[str, str], seen: set[str]) -> FaqEntry:
-     question_raw = raw.get("question") if "question" in raw else raw.get("q")
-     answer_raw = raw.get("answer") if "answer" in raw else raw.get("a")
-     question = _normalize_question(str(question_raw or ""), seen)
-     answer = _normalize_answer(str(answer_raw or ""))
-     anchor = str(raw.get("anchor") or _sanitize_anchor(question))
-     return FaqEntry(question=question, answer=answer, anchor=anchor)
+ __all__ = ["build_prompt"]
+ 
+diff --git a/tests/test_length_limits.py b/tests/test_length_limits.py
+index ae5f6c3a1c00b5e8762f821cd984ba7fdf569b00..bca6554b0752780fdf3c3eee42db76ef242fd9df 100644
+--- a/tests/test_length_limits.py
++++ b/tests/test_length_limits.py
+@@ -1,56 +1,56 @@
+ from length_limits import compute_soft_length_bounds, resolve_length_limits
  
  
- def _generate_generic_entries(topic: str, keywords: Sequence[str]) -> List[FaqEntry]:
-     base_topic = topic or "теме"
--    key_iter = list(keywords)[:5]
-+    key_iter = list(keywords)[:FAQ_MAX_COUNT]
-     templates = [
-         "Как оценить основные риски, связанные с {topic}?",
-         "Какие шаги помогут подготовиться к решению вопросов по {topic}?",
-         "Какие цифры считать ориентиром, когда речь заходит о {topic}?",
-         "Как использовать программы поддержки, если речь идёт о {topic}?",
-         "Что делать, если ситуация с {topic} резко меняется?",
-+        "Как оптимизировать расходы, связанные с {topic}?",
-+        "Какие ошибки чаще всего совершают при работе с {topic}?",
-+        "Что контролировать после внедрения решений по {topic}?",
-     ]
-     answers = [
-         "Начните с базовой диагностики: опишите текущую ситуацию, посчитайте ключевые показатели и зафиксируйте цели. "
-         "Далее сопоставьте результаты с отраслевыми нормами и составьте план коррекции.",
--        "Сформируйте пошаговый чек-лист. Включите в него анализ документов, консультации с экспертами и список сервисов, которые помогут собрать данные. "
-+        "Сформируйте пошаговый чек-лист. Включите в него анализ документов, консультации с экспертами и список сервисов, которые"
-+        " помогают собрать данные. "
-         "По мере продвижения фиксируйте выводы, чтобы вернуться к ним на этапе принятия решения.",
-         "Используйте диапазон значений из методических материалов и банковской аналитики. "
-         "Сравните собственные показатели с усреднёнными и определите пороги, при которых стоит пересмотреть стратегию.",
-         "Изучите федеральные и региональные программы, подходящие под ваш профиль. "
-         "Составьте список требований, подготовьте пакет документов и оцените сроки рассмотрения, чтобы не потерять время.",
--        "Создайте резервный план действий: определите, какие параметры контролировать ежемесячно, и заранее договоритесь о точках проверки. "
-+        "Создайте резервный план действий: определите, какие параметры контролировать ежемесячно, и заранее договоритесь о точках"
-+        " проверки. "
-         "Если изменения превышают допустимый порог, инициируйте пересмотр стратегии и подключите независимую экспертизу.",
-+        "Проверьте постоянные и переменные траты, сравните предложения подрядчиков и автоматизируйте рутинные операции, чтобы"
-+        " снизить накладные расходы.",
-+        "Отсутствие контроля за дедлайнами и финансовыми ограничениями, игнорирование обратной связи и слабая документация чаще"
-+        " всего приводят к сбоям — заложите проверки на каждом этапе.",
-+        "Отслеживайте показатели эффективности, фиксируйте обратную связь пользователей и заранее планируйте корректировки, чтобы"
-+        " удерживать результат на нужном уровне.",
-     ]
- 
-     entries: List[FaqEntry] = []
--    for idx in range(5):
-+    for idx in range(FAQ_MAX_COUNT):
-         keyword_hint = key_iter[idx] if idx < len(key_iter) else ""
-         question = templates[idx].format(topic=base_topic)
-         if keyword_hint:
-             question = f"{question[:-1]} и {keyword_hint}?"
-         answer = _normalize_answer(answers[idx])
-         anchor = _sanitize_anchor(question)
-         entries.append(FaqEntry(question=question, answer=answer, anchor=anchor))
-     return entries
+ def test_resolve_uses_brief_values():
+     payload = {"length_limits": {"min_chars": 1000, "max_chars": 1200}}
+     result = resolve_length_limits("finance", payload)
+     assert result.min_chars == 1000
+     assert result.max_chars == 1200
+     assert result.min_source == "brief"
+     assert result.max_source == "brief"
+     assert not result.warnings
  
  
- def _render_markdown(entries: Sequence[FaqEntry]) -> str:
-     lines: List[str] = []
-     for idx, entry in enumerate(entries, start=1):
-         lines.append(f"**Вопрос {idx}.** {entry.question}")
-         lines.append(
-             "**Ответ.** "
-             + entry.answer
-             + " Это помогает не только понять детали, но и оформить решение в рабочем формате."
-         )
-         lines.append("")
-     return "\n".join(lines).strip()
+ def test_resolve_uses_profile_defaults_when_missing():
+     result = resolve_length_limits("finance", {})
+-    assert result.min_chars == 5200
+-    assert result.max_chars == 6800
++    assert result.min_chars == 3500
++    assert result.max_chars == 6000
+     assert result.min_source == "profile"
+     assert result.max_source == "profile"
+     assert result.profile_source.endswith("profiles/finance/settings.json")
  
  
- def _build_jsonld(entries: Sequence[FaqEntry]) -> str:
-     payload = {
-@@ -112,61 +126,70 @@ def _build_jsonld(entries: Sequence[FaqEntry]) -> str:
-                 "acceptedAnswer": {"@type": "Answer", "text": entry.answer},
-             }
-             for entry in entries
-         ],
-     }
-     compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-     return f'<script type="application/ld+json">\n{compact}\n</script>'
+ def test_resolve_swaps_when_min_greater_than_max():
+-    payload = {"length_limits": {"min_chars": 6800, "max_chars": 5200}}
++    payload = {"length_limits": {"min_chars": 6000, "max_chars": 3500}}
+     result = resolve_length_limits("finance", payload)
+-    assert result.min_chars == 5200
+-    assert result.max_chars == 6800
++    assert result.min_chars == 3500
++    assert result.max_chars == 6000
+     assert result.swapped
+     assert result.min_source == "brief"
+     assert result.max_source == "brief"
+     assert any("поменяли" in warning.lower() or "перестав" in warning.lower() for warning in result.warnings)
  
  
- def build_faq_block(
-     *,
-     base_text: str,
-     topic: str,
-     keywords: Iterable[str],
-     provided_entries: Sequence[Dict[str, str]] | None = None,
- ) -> FaqBuildResult:
-     entries: List[FaqEntry] = []
-     seen_questions: set[str] = set()
-     if provided_entries:
-         for entry in provided_entries:
-             try:
-                 normalized = _normalize_entry(entry, seen_questions)
-             except ValueError:
-                 continue
-             entries.append(normalized)
--            if len(entries) == 5:
-+            if len(entries) == FAQ_MAX_COUNT:
-                 break
--    if len(entries) < 5:
-+    if len(entries) < FAQ_DEFAULT_LIMIT:
-         for candidate in _generate_generic_entries(topic, list(keywords)):
--            if len(entries) == 5:
-+            if len(entries) >= FAQ_DEFAULT_LIMIT:
-                 break
-             if candidate.question.lower() in seen_questions:
-                 continue
-             seen_questions.add(candidate.question.lower())
-             entries.append(candidate)
+ def test_compute_soft_length_bounds_adds_reasonable_tolerance():
+-    soft_min, soft_max, tol_below, tol_above = compute_soft_length_bounds(5200, 6800)
+-    assert soft_min == 5096
+-    assert soft_max == 6936
+-    assert tol_below == 104
+-    assert tol_above == 136
++    soft_min, soft_max, tol_below, tol_above = compute_soft_length_bounds(3500, 6000)
++    assert soft_min == 3430
++    assert soft_max == 6120
++    assert tol_below == 70
++    assert tol_above == 120
  
--    if len(entries) != 5:
--        raise ValueError("Не удалось собрать пять валидных вопросов для FAQ")
-+    if len(entries) < FAQ_MIN_COUNT:
-+        raise ValueError("Не удалось собрать минимум шесть валидных вопросов для FAQ")
-+    if len(entries) > FAQ_MAX_COUNT:
-+        entries = entries[:FAQ_MAX_COUNT]
  
-     rendered = _render_markdown(entries)
-     placeholder = "<!--FAQ_START-->"
-     end_placeholder = "<!--FAQ_END-->"
-     if placeholder not in base_text or end_placeholder not in base_text:
-         raise ValueError("FAQ placeholder missing in base text")
+ def test_compute_soft_length_bounds_handles_inverted_values():
+-    soft_min, soft_max, _, _ = compute_soft_length_bounds(6800, 5200)
+-    assert soft_min == 5096
+-    assert soft_max == 6936
++    soft_min, soft_max, _, _ = compute_soft_length_bounds(6000, 3500)
++    assert soft_min == 3430
++    assert soft_max == 6120
  
-     before, remainder = base_text.split(placeholder, 1)
-     inside, after = remainder.split(end_placeholder, 1)
-     inside = inside.strip()
-     if inside:
-         rendered = f"{inside}\n\n{rendered}".strip()
-     merged = f"{before}{placeholder}\n{rendered}\n{end_placeholder}{after}"
-     jsonld = _build_jsonld(entries)
-     # JSON-LD валидация
-     try:
-         raw_json = jsonld.split("\n", 1)[1].rsplit("\n", 1)[0]
-         payload = json.loads(raw_json)
-     except Exception as exc:  # noqa: BLE001
-         raise ValueError(f"Некорректный JSON-LD FAQ: {exc}") from exc
--    if not isinstance(payload, dict) or payload.get("@type") != "FAQPage" or len(payload.get("mainEntity", [])) != 5:
-+    main_entities = payload.get("mainEntity") if isinstance(payload, dict) else []
-+    count = len(main_entities) if isinstance(main_entities, list) else 0
-+    if (
-+        not isinstance(payload, dict)
-+        or payload.get("@type") != "FAQPage"
-+        or count < FAQ_MIN_COUNT
-+        or count > FAQ_MAX_COUNT
-+    ):
-         raise ValueError("JSON-LD FAQ не соответствует схеме FAQPage")
-     return FaqBuildResult(text=merged, entries=entries, jsonld=jsonld)
+ 
+ def test_resolve_length_target_translates_to_soft_bounds():
+     payload = {"length_target": 6000}
+     result = resolve_length_limits("finance", payload)
+ 
+     assert result.min_chars == 5880
+     assert result.max_chars == 6120
+     assert result.min_source == "brief"
+     assert result.max_source == "brief"
+     assert payload.get("_length_limits_requested", {}).get("target") == 6000
+diff --git a/tests/test_orchestrate_utils.py b/tests/test_orchestrate_utils.py
+index 9ee4c1fb48a2dc7c9c05b0809fe732f096b99e69..779ab070c3c28ac1377a12ab37d0419481cd6832 100644
+--- a/tests/test_orchestrate_utils.py
++++ b/tests/test_orchestrate_utils.py
+@@ -1,84 +1,84 @@
+ import json
+ import uuid
+ from pathlib import Path
+ 
+ import pytest
+ 
+ from config import LLM_ALLOW_FALLBACK, LLM_ROUTE
+ from deterministic_pipeline import DeterministicPipeline, PipelineStep
+-from faq_builder import build_faq_block
++from faq_builder import FAQ_DEFAULT_LIMIT, build_faq_block
+ from keyword_injector import LOCK_START_TEMPLATE, inject_keywords
+ from length_limits import compute_soft_length_bounds
+ from length_trimmer import trim_text
+ from llm_client import GenerationResult
+ from orchestrate import generate_article_from_payload, gather_health_status
+ from validators import ValidationError, ValidationResult, strip_jsonld, validate_article
+ 
+-MIN_REQUIRED = 5200
+-MAX_REQUIRED = 6800
++MIN_REQUIRED = 3500
++MAX_REQUIRED = 6000
+ 
+ def test_keyword_injection_protects_terms_and_locks_all_occurrences():
+     base_text = "## Основная часть\n\nОписание практик.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
+     result = inject_keywords(base_text, ["ключевая фраза", "дополнительный термин"])
+     assert result.coverage_report == "2/2"
+     assert result.missing_terms == []
+     main_section = result.text.split("## FAQ", 1)[0]
+     first_phrase = (
+         "Дополнительно рассматривается "
+         + f"{LOCK_START_TEMPLATE.format(term='ключевая фраза')}ключевая фраза<!--LOCK_END-->"
+         + " через прикладные сценарии."
+     )
+     second_phrase = (
+         "Дополнительно рассматривается "
+         + f"{LOCK_START_TEMPLATE.format(term='дополнительный термин')}дополнительный термин<!--LOCK_END-->"
+         + " через прикладные сценарии."
+     )
+     assert first_phrase in main_section
+     assert second_phrase in main_section
+     assert "### Разбираемся в терминах" not in result.text
+     assert not result.inserted_section
+ 
+ 
+ def test_keyword_injection_adds_terms_inset_when_needed():
+     base_text = "# Заголовок\n\nВступление.\n\n## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
+     result = inject_keywords(base_text, ["редкий термин"])
+     assert result.inserted_section is True
+     assert "### Разбираемся в терминах" in result.text
+     lock_token = LOCK_START_TEMPLATE.format(term="редкий термин")
+     assert lock_token in result.text
+     assert result.coverage_report == "1/1"
+ 
+ 
+ def test_faq_builder_produces_jsonld_block():
+     base_text = "## FAQ\n\n<!--FAQ_START-->\n<!--FAQ_END-->\n"
+     faq_result = build_faq_block(base_text=base_text, topic="Долговая нагрузка", keywords=["платёж"])
+-    assert faq_result.text.count("**Вопрос") == 5
++    assert faq_result.text.count("**Вопрос") == FAQ_DEFAULT_LIMIT
+     assert faq_result.jsonld.strip().startswith('<script type="application/ld+json">')
+     payload = json.loads(faq_result.jsonld.split("\n", 1)[1].rsplit("\n", 1)[0])
+     assert payload["@type"] == "FAQPage"
+-    assert len(payload["mainEntity"]) == 5
++    assert len(payload["mainEntity"]) == FAQ_DEFAULT_LIMIT
+ 
+ 
+ def test_trim_preserves_locked_and_faq():
+     intro = " ".join(["Параграф с вводной информацией, который можно сократить." for _ in range(4)])
+     removable = "Дополнительный абзац с примерами, который допустимо удалить."
+     faq_lines = []
+     for idx in range(1, 6):
+         faq_lines.append(f"**Вопрос {idx}.** Что важно?")
+         faq_lines.append("**Ответ.** Ответ с деталями.")
+         faq_lines.append("")
+     faq_block = "\n".join(faq_lines).strip()
+     article = (
+         f"## Введение\n\n{intro}\n\n"
+         f"{LOCK_START_TEMPLATE.format(term='важный термин')}важный термин<!--LOCK_END-->\n\n"
+         f"{removable}\n\n"
+         "## FAQ\n\n<!--FAQ_START-->\n"
+         f"{faq_block}\n"
+         "<!--FAQ_END-->"
+     )
+     trimmed = trim_text(article, min_chars=200, max_chars=400)
+     assert "важный термин" in trimmed.text
+     assert "<!--FAQ_START-->" in trimmed.text
+     assert len("".join(trimmed.text.split())) <= 400
+     assert trimmed.removed_paragraphs
+ 
 

@@ -84,14 +84,19 @@ TAIL_FILL_MAX_TOKENS = max(200, _env_int("TAIL_FILL_MAX_TOKENS", 700))
 
 # Дефолтные настройки ядра
 DEFAULT_TONE = "экспертный, дружелюбный"
-DEFAULT_STRUCTURE = ["Введение", "Основная часть", "FAQ", "Вывод"]
+DEFAULT_STRUCTURE = [
+    "Введение",
+    "Основная часть с подзаголовками",
+    "FAQ",
+    "Вывод/CTA",
+]
 
 # Простая «норма» для SEO: ориентир по упоминаниям ключей на ~100 слов
 DEFAULT_SEO_DENSITY = 2
 
 # Рекомендуемые границы объёма (знаков)
-DEFAULT_MIN_LENGTH = 5200
-DEFAULT_MAX_LENGTH = 6800
+DEFAULT_MIN_LENGTH = 3500
+DEFAULT_MAX_LENGTH = 6000
 
 # Максимальный объём пользовательского контекста (символов)
 MAX_CUSTOM_CONTEXT_CHARS = 20_000

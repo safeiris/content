@@ -56,7 +56,6 @@ const downloadReportBtn = document.getElementById("download-report");
 const clearLogBtn = document.getElementById("clear-log");
 const structurePreset = document.getElementById("structure-preset");
 const structureInput = document.getElementById("structure-input");
-const topicInput = document.getElementById("topic-input");
 const keywordsInput = document.getElementById("keywords-input");
 const titleInput = document.getElementById("title-input");
 const audienceInput = document.getElementById("audience-input");
@@ -107,6 +106,7 @@ const STEP_LABELS = {
 
 const PROGRESS_STAGE_LABELS = {
   draft: "Черновик",
+  refine: "Доработка",
   trim: "Нормализация",
   validate: "Проверка",
   done: "Готово",
@@ -115,6 +115,7 @@ const PROGRESS_STAGE_LABELS = {
 
 const PROGRESS_STAGE_MESSAGES = {
   draft: "Генерируем черновик",
+  refine: "Дорабатываем черновик",
   trim: "Нормализуем объём",
   validate: "Проверяем результат",
   done: "Готово",
@@ -123,11 +124,11 @@ const PROGRESS_STAGE_MESSAGES = {
 
 const DEGRADATION_LABELS = {
   draft_failed: "Черновик по запасному сценарию",
-  refine_skipped: "Шаг уточнения пропущен",
-  jsonld_missing: "JSON-LD отсутствует",
-  jsonld_repaired: "JSON-LD восстановлен",
-  post_analysis_skipped: "Проверки пропущены",
-  soft_timeout: "Сработал мягкий таймаут",
+  refine_skipped: "Доработка пропущена",
+  jsonld_missing: "JSON-LD не сформирован",
+  jsonld_repaired: "JSON-LD восстановлен вручную",
+  post_analysis_skipped: "Отчёт о качестве недоступен",
+  soft_timeout: "Мягкий таймаут — результат сохранён",
 };
 
 const DEFAULT_PROGRESS_MESSAGE =
@@ -743,15 +744,23 @@ function renderArtifacts() {
     const metadata = artifact.metadata || {};
     const title = artifact.name || metadata.name || artifact.id || "Без названия";
     const themeName = metadata.theme || extractThemeFromName(title);
-    const topic = metadata.input_data?.theme || metadata.data?.theme || metadata.topic || "Без темы";
+    const topic =
+      metadata.input_data?.title
+      || metadata.data?.title
+      || metadata.title
+      || metadata.input_data?.goal
+      || metadata.input_data?.theme
+      || metadata.data?.theme
+      || metadata.topic
+      || "";
     card.dataset.artifactId = artifact.id || artifact.path || "";
     card.querySelector(".card-title").textContent = title;
     const statusInfo = resolveArtifactStatus(artifact);
     const statusEl = card.querySelector(".status");
     statusEl.textContent = statusInfo.label;
     statusEl.dataset.status = statusInfo.value;
-    const topicText = [themeName, topic].filter(Boolean).join(" · ") || topic;
-    card.querySelector(".card-topic").textContent = topicText;
+    const topicText = [themeName, topic].filter(Boolean).join(" · ");
+    card.querySelector(".card-topic").textContent = topicText || themeName || "Без темы";
     const updatedAt = artifact.modified_at ? new Date(artifact.modified_at) : null;
     card.querySelector(".card-meta").textContent = updatedAt
       ? `Обновлено ${updatedAt.toLocaleString("ru-RU")}`
@@ -1766,7 +1775,13 @@ function renderGenerationResult(snapshot, { payload }) {
         : null,
   };
   draftView.innerHTML = markdownToHtml(markdown);
-  resultTitle.textContent = payload?.data?.theme || "Результат генерации";
+  const requestedLabel =
+    payload?.data?.title
+      || payload?.data?.theme
+      || payload?.data?.goal
+      || payload?.theme
+      || "";
+  resultTitle.textContent = requestedLabel || "Результат генерации";
   const metaParts = [];
   if (hasContent) {
     metaParts.push(`Символов: ${characters.toLocaleString("ru-RU")}`);
@@ -1852,10 +1867,6 @@ function buildRequestPayload() {
   if (!theme) {
     throw new Error("Выберите тематику");
   }
-  const topic = topicInput?.value?.trim() || "";
-  if (!topic) {
-    throw new Error("Укажите тему материала");
-  }
 
   const keywords = keywordsInput.value
     .split(/\r?\n|,/)
@@ -1874,7 +1885,6 @@ function buildRequestPayload() {
   const contextPayload = resolveCustomContextPayload(contextSource);
 
   const data = {
-    theme: topic,
     keywords,
     keywords_mode: keywordMode,
     include_faq: true,
@@ -1930,6 +1940,11 @@ function buildRequestPayload() {
     }
   } else {
     delete data.context_filename;
+  }
+
+  const inferredTopic = titleValue || goalValue || "";
+  if (inferredTopic) {
+    data.theme = inferredTopic;
   }
 
   const payload = {
@@ -3071,7 +3086,7 @@ function updateProgressFromSnapshot(snapshot) {
 
   if (progressStage) {
     const label = PROGRESS_STAGE_LABELS[stage] || PROGRESS_STAGE_LABELS.draft;
-    progressStage.textContent = label;
+    progressStage.textContent = `Шаг: ${label} 0→100%`;
   }
 
   const payload = snapshot.progress_payload && typeof snapshot.progress_payload === "object"
