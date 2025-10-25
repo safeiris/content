@@ -17,6 +17,7 @@ class DummyHealthClient:
         self._responses = list(responses)
         self._index = 0
         self.requests: List[dict] = []
+        self.timeout: Optional[httpx.Timeout] = None
 
     def __enter__(self):
         return self
@@ -30,10 +31,6 @@ class DummyHealthClient:
         response = self._responses[self._index]
         self._index += 1
         return response
-
-    def get(self, url, headers=None, **kwargs):
-        self.requests.append({"method": "GET", "url": url, "headers": headers})
-        return self._next()
 
     def post(self, url, json=None, headers=None, **kwargs):
         self.requests.append({"method": "POST", "url": url, "json": json, "headers": headers})
@@ -63,82 +60,83 @@ def _response(
 
 def test_health_ping_success(monkeypatch):
     payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
-    responses = [
-        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
-        _response(200, payload),
-    ]
+    responses = [_response(200, payload)]
     client = DummyHealthClient(responses)
-    monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
+
+    def _client_factory(timeout=None):
+        client.timeout = timeout
+        return client
+
+    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
 
     result = orchestrate._run_health_ping()
 
     assert result["ok"] is True
     assert result["route"] == LLM_ROUTE
     assert result["fallback_used"] is LLM_ALLOW_FALLBACK
-    expected_label = f"Responses OK (gpt-5, {orchestrate.HEALTH_INITIAL_MAX_TOKENS} токена)"
+    expected_label = f"Responses OK (gpt-5, {orchestrate.HEALTH_INITIAL_MAX_TOKENS} токенов)"
     assert expected_label in result["message"]
 
-    assert client.requests[0]["method"] == "GET"
-    request_payload = client.requests[1]["json"]
+    assert isinstance(client.timeout, httpx.Timeout)
+    assert client.timeout.read == 40.0
+    assert client.timeout.connect == 10.0
+    assert client.timeout.write == 10.0
+    assert client.timeout.pool == 10.0
+
+    assert len(client.requests) == 1
+    request_payload = client.requests[0]["json"]
     assert request_payload["max_output_tokens"] == orchestrate.HEALTH_INITIAL_MAX_TOKENS
+    assert request_payload["input"] == orchestrate.HEALTH_PROMPT
     assert request_payload["text"]["format"]["type"] == "text"
     assert "temperature" not in request_payload
 
 
-def test_health_ping_incomplete_max_tokens(monkeypatch):
-    payload = {
-        "status": "incomplete",
-        "incomplete_details": {"reason": "max_output_tokens"},
-        "output": [],
-    }
-    responses = [
-        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
-        _response(200, payload),
-    ]
-    client = DummyHealthClient(responses)
-    monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
-
-    result = orchestrate._run_health_ping()
-
-    assert result["ok"] is True
-    assert "incomplete по лимиту — норм для health" in result["message"]
-
-
-def test_health_ping_auto_bump(monkeypatch):
-    monkeypatch.setattr(orchestrate, "HEALTH_INITIAL_MAX_TOKENS", 12)
-    error_payload = {
-        "error": {
-            "type": "invalid_request_error",
-            "message": "Invalid 'max_output_tokens': Expected a value >= 16",
-        }
-    }
-    success_payload = {"status": "completed", "output": [{"content": [{"type": "text", "text": "PONG"}]}]}
-    responses = [
-        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
-        _response(400, error_payload),
-        _response(200, success_payload),
-    ]
-    client = DummyHealthClient(responses)
-    monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
-
-    result = orchestrate._run_health_ping()
-
-    assert result["ok"] is True
-    assert f"auto-bump до {orchestrate.HEALTH_MIN_BUMP_TOKENS}" in result["message"]
-    assert len(client.requests) == 3
-    assert client.requests[1]["json"]["max_output_tokens"] == 12
-    assert client.requests[2]["json"]["max_output_tokens"] >= orchestrate.HEALTH_MIN_BUMP_TOKENS
-
-
 def test_health_ping_5xx_failure(monkeypatch):
-    responses = [
-        _response(200, {"id": orchestrate.HEALTH_MODEL}, method="GET", url=f"https://api.openai.com/v1/models/{orchestrate.HEALTH_MODEL}"),
-        _response(502, None, text="Bad gateway"),
-    ]
+    responses = [_response(502, None, text="Bad gateway")]
     client = DummyHealthClient(responses)
-    monkeypatch.setattr(orchestrate.httpx, "Client", lambda timeout=None: client)
+    def _client_factory(timeout=None):
+        client.timeout = timeout
+        return client
+
+    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
 
     result = orchestrate._run_health_ping()
 
     assert result["ok"] is False
     assert "HTTP 502" in result["message"]
+    assert len(client.requests) == 1
+
+
+def test_health_ping_timeout_degraded(monkeypatch):
+    class TimeoutClient:
+        def __init__(self):
+            self.calls = 0
+            self.timeout: Optional[httpx.Timeout] = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None, **kwargs):
+            self.calls += 1
+            raise httpx.ReadTimeout("timeout", request=httpx.Request("POST", url))
+
+    timeout_client = TimeoutClient()
+
+    def _client_factory(timeout=None):
+        timeout_client.timeout = timeout
+        return timeout_client
+
+    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
+    monkeypatch.setattr(orchestrate.random, "uniform", lambda a, b: 0.4)
+    monkeypatch.setattr(orchestrate.time, "sleep", lambda _: None)
+
+    result = orchestrate._run_health_ping()
+
+    assert result["ok"] is False
+    assert result["status"] == "degraded"
+    assert result["attempts"] == 2
+    assert result["message"] == "LLM degraded: timeout on health ping (2 attempts, read=40s)."
+    assert timeout_client.calls == 2

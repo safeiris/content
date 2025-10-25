@@ -5,6 +5,7 @@ import json
 import logging
 import httpx
 import os
+import random
 import sys
 import time
 from copy import deepcopy
@@ -30,7 +31,6 @@ from llm_client import (
     DEFAULT_MODEL,
     RESPONSES_API_URL,
     build_responses_payload,
-    is_min_tokens_error,
     sanitize_payload_for_responses,
 )
 from keywords import parse_manual_keywords
@@ -42,11 +42,10 @@ TARGET_LENGTH_RANGE: Tuple[int, int] = (DEFAULT_MIN_LENGTH, DEFAULT_MAX_LENGTH)
 LATEST_SCHEMA_VERSION = "2024-06"
 
 HEALTH_MODEL = DEFAULT_MODEL
-HEALTH_PROMPT = "Ответь ровно словом: PONG"
+HEALTH_PROMPT = "ping"
 LOGGER = logging.getLogger(__name__)
 
-HEALTH_INITIAL_MAX_TOKENS = 10
-HEALTH_MIN_BUMP_TOKENS = 24
+HEALTH_INITIAL_MAX_TOKENS = 8
 
 
 @dataclass
@@ -708,9 +707,31 @@ def _run_health_ping() -> Dict[str, object]:
     sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
     sanitized_payload["text"] = {"format": deepcopy(text_format)}
     sanitized_payload["max_output_tokens"] = max_tokens
+    sanitized_payload.pop("response_format", None)
+    sanitized_payload.pop("tool_resources", None)
+
+    endpoint = RESPONSES_API_URL
+    start = time.perf_counter()
+
+    def _is_direct(url: str) -> bool:
+        host = url.split("//", 1)[-1].split("/", 1)[0].lower()
+        return "api.openai.com" in host
+
+    via = "direct" if _is_direct(endpoint) else "relay"
+
+    def _log_health(duration_ms: int) -> None:
+        LOGGER.info(
+            "health_ping endpoint=%s model=%s via=%s duration=%d",
+            endpoint,
+            model,
+            via,
+            duration_ms,
+        )
 
     api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
     if not api_key:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        _log_health(latency_ms)
         return {
             "ok": False,
             "message": "Responses недоступен: ключ не задан",
@@ -725,62 +746,97 @@ def _run_health_ping() -> Dict[str, object]:
 
     route = LLM_ROUTE
     fallback_used = LLM_ALLOW_FALLBACK
-    model_url = f"https://api.openai.com/v1/models/{model}"
-
-    start = time.perf_counter()
-    attempts = 0
-    max_attempts = 2
-    min_bump_done = False
-    current_max_tokens = max_tokens
-    auto_bump_applied = False
-    data: Optional[Dict[str, object]] = None
-    response: Optional[httpx.Response] = None
+    timeout = httpx.Timeout(connect=10.0, read=40.0, write=10.0, pool=10.0)
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
-            model_probe = client.get(model_url, headers=headers)
-            if model_probe.status_code != 200:
-                detail = model_probe.text.strip()
-                if len(detail) > 120:
-                    detail = f"{detail[:117]}..."
+        with httpx.Client(timeout=timeout) as client:
+            max_attempts = 2
+            attempt = 0
+            response: Optional[httpx.Response] = None
+            while attempt < max_attempts:
+                attempt += 1
+                try:
+                    response = client.post(
+                        endpoint,
+                        json=sanitized_payload,
+                        headers=headers,
+                    )
+                    break
+                except httpx.TimeoutException:
+                    LOGGER.warning(
+                        "health_ping timeout attempt=%d read=%.0fs endpoint=%s",
+                        attempt,
+                        timeout.read,
+                        endpoint,
+                    )
+                    if attempt >= max_attempts:
+                        latency_ms = int((time.perf_counter() - start) * 1000)
+                        LOGGER.warning(
+                            "health_ping degraded attempts=%d endpoint=%s",
+                            attempt,
+                            endpoint,
+                        )
+                        _log_health(latency_ms)
+                        return {
+                            "ok": False,
+                            "message": "LLM degraded: timeout on health ping (2 attempts, read=40s).",
+                            "route": route,
+                            "fallback_used": fallback_used,
+                            "latency_ms": latency_ms,
+                            "status": "degraded",
+                            "attempts": attempt,
+                        }
+                    delay = random.uniform(0.4, 0.8)
+                    time.sleep(delay)
+            if response is None:
                 latency_ms = int((time.perf_counter() - start) * 1000)
+                LOGGER.warning("health_ping no_response endpoint=%s", endpoint)
+                _log_health(latency_ms)
                 return {
                     "ok": False,
-                    "message": (
-                        f"Модель {model} недоступна: HTTP {model_probe.status_code}"
-                        + (f" — {detail}" if detail else "")
-                    ),
-                    "route": "models",
-                    "fallback_used": LLM_ALLOW_FALLBACK,
+                    "message": "Responses недоступен: нет ответа",
+                    "route": route,
+                    "fallback_used": fallback_used,
                     "latency_ms": latency_ms,
                 }
 
-            while attempts < max_attempts:
-                attempts += 1
-                payload_snapshot = dict(sanitized_payload)
-                payload_snapshot["text"] = {"format": deepcopy(text_format)}
-                payload_snapshot["max_output_tokens"] = current_max_tokens
-                input_candidate = payload_snapshot.get("input", "")
-                input_len = len(input_candidate) if isinstance(input_candidate, str) else 0
-                LOGGER.info("responses input_len=%d", input_len)
-                response = client.post(
-                    RESPONSES_API_URL,
-                    json=payload_snapshot,
-                    headers=headers,
+            latency_ms = int((time.perf_counter() - start) * 1000)
+
+            if response.status_code != 200:
+                detail = response.text.strip()
+                if len(detail) > 120:
+                    detail = f"{detail[:117]}..."
+                LOGGER.warning(
+                    "health_ping http_error status=%d endpoint=%s",
+                    response.status_code,
+                    endpoint,
                 )
-                if (
-                    response.status_code == 400
-                    and not min_bump_done
-                    and is_min_tokens_error(response)
-                ):
-                    current_max_tokens = max(current_max_tokens, HEALTH_MIN_BUMP_TOKENS)
-                    sanitized_payload["max_output_tokens"] = current_max_tokens
-                    min_bump_done = True
-                    auto_bump_applied = True
-                    continue
-                break
+                _log_health(latency_ms)
+                return {
+                    "ok": False,
+                    "message": f"Responses недоступен: HTTP {response.status_code} — {detail or 'ошибка'}",
+                    "route": route,
+                    "fallback_used": fallback_used,
+                    "latency_ms": latency_ms,
+                }
+
+            try:
+                data = response.json()
+            except ValueError:
+                LOGGER.warning("health_ping invalid_json endpoint=%s", endpoint)
+                _log_health(latency_ms)
+                return {
+                    "ok": False,
+                    "message": "Responses недоступен: некорректный JSON",
+                    "route": route,
+                    "fallback_used": fallback_used,
+                    "latency_ms": latency_ms,
+                }
+
     except httpx.TimeoutException:
         latency_ms = int((time.perf_counter() - start) * 1000)
+        LOGGER.warning("health_ping timeout outer endpoint=%s", endpoint)
+        _log_health(latency_ms)
         return {
             "ok": False,
             "message": "Responses недоступен: таймаут",
@@ -791,43 +847,11 @@ def _run_health_ping() -> Dict[str, object]:
     except httpx.HTTPError as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
         reason = str(exc).strip() or exc.__class__.__name__
+        LOGGER.warning("health_ping http_error exception=%s endpoint=%s", reason, endpoint)
+        _log_health(latency_ms)
         return {
             "ok": False,
             "message": f"Responses недоступен: {reason}",
-            "route": route,
-            "fallback_used": fallback_used,
-            "latency_ms": latency_ms,
-        }
-
-    latency_ms = int((time.perf_counter() - start) * 1000)
-
-    if response is None:
-        return {
-            "ok": False,
-            "message": "Responses недоступен: нет ответа",
-            "route": route,
-            "fallback_used": fallback_used,
-            "latency_ms": latency_ms,
-        }
-
-    if response.status_code != 200:
-        detail = response.text.strip()
-        if len(detail) > 120:
-            detail = f"{detail[:117]}..."
-        return {
-            "ok": False,
-            "message": f"Responses недоступен: HTTP {response.status_code} — {detail or 'ошибка'}",
-            "route": route,
-            "fallback_used": fallback_used,
-            "latency_ms": latency_ms,
-        }
-
-    try:
-        data = response.json()
-    except ValueError:
-        return {
-            "ok": False,
-            "message": "Responses недоступен: некорректный JSON",
             "route": route,
             "fallback_used": fallback_used,
             "latency_ms": latency_ms,
@@ -848,16 +872,8 @@ def _run_health_ping() -> Dict[str, object]:
     elif isinstance(data.get("output"), list) or isinstance(data.get("outputs"), list):
         got_output = True
 
-    extras: List[str] = []
-    if auto_bump_applied:
-        extras.append(f"auto-bump до {current_max_tokens}")
-
     if status == "completed":
-        message = f"Responses OK (gpt-5, {current_max_tokens} токена"
-        ok = True
-    elif status == "incomplete" and incomplete_reason == "max_output_tokens":
-        extras.insert(0, "incomplete по лимиту — норм для health")
-        message = f"Responses OK (gpt-5, {current_max_tokens} токена"
+        message = f"Responses OK (gpt-5, {max_tokens} токенов)"
         ok = True
     else:
         if not status:
@@ -866,6 +882,8 @@ def _run_health_ping() -> Dict[str, object]:
             reason = status
             if incomplete_reason:
                 reason = f"{reason} ({incomplete_reason})"
+        LOGGER.warning("health_ping bad_status status=%s endpoint=%s", status or "", endpoint)
+        _log_health(latency_ms)
         return {
             "ok": False,
             "message": f"Responses недоступен: статус {reason}",
@@ -875,22 +893,20 @@ def _run_health_ping() -> Dict[str, object]:
             "status": status or "",
         }
 
-    if extras:
-        message = f"{message}; {'; '.join(extras)})"
-    else:
-        message = f"{message})"
-
     result: Dict[str, object] = {
         "ok": ok,
         "message": message,
         "route": route,
         "fallback_used": fallback_used,
         "latency_ms": latency_ms,
-        "tokens": current_max_tokens,
+        "tokens": max_tokens,
         "status": status,
         "incomplete_reason": incomplete_reason or None,
         "got_output": got_output,
     }
+
+    duration_ms = int((time.perf_counter() - start) * 1000)
+    _log_health(duration_ms)
     return result
 
 
