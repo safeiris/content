@@ -7,6 +7,8 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+import llm_client as llm_client_module  # noqa: E402
+
 from config import LLM_ALLOW_FALLBACK, LLM_MODEL, LLM_ROUTE
 from llm_client import (  # noqa: E402
     DEFAULT_RESPONSES_TEXT_FORMAT,
@@ -247,3 +249,49 @@ def test_generate_accepts_incomplete_with_text():
     flags = metadata.get("degradation_flags") or []
     assert "draft_max_tokens" in flags
     assert len(client.requests) == 1
+
+
+def test_responses_continue_includes_model_and_tokens(monkeypatch):
+    monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_BASE", 64, raising=False)
+    monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP1", 96, raising=False)
+    monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_STEP2", 128, raising=False)
+    monkeypatch.setattr("llm_client.G5_MAX_OUTPUT_TOKENS_MAX", 128, raising=False)
+    monkeypatch.setattr("llm_client.G5_ESCALATION_LADDER", (64, 96, 128), raising=False)
+
+    incomplete_payload = {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "id": "resp-1",
+        "output": [],
+    }
+    final_payload = {
+        "status": "completed",
+        "output": [
+            {
+                "content": [
+                    {"type": "text", "text": "Готовый текст"},
+                ]
+            }
+        ],
+    }
+
+    with patch("llm_client.LOGGER"):
+        result, client = _generate_with_dummy(
+            responses=[incomplete_payload, final_payload],
+            max_tokens=64,
+        )
+
+    assert len(client.requests) == 2
+    primary_payload = client.requests[0]["json"]
+    continue_payload = client.requests[1]["json"]
+
+    assert continue_payload["previous_response_id"] == "resp-1"
+    assert continue_payload["model"] == primary_payload["model"]
+    assert continue_payload["text"]["format"] == primary_payload["text"]["format"]
+    expected_tokens = llm_client_module.G5_ESCALATION_LADDER[1]
+    assert continue_payload["max_output_tokens"] == expected_tokens
+
+    metadata = result.metadata or {}
+    flags = metadata.get("degradation_flags") or []
+    assert "draft_max_tokens" in flags
+    assert metadata.get("completion_warning") == "max_output_tokens"

@@ -1607,6 +1607,9 @@ def generate(
             previous_response_id=effective_previous_id,
         )
         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
+        base_model_name = str(sanitized_payload.get("model") or target_model).strip()
+        if not base_model_name:
+            base_model_name = target_model
 
         text_section = sanitized_payload.get("text")
         if not isinstance(text_section, dict):
@@ -1830,6 +1833,46 @@ def generate(
         cap_retry_performed = False
         empty_retry_attempted = False
         empty_direct_retry_attempted = False
+        pending_degradation_flags: List[str] = []
+        pending_completion_warning: Optional[str] = None
+
+        def _record_pending_degradation(reason: str) -> None:
+            nonlocal pending_completion_warning
+            normalized_reason = (reason or "").strip().lower()
+            if not normalized_reason:
+                return
+            flag_map = {
+                "max_output_tokens": "draft_max_tokens",
+                "soft_timeout": "draft_soft_timeout",
+            }
+            flag = flag_map.get(normalized_reason)
+            if flag and flag not in pending_degradation_flags:
+                pending_degradation_flags.append(flag)
+            if not pending_completion_warning:
+                pending_completion_warning = normalized_reason
+
+        def _apply_pending_degradation(metadata: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(metadata, dict):
+                metadata = {}
+            else:
+                metadata = dict(metadata)
+            if pending_degradation_flags:
+                existing: List[str] = []
+                raw_flags = metadata.get("degradation_flags")
+                if isinstance(raw_flags, list):
+                    existing.extend(
+                        str(flag).strip()
+                        for flag in raw_flags
+                        if isinstance(flag, str) and str(flag).strip()
+                    )
+                for flag in pending_degradation_flags:
+                    if flag not in existing:
+                        existing.append(flag)
+                if existing:
+                    metadata["degradation_flags"] = existing
+            if pending_completion_warning and not metadata.get("completion_warning"):
+                metadata["completion_warning"] = pending_completion_warning
+            return metadata
 
         def _compute_next_max_tokens(current: int, step_index: int, cap: Optional[int]) -> int:
             ladder: List[int] = []
@@ -1902,11 +1945,18 @@ def generate(
         while attempts < max_attempts:
             attempts += 1
             if resume_from_response_id:
-                current_payload: Dict[str, object] = {
+                current_payload = {
+                    "model": base_model_name,
                     "previous_response_id": resume_from_response_id,
+                    "max_output_tokens": max(min_token_floor, int(current_max)),
                 }
                 _apply_text_format(current_payload)
-                LOGGER.info("RESP_CONTINUE previous_response_id=%s", resume_from_response_id)
+                LOGGER.info(
+                    "RESP_CONTINUE previous_response_id=%s model=%s max_output_tokens=%s",
+                    resume_from_response_id,
+                    base_model_name,
+                    current_payload.get("max_output_tokens"),
+                )
             else:
                 current_payload = dict(sanitized_payload)
                 _apply_text_format(current_payload)
@@ -1934,8 +1984,6 @@ def generate(
             format_block, fmt_type, fmt_name, has_schema, fixed_name = _ensure_format_name(current_payload)
             if resume_from_response_id:
                 current_payload.pop("input", None)
-                current_payload.pop("max_output_tokens", None)
-                current_payload.pop("model", None)
             suffix = " (fixed=name)" if fixed_name else ""
             LOGGER.info(
                 "LOG:RESP_PAYLOAD_FORMAT type=%s name=%s has_schema=%s%s",
@@ -2021,26 +2069,33 @@ def generate(
                         segments = int(parse_flags.get("segments", 0) or 0)
                         LOGGER.info("RESP_STATUS=%s|%s", status or "ok", reason or "-")
                 if status == "incomplete":
+                    response_id_value = metadata.get("response_id") or ""
+                    prev_field_present = "previous_response_id" in data or (
+                        isinstance(metadata.get("previous_response_id"), str)
+                        and metadata.get("previous_response_id")
+                    )
+                    if (
+                        response_id_value
+                        and reason in {"max_output_tokens", "soft_timeout"}
+                        and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
+                    ):
+                        resume_from_response_id = str(response_id_value)
                     if reason == "max_output_tokens":
                         LOGGER.info(
                             "RESP_STATUS=incomplete|max_output_tokens=%s",
                             current_payload.get("max_output_tokens"),
                         )
-                        response_id_value = metadata.get("response_id") or ""
-                        prev_field_present = "previous_response_id" in data or (
-                            isinstance(metadata.get("previous_response_id"), str)
-                            and metadata.get("previous_response_id")
-                        )
-                        if (
-                            response_id_value
-                            and (G5_ENABLE_PREVIOUS_ID_FETCH or prev_field_present)
-                        ):
-                            resume_from_response_id = str(response_id_value)
                         schema_dict: Optional[Dict[str, Any]] = None
                         if isinstance(format_block, dict):
                             candidate_schema = format_block.get("schema")
                             if isinstance(candidate_schema, dict):
                                 schema_dict = candidate_schema
+                        if (
+                            not text
+                            and schema_label == "responses.none"
+                            and segments == 0
+                        ):
+                            _record_pending_degradation(reason)
                         if text:
                             metadata = dict(metadata)
                             metadata["status"] = "completed"
@@ -2069,6 +2124,7 @@ def generate(
                                     len(text),
                                 )
                                 metadata["completion_schema_valid"] = False
+                            metadata = _apply_pending_degradation(metadata)
                             parse_flags["metadata"] = metadata
                             updated_data = dict(data)
                             updated_data["metadata"] = metadata
@@ -2159,6 +2215,13 @@ def generate(
                     continue
                 if not text:
                     if (
+                        status == "incomplete"
+                        and reason == "soft_timeout"
+                        and schema_label == "responses.none"
+                        and segments == 0
+                    ):
+                        _record_pending_degradation(reason)
+                    if (
                         allow_empty_retry
                         and status == "incomplete"
                         and segments == 0
@@ -2205,8 +2268,12 @@ def generate(
                     if not allow_empty_retry:
                         raise last_error
                     continue
-                _persist_raw_response(data)
-                return text, parse_flags, data, schema_label
+                metadata = _apply_pending_degradation(metadata)
+                parse_flags["metadata"] = metadata
+                updated_data = dict(data)
+                updated_data["metadata"] = metadata
+                _persist_raw_response(updated_data)
+                return text, parse_flags, updated_data, schema_label
             except EmptyCompletionError as exc:
                 last_error = exc
                 if not allow_empty_retry:
