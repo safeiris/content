@@ -45,7 +45,6 @@ RESPONSES_ALLOWED_KEYS = (
     "input",
     "max_output_tokens",
     "text",
-    "response_format",
     "previous_response_id",
 )
 RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
@@ -385,7 +384,7 @@ def build_responses_payload(
         "model": str(model).strip(),
         "input": joined_input.strip(),
         "max_output_tokens": int(max_tokens),
-        "response_format": format_block,
+        "text": {"format": format_block},
     }
     if previous_response_id and previous_response_id.strip():
         payload["previous_response_id"] = previous_response_id.strip()
@@ -470,13 +469,22 @@ def _sanitize_text_format_in_place(
     if not isinstance(format_block, dict):
         return False, False, 0
 
+    removed_keys: List[str] = []
+
+    def _pop_key(key: str) -> None:
+        if key in format_block:
+            format_block.pop(key, None)
+            removed_keys.append(key)
+
     allowed_keys = {"type", "name", "schema", "strict"}
 
     if not isinstance(format_block.get("schema"), dict):
         if "schema" in format_block:
-            format_block.pop("schema", None)
+            _pop_key("schema")
             migrated = True
 
+    if "json_schema" in format_block:
+        removed_keys.append("json_schema")
     legacy_block = format_block.pop("json_schema", None)
     if isinstance(legacy_block, dict):
         schema_candidate = legacy_block.get("schema")
@@ -500,7 +508,7 @@ def _sanitize_text_format_in_place(
                 format_block["type"] = "text"
                 migrated = True
         else:
-            format_block.pop("type", None)
+            _pop_key("type")
             migrated = True
     elif type_value is not None:
         trimmed = str(type_value).strip()
@@ -509,7 +517,7 @@ def _sanitize_text_format_in_place(
             format_block["type"] = "text" if normalized == "output_text" else trimmed
             migrated = True
         else:
-            format_block.pop("type", None)
+            _pop_key("type")
             migrated = True
 
     name_value = format_block.get("name")
@@ -520,7 +528,7 @@ def _sanitize_text_format_in_place(
                 format_block["name"] = trimmed
                 migrated = True
         else:
-            format_block.pop("name", None)
+            _pop_key("name")
             migrated = True
     elif name_value is not None:
         trimmed = str(name_value).strip()
@@ -528,14 +536,14 @@ def _sanitize_text_format_in_place(
             format_block["name"] = trimmed
             migrated = True
         else:
-            format_block.pop("name", None)
+            _pop_key("name")
             migrated = True
 
     strict_value = format_block.get("strict")
     strict_bool = _coerce_bool(strict_value)
     if strict_bool is None:
         if "strict" in format_block:
-            format_block.pop("strict", None)
+            _pop_key("strict")
             migrated = True
     else:
         if strict_value is not strict_bool:
@@ -547,14 +555,14 @@ def _sanitize_text_format_in_place(
         stripped_any = False
         for forbidden_key in ("name", "schema", "strict"):
             if forbidden_key in format_block:
-                format_block.pop(forbidden_key, None)
+                _pop_key(forbidden_key)
                 stripped_any = True
         if stripped_any:
             migrated = True
 
     for key in list(format_block.keys()):
         if key not in allowed_keys:
-            format_block.pop(key, None)
+            _pop_key(key)
             migrated = True
 
     if "type" not in format_block and isinstance(format_block.get("schema"), dict):
@@ -581,6 +589,12 @@ def _sanitize_text_format_in_place(
             context,
             fmt_type,
             fmt_name,
+        )
+    if removed_keys:
+        LOGGER.warning(
+            "LOG:RESP_SCHEMA_KEYS_REMOVED context=%s keys=%s",
+            context,
+            sorted(set(removed_keys)),
         )
     if enforced_count > 0:
         LOGGER.info(
@@ -621,7 +635,7 @@ def _prepare_text_format_for_request(
     return working_copy, migrated, has_schema
 
 
-def _sanitize_response_format_block(
+def _sanitize_text_format_block(
     format_value: Dict[str, object],
     *,
     context: str,
@@ -643,7 +657,7 @@ def _sanitize_text_block(text_value: Dict[str, object]) -> Optional[Dict[str, ob
     if not isinstance(text_value, dict):
         return None
     format_block = text_value.get("format")
-    sanitized_format = _sanitize_response_format_block(
+    sanitized_format = _sanitize_text_format_block(
         format_block,
         context="sanitize_payload.text",
     )
@@ -696,20 +710,11 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
             except (TypeError, ValueError):
                 continue
             continue
-        if key == "response_format":
-            if isinstance(value, dict):
-                sanitized_format = _sanitize_response_format_block(
-                    value,
-                    context="sanitize_payload.response_format",
-                )
-                if sanitized_format:
-                    sanitized["response_format"] = sanitized_format
-            continue
         if key == "text":
             if isinstance(value, dict):
                 sanitized_text = _sanitize_text_block(value)
                 if sanitized_text:
-                    sanitized["response_format"] = sanitized_text.get("format", {})
+                    sanitized["text"] = sanitized_text
             continue
     input_value = sanitized.get("input", "")
     input_length = len(input_value) if isinstance(input_value, str) else 0
@@ -1603,7 +1608,10 @@ def generate(
         )
         sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
 
-        format_template_source = sanitized_payload.get("response_format")
+        text_section = sanitized_payload.get("text")
+        if not isinstance(text_section, dict):
+            text_section = {}
+        format_template_source = text_section.get("format")
         if not isinstance(format_template_source, dict) or not format_template_source:
             raw_format_template = (
                 text_format_override
@@ -1637,63 +1645,52 @@ def generate(
             if current_name not in allowed_names:
                 format_template["name"] = RESPONSES_FORMAT_DEFAULT_NAME
 
-        def _clone_response_format() -> Dict[str, object]:
+        def _clone_text_format() -> Dict[str, object]:
             return deepcopy(format_template)
 
-        def _apply_response_format(target: Dict[str, object]) -> None:
-            target["response_format"] = _clone_response_format()
-            target.pop("text", None)
-
-        def _normalize_format_block(
-            format_block: Optional[Dict[str, object]]
-        ) -> Tuple[str, str, bool, bool]:
-            fmt_type = "-"
-            fmt_name = "-"
-            has_schema = False
-            fixed = False
-            if isinstance(format_block, dict):
-                _sanitize_text_format_in_place(
-                    format_block,
-                    context="normalize_format_block",
-                    log_on_migration=False,
-                )
-                fmt_type = str(format_block.get("type", "")).strip() or "-"
-                has_schema = isinstance(format_block.get("schema"), dict)
-                current_name = str(format_block.get("name", "")).strip()
-                if fmt_type.lower() == "json_schema":
-                    allowed_names = {
-                        RESPONSES_FORMAT_DEFAULT_NAME,
-                        FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT.get("name"),
-                    }
-                    desired = RESPONSES_FORMAT_DEFAULT_NAME
-                    if current_name not in allowed_names:
-                        format_block["name"] = desired
-                        current_name = desired
-                        fixed = True
-                if current_name:
-                    fmt_name = current_name
-            return fmt_type, fmt_name, has_schema, fixed
+        def _apply_text_format(target: Dict[str, object]) -> Dict[str, object]:
+            text_container = target.get("text")
+            if not isinstance(text_container, dict):
+                text_container = {}
+            format_block = text_container.get("format")
+            if not isinstance(format_block, dict):
+                format_block = _clone_text_format()
+            else:
+                format_block = deepcopy(format_block)
+            text_container["format"] = format_block
+            target["text"] = text_container
+            return format_block
 
         def _ensure_format_name(
             target: Dict[str, object]
-        ) -> Tuple[Optional[Dict[str, object]], str, str, bool, bool]:
-            format_block = target.get("response_format")
-            if not isinstance(format_block, dict):
-                text_block = target.get("text")
-                if isinstance(text_block, dict):
-                    candidate = text_block.get("format")
-                    if isinstance(candidate, dict):
-                        format_block = deepcopy(candidate)
-            if not isinstance(format_block, dict):
-                format_block = _clone_response_format()
-            else:
-                format_block = deepcopy(format_block)
-            target["response_format"] = format_block
-            target.pop("text", None)
-            fmt_type, fmt_name, has_schema, fixed = _normalize_format_block(format_block)
+        ) -> Tuple[Dict[str, object], str, str, bool, bool]:
+            format_block = _apply_text_format(target)
+            _sanitize_text_format_in_place(
+                format_block,
+                context="normalize_format_block",
+                log_on_migration=False,
+            )
+            fmt_type = str(format_block.get("type", "")).strip() or "-"
+            has_schema = isinstance(format_block.get("schema"), dict)
+            fmt_name = str(format_block.get("name", "")).strip()
+            fixed = False
+            if fmt_type.lower() == "json_schema":
+                allowed_names = {RESPONSES_FORMAT_DEFAULT_NAME}
+                fallback_name = str(
+                    FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT.get("name", "")
+                ).strip()
+                if fallback_name:
+                    allowed_names.add(fallback_name)
+                desired = RESPONSES_FORMAT_DEFAULT_NAME
+                if fmt_name not in allowed_names:
+                    format_block["name"] = desired
+                    fmt_name = desired
+                    fixed = True
+            if not fmt_name:
+                fmt_name = "-"
             return format_block, fmt_type, fmt_name, has_schema, fixed
 
-        _apply_response_format(sanitized_payload)
+        sanitized_payload["text"] = {"format": deepcopy(format_template)}
 
         raw_max_tokens = sanitized_payload.get("max_output_tokens")
         try:
@@ -1730,15 +1727,11 @@ def generate(
             LOGGER.info("responses input_len=%d", length)
             LOGGER.info("responses max_output_tokens=%s", snapshot.get("max_output_tokens"))
             format_block: Optional[Dict[str, object]] = None
-            response_block = snapshot.get("response_format")
-            if isinstance(response_block, dict):
-                format_block = response_block
-            else:
-                text_block = snapshot.get("text")
-                if isinstance(text_block, dict):
-                    candidate = text_block.get("format")
-                    if isinstance(candidate, dict):
-                        format_block = candidate
+            text_block = snapshot.get("text")
+            if isinstance(text_block, dict):
+                candidate = text_block.get("format")
+                if isinstance(candidate, dict):
+                    format_block = candidate
             format_type = "-"
             format_name = "-"
             has_schema = False
@@ -1911,12 +1904,12 @@ def generate(
             if resume_from_response_id:
                 current_payload: Dict[str, object] = {
                     "previous_response_id": resume_from_response_id,
-                    "response_format": _clone_response_format(),
                 }
+                _apply_text_format(current_payload)
                 LOGGER.info("RESP_CONTINUE previous_response_id=%s", resume_from_response_id)
             else:
                 current_payload = dict(sanitized_payload)
-                _apply_response_format(current_payload)
+                _apply_text_format(current_payload)
                 if not content_started:
                     if shrink_applied and shrunken_input:
                         current_payload["input"] = shrunken_input
@@ -1956,20 +1949,20 @@ def generate(
                 try:
                     updated_format = deepcopy(format_block)
                 except (TypeError, ValueError):
-                    updated_format = _clone_response_format()
-            if not resume_from_response_id and updated_format is not None:
-                sanitized_payload["response_format"] = deepcopy(updated_format)
+                    updated_format = _clone_text_format()
+            if not resume_from_response_id and isinstance(updated_format, dict):
+                sanitized_payload["text"] = {"format": deepcopy(updated_format)}
                 format_template = deepcopy(updated_format)
-            if updated_format is not None:
+            if isinstance(updated_format, dict):
                 try:
                     format_snapshot = json.dumps(updated_format, ensure_ascii=False, sort_keys=True)
                 except (TypeError, ValueError):
                     format_snapshot = str(updated_format)
-                LOGGER.debug("DEBUG:payload.response_format = %s", format_snapshot)
-                current_payload["response_format"] = deepcopy(updated_format)
+                LOGGER.debug("DEBUG:payload.text.format = %s", format_snapshot)
+                current_payload["text"] = {"format": deepcopy(updated_format)}
             else:
-                LOGGER.debug("DEBUG:payload.response_format = null")
-                current_payload["response_format"] = _clone_response_format()
+                LOGGER.debug("DEBUG:payload.text.format = null")
+                current_payload["text"] = {"format": _clone_text_format()}
             _log_payload(current_payload)
             try:
                 _store_responses_request_snapshot(current_payload)
@@ -2232,7 +2225,7 @@ def generate(
                     format_retry_done = True
                     retry_used = True
                     LOGGER.warning("RESP_RETRY_REASON=response_format_moved")
-                    _apply_response_format(sanitized_payload)
+                    _apply_text_format(sanitized_payload)
                     continue
                 if (
                     status == 400
@@ -2243,8 +2236,13 @@ def generate(
                     format_type_retry_done = True
                     retry_used = True
                     LOGGER.warning("RESP_RETRY_REASON=text_format_type_migrated")
-                    _apply_response_format(sanitized_payload)
-                    fmt_block = sanitized_payload.get("response_format")
+                    _apply_text_format(sanitized_payload)
+                    text_block = sanitized_payload.get("text")
+                    fmt_block = None
+                    if isinstance(text_block, dict):
+                        candidate = text_block.get("format")
+                        if isinstance(candidate, dict):
+                            fmt_block = candidate
                     if isinstance(fmt_block, dict):
                         fmt_block["type"] = "text"
                         format_template = deepcopy(fmt_block)
@@ -2261,11 +2259,10 @@ def generate(
                             "RESP_RETRY_REASON=format_name_missing route=responses attempt=%d",
                             attempts,
                         )
-                        _apply_response_format(sanitized_payload)
-                        _ensure_format_name(sanitized_payload)
-                        response_format_block = sanitized_payload.get("response_format")
-                        if isinstance(response_format_block, dict):
-                            format_template = deepcopy(response_format_block)
+                        _apply_text_format(sanitized_payload)
+                        format_block, _, _, _, _ = _ensure_format_name(sanitized_payload)
+                        if isinstance(format_block, dict):
+                            format_template = deepcopy(format_block)
                         continue
                 if (
                     status == 400
