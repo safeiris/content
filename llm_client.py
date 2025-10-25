@@ -246,7 +246,10 @@ def extract_min_tokens_requirement(response: Optional[httpx.Response]) -> Option
 RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
 SKELETON_COMPACT_INSTRUCTION = (
     "Значения полей — кратко: по 1–2 предложения, без развернутых эссе. "
-    "При нехватке лимита — оставляй пустые строки, но JSON должен быть валиден."
+    "При нехватке лимита — оставляй пустые строки, но JSON должен быть валиден. "
+    "Краткость обязательна: каждое строковое поле ≤ 220 символов. "
+    "В массивах не более 4 элементов. Если не уверена — поставь \"\" (пустую строку). "
+    "Выводи только валидный JSON по схеме."
 )
 
 
@@ -256,20 +259,20 @@ DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
     "schema": {
         "type": "object",
         "properties": {
-            "intro": {"type": "string"},
+            "intro": {"type": "string", "maxLength": 220},
             "main": {
                 "type": "array",
-                "items": {"type": "string"},
+                "items": {"type": "string", "maxLength": 220},
                 "minItems": 3,
-                "maxItems": 6,
+                "maxItems": 4,
             },
             "faq": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "q": {"type": "string"},
-                        "a": {"type": "string"},
+                        "q": {"type": "string", "maxLength": 220},
+                        "a": {"type": "string", "maxLength": 220},
                     },
                     "required": ["q", "a"],
                     "additionalProperties": False,
@@ -277,7 +280,7 @@ DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
                 "minItems": 5,
                 "maxItems": 5,
             },
-            "conclusion": {"type": "string"},
+            "conclusion": {"type": "string", "maxLength": 220},
         },
         "required": ["intro", "main", "faq", "conclusion"],
         "additionalProperties": False,
@@ -2300,12 +2303,20 @@ def generate(
                                 current_tokens_int = int(current_tokens_value)
                             except (TypeError, ValueError):
                                 current_tokens_int = int(current_max)
+                            max_schema_escalations = max(
+                                0, min(RESPONSES_MAX_ESCALATIONS, 1)
+                            )
                             if (
-                                schema_escalations < RESPONSES_MAX_ESCALATIONS
+                                schema_escalations < max_schema_escalations
                                 and int(current_max) < int(allowed_cap)
                             ):
-                                next_max_candidate = max(int(current_max) * 2, 512)
-                                next_max = min(int(allowed_cap), next_max_candidate)
+                                doubled = int(current_max) * 2
+                                next_max_candidate = max(doubled, 1024)
+                                next_max = min(
+                                    int(allowed_cap),
+                                    int(RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA),
+                                    next_max_candidate,
+                                )
                                 if next_max > int(current_max):
                                     schema_escalations += 1
                                     token_escalations += 1

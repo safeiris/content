@@ -2135,9 +2135,9 @@ class DeterministicPipeline:
         sanitized = [str(item or "").strip() for item in main_blocks if str(item or "").strip()]
         before_len = len(sanitized)
         result = list(sanitized)
-        if len(result) > 6:
-            LOGGER.info("LOG:SKELETON_MAIN_TRIMMED from=%d to=6", len(result))
-            result = result[:6]
+        if len(result) > 4:
+            LOGGER.info("LOG:SKELETON_MAIN_TRIMMED from=%d to=4", len(result))
+            result = result[:4]
         needed = max(0, min(3 - len(result), 3))
         if needed > 0:
             additional = self._generate_additional_main_sections(
@@ -2173,8 +2173,8 @@ class DeterministicPipeline:
         normalized_main: List[str] = [
             str(item or "").strip() for item in raw_main if str(item or "").strip()
         ]
-        if len(normalized_main) > 6:
-            normalized_main = normalized_main[:6]
+        if len(normalized_main) > 4:
+            normalized_main = normalized_main[:4]
         placeholders_needed = max(0, 3 - len(normalized_main))
         if placeholders_needed:
             for _ in range(placeholders_needed):

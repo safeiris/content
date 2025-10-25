@@ -29,7 +29,7 @@ def test_normalize_skeleton_payload_enforces_main_range():
 
     normalized = normalize_skeleton_payload(raw_payload)
 
-    assert len(normalized["main"]) == 6
+    assert len(normalized["main"]) == 4
     assert normalized["main"][0] == "Block 0"
 
 

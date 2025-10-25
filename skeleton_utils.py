@@ -152,9 +152,9 @@ def normalize_skeleton_payload(payload: Any) -> Any:
     normalized_main = [
         str(item or "").strip() for item in _as_list(normalized.get("main")) if str(item or "").strip()
     ]
-    if len(normalized_main) > 6:
-        LOGGER.info("LOG:SKELETON_MAIN_TRIM normalize from=%d to=6", len(normalized_main))
-        normalized_main = normalized_main[:6]
+    if len(normalized_main) > 4:
+        LOGGER.info("LOG:SKELETON_MAIN_TRIM normalize from=%d to=4", len(normalized_main))
+        normalized_main = normalized_main[:4]
     while len(normalized_main) < 3:
         normalized_main.append(_DEFAULT_MAIN_PLACEHOLDER)
     normalized["main"] = normalized_main
