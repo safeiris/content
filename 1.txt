@@ -1,1363 +1,206 @@
-diff --git a/frontend_demo/index.html b/frontend_demo/index.html
-index 72b144db067771fcfdfff692cb7a3e85df2eb6c7..39a602afe0b0ad81aa932e48adf07ef69052e693 100644
---- a/frontend_demo/index.html
-+++ b/frontend_demo/index.html
-@@ -6,176 +6,202 @@
-     <title>Фабрика контента — демо</title>
-     <link rel="stylesheet" href="styles.css" />
-   </head>
-   <body>
-     <header class="app-header">
-       <div class="app-shell header-inner">
-         <div>
-           <h1>Фабрика контента</h1>
-           <p class="subtitle">Платформа генерации текстов на базе AI</p>
-         </div>
-       </div>
-     </header>
+diff --git a/faq_builder.py b/faq_builder.py
+index 9ee6da4705f704083d4fd7cc0f4bef2d5d24d0a4..797e022d12dd33650960082b301568030e9b9686 100644
+--- a/faq_builder.py
++++ b/faq_builder.py
+@@ -1,31 +1,34 @@
+ from __future__ import annotations
  
-     <main class="app app-shell">
-       <nav class="tabs" role="tablist">
-         <button class="tab active" data-tab="new-request" role="tab">Новый запрос</button>
-         <button class="tab" data-tab="materials" role="tab">Сгенерированные материалы</button>
-         <button class="tab" data-tab="pipes" role="tab">Тематики</button>
-         <button class="tab" data-tab="result" role="tab">Результат</button>
-       </nav>
+ import json
+ from dataclasses import dataclass
+ from typing import Dict, Iterable, List, Sequence
  
-       <section class="tab-panel active" id="new-request" role="tabpanel">
-         <div class="request-shell">
-           <div class="request-grid">
-             <form id="brief-form" class="brief-form">
--              <section class="form-card">
--                <header class="form-card__header">
--                  <h2 class="form-card__title">Основные параметры</h2>
-+              <section class="parameters-card">
-+                <header class="parameters-card__header">
-+                  <h2 class="parameters-card__title">Параметры текста</h2>
-                 </header>
--                <div class="form-card__body">
-+                <div class="parameters-card__body">
-                   <div class="form-row">
-                     <label for="pipe-select">Тематика</label>
-                     <select id="pipe-select" required></select>
-                   </div>
-                   <div class="form-row">
-                     <label for="topic-input">Тема</label>
--                    <input id="topic-input" type="text" placeholder="Например, 'Как выбрать дебетовую карту'" required />
-+                    <input id="topic-input" type="text" placeholder="Например, «Как выбрать дебетовую карту»" required />
-                   </div>
-                   <div class="form-row">
--                    <label for="style-profile-select">Стиль</label>
-+                    <label for="title-input">Название</label>
-+                    <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
-+                    <p class="field-hint">Оставьте пустым, чтобы взять название из профиля.</p>
-+                  </div>
-+                  <div class="form-row">
-+                    <label for="goal-input">Цель</label>
-+                    <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
-+                  </div>
-+                  <div class="form-row">
-+                    <label for="audience-input">Аудитория</label>
-+                    <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
-+                  </div>
-+                  <div class="form-row">
-+                    <label for="tone-select">Тон</label>
-+                    <select id="tone-select">
-+                      <option value="экспертный" selected>Экспертный</option>
-+                      <option value="дружелюбный">Дружелюбный</option>
-+                      <option value="строгий">Строгий</option>
-+                    </select>
-+                  </div>
-+                  <div class="form-row">
-+                    <label for="style-profile-select">Стиль бренда</label>
-                     <select id="style-profile-select">
-                       <option value="sravni.ru" selected>sravni.ru — экспертно, структурировано</option>
-                       <option value="tinkoff.ru">tinkoff.ru — дружелюбно и с примерами</option>
-                       <option value="banki.ru">banki.ru — аналитично и по делу</option>
--                      <option value="off">off — без стилевого профиля</option>
-+                      <option value="off">Без привязки к бренду</option>
-                     </select>
-                     <p class="field-hint" id="style-profile-hint">
-                       Определяет тон и подачу текста, близкие к стилю выбранного бренда.
-                     </p>
-                   </div>
--                </div>
--              </section>
--
--              <section class="form-card">
--                <header class="form-card__header">
--                  <h2 class="form-card__title">Ключевые слова</h2>
--                </header>
--                <div class="form-card__body">
-                   <div class="form-row">
--                    <label for="keywords-input">Ключевые слова</label>
--                    <textarea id="keywords-input" rows="4" placeholder="Каждое слово с новой строки"></textarea>
--                    <p class="field-hint">Можно оставить пустым — ключевые слова не будут добавлены.</p>
-+                    <label for="min-chars-input">Объём текста</label>
-+                    <div class="length-range-inline">
-+                      <input
-+                        id="min-chars-input"
-+                        type="number"
-+                        min="500"
-+                        step="50"
-+                        value="3500"
-+                        aria-label="Минимум символов"
-+                      />
-+                      <span aria-hidden="true" class="range-separator">—</span>
-+                      <input
-+                        id="max-chars-input"
-+                        type="number"
-+                        min="500"
-+                        step="50"
-+                        value="6000"
-+                        aria-label="Максимум символов"
-+                      />
-+                    </div>
-+                    <p class="field-hint">Символов без пробелов. Можно изменить диапазон под задачу.</p>
-                   </div>
--                </div>
--              </section>
--
--              <section class="form-card">
--                <header class="form-card__header">
--                  <h2 class="form-card__title">Расширенные параметры</h2>
--                </header>
--                <div class="form-card__body">
-                   <div class="form-row">
--                    <label for="title-input">Название текста</label>
--                    <input id="title-input" type="text" placeholder="Например, «Гид по дебетовым картам 2024»" />
--                    <p class="field-hint">Оставьте пустым, чтобы использовать название из профиля.</p>
-+                    <label for="structure-preset">Пресет структуры</label>
-+                    <select id="structure-preset">
-+                      <option value="seo" selected>SEO-статья</option>
-+                      <option value="faq">FAQ и поддержка</option>
-+                      <option value="overview">Обзор продукта</option>
-+                    </select>
-+                    <p class="field-hint">Выберите заготовку или отредактируйте структуру вручную ниже.</p>
-                   </div>
-                   <div class="form-row">
--                    <label>Объём</label>
--                    <div class="length-mode-toggle">
--                      <label class="length-mode-option">
--                        <input type="radio" name="length-mode" value="target" checked />
--                        Целевая длина
--                      </label>
--                      <label class="length-mode-option">
--                        <input type="radio" name="length-mode" value="range" />
--                        Диапазон
--                      </label>
--                    </div>
--                    <div class="length-target" data-length-target>
--                      <input id="length-target-input" type="number" min="500" step="50" placeholder="Например, 6000" />
--                      <p class="field-hint">Символов без пробелов. Пусто — используем профиль.</p>
--                    </div>
--                    <div class="length-range" data-length-range hidden>
--                      <div class="length-range-inputs">
--                        <input id="min-chars-input" type="number" min="500" step="50" placeholder="Минимум" />
--                        <input id="max-chars-input" type="number" min="500" step="50" placeholder="Максимум" />
--                      </div>
--                      <p class="field-hint">Можно заполнить одно или оба поля.</p>
--                    </div>
-+                    <label for="structure-input">Структура материала</label>
-+                    <textarea
-+                      id="structure-input"
-+                      rows="4"
-+                      placeholder="Каждый пункт с новой строки: вводная, блок преимуществ, FAQ, заключение"
-+                    ></textarea>
-                   </div>
-                   <div class="form-row">
--                    <label for="goal-input">Цель текста</label>
--                    <textarea id="goal-input" rows="2" placeholder="Например, объяснить преимущества продукта и увеличить заявки"></textarea>
-+                    <label for="keywords-input">Ключевые слова</label>
-+                    <textarea
-+                      id="keywords-input"
-+                      rows="4"
-+                      placeholder="Каждое ключевое слово или фраза с новой строки"
-+                    ></textarea>
-+                    <div class="keyword-mode">
-+                      <span class="field-label">Режим вхождений</span>
-+                      <div class="keyword-mode__options">
-+                        <label class="radio-option">
-+                          <input type="radio" name="keywords-mode" value="strict" checked />
-+                          <span>Строгое — точные вхождения</span>
-+                        </label>
-+                        <label class="radio-option">
-+                          <input type="radio" name="keywords-mode" value="soft" />
-+                          <span>Мягкое — допускает формы и синонимы</span>
-+                        </label>
-+                        <label class="radio-option">
-+                          <input type="radio" name="keywords-mode" value="anti_spam" />
-+                          <span>Антипереспам — следим за частотой</span>
-+                        </label>
-+                      </div>
-+                    </div>
-+                    <p class="field-hint">Можно оставить пустым — ключевые слова не будут добавлены.</p>
-                   </div>
-                   <div class="form-row">
--                    <label for="audience-input">Целевая аудитория</label>
--                    <textarea id="audience-input" rows="2" placeholder="Например, пользователи, выбирающие первую дебетовую карту"></textarea>
-+                    <label>Источники (референсы)</label>
-+                    <div id="sources-list" class="sources-list"></div>
-+                    <div class="sources-actions">
-+                      <button type="button" class="ghost small" id="add-source-btn">Добавить источник</button>
-+                    </div>
-+                    <p class="field-hint">Добавьте ссылки и тип использования, если нужно опираться на конкретные материалы.</p>
-                   </div>
--                </div>
--              </section>
--
--              <section class="form-card">
--                <header class="form-card__header">
--                  <h2 class="form-card__title">Контекст</h2>
--                </header>
--                <div class="form-card__body">
-                   <div class="form-row">
-                     <label for="context-source-select">Контекст</label>
-                     <select id="context-source-select">
-                       <option value="index.json" selected>Профиль темы (index.json)</option>
-                       <option value="custom">Свой текст</option>
-                       <option value="off">Без контекста</option>
-                     </select>
-                     <p id="context-source-help" class="field-hint">
-                       Определяет, откуда система возьмёт дополнительные сведения для промпта.
-                     </p>
-                     <div class="custom-context-block" id="custom-context-block" hidden>
-                       <p class="field-hint custom-context-hint">
-                         Можно вставить текст или загрузить .txt/.json. До 20 000 символов.
-                       </p>
-                       <label class="field-label" for="customContext">Пользовательский контекст</label>
-                       <textarea id="customContext" placeholder="Вставьте сюда текст или JSON"></textarea>
-                       <div class="custom-context-meta">
-                         <span class="custom-context-counter" id="customContextCounter">0 / 20 000 символов</span>
-                         <div class="custom-context-file">
-                           <input type="file" id="customContextFile" accept=".txt,.json" />
-                           <button type="button" class="ghost small" id="customContextClear">Очистить</button>
-                         </div>
-                       </div>
-                     </div>
-                   </div>
-                 </div>
--              </section>
--
--              <footer class="form-card form-card--actions">
-                 <div class="form-actions">
-                   <button type="submit" class="primary">
-                     <span class="btn-label">Сгенерировать</span>
-                   </button>
-                 </div>
--              </footer>
-+              </section>
-             </form>
-             <aside class="status-panel">
-               <section class="status-card">
-                 <h3>Health</h3>
-                 <div id="health-status" class="status-grid"></div>
-               </section>
-               <section class="status-card">
-                 <div class="section-header">
-                   <h3>Reindex log</h3>
-                   <button type="button" class="ghost small" id="clear-log">Очистить</button>
-                 </div>
-                 <div id="reindex-log" class="console-log">
-                   <div class="log-empty">Пока без запусков.</div>
-                 </div>
-               </section>
-             </aside>
-           </div>
-         </div>
-       </section>
-       <section class="tab-panel" id="materials" role="tabpanel">
-         <div class="materials-toolbar">
-           <div class="materials-toolbar__spacer"></div>
-           <button type="button" class="ghost small" id="cleanup-artifacts">Очистить список</button>
-         </div>
-         <div id="artifacts-list" class="cards-grid"></div>
-@@ -252,51 +278,56 @@
-         </div>
-       </section>
-     </main>
++FAQ_MIN_COUNT = 6
++FAQ_MAX_COUNT = 8
++FAQ_DEFAULT_LIMIT = 7
  
-     <div id="progress-overlay" class="progress-overlay hidden" role="alert" aria-live="polite">
-       <div class="progress-card">
-         <p class="progress-stage" data-role="progress-stage">Подготовка…</p>
-         <div
-           class="progress-bar"
-           role="progressbar"
-           aria-valuemin="0"
-           aria-valuemax="100"
-           aria-valuenow="0"
-           data-role="progress-bar"
-         >
-           <div class="progress-bar__fill" data-role="progress-bar-fill"></div>
-         </div>
-         <p class="progress-percent" data-role="progress-percent">0%</p>
-         <p class="progress-message" data-role="progress-message">Готовим данные…</p>
-         <p class="progress-details" data-role="progress-details"></p>
-       </div>
-     </div>
+ @dataclass
+ class FaqEntry:
+     question: str
+     answer: str
+     anchor: str
  
-     <template id="source-row-template">
-       <div class="source-row">
--        <textarea class="source-input" rows="2" placeholder="https://example.com"></textarea>
-+        <input class="source-input" type="text" placeholder="https://example.com" />
-+        <select class="source-usage" aria-label="Тип использования источника">
-+          <option value="summary" selected>Пересказ</option>
-+          <option value="quote">Цитата</option>
-+          <option value="inspiration">Вдохновение</option>
-+        </select>
-         <button type="button" class="icon-button remove-source" aria-label="Удалить источник">✕</button>
-       </div>
-     </template>
  
-     <template id="artifact-card-template">
-       <article class="card">
-         <div class="card-header">
-           <h3 class="card-title"></h3>
-           <span class="status"></span>
-         </div>
-         <p class="card-topic"></p>
-         <p class="card-meta"></p>
-         <div class="card-actions">
-           <button type="button" class="secondary subtle open-btn">
-             <span class="btn-label">Открыть</span>
-           </button>
-           <button type="button" class="secondary subtle download-btn">
-             <span class="btn-label">Скачать</span>
-           </button>
-           <button type="button" class="secondary danger delete-btn">
-             <span class="btn-label">Удалить</span>
-           </button>
-         </div>
-       </article>
-     </template>
-diff --git a/frontend_demo/script.js b/frontend_demo/script.js
-index 90f6bfe2cf05d8be6858501fe7354bf0a95f2451..ad76927dec4b975ddac02929895344eac165acb0 100644
---- a/frontend_demo/script.js
-+++ b/frontend_demo/script.js
-@@ -39,72 +39,58 @@ const progressMessage = progressOverlay?.querySelector('[data-role="progress-mes
- const progressStage = progressOverlay?.querySelector('[data-role="progress-stage"]') || null;
- const progressPercent = progressOverlay?.querySelector('[data-role="progress-percent"]') || null;
- const progressBar = progressOverlay?.querySelector('[data-role="progress-bar"]') || null;
- const progressBarFill = progressOverlay?.querySelector('[data-role="progress-bar-fill"]') || null;
- const progressDetails = progressOverlay?.querySelector('[data-role="progress-details"]') || null;
- if (progressStage && progressStage.textContent) {
-   progressStage.dataset.defaultLabel = progressStage.textContent.trim();
- }
- const toastRoot = document.getElementById("toast-root");
- const draftView = document.getElementById("draft-view");
- const reportView = document.getElementById("report-view");
- const resultTitle = document.getElementById("result-title");
- const resultMeta = document.getElementById("result-meta");
- const resultBadges = document.getElementById("result-badges");
- const retryBtn = document.getElementById("retry-btn");
- const downloadMdBtn = document.getElementById("download-md");
- const downloadReportBtn = document.getElementById("download-report");
- const clearLogBtn = document.getElementById("clear-log");
- const structurePreset = document.getElementById("structure-preset");
- const structureInput = document.getElementById("structure-input");
- const topicInput = document.getElementById("topic-input");
- const keywordsInput = document.getElementById("keywords-input");
- const titleInput = document.getElementById("title-input");
- const audienceInput = document.getElementById("audience-input");
- const goalInput = document.getElementById("goal-input");
--const kInput = document.getElementById("k-input");
--const maxTokensInput = document.getElementById("max-tokens-input");
--const modelInput = document.getElementById("model-input");
--const includeFaq = document.getElementById("include-faq");
--const includeJsonld = document.getElementById("include-jsonld");
--const lengthTargetInput = document.getElementById("length-target-input");
-+const toneSelect = document.getElementById("tone-select");
- const minCharsInput = document.getElementById("min-chars-input");
- const maxCharsInput = document.getElementById("max-chars-input");
--const lengthModeRadios = document.querySelectorAll("input[name='length-mode']");
--const lengthTargetBlock = document.querySelector("[data-length-target]");
--const lengthRangeBlock = document.querySelector("[data-length-range]");
- const keywordModeInputs = document.querySelectorAll("input[name='keywords-mode']");
- const styleProfileSelect = document.getElementById("style-profile-select");
- const styleProfileHint = document.getElementById("style-profile-hint");
--const useStyleCheckbox = document.getElementById("useStyleCheckbox");
--const styleSettings = document.getElementById("styleSettings");
--const styleSelect = document.getElementById("styleSelect");
--const styleStrengthInput = document.getElementById("styleStrength");
- const sourcesList = document.getElementById("sources-list");
- const addSourceBtn = document.getElementById("add-source-btn");
--const faqCountInput = document.getElementById("faq-count-input");
--const faqCountWrapper = document.getElementById("faq-count-wrapper");
- const contextSourceSelect = document.getElementById("context-source-select");
- const healthStatus = document.getElementById("health-status");
- const reindexLog = document.getElementById("reindex-log");
- const previewSystem = document.getElementById("preview-system");
- const previewUser = document.getElementById("preview-user");
- const contextList = document.getElementById("context-list");
- const contextSummary = document.getElementById("context-summary");
- const contextBadge = document.getElementById("context-badge");
- const customContextBlock = document.getElementById("custom-context-block");
- const customContextTextarea = document.getElementById("customContext");
- const customContextCounter = document.getElementById("customContextCounter");
- const customContextFileInput = document.getElementById("customContextFile");
- const customContextClearBtn = document.getElementById("customContextClear");
- const generateBtn = briefForm.querySelector("button[type='submit']");
- const advancedSettings = document.getElementById("advanced-settings");
- const advancedSupportSection = document.querySelector("[data-section='support']");
- const usedKeywordsSection = document.getElementById("used-keywords");
- const usedKeywordsList = document.getElementById("used-keywords-list");
- const usedKeywordsEmpty = document.getElementById("used-keywords-empty");
+ @dataclass
+ class FaqBuildResult:
+     text: str
+     entries: List[FaqEntry]
+     jsonld: str
  
- const ADVANCED_SETTINGS_STORAGE_KEY = "content-demo:advanced-settings-open";
  
- const LOG_STATUS_LABELS = {
-   info: "INFO",
-   success: "SUCCESS",
-@@ -128,51 +114,51 @@ const PROGRESS_STAGE_LABELS = {
- };
+ def _sanitize_anchor(text: str) -> str:
+     return "-" + "-".join(text.lower().split())
  
- const PROGRESS_STAGE_MESSAGES = {
-   draft: "Генерируем черновик",
-   trim: "Нормализуем объём",
-   validate: "Проверяем результат",
-   done: "Готово",
-   error: "Завершено с ошибкой",
- };
  
- const DEGRADATION_LABELS = {
-   draft_failed: "Черновик по запасному сценарию",
-   refine_skipped: "Шаг уточнения пропущен",
-   jsonld_missing: "JSON-LD отсутствует",
-   jsonld_repaired: "JSON-LD восстановлен",
-   post_analysis_skipped: "Проверки пропущены",
-   soft_timeout: "Сработал мягкий таймаут",
- };
+ def _normalize_answer(answer: str) -> str:
+     paragraphs = [part.strip() for part in answer.split("\n\n") if part.strip()]
+     if not paragraphs:
+         raise ValueError("Ответ пустой")
+     if len(paragraphs) > 3:
+         paragraphs = paragraphs[:3]
+@@ -33,73 +36,84 @@ def _normalize_answer(answer: str) -> str:
+         raise ValueError("Ответ слишком короткий")
+     return "\n\n".join(paragraphs)
  
- const DEFAULT_PROGRESS_MESSAGE =
-   progressMessage?.textContent?.trim() || PROGRESS_STAGE_MESSAGES.draft;
- const MAX_TOASTS = 3;
- const MAX_CUSTOM_CONTEXT_CHARS = 20000;
- const MAX_CUSTOM_CONTEXT_LABEL = MAX_CUSTOM_CONTEXT_CHARS.toLocaleString("ru-RU");
  
--const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 5200, max: 6800, hard: 7200 });
-+const DEFAULT_LENGTH_RANGE = Object.freeze({ min: 3500, max: 6000, hard: 6500 });
+ def _normalize_question(question: str, seen: set[str]) -> str:
+     normalized = question.strip()
+     if not normalized:
+         raise ValueError("Вопрос пустой")
+     if normalized.lower() in seen:
+         raise ValueError("Дублирующийся вопрос")
+     seen.add(normalized.lower())
+     return normalized
  
- const HEALTH_STATUS_MESSAGES = {
-   openai_key: {
-     label: "OpenAI",
-     ok: "активен",
-     fail: "не найден",
-   },
-   llm_ping: {
-     label: "LLM",
-     ok: "отвечает",
-     fail: "нет ответа",
-   },
-   retrieval_index: {
-     label: "Retrieval index",
-     ok: "найден",
-     fail: "не найден",
-   },
-   artifacts_writable: {
-     label: "Каталог артефактов",
-     ok: "доступен",
-     fail: "недоступен",
-   },
-   theme_index: {
-     label: "Индекс темы",
-     ok: "найден",
-@@ -262,179 +248,141 @@ if (reindexBtn) {
- if (healthBtn) {
-   interactiveElements.push(healthBtn);
- }
- if (cleanupArtifactsBtn) {
-   interactiveElements.push(cleanupArtifactsBtn);
- }
  
- tabs.forEach((tab) => {
-   tab.addEventListener("click", () => switchTab(tab.dataset.tab));
- });
+ def _normalize_entry(raw: Dict[str, str], seen: set[str]) -> FaqEntry:
+     question_raw = raw.get("question") if "question" in raw else raw.get("q")
+     answer_raw = raw.get("answer") if "answer" in raw else raw.get("a")
+     question = _normalize_question(str(question_raw or ""), seen)
+     answer = _normalize_answer(str(answer_raw or ""))
+     anchor = str(raw.get("anchor") or _sanitize_anchor(question))
+     return FaqEntry(question=question, answer=answer, anchor=anchor)
  
- if (structurePreset) {
-   structurePreset.addEventListener("change", () => applyStructurePreset(structurePreset.value));
- }
- pipeSelect.addEventListener("change", () => applyPipeDefaults(pipeSelect.value));
- briefForm.addEventListener("submit", handleGenerate);
- if (retryBtn) {
-   retryBtn.addEventListener("click", handleRetryClick);
- }
- if (styleProfileSelect) {
-   styleProfileSelect.addEventListener("change", handleStyleProfileChange);
- }
- if (contextSourceSelect) {
-   contextSourceSelect.addEventListener("change", handleContextSourceChange);
- }
--lengthModeRadios.forEach((radio) => {
--  radio.addEventListener("change", handleLengthModeChange);
--});
- if (customContextTextarea) {
-   customContextTextarea.addEventListener("input", handleCustomContextInput);
- }
- if (customContextFileInput) {
-   customContextFileInput.addEventListener("change", handleCustomContextFileChange);
- }
- if (customContextClearBtn) {
-   customContextClearBtn.addEventListener("click", handleCustomContextClear);
- }
-+if (addSourceBtn) {
-+  addSourceBtn.addEventListener("click", handleAddSource);
-+}
-+if (sourcesList) {
-+  sourcesList.addEventListener("click", handleSourceListClick);
-+}
- if (reindexBtn) {
-   reindexBtn.addEventListener("click", handleReindex);
- }
- if (healthBtn) {
-   healthBtn.addEventListener("click", handleHealthCheck);
- }
- if (cleanupArtifactsBtn) {
-   cleanupArtifactsBtn.addEventListener("click", handleArtifactsCleanup);
- }
- if (downloadMdBtn) {
-   setDownloadLinkAvailability(downloadMdBtn, null);
-   downloadMdBtn.addEventListener("click", (event) => handleDownloadClick(event, "markdown"));
- }
- if (downloadReportBtn) {
-   setDownloadLinkAvailability(downloadReportBtn, null);
-   downloadReportBtn.addEventListener("click", (event) => handleDownloadClick(event, "report"));
- }
- if (clearLogBtn) {
-   clearLogBtn.addEventListener("click", () => {
-     clearReindexLog();
-     showToast({ message: "Журнал очищен", type: "info" });
-   });
- }
  
- setupAdvancedSettings();
- handleStyleProfileChange();
--handleFaqToggle();
- handleContextSourceChange();
--handleLengthModeChange();
- updateCustomContextCounter();
- init();
+ def _generate_generic_entries(topic: str, keywords: Sequence[str]) -> List[FaqEntry]:
+     base_topic = topic or "теме"
+-    key_iter = list(keywords)[:5]
++    key_iter = list(keywords)[:FAQ_MAX_COUNT]
+     templates = [
+         "Как оценить основные риски, связанные с {topic}?",
+         "Какие шаги помогут подготовиться к решению вопросов по {topic}?",
+         "Какие цифры считать ориентиром, когда речь заходит о {topic}?",
+         "Как использовать программы поддержки, если речь идёт о {topic}?",
+         "Что делать, если ситуация с {topic} резко меняется?",
++        "Как оптимизировать расходы, связанные с {topic}?",
++        "Какие ошибки чаще всего совершают при работе с {topic}?",
++        "Что контролировать после внедрения решений по {topic}?",
+     ]
+     answers = [
+         "Начните с базовой диагностики: опишите текущую ситуацию, посчитайте ключевые показатели и зафиксируйте цели. "
+         "Далее сопоставьте результаты с отраслевыми нормами и составьте план коррекции.",
+-        "Сформируйте пошаговый чек-лист. Включите в него анализ документов, консультации с экспертами и список сервисов, которые помогут собрать данные. "
++        "Сформируйте пошаговый чек-лист. Включите в него анализ документов, консультации с экспертами и список сервисов, которые"
++        " помогают собрать данные. "
+         "По мере продвижения фиксируйте выводы, чтобы вернуться к ним на этапе принятия решения.",
+         "Используйте диапазон значений из методических материалов и банковской аналитики. "
+         "Сравните собственные показатели с усреднёнными и определите пороги, при которых стоит пересмотреть стратегию.",
+         "Изучите федеральные и региональные программы, подходящие под ваш профиль. "
+         "Составьте список требований, подготовьте пакет документов и оцените сроки рассмотрения, чтобы не потерять время.",
+-        "Создайте резервный план действий: определите, какие параметры контролировать ежемесячно, и заранее договоритесь о точках проверки. "
++        "Создайте резервный план действий: определите, какие параметры контролировать ежемесячно, и заранее договоритесь о точках"
++        " проверки. "
+         "Если изменения превышают допустимый порог, инициируйте пересмотр стратегии и подключите независимую экспертизу.",
++        "Проверьте постоянные и переменные траты, сравните предложения подрядчиков и автоматизируйте рутинные операции, чтобы"
++        " снизить накладные расходы.",
++        "Отсутствие контроля за дедлайнами и финансовыми ограничениями, игнорирование обратной связи и слабая документация чаще"
++        " всего приводят к сбоям — заложите проверки на каждом этапе.",
++        "Отслеживайте показатели эффективности, фиксируйте обратную связь пользователей и заранее планируйте корректировки, чтобы"
++        " удерживать результат на нужном уровне.",
+     ]
  
- function switchTab(tabId) {
-   tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === tabId));
-   panels.forEach((panel) => panel.classList.toggle("active", panel.id === tabId));
- }
+     entries: List[FaqEntry] = []
+-    for idx in range(5):
++    for idx in range(FAQ_MAX_COUNT):
+         keyword_hint = key_iter[idx] if idx < len(key_iter) else ""
+         question = templates[idx].format(topic=base_topic)
+         if keyword_hint:
+             question = f"{question[:-1]} и {keyword_hint}?"
+         answer = _normalize_answer(answers[idx])
+         anchor = _sanitize_anchor(question)
+         entries.append(FaqEntry(question=question, answer=answer, anchor=anchor))
+     return entries
  
- function handleStyleProfileChange() {
-   if (!styleProfileSelect || !styleProfileHint) {
-     return;
-   }
-   const value = styleProfileSelect.value || "off";
-   styleProfileHint.textContent = STYLE_PROFILE_HINTS[value] || STYLE_PROFILE_HINTS.off;
- }
  
--function handleFaqToggle() {
--  if (!faqCountWrapper || !faqCountInput || !includeFaq) {
--    return;
--  }
--  const enabled = includeFaq.checked;
--  faqCountWrapper.hidden = !enabled;
--  faqCountInput.disabled = !enabled;
--  if (enabled && !faqCountInput.value) {
--    faqCountInput.value = "5";
--  }
--}
--
--function handleLengthModeChange() {
--  const mode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
--  if (lengthTargetBlock) {
--    lengthTargetBlock.hidden = mode !== "target";
--  }
--  if (lengthTargetInput) {
--    lengthTargetInput.disabled = mode !== "target";
--  }
--  if (lengthRangeBlock) {
--    lengthRangeBlock.hidden = mode !== "range";
--  }
--  if (minCharsInput) {
--    minCharsInput.disabled = mode !== "range";
--  }
--  if (maxCharsInput) {
--    maxCharsInput.disabled = mode !== "range";
--  }
--}
--
- function handleAddSource(event) {
-   event.preventDefault();
-   addSourceRow();
- }
+ def _render_markdown(entries: Sequence[FaqEntry]) -> str:
+     lines: List[str] = []
+     for idx, entry in enumerate(entries, start=1):
+         lines.append(f"**Вопрос {idx}.** {entry.question}")
+         lines.append(
+             "**Ответ.** "
+             + entry.answer
+             + " Это помогает не только понять детали, но и оформить решение в рабочем формате."
+         )
+         lines.append("")
+     return "\n".join(lines).strip()
  
- function handleSourceListClick(event) {
-   const target = event.target;
-   if (!(target instanceof HTMLElement)) {
-     return;
-   }
-   if (target.classList.contains("remove-source")) {
-     const row = target.closest(".source-row");
-     if (row) {
-       row.remove();
+ 
+ def _build_jsonld(entries: Sequence[FaqEntry]) -> str:
+     payload = {
+@@ -112,61 +126,70 @@ def _build_jsonld(entries: Sequence[FaqEntry]) -> str:
+                 "acceptedAnswer": {"@type": "Answer", "text": entry.answer},
+             }
+             for entry in entries
+         ],
      }
-   }
- }
- 
- function handleContextSourceChange() {
-   if (!contextSourceSelect) {
-     return;
-   }
-   const value = String(contextSourceSelect.value || "index.json").toLowerCase();
-   const isCustom = value === "custom";
-   const isOff = value === "off";
-   if (customContextBlock) {
-     customContextBlock.hidden = !isCustom;
-     if (!isCustom) {
-       resetCustomContextState();
-     } else {
-       updateCustomContextCounter();
-     }
-   }
--  if (kInput) {
--    if (isCustom || isOff) {
--      kInput.value = "0";
--      kInput.disabled = true;
--    } else {
--      kInput.disabled = false;
--    }
--  }
- }
- 
- function resetCustomContextState() {
-   customContextState.textareaText = "";
-   customContextState.fileText = "";
-   customContextState.fileName = "";
-   customContextState.noticeShown = false;
-   if (customContextTextarea) {
-     customContextTextarea.value = "";
-   }
-   if (customContextFileInput) {
-     customContextFileInput.value = "";
-   }
-   updateCustomContextCounter();
- }
- 
- function updateCustomContextCounter() {
-   if (!customContextCounter) {
-     return;
-   }
-   const activeText = customContextState.fileText || customContextState.textareaText;
-   const current = activeText.length;
-   customContextCounter.textContent = `${current.toLocaleString("ru-RU")} / ${MAX_CUSTOM_CONTEXT_LABEL} символов`;
- }
- 
-@@ -566,84 +514,93 @@ function resolveCustomContextPayload(contextSource) {
-   const sourceText = customContextState.fileText || customContextState.textareaText;
-   const { text, truncated } = normalizeCustomContext(sourceText);
-   if (!text) {
-     throw new Error("Добавьте текст для пользовательского контекста");
-   }
-   const shouldNotify = truncated && !customContextState.noticeShown;
-   customContextState.noticeShown = truncated;
-   if (shouldNotify) {
-     showToast({ message: "Слишком длинный контекст: сокращён до 20 000 символов", type: "warn" });
-   }
-   if (text !== sourceText) {
-     if (customContextState.fileText) {
-       customContextState.fileText = text;
-     } else {
-       customContextState.textareaText = text;
-     }
-     if (customContextTextarea) {
-       customContextTextarea.value = text;
-     }
-     updateCustomContextCounter();
-   }
-   const filename = customContextState.fileText ? customContextState.fileName : "";
-   return { text, filename: filename || null };
- }
- 
--function addSourceRow(value = "") {
-+function addSourceRow(source = { value: "", usage: "summary" }) {
-   if (!sourcesList) {
-     return;
-   }
-   const template = document.getElementById("source-row-template");
-   if (!(template instanceof HTMLTemplateElement)) {
-     return;
-   }
-   const fragment = template.content.cloneNode(true);
-   const row = fragment.querySelector(".source-row");
-   if (!row) {
-     return;
-   }
-   const input = row.querySelector(".source-input");
-   if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
--    input.value = value;
-+    input.value = source?.value || "";
-+  }
-+  const usageSelect = row.querySelector(".source-usage");
-+  if (usageSelect instanceof HTMLSelectElement && source?.usage) {
-+    const normalized = String(source.usage).trim().toLowerCase();
-+    const option = Array.from(usageSelect.options).find((item) => item.value === normalized);
-+    usageSelect.value = option ? option.value : usageSelect.value;
-   }
-   sourcesList.append(row);
- }
- 
- function collectSources() {
-   if (!sourcesList) {
-     return [];
-   }
-   const rows = Array.from(sourcesList.querySelectorAll(".source-row"));
-   const items = [];
-   for (const row of rows) {
-     const input = row.querySelector(".source-input");
-     const value =
-       input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement ? input.value.trim() : "";
-     if (!value) {
-       continue;
-     }
--    items.push(value);
-+    const usageSelect = row.querySelector(".source-usage");
-+    const usage =
-+      usageSelect instanceof HTMLSelectElement ? String(usageSelect.value || "").trim().toLowerCase() : "";
-+    items.push({ value, usage });
-   }
-   return items;
- }
- 
- async function init() {
-   let pipesLoaded = false;
-   try {
-     await loadPipes();
-     pipesLoaded = true;
-   } catch (error) {
-     console.error(error);
-     showToast({ message: `Не удалось загрузить тематики: ${getErrorMessage(error)}`, type: "error" });
-   }
- 
-   try {
-     await loadArtifacts();
-   } catch (error) {
-     console.error(error);
-     showToast({ message: `Не удалось загрузить материалы: ${getErrorMessage(error)}`, type: "error" });
-   }
- 
-   if (pipesLoaded) {
-     applyStructurePreset(structurePreset.value);
-   }
- 
-@@ -1423,50 +1380,57 @@ function inlineFormat(text) {
-     .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
-     .replace(/`([^`]+)`/g, "<code>$1</code>");
- }
- 
- function applyStructurePreset(presetKey) {
-   if (!structureInput) {
-     return;
-   }
-   if (presetKey === "custom") {
-     return;
-   }
-   const preset = STRUCTURE_PRESETS[presetKey];
-   if (preset) {
-     structureInput.value = preset.join("\n");
-   }
- }
- 
- function applyPipeDefaults(pipeId) {
-   const pipe = state.pipes.get(pipeId);
-   if (!pipe) {
-     return;
-   }
-   if (structureInput && !structureInput.value && Array.isArray(pipe.default_structure)) {
-     structureInput.value = pipe.default_structure.join("\n");
-   }
-+  if (toneSelect && pipe.tone) {
-+    const normalized = String(pipe.tone).trim().toLowerCase();
-+    const option = Array.from(toneSelect.options || []).find((item) => item.value === normalized);
-+    if (option) {
-+      toneSelect.value = option.value;
-+    }
-+  }
- }
- 
- async function handlePromptPreview() {
-   try {
-     const payload = buildRequestPayload();
-     setInteractiveBusy(true);
-     setButtonLoading(previewBtn, true);
-     showProgress(true, "Собираем промпт…");
-     const previewRequest = {
-       theme: payload.theme,
-       data: payload.data,
-       k: payload.k,
-       context_source: payload.context_source,
-     };
-     if (payload.context_source === "custom") {
-       previewRequest.context_text = payload.context_text;
-       if (payload.context_filename) {
-         previewRequest.context_filename = payload.context_filename;
-       }
-     }
-     const preview = await fetchJson("/api/prompt/preview", {
-       method: "POST",
-       body: JSON.stringify(previewRequest),
-     });
-     updatePromptPreview(preview);
-@@ -1892,119 +1856,108 @@ function buildRequestPayload() {
-   if (!topic) {
-     throw new Error("Укажите тему материала");
-   }
- 
-   const keywords = keywordsInput.value
-     .split(/\r?\n|,/)
-     .map((item) => item.trim())
-     .filter(Boolean);
-   const structure = structureInput
-     ? structureInput.value
-         .split(/\r?\n/)
-         .map((item) => item.trim())
-         .filter(Boolean)
-     : [];
- 
-   const keywordMode = Array.from(keywordModeInputs).find((input) => input.checked)?.value || "strict";
-   const styleProfile = styleProfileSelect?.value || "sravni.ru";
-   const contextSource = String(contextSourceSelect?.value || "index.json").toLowerCase();
-   const contextPayload = resolveCustomContextPayload(contextSource);
- 
-   const data = {
-     theme: topic,
-     keywords,
-     keywords_mode: keywordMode,
-     include_faq: true,
-+    faq_questions: 5,
-     include_jsonld: true,
-     structure,
-     pipe_id: theme,
-     style_profile: styleProfile,
-     context_source: contextSource,
-   };
- 
-   const titleValue = titleInput?.value?.trim();
-   if (titleValue) {
-     data.title = titleValue;
-   }
- 
-   const goalValue = goalInput?.value?.trim();
-   if (goalValue) {
-     data.goal = goalValue;
-   }
- 
-   const audienceValue = audienceInput?.value?.trim();
-   if (audienceValue) {
-     data.target_audience = audienceValue;
-   }
- 
--  const selectedLengthMode = Array.from(lengthModeRadios).find((input) => input.checked)?.value || "target";
--  if (selectedLengthMode === "range") {
--    const minValue = parsePositiveInt(minCharsInput?.value);
--    const maxValue = parsePositiveInt(maxCharsInput?.value);
--    if (minValue !== null && maxValue !== null && maxValue < minValue) {
--      throw new Error("Максимальный объём должен быть больше или равен минимальному");
--    }
--    if (minValue !== null || maxValue !== null) {
--      data.length_limits = {};
--      if (minValue !== null) {
--        data.length_limits.min_chars = minValue;
--      }
--      if (maxValue !== null) {
--        data.length_limits.max_chars = maxValue;
--      }
--    }
--  } else {
--    const targetValue = parsePositiveInt(lengthTargetInput?.value);
--    if (targetValue !== null) {
--      data.length_target = targetValue;
--    }
-+  const toneValue = toneSelect?.value?.trim();
-+  if (toneValue) {
-+    data.tone = toneValue;
-   }
- 
--  if (includeFaq) {
--    data.include_faq = true;
--    const faqValue = parsePositiveInt(faqCountInput?.value) || 5;
--    data.faq_questions = faqValue;
-+  const minValue = parsePositiveInt(minCharsInput?.value);
-+  const maxValue = parsePositiveInt(maxCharsInput?.value);
-+  const effectiveMin = minValue ?? DEFAULT_LENGTH_RANGE.min;
-+  const effectiveMax = maxValue ?? DEFAULT_LENGTH_RANGE.max;
-+  if (effectiveMax < effectiveMin) {
-+    throw new Error("Максимальный объём должен быть больше или равен минимальному");
-   }
--  if (includeJsonld) {
--    data.include_jsonld = true;
-+  data.length_limits = {
-+    min_chars: effectiveMin,
-+    max_chars: effectiveMax,
-+  };
-+
-+  const sources = collectSources();
-+  if (sources.length) {
-+    data.sources = sources;
-   }
- 
-   if (contextSource === "custom") {
-     data.context_source = "custom";
-     if (contextPayload.filename) {
-       data.context_filename = contextPayload.filename;
-     }
-   } else {
-     delete data.context_filename;
-   }
- 
-   const payload = {
-     theme,
-     data,
-     k: 0,
--    maxTokens: 0,
--    model: undefined,
-     context_source: contextSource,
-   };
- 
-   if (contextSource === "custom") {
-     payload.context_text = contextPayload.text;
-     if (contextPayload.filename) {
-       payload.context_filename = contextPayload.filename;
-     }
-   }
- 
-   return payload;
- }
- 
- function renderMetadata(meta) {
-   reportView.innerHTML = "";
-   const lengthWarnings = [];
-   if (Array.isArray(meta?.length_limits_warnings)) {
-     meta.length_limits_warnings.forEach((note) => {
-       if (typeof note === "string" && note.trim()) {
-         lengthWarnings.push(note.trim());
-       }
-     });
-   }
-   if (typeof meta?.length_limits_warning === "string" && meta.length_limits_warning.trim()) {
-     lengthWarnings.push(meta.length_limits_warning.trim());
-@@ -3206,71 +3159,62 @@ function setButtonLoading(button, isLoading) {
-     }
-     delete button.dataset.originalDisabled;
-   }
- }
- 
- function toggleFeatureElements(elements, hidden) {
-   elements
-     .filter(Boolean)
-     .forEach((element) => {
-       const target = element.closest?.("[data-feature-root]")
-         || element.closest?.(".form-row")
-         || element;
-       if (!target) {
-         return;
-       }
-       if (hidden) {
-         target.classList.add("feature-hidden");
-       } else {
-         target.classList.remove("feature-hidden");
-       }
-     });
- }
- 
- function applyFeatureFlags() {
-   const modelElements = [];
--  if (modelInput) {
--    modelElements.push(modelInput);
--  }
-   document.querySelectorAll('[data-feature="model-selector"]').forEach((element) => {
-     modelElements.push(element);
-   });
-   toggleFeatureElements(modelElements, featureState.hideModelSelector);
- 
-   const tokenElements = [];
--  if (maxTokensInput) {
--    tokenElements.push(maxTokensInput);
--  }
-   if (minCharsInput) {
-     tokenElements.push(minCharsInput);
-   }
-   if (maxCharsInput) {
-     tokenElements.push(maxCharsInput);
-   }
--  if (kInput) {
--    tokenElements.push(kInput);
--  }
-   document.querySelectorAll('[data-feature="token-sliders"]').forEach((element) => {
-     tokenElements.push(element);
-   });
-   toggleFeatureElements(tokenElements, featureState.hideTokenSliders);
- }
- 
- async function initFeatureFlags() {
-   applyFeatureFlags();
-   try {
-     const config = await fetchJson("/api/features");
-     if (config && typeof config === "object") {
-       if (typeof config.hide_model_selector === "boolean") {
-         featureState.hideModelSelector = config.hide_model_selector;
-       }
-       if (typeof config.hide_token_sliders === "boolean") {
-         featureState.hideTokenSliders = config.hide_token_sliders;
-       }
-     }
-   } catch (error) {
-     console.debug("Не удалось загрузить настройки фич", error);
-   } finally {
-     applyFeatureFlags();
-   }
- }
- 
-diff --git a/frontend_demo/styles.css b/frontend_demo/styles.css
-index 565bf35662624c4dd860eb5c295253877246e6db..6f905d6f7ed61bf8cef04c646d1b6fe6cc93bc17 100644
---- a/frontend_demo/styles.css
-+++ b/frontend_demo/styles.css
-@@ -139,101 +139,94 @@ body {
- 
- @media (min-width: 992px) and (max-width: 1199px) {
-   .request-grid {
-     grid-template-columns: 320px 1fr;
-   }
- }
- 
- @media (min-width: 1600px) {
-   .request-grid {
-     grid-template-columns: 400px 1fr;
-   }
- }
- 
- .brief-form {
-   display: flex;
-   flex-direction: column;
-   gap: 24px;
- }
- 
- @media (max-width: 991px) {
-   .brief-form {
-     gap: 20px;
-   }
- }
- 
--.form-card {
-+.parameters-card {
-   background: #ffffff;
--  border-radius: 16px;
--  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
--  padding: 24px;
-+  border-radius: 18px;
-+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.08);
-+  padding: 28px;
-   display: flex;
-   flex-direction: column;
--  gap: 16px;
-+  gap: 24px;
-   min-width: 0;
- }
- 
--.form-card__header {
-+.parameters-card__header {
-   display: flex;
--  align-items: center;
-+  align-items: baseline;
-   justify-content: space-between;
-   gap: 12px;
- }
- 
--.form-card__title {
-+.parameters-card__title {
-   margin: 0;
--  font-size: 18px;
-+  font-size: 22px;
-   font-weight: 600;
-+  color: #111827;
- }
- 
--.form-card__body {
--  display: flex;
--  flex-direction: column;
--  gap: 16px;
--}
--
--.form-card--actions {
--  padding: 20px 24px;
--}
--
--.style-toggle-block {
-+.parameters-card__body {
-   display: flex;
-   flex-direction: column;
--  gap: 8px;
--  margin-bottom: 16px;
-+  gap: 20px;
- }
- 
--#styleSettings {
--  display: none;
--  flex-direction: column;
--  gap: 12px;
-+.parameters-card .form-actions {
-+  justify-content: flex-end;
-+  padding-top: 8px;
- }
- 
--#styleSettings label {
--  display: flex;
--  flex-direction: column;
--  gap: 6px;
-+@media (max-width: 599px) {
-+  .parameters-card {
-+    padding: 22px;
-+    gap: 20px;
-+  }
-+  .parameters-card__title {
-+    font-size: 20px;
-+  }
- }
- 
- .brief-form * {
-   box-sizing: border-box;
- }
- 
- .form-row {
-   display: flex;
-   flex-direction: column;
-   gap: 8px;
- }
- 
- .form-row label,
- .field-label,
- .field-label-inline,
- .radio-option,
- .checkbox-with-hint,
- .checkbox-with-hint span {
-   white-space: normal;
-   word-break: break-word;
-   overflow-wrap: anywhere;
- }
- 
- .field-label {
-   display: flex;
-@@ -319,173 +312,168 @@ body {
- .form-row textarea {
-   padding: 12px 14px;
-   border-radius: 10px;
-   border: 1px solid #d4d8dd;
-   font-size: 15px;
-   font-family: inherit;
-   width: 100%;
-   max-width: 100%;
-   min-width: 0;
-   box-sizing: border-box;
- }
- 
- .form-row textarea {
-   resize: vertical;
-   overflow-wrap: anywhere;
-   word-break: break-word;
-   min-height: 120px;
- }
- 
- .optional {
-   font-size: 13px;
-   color: #9ca3af;
-   font-weight: 400;
- }
- 
--.length-mode-toggle {
--  display: flex;
--  flex-wrap: wrap;
--  gap: 12px;
--}
--
--.length-mode-option {
-+.length-range-inline {
-   display: inline-flex;
-   align-items: center;
--  gap: 8px;
--  padding: 6px 14px;
--  border-radius: 999px;
--  background: #f3f4f6;
--  cursor: pointer;
--  font-size: 14px;
--  transition: background-color 0.2s ease, box-shadow 0.2s ease;
--}
--
--.length-mode-option input {
--  margin: 0;
--  accent-color: #4f46e5;
-+  gap: 10px;
-+  flex-wrap: wrap;
- }
- 
--.length-mode-option:focus-within {
--  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
-+.length-range-inline input {
-+  width: 140px;
-+  flex: 0 0 140px;
- }
- 
--.length-range-inputs {
--  display: grid;
--  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
--  gap: 12px;
-+.range-separator {
-+  font-size: 18px;
-+  color: #9ca3af;
- }
- 
--.length-range-inputs input,
--.length-target input {
--  width: 100%;
--  min-width: 0;
-+@media (max-width: 599px) {
-+  .length-range-inline input {
-+    width: 100%;
-+    flex: 1 1 120px;
-+  }
- }
- 
--@media (min-width: 768px) {
--  .length-range {
--    grid-template-columns: 1fr auto 1fr;
--    align-items: center;
--  }
-+.keyword-mode {
-+  display: flex;
-+  flex-direction: column;
-+  gap: 8px;
- }
- 
--.keyword-mode-group {
-+.keyword-mode__options {
-   display: grid;
--  gap: 12px;
-+  gap: 10px;
-   background: #f5f6fb;
-   border: 1px solid #e4e7ec;
-   border-radius: 12px;
-   padding: 12px 16px;
--  overflow-wrap: anywhere;
-+}
-+
-+@media (min-width: 768px) {
-+  .keyword-mode__options {
-+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-+  }
- }
- 
- .field-label-inline {
-   font-weight: 600;
-   font-size: 14px;
-   color: #1f2937;
- }
- 
- .radio-option {
-   display: grid;
-   grid-template-columns: auto 1fr;
-   align-items: start;
-   column-gap: 8px;
-   row-gap: 4px;
-   font-size: 14px;
-   color: #374151;
- }
- 
- .radio-option span {
-   min-width: 0;
- }
- 
- .radio-option input {
-   margin-top: 2px;
- }
- 
- .sources-control {
-   display: grid;
-   gap: 12px;
-   white-space: normal;
-   word-break: break-word;
-   overflow-wrap: anywhere;
- }
- 
- .sources-list {
--  display: grid;
--  gap: 10px;
-+  display: flex;
-+  flex-direction: column;
-+  gap: 12px;
- }
- 
- .source-row {
-   display: grid;
-   gap: 12px;
--  grid-template-columns: minmax(0, 1fr);
--  align-items: start;
-+  grid-template-columns: minmax(0, 1fr) minmax(140px, 180px) auto;
-+  align-items: center;
- }
- 
--.source-row .source-input {
-+.source-row .source-input,
-+.source-row .source-usage {
-   width: 100%;
-   min-width: 0;
--  overflow-wrap: anywhere;
--  word-break: break-word;
--  resize: vertical;
--  min-height: 48px;
-+  min-height: 44px;
- }
- 
- .source-row .icon-button {
--  justify-self: flex-start;
-+  justify-self: flex-end;
- }
- 
--@media (min-width: 600px) {
-+@media (max-width: 599px) {
-   .source-row {
--    grid-template-columns: minmax(0, 1fr) auto;
-+    grid-template-columns: minmax(0, 1fr);
-   }
- 
-+  .source-row .source-usage,
-   .source-row .icon-button {
--    justify-self: flex-end;
-+    justify-self: flex-start;
-   }
- }
- 
-+.sources-actions {
-+  display: flex;
-+  gap: 12px;
-+  flex-wrap: wrap;
-+}
-+
- .icon-button {
-   border: none;
-   background: transparent;
-   color: #6b7280;
-   cursor: pointer;
-   padding: 6px 8px;
-   border-radius: 8px;
-   font-size: 15px;
-   line-height: 1;
-   transition: color 0.2s ease, background-color 0.2s ease;
- }
- 
- .icon-button:hover {
-   color: #ef4444;
-   background-color: rgba(239, 68, 68, 0.1);
- }
- 
- .inline-field {
-   display: grid;
-   grid-template-columns: 1fr;
-   gap: 8px;
-   align-items: center;
- }
- 
- @media (min-width: 768px) {
+     compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+     return f'<script type="application/ld+json">\n{compact}\n</script>'
+ 
+ 
+ def build_faq_block(
+     *,
+     base_text: str,
+     topic: str,
+     keywords: Iterable[str],
+     provided_entries: Sequence[Dict[str, str]] | None = None,
+ ) -> FaqBuildResult:
+     entries: List[FaqEntry] = []
+     seen_questions: set[str] = set()
+     if provided_entries:
+         for entry in provided_entries:
+             try:
+                 normalized = _normalize_entry(entry, seen_questions)
+             except ValueError:
+                 continue
+             entries.append(normalized)
+-            if len(entries) == 5:
++            if len(entries) == FAQ_MAX_COUNT:
+                 break
+-    if len(entries) < 5:
++    if len(entries) < FAQ_DEFAULT_LIMIT:
+         for candidate in _generate_generic_entries(topic, list(keywords)):
+-            if len(entries) == 5:
++            if len(entries) >= FAQ_DEFAULT_LIMIT:
+                 break
+             if candidate.question.lower() in seen_questions:
+                 continue
+             seen_questions.add(candidate.question.lower())
+             entries.append(candidate)
+ 
+-    if len(entries) != 5:
+-        raise ValueError("Не удалось собрать пять валидных вопросов для FAQ")
++    if len(entries) < FAQ_MIN_COUNT:
++        raise ValueError("Не удалось собрать минимум шесть валидных вопросов для FAQ")
++    if len(entries) > FAQ_MAX_COUNT:
++        entries = entries[:FAQ_MAX_COUNT]
+ 
+     rendered = _render_markdown(entries)
+     placeholder = "<!--FAQ_START-->"
+     end_placeholder = "<!--FAQ_END-->"
+     if placeholder not in base_text or end_placeholder not in base_text:
+         raise ValueError("FAQ placeholder missing in base text")
+ 
+     before, remainder = base_text.split(placeholder, 1)
+     inside, after = remainder.split(end_placeholder, 1)
+     inside = inside.strip()
+     if inside:
+         rendered = f"{inside}\n\n{rendered}".strip()
+     merged = f"{before}{placeholder}\n{rendered}\n{end_placeholder}{after}"
+     jsonld = _build_jsonld(entries)
+     # JSON-LD валидация
+     try:
+         raw_json = jsonld.split("\n", 1)[1].rsplit("\n", 1)[0]
+         payload = json.loads(raw_json)
+     except Exception as exc:  # noqa: BLE001
+         raise ValueError(f"Некорректный JSON-LD FAQ: {exc}") from exc
+-    if not isinstance(payload, dict) or payload.get("@type") != "FAQPage" or len(payload.get("mainEntity", [])) != 5:
++    main_entities = payload.get("mainEntity") if isinstance(payload, dict) else []
++    count = len(main_entities) if isinstance(main_entities, list) else 0
++    if (
++        not isinstance(payload, dict)
++        or payload.get("@type") != "FAQPage"
++        or count < FAQ_MIN_COUNT
++        or count > FAQ_MAX_COUNT
++    ):
+         raise ValueError("JSON-LD FAQ не соответствует схеме FAQPage")
+     return FaqBuildResult(text=merged, entries=entries, jsonld=jsonld)
 

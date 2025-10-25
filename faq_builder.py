@@ -4,6 +4,9 @@ import json
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence
 
+FAQ_MIN_COUNT = 6
+FAQ_MAX_COUNT = 8
+FAQ_DEFAULT_LIMIT = 7
 
 @dataclass
 class FaqEntry:
@@ -55,29 +58,40 @@ def _normalize_entry(raw: Dict[str, str], seen: set[str]) -> FaqEntry:
 
 def _generate_generic_entries(topic: str, keywords: Sequence[str]) -> List[FaqEntry]:
     base_topic = topic or "теме"
-    key_iter = list(keywords)[:5]
+    key_iter = list(keywords)[:FAQ_MAX_COUNT]
     templates = [
         "Как оценить основные риски, связанные с {topic}?",
         "Какие шаги помогут подготовиться к решению вопросов по {topic}?",
         "Какие цифры считать ориентиром, когда речь заходит о {topic}?",
         "Как использовать программы поддержки, если речь идёт о {topic}?",
         "Что делать, если ситуация с {topic} резко меняется?",
+        "Как оптимизировать расходы, связанные с {topic}?",
+        "Какие ошибки чаще всего совершают при работе с {topic}?",
+        "Что контролировать после внедрения решений по {topic}?",
     ]
     answers = [
         "Начните с базовой диагностики: опишите текущую ситуацию, посчитайте ключевые показатели и зафиксируйте цели. "
         "Далее сопоставьте результаты с отраслевыми нормами и составьте план коррекции.",
-        "Сформируйте пошаговый чек-лист. Включите в него анализ документов, консультации с экспертами и список сервисов, которые помогут собрать данные. "
+        "Сформируйте пошаговый чек-лист. Включите в него анализ документов, консультации с экспертами и список сервисов, которые"
+        " помогают собрать данные. "
         "По мере продвижения фиксируйте выводы, чтобы вернуться к ним на этапе принятия решения.",
         "Используйте диапазон значений из методических материалов и банковской аналитики. "
         "Сравните собственные показатели с усреднёнными и определите пороги, при которых стоит пересмотреть стратегию.",
         "Изучите федеральные и региональные программы, подходящие под ваш профиль. "
         "Составьте список требований, подготовьте пакет документов и оцените сроки рассмотрения, чтобы не потерять время.",
-        "Создайте резервный план действий: определите, какие параметры контролировать ежемесячно, и заранее договоритесь о точках проверки. "
+        "Создайте резервный план действий: определите, какие параметры контролировать ежемесячно, и заранее договоритесь о точках"
+        " проверки. "
         "Если изменения превышают допустимый порог, инициируйте пересмотр стратегии и подключите независимую экспертизу.",
+        "Проверьте постоянные и переменные траты, сравните предложения подрядчиков и автоматизируйте рутинные операции, чтобы"
+        " снизить накладные расходы.",
+        "Отсутствие контроля за дедлайнами и финансовыми ограничениями, игнорирование обратной связи и слабая документация чаще"
+        " всего приводят к сбоям — заложите проверки на каждом этапе.",
+        "Отслеживайте показатели эффективности, фиксируйте обратную связь пользователей и заранее планируйте корректировки, чтобы"
+        " удерживать результат на нужном уровне.",
     ]
 
     entries: List[FaqEntry] = []
-    for idx in range(5):
+    for idx in range(FAQ_MAX_COUNT):
         keyword_hint = key_iter[idx] if idx < len(key_iter) else ""
         question = templates[idx].format(topic=base_topic)
         if keyword_hint:
@@ -134,19 +148,21 @@ def build_faq_block(
             except ValueError:
                 continue
             entries.append(normalized)
-            if len(entries) == 5:
+            if len(entries) == FAQ_MAX_COUNT:
                 break
-    if len(entries) < 5:
+    if len(entries) < FAQ_DEFAULT_LIMIT:
         for candidate in _generate_generic_entries(topic, list(keywords)):
-            if len(entries) == 5:
+            if len(entries) >= FAQ_DEFAULT_LIMIT:
                 break
             if candidate.question.lower() in seen_questions:
                 continue
             seen_questions.add(candidate.question.lower())
             entries.append(candidate)
 
-    if len(entries) != 5:
-        raise ValueError("Не удалось собрать пять валидных вопросов для FAQ")
+    if len(entries) < FAQ_MIN_COUNT:
+        raise ValueError("Не удалось собрать минимум шесть валидных вопросов для FAQ")
+    if len(entries) > FAQ_MAX_COUNT:
+        entries = entries[:FAQ_MAX_COUNT]
 
     rendered = _render_markdown(entries)
     placeholder = "<!--FAQ_START-->"
@@ -167,6 +183,13 @@ def build_faq_block(
         payload = json.loads(raw_json)
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"Некорректный JSON-LD FAQ: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("@type") != "FAQPage" or len(payload.get("mainEntity", [])) != 5:
+    main_entities = payload.get("mainEntity") if isinstance(payload, dict) else []
+    count = len(main_entities) if isinstance(main_entities, list) else 0
+    if (
+        not isinstance(payload, dict)
+        or payload.get("@type") != "FAQPage"
+        or count < FAQ_MIN_COUNT
+        or count > FAQ_MAX_COUNT
+    ):
         raise ValueError("JSON-LD FAQ не соответствует схеме FAQPage")
     return FaqBuildResult(text=merged, entries=entries, jsonld=jsonld)
