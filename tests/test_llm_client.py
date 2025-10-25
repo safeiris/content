@@ -288,6 +288,15 @@ def test_responses_continue_includes_model_and_tokens(monkeypatch):
     assert continue_payload["previous_response_id"] == "resp-1"
     assert continue_payload["model"] == primary_payload["model"]
     assert continue_payload["text"]["format"] == primary_payload["text"]["format"]
+    assert "input" in continue_payload
+    assert isinstance(continue_payload["input"], str)
+    if primary_payload.get("input"):
+        assert continue_payload["input"] in {
+            primary_payload["input"],
+            "Continue generation",
+        }
+    else:
+        assert continue_payload["input"] in {"", "Continue generation"}
     expected_tokens = llm_client_module.G5_ESCALATION_LADDER[1]
     assert continue_payload["max_output_tokens"] == expected_tokens
 

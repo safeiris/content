@@ -684,12 +684,12 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
             continue
         if isinstance(value, str):
             trimmed = value.strip()
+            if key == "input":
+                sanitized[key] = trimmed
+                continue
             if not trimmed:
                 continue
             if key == "model":
-                sanitized[key] = trimmed
-                continue
-            if key == "input":
                 sanitized[key] = trimmed
                 continue
             if key == "previous_response_id":
@@ -701,7 +701,7 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
             else:
                 converted = str(value)
             converted = converted.strip()
-            if converted:
+            if converted or "input" not in sanitized:
                 sanitized[key] = converted
             continue
         if key == "max_output_tokens":
@@ -716,6 +716,15 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
                 if sanitized_text:
                     sanitized["text"] = sanitized_text
             continue
+    if "input" not in sanitized and "input" in payload:
+        raw_input = payload.get("input")
+        if isinstance(raw_input, str):
+            sanitized["input"] = raw_input.strip()
+        elif raw_input is None:
+            sanitized["input"] = ""
+        else:
+            sanitized["input"] = str(raw_input).strip()
+
     input_value = sanitized.get("input", "")
     input_length = len(input_value) if isinstance(input_value, str) else 0
     return sanitized, input_length
@@ -1455,6 +1464,9 @@ def _make_request(
     while attempt_index < MAX_RETRIES:
         attempt_index += 1
         try:
+            input_candidate = current_payload.get("input", "")
+            input_len = len(input_candidate) if isinstance(input_candidate, str) else 0
+            LOGGER.info("responses input_len=%d", input_len)
             response = http_client.post(api_url, headers=headers, json=current_payload)
             response.raise_for_status()
             data = response.json()
@@ -1950,6 +1962,8 @@ def generate(
                     "previous_response_id": resume_from_response_id,
                     "max_output_tokens": max(min_token_floor, int(current_max)),
                 }
+                continue_prompt = base_input_text if base_input_text else "Continue generation"
+                current_payload["input"] = continue_prompt
                 _apply_text_format(current_payload)
                 LOGGER.info(
                     "RESP_CONTINUE previous_response_id=%s model=%s max_output_tokens=%s",
@@ -1982,8 +1996,6 @@ def generate(
             if attempts > 1:
                 retry_used = True
             format_block, fmt_type, fmt_name, has_schema, fixed_name = _ensure_format_name(current_payload)
-            if resume_from_response_id:
-                current_payload.pop("input", None)
             suffix = " (fixed=name)" if fixed_name else ""
             LOGGER.info(
                 "LOG:RESP_PAYLOAD_FORMAT type=%s name=%s has_schema=%s%s",

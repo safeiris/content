@@ -151,6 +151,21 @@ def test_sanitize_payload_converts_legacy_json_schema():
     assert format_block["strict"] is True
 
 
+def test_sanitize_payload_preserves_empty_input():
+    payload = {
+        "model": "gpt-5",
+        "input": "   ",
+        "max_output_tokens": 128,
+    }
+
+    sanitized, length = sanitize_payload_for_responses(payload)
+
+    assert sanitized["model"] == "gpt-5"
+    assert "input" in sanitized
+    assert sanitized["input"] == ""
+    assert length == 0
+
+
 def test_generate_retries_with_min_token_bump(monkeypatch):
     error_payload = {
         "__error__": "http",

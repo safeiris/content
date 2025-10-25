@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import httpx
 import os
 import sys
@@ -42,6 +43,8 @@ LATEST_SCHEMA_VERSION = "2024-06"
 
 HEALTH_MODEL = DEFAULT_MODEL
 HEALTH_PROMPT = "Ответь ровно словом: PONG"
+LOGGER = logging.getLogger(__name__)
+
 HEALTH_INITIAL_MAX_TOKENS = 10
 HEALTH_MIN_BUMP_TOKENS = 24
 
@@ -757,6 +760,9 @@ def _run_health_ping() -> Dict[str, object]:
                 payload_snapshot = dict(sanitized_payload)
                 payload_snapshot["text"] = {"format": deepcopy(text_format)}
                 payload_snapshot["max_output_tokens"] = current_max_tokens
+                input_candidate = payload_snapshot.get("input", "")
+                input_len = len(input_candidate) if isinstance(input_candidate, str) else 0
+                LOGGER.info("responses input_len=%d", input_len)
                 response = client.post(
                     RESPONSES_API_URL,
                     json=payload_snapshot,
