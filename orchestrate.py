@@ -30,6 +30,7 @@ from deterministic_pipeline import DeterministicPipeline, PipelineStep, Pipeline
 from llm_client import (
     DEFAULT_MODEL,
     RESPONSES_API_URL,
+    RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS,
     build_responses_payload,
     clamp_responses_max_output_tokens,
     sanitize_payload_for_responses,
@@ -695,7 +696,10 @@ def _mask_openai_key(raw_key: str) -> str:
 def _run_health_ping() -> Dict[str, object]:
     model = HEALTH_MODEL
     prompt = HEALTH_PROMPT
-    max_tokens = clamp_responses_max_output_tokens(HEALTH_INITIAL_MAX_TOKENS)
+    max_tokens = max(
+        RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS,
+        clamp_responses_max_output_tokens(HEALTH_INITIAL_MAX_TOKENS),
+    )
     text_format = {"type": "text"}
 
     base_payload = build_responses_payload(

@@ -73,21 +73,31 @@ _HTTP_CLIENT_LIMITS = httpx.Limits(
 _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
 
 
-RESPONSES_MAX_OUTPUT_TOKENS_MIN = 64
-RESPONSES_MAX_OUTPUT_TOKENS_MAX = 256
+RESPONSES_MAX_OUTPUT_TOKENS_MIN = 16
+RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS = 64
+RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT = 256
+RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA = 1200
 
 
-def clamp_responses_max_output_tokens(value: object) -> int:
+def clamp_responses_max_output_tokens(
+    value: object,
+    *,
+    format_type: Optional[str] = None,
+) -> int:
     """Clamp max_output_tokens to the supported Responses bounds."""
 
     try:
         numeric_value = int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         numeric_value = RESPONSES_MAX_OUTPUT_TOKENS_MIN
-    return max(
-        RESPONSES_MAX_OUTPUT_TOKENS_MIN,
-        min(numeric_value, RESPONSES_MAX_OUTPUT_TOKENS_MAX),
-    )
+    normalized_type = str(format_type or "").strip().lower()
+    lower_bound = RESPONSES_MAX_OUTPUT_TOKENS_MIN
+    if normalized_type in {"json_schema", "json_object"}:
+        upper_bound = RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA
+        lower_bound = max(lower_bound, RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS)
+    else:
+        upper_bound = RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT
+    return max(lower_bound, min(numeric_value, upper_bound))
 
 
 def reset_http_client_cache() -> None:
@@ -179,11 +189,18 @@ def _acquire_http_client(timeout_value: float) -> httpx.Client:
         except Exception:  # pragma: no cover - best effort cleanup
             pass
     return client
-def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
-    """Detect the specific 400 error about max_output_tokens being too small."""
+_MIN_TOKENS_PATTERNS = [
+    re.compile(r"max_output_tokens[^0-9]*(?:>=|≥|at least|минимум|не менее)\s*(\d+)", re.IGNORECASE),
+    re.compile(r"(?:>=|≥|at least|минимум|не менее|минимальное значение|не меньше)\s*(\d+)", re.IGNORECASE),
+    re.compile(r"at\s+least\s+(\d+)", re.IGNORECASE),
+]
+
+
+def extract_min_tokens_requirement(response: Optional[httpx.Response]) -> Optional[int]:
+    """Return the minimum max_output_tokens hinted by an HTTP 400 error, if any."""
 
     if response is None:
-        return False
+        return None
 
     message = ""
     try:
@@ -198,16 +215,39 @@ def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
     if not message:
         message = response.text or ""
 
-    normalized = re.sub(r"\s+", " ", message).lower()
-    if "max_output_tokens" not in normalized:
-        return False
-    return (
-        "expected" in normalized
-        and ">=" in normalized
-        and str(RESPONSES_MAX_OUTPUT_TOKENS_MIN) in normalized
-    )
+    normalized = re.sub(r"\s+", " ", message).strip()
+    if not normalized:
+        return None
+
+    for pattern in _MIN_TOKENS_PATTERNS:
+        match = pattern.search(normalized)
+        if match:
+            try:
+                value = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+
+    # Fallback: look for numbers in proximity to the field name.
+    lower = normalized.lower()
+    if "max_output_tokens" in lower:
+        trailing_match = re.search(r"max_output_tokens[^\d]*(\d+)", normalized, re.IGNORECASE)
+        if trailing_match:
+            try:
+                value = int(trailing_match.group(1))
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+
+    return None
 
 RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
+SKELETON_COMPACT_INSTRUCTION = (
+    "Значения полей — кратко: по 1–2 предложения, без развернутых эссе. "
+    "При нехватке лимита — оставляй пустые строки, но JSON должен быть валиден."
+)
 
 
 DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
@@ -437,11 +477,18 @@ def build_responses_payload(
         context="build_payload",
         log_on_migration=False,
     )
+    format_type = ""
+    if isinstance(format_block, dict):
+        raw_type = format_block.get("type")
+        if isinstance(raw_type, str):
+            format_type = raw_type.strip().lower()
 
     payload: Dict[str, object] = {
         "model": str(model).strip(),
         "input": joined_input.strip(),
-        "max_output_tokens": clamp_responses_max_output_tokens(max_tokens),
+        "max_output_tokens": clamp_responses_max_output_tokens(
+            max_tokens, format_type=format_type
+        ),
         "text": {"format": format_block},
     }
     if previous_response_id and previous_response_id.strip():
@@ -743,6 +790,14 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
     """Restrict Responses payload to the documented whitelist and types."""
 
     sanitized: Dict[str, object] = {}
+    format_hint_type = ""
+    text_candidate = payload.get("text")
+    if isinstance(text_candidate, dict):
+        format_candidate = text_candidate.get("format")
+        if isinstance(format_candidate, dict):
+            raw_type = format_candidate.get("type")
+            if isinstance(raw_type, str) and raw_type.strip():
+                format_hint_type = raw_type.strip().lower()
     unexpected_keys = [key for key in payload.keys() if key not in RESPONSES_ALLOWED_KEYS]
     if unexpected_keys:
         LOGGER.warning(
@@ -779,7 +834,9 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
             continue
         if key == "max_output_tokens":
             try:
-                sanitized[key] = clamp_responses_max_output_tokens(value)
+                sanitized[key] = clamp_responses_max_output_tokens(
+                    value, format_type=format_hint_type
+                )
             except (TypeError, ValueError):
                 continue
             continue
@@ -788,6 +845,12 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
                 sanitized_text = _sanitize_text_block(value)
                 if sanitized_text:
                     sanitized["text"] = sanitized_text
+                    format_hint_type = ""
+                    format_block = sanitized_text.get("format")
+                    if isinstance(format_block, dict):
+                        raw_type = format_block.get("type")
+                        if isinstance(raw_type, str) and raw_type.strip():
+                            format_hint_type = raw_type.strip().lower()
             continue
     if "input" not in sanitized and "input" in payload:
         raw_input = payload.get("input")
@@ -1542,8 +1605,17 @@ def _make_request(
             LOGGER.info("responses input_len=%d", input_len)
             if "max_output_tokens" in current_payload:
                 current_payload = dict(current_payload)
+                format_type_hint = ""
+                text_block = current_payload.get("text")
+                if isinstance(text_block, dict):
+                    format_block = text_block.get("format")
+                    if isinstance(format_block, dict):
+                        raw_type = format_block.get("type")
+                        if isinstance(raw_type, str) and raw_type.strip():
+                            format_type_hint = raw_type.strip().lower()
                 current_payload["max_output_tokens"] = clamp_responses_max_output_tokens(
-                    current_payload.get("max_output_tokens")
+                    current_payload.get("max_output_tokens"),
+                    format_type=format_type_hint,
                 )
             response = http_client.post(api_url, headers=headers, json=current_payload)
             response.raise_for_status()
@@ -1673,6 +1745,10 @@ def generate(
             log_on_migration=False,
         )
         style_format_type = str(style_template.get("type", "")).strip().lower()
+        style_format_name = ""
+        raw_style_name = style_template.get("name") if isinstance(style_template, dict) else None
+        if isinstance(raw_style_name, str):
+            style_format_name = raw_style_name.strip().lower()
         system_segments: List[str] = []
         user_segments: List[str] = []
         for item in payload_messages:
@@ -1686,6 +1762,10 @@ def generate(
                 user_segments.append(content)
             else:
                 user_segments.append(f"{role.upper()}:\n{content}")
+        default_format_name_lower = RESPONSES_FORMAT_DEFAULT_NAME.lower()
+        if style_format_name == default_format_name_lower:
+            if not any(SKELETON_COMPACT_INSTRUCTION in segment for segment in system_segments):
+                system_segments.append(SKELETON_COMPACT_INSTRUCTION)
 
         system_text = "\n\n".join(system_segments)
         system_text = _apply_living_style_instruction(
@@ -1739,6 +1819,7 @@ def generate(
             log_on_migration=False,
         )
         fmt_template_type = str(format_template.get("type", "")).strip().lower()
+        format_is_structured = fmt_template_type in _JSON_STYLE_GUARD
         if fmt_template_type == "json_schema":
             current_name = str(format_template.get("name", "")).strip()
             allowed_names = {RESPONSES_FORMAT_DEFAULT_NAME}
@@ -1805,7 +1886,16 @@ def generate(
         if max_tokens_value <= 0:
             fallback_default = G5_MAX_OUTPUT_TOKENS_BASE if G5_MAX_OUTPUT_TOKENS_BASE > 0 else 1500
             max_tokens_value = fallback_default
-        upper_cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+        format_cap = (
+            RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA
+            if format_is_structured
+            else RESPONSES_MAX_OUTPUT_TOKENS_MAX_TEXT
+        )
+        env_upper_cap = G5_MAX_OUTPUT_TOKENS_MAX if G5_MAX_OUTPUT_TOKENS_MAX > 0 else None
+        if env_upper_cap is not None and env_upper_cap > 0:
+            upper_cap = min(env_upper_cap, format_cap)
+        else:
+            upper_cap = format_cap
         if upper_cap is not None and max_tokens_value > upper_cap:
             LOGGER.info(
                 "responses max_output_tokens clamped requested=%s limit=%s",
@@ -1930,6 +2020,8 @@ def generate(
         shrink_applied = False
         incomplete_retry_count = 0
         token_escalations = 0
+        schema_token_history: List[int] = []
+        schema_escalations = 0
         resume_from_response_id: Optional[str] = None
         content_started = False
         cap_retry_performed = False
@@ -2094,6 +2186,14 @@ def generate(
                 has_schema,
                 suffix,
             )
+            fmt_type_normalized = str(fmt_type or "").strip().lower()
+            schema_mode_active = fmt_type_normalized in _JSON_STYLE_GUARD
+            if schema_mode_active:
+                token_value = current_payload.get("max_output_tokens")
+                try:
+                    schema_token_history.append(int(token_value))
+                except (TypeError, ValueError):
+                    pass
             updated_format: Optional[Dict[str, object]] = None
             if isinstance(format_block, dict):
                 try:
@@ -2119,7 +2219,8 @@ def generate(
                 if "max_output_tokens" in current_payload:
                     current_payload = dict(current_payload)
                     current_payload["max_output_tokens"] = clamp_responses_max_output_tokens(
-                        current_payload.get("max_output_tokens")
+                        current_payload.get("max_output_tokens"),
+                        format_type=fmt_type_normalized,
                     )
                 response = http_client.post(
                     RESPONSES_API_URL,
@@ -2188,6 +2289,59 @@ def generate(
                     ):
                         resume_from_response_id = str(response_id_value)
                     if reason == "max_output_tokens":
+                        if schema_mode_active:
+                            allowed_cap = (
+                                upper_cap
+                                if upper_cap is not None
+                                else RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA
+                            )
+                            current_tokens_value = current_payload.get("max_output_tokens")
+                            try:
+                                current_tokens_int = int(current_tokens_value)
+                            except (TypeError, ValueError):
+                                current_tokens_int = int(current_max)
+                            if (
+                                schema_escalations < RESPONSES_MAX_ESCALATIONS
+                                and int(current_max) < int(allowed_cap)
+                            ):
+                                next_max_candidate = max(int(current_max) * 2, 512)
+                                next_max = min(int(allowed_cap), next_max_candidate)
+                                if next_max > int(current_max):
+                                    schema_escalations += 1
+                                    token_escalations += 1
+                                    retry_used = True
+                                    LOGGER.info(
+                                        "RESP_RETRY_REASON=max_tokens_escalate schema from=%s to=%s",
+                                        current_tokens_int,
+                                        next_max,
+                                    )
+                                    current_max = next_max
+                                    sanitized_payload["max_output_tokens"] = max(
+                                        min_token_floor, int(current_max)
+                                    )
+                                    if (
+                                        upper_cap is not None
+                                        and int(current_max) == int(upper_cap)
+                                    ):
+                                        cap_retry_performed = True
+                                    sanitized_payload.pop("previous_response_id", None)
+                                    resume_from_response_id = None
+                                    empty_retry_attempted = False
+                                    empty_direct_retry_attempted = False
+                                    shrink_next_attempt = False
+                                    if attempts > 0:
+                                        attempts -= 1
+                                    continue
+                            tried_repr = ", ".join(
+                                str(token)
+                                for token in schema_token_history
+                                if isinstance(token, int) and token > 0
+                            )
+                            tried_label = f"[{tried_repr}]" if tried_repr else "[]"
+                            last_error = RuntimeError(
+                                f"skeleton_incomplete: max_output_tokens_exhausted (tried={tried_label})"
+                            )
+                            break
                         LOGGER.info(
                             "RESP_STATUS=incomplete|max_output_tokens=%s",
                             current_payload.get("max_output_tokens"),
@@ -2526,21 +2680,29 @@ def generate(
                         if isinstance(format_block, dict):
                             format_template = deepcopy(format_block)
                         continue
+                if status == 400 and not min_tokens_bump_done:
+                    required_floor = extract_min_tokens_requirement(response_obj)
+                else:
+                    required_floor = None
                 if (
                     status == 400
                     and not min_tokens_bump_done
-                    and is_min_tokens_error(response_obj)
+                    and required_floor is not None
                 ):
                     min_tokens_bump_done = True
                     retry_used = True
-                    min_token_floor = max(
-                        min_token_floor, RESPONSES_MAX_OUTPUT_TOKENS_MIN
-                    )
+                    target_floor = max(min_token_floor, required_floor)
+                    if schema_mode_active:
+                        target_floor = max(target_floor, RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS)
+                    min_token_floor = target_floor
                     current_max = max(current_max, min_token_floor)
                     sanitized_payload["max_output_tokens"] = max(
                         current_max, min_token_floor
                     )
-                    LOGGER.warning("LOG:RESP_RETRY_REASON=max_tokens_min_bump")
+                    LOGGER.warning(
+                        "LOG:RESP_RETRY_REASON=max_tokens_min_bump required=%s",
+                        min_token_floor,
+                    )
                     continue
                 if status == 400 and response_obj is not None:
                     shim_param = _extract_unknown_parameter_name(response_obj)

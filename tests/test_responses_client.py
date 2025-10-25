@@ -11,6 +11,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from llm_client import (
     RESPONSES_FORMAT_DEFAULT_NAME,
     RESPONSES_MAX_OUTPUT_TOKENS_MIN,
+    RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS,
     build_responses_payload,
     generate,
     sanitize_payload_for_responses,
@@ -200,12 +201,18 @@ def test_generate_retries_with_min_token_bump(monkeypatch):
     assert dummy_client.call_count == 2
     first_request = dummy_client.requests[0]["json"]
     second_request = dummy_client.requests[1]["json"]
-    assert first_request["max_output_tokens"] == RESPONSES_MAX_OUTPUT_TOKENS_MIN
-    assert (
-        second_request["max_output_tokens"]
-        >= RESPONSES_MAX_OUTPUT_TOKENS_MIN
+    assert first_request["max_output_tokens"] == max(
+        RESPONSES_MAX_OUTPUT_TOKENS_MIN,
+        RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS,
     )
-    mock_logger.warning.assert_any_call("LOG:RESP_RETRY_REASON=max_tokens_min_bump")
+    assert second_request["max_output_tokens"] == max(
+        RESPONSES_MAX_OUTPUT_TOKENS_MIN,
+        RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS,
+    )
+    mock_logger.warning.assert_any_call(
+        "LOG:RESP_RETRY_REASON=max_tokens_min_bump required=%s",
+        RESPONSES_MIN_SCHEMA_OUTPUT_TOKENS,
+    )
 
 
 def test_generate_retries_on_missing_format_name(monkeypatch):

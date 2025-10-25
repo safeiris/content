@@ -16,6 +16,7 @@ from llm_client import (  # noqa: E402
     FALLBACK_RESPONSES_PLAIN_OUTLINE_FORMAT,
     G5_ESCALATION_LADDER,
     LIVING_STYLE_INSTRUCTION,
+    SKELETON_COMPACT_INSTRUCTION,
     GenerationResult,
     generate,
     reset_http_client_cache,
@@ -142,7 +143,10 @@ def test_generate_uses_responses_payload_for_gpt5():
     result, client = _generate_with_dummy(responses=[payload])
     request_payload = client.requests[-1]["json"]
     assert request_payload["model"] == "gpt-5"
-    assert request_payload["input"] == "ping"
+    input_text = request_payload["input"]
+    assert input_text.endswith("ping")
+    assert SKELETON_COMPACT_INSTRUCTION in input_text
+    assert input_text.count(SKELETON_COMPACT_INSTRUCTION) == 1
     assert request_payload["max_output_tokens"] == 64
     assert request_payload["text"]["format"] == DEFAULT_RESPONSES_TEXT_FORMAT
     assert "temperature" not in request_payload
@@ -325,7 +329,7 @@ def test_generate_retries_when_incomplete_text_missing_schema_content():
     assert isinstance(result, GenerationResult)
     assert len(client.requests) == 2
     continue_payload = client.requests[1]["json"]
-    assert continue_payload.get("previous_response_id") == "resp-1"
+    assert "previous_response_id" not in continue_payload
     assert continue_payload["max_output_tokens"] > client.requests[0]["json"]["max_output_tokens"]
     assert json.loads(result.text)["intro"] == "Hello"
 
@@ -338,17 +342,11 @@ def test_generate_marks_final_cap_as_degraded():
         "output": [],
     }
     with patch("llm_client.LOGGER"):
-        result, client = _generate_with_dummy(responses=[payload], max_tokens=3600)
-    assert isinstance(result, GenerationResult)
-    metadata = result.metadata or {}
-    assert metadata.get("step_status") == "degraded"
-    assert metadata.get("cap_reached_final") is True
-    assert metadata.get("degradation_reason") == "max_output_tokens_final"
-    assert metadata.get("incomplete_reason") == "max_output_tokens_final"
-    flags = metadata.get("degradation_flags") or []
-    assert "draft_max_tokens" in flags
-    assert result.text == ""
-    assert len(client.requests) == 1
+        with pytest.raises(RuntimeError) as excinfo:
+            _generate_with_dummy(responses=[payload], max_tokens=3600)
+    message = str(excinfo.value)
+    assert message.startswith("skeleton_incomplete: max_output_tokens_exhausted")
+    assert "tried=[" in message
 
 
 def test_responses_continue_includes_model_and_tokens(monkeypatch):
@@ -385,7 +383,7 @@ def test_responses_continue_includes_model_and_tokens(monkeypatch):
     primary_payload = client.requests[0]["json"]
     continue_payload = client.requests[1]["json"]
 
-    assert continue_payload["previous_response_id"] == "resp-1"
+    assert "previous_response_id" not in continue_payload
     assert continue_payload["model"] == primary_payload["model"]
     assert continue_payload["text"]["format"] == primary_payload["text"]["format"]
     assert "input" in continue_payload
@@ -397,10 +395,12 @@ def test_responses_continue_includes_model_and_tokens(monkeypatch):
         }
     else:
         assert continue_payload["input"] in {"", "Continue generation"}
-    expected_tokens = llm_client_module.G5_ESCALATION_LADDER[1]
+    expected_tokens = min(
+        llm_client_module.G5_MAX_OUTPUT_TOKENS_MAX,
+        llm_client_module.RESPONSES_MAX_OUTPUT_TOKENS_MAX_SCHEMA,
+        max(primary_payload["max_output_tokens"] * 2, 512),
+    )
     assert continue_payload["max_output_tokens"] == expected_tokens
 
     metadata = result.metadata or {}
-    flags = metadata.get("degradation_flags") or []
-    assert "draft_max_tokens" in flags
-    assert metadata.get("completion_warning") == "max_output_tokens"
+    assert metadata.get("status") == "completed"
