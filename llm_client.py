@@ -73,7 +73,7 @@ _HTTP_CLIENT_LIMITS = httpx.Limits(
 _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
 
 
-RESPONSES_MAX_OUTPUT_TOKENS_MIN = 16
+RESPONSES_MAX_OUTPUT_TOKENS_MIN = 64
 RESPONSES_MAX_OUTPUT_TOKENS_MAX = 256
 
 
@@ -201,7 +201,11 @@ def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
     normalized = re.sub(r"\s+", " ", message).lower()
     if "max_output_tokens" not in normalized:
         return False
-    return "expected" in normalized and ">=" in normalized and "16" in normalized
+    return (
+        "expected" in normalized
+        and ">=" in normalized
+        and str(RESPONSES_MAX_OUTPUT_TOKENS_MIN) in normalized
+    )
 
 RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
 
@@ -2529,9 +2533,13 @@ def generate(
                 ):
                     min_tokens_bump_done = True
                     retry_used = True
-                    min_token_floor = max(min_token_floor, 24)
+                    min_token_floor = max(
+                        min_token_floor, RESPONSES_MAX_OUTPUT_TOKENS_MIN
+                    )
                     current_max = max(current_max, min_token_floor)
-                    sanitized_payload["max_output_tokens"] = max(current_max, min_token_floor)
+                    sanitized_payload["max_output_tokens"] = max(
+                        current_max, min_token_floor
+                    )
                     LOGGER.warning("LOG:RESP_RETRY_REASON=max_tokens_min_bump")
                     continue
                 if status == 400 and response_obj is not None:

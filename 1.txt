@@ -1,8 +1,8 @@
 diff --git a/llm_client.py b/llm_client.py
-index 80f65aa8693229ca4fb845aba45b0fc17e89eb60..8deea936af772c93f9c548c7d7f5bed67854d963 100644
+index 8deea936af772c93f9c548c7d7f5bed67854d963..c75a531ced4975e328e0bc4ff57be68a5d1f73c2 100644
 --- a/llm_client.py
 +++ b/llm_client.py
-@@ -51,50 +51,67 @@ RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
+@@ -51,51 +51,51 @@ RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
  RESPONSES_MAX_ESCALATIONS = 2
  MAX_RESPONSES_POLL_ATTEMPTS = (
      G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
@@ -28,23 +28,24 @@ index 80f65aa8693229ca4fb845aba45b0fc17e89eb60..8deea936af772c93f9c548c7d7f5bed6
  _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
  
  
-+RESPONSES_MAX_OUTPUT_TOKENS_MIN = 16
-+RESPONSES_MAX_OUTPUT_TOKENS_MAX = 256
-+
-+
-+def clamp_responses_max_output_tokens(value: object) -> int:
-+    """Clamp max_output_tokens to the supported Responses bounds."""
-+
-+    try:
-+        numeric_value = int(value)  # type: ignore[arg-type]
-+    except (TypeError, ValueError):
-+        numeric_value = RESPONSES_MAX_OUTPUT_TOKENS_MIN
-+    return max(
-+        RESPONSES_MAX_OUTPUT_TOKENS_MIN,
-+        min(numeric_value, RESPONSES_MAX_OUTPUT_TOKENS_MAX),
-+    )
-+
-+
+-RESPONSES_MAX_OUTPUT_TOKENS_MIN = 16
++RESPONSES_MAX_OUTPUT_TOKENS_MIN = 64
+ RESPONSES_MAX_OUTPUT_TOKENS_MAX = 256
+ 
+ 
+ def clamp_responses_max_output_tokens(value: object) -> int:
+     """Clamp max_output_tokens to the supported Responses bounds."""
+ 
+     try:
+         numeric_value = int(value)  # type: ignore[arg-type]
+     except (TypeError, ValueError):
+         numeric_value = RESPONSES_MAX_OUTPUT_TOKENS_MIN
+     return max(
+         RESPONSES_MAX_OUTPUT_TOKENS_MIN,
+         min(numeric_value, RESPONSES_MAX_OUTPUT_TOKENS_MAX),
+     )
+ 
+ 
  def reset_http_client_cache() -> None:
      """Close and clear pooled HTTP clients.
  
@@ -54,260 +55,128 @@ index 80f65aa8693229ca4fb845aba45b0fc17e89eb60..8deea936af772c93f9c548c7d7f5bed6
      while _HTTP_CLIENTS:
          _, pooled_client = _HTTP_CLIENTS.popitem(last=False)
          try:
-             pooled_client.close()
+@@ -179,51 +179,55 @@ def _acquire_http_client(timeout_value: float) -> httpx.Client:
          except Exception:  # pragma: no cover - best effort cleanup
              pass
+     return client
+ def is_min_tokens_error(response: Optional[httpx.Response]) -> bool:
+     """Detect the specific 400 error about max_output_tokens being too small."""
+ 
+     if response is None:
+         return False
+ 
+     message = ""
+     try:
+         payload = response.json()
+     except ValueError:
+         payload = None
+ 
+     if isinstance(payload, dict):
+         error_block = payload.get("error")
+         if isinstance(error_block, dict):
+             message = str(error_block.get("message", ""))
+     if not message:
+         message = response.text or ""
+ 
+     normalized = re.sub(r"\s+", " ", message).lower()
+     if "max_output_tokens" not in normalized:
+         return False
+-    return "expected" in normalized and ">=" in normalized and "16" in normalized
++    return (
++        "expected" in normalized
++        and ">=" in normalized
++        and str(RESPONSES_MAX_OUTPUT_TOKENS_MIN) in normalized
++    )
+ 
+ RESPONSES_FORMAT_DEFAULT_NAME = "seo_article_skeleton"
  
  
- _JSON_STYLE_GUARD: Set[str] = {"json_schema", "json_object"}
- 
- 
- def _should_apply_living_style(format_type: str) -> bool:
-     normalized = str(format_type or "").strip().lower()
-     return not normalized or normalized not in _JSON_STYLE_GUARD
- 
- 
- def _apply_living_style_instruction(system_text: str, *, format_type: str) -> str:
-     instruction = LIVING_STYLE_INSTRUCTION.strip()
-     if not instruction:
-@@ -398,51 +415,51 @@ def build_responses_payload(
-     """Construct a minimal Responses API payload for GPT-5 models."""
- 
-     sections: List[str] = []
- 
-     system_block = (system_text or "").strip()
-     if system_block:
-         sections.append(system_block)
- 
-     user_block = (user_text or "").strip()
-     if user_block:
-         sections.append(user_block)
- 
-     joined_input = "\n\n".join(section for section in sections if section)
-     joined_input = re.sub(r"[ ]{2,}", " ", joined_input)
-     joined_input = re.sub(r"\n{3,}", "\n\n", joined_input)
- 
-     format_block, _, _ = _prepare_text_format_for_request(
-         text_format or DEFAULT_RESPONSES_TEXT_FORMAT,
-         context="build_payload",
-         log_on_migration=False,
-     )
- 
-     payload: Dict[str, object] = {
-         "model": str(model).strip(),
-         "input": joined_input.strip(),
--        "max_output_tokens": int(max_tokens),
-+        "max_output_tokens": clamp_responses_max_output_tokens(max_tokens),
-         "text": {"format": format_block},
-     }
-     if previous_response_id and previous_response_id.strip():
-         payload["previous_response_id"] = previous_response_id.strip()
-     return payload
- 
- 
- def _shrink_responses_input(text_value: str) -> str:
-     """Return a slightly condensed version of the Responses input payload."""
- 
-     if not text_value:
-         return text_value
- 
-     normalized_lines: List[str] = []
-     seen: set[str] = set()
-     for raw_line in text_value.splitlines():
-         stripped = raw_line.strip()
-         if not stripped:
-             continue
-         fingerprint = re.sub(r"\s+", " ", stripped.lower())
-         if fingerprint in seen:
-             continue
-         seen.add(fingerprint)
-         normalized_lines.append(stripped)
- 
-@@ -736,51 +753,51 @@ def sanitize_payload_for_responses(payload: Dict[str, object]) -> Tuple[Dict[str
-             continue
-         if isinstance(value, str):
-             trimmed = value.strip()
-             if key == "input":
-                 sanitized[key] = trimmed
-                 continue
-             if not trimmed:
-                 continue
-             if key == "model":
-                 sanitized[key] = trimmed
-                 continue
-             if key == "previous_response_id":
-                 sanitized[key] = trimmed
-                 continue
-         if key == "input" and not isinstance(value, str):
-             if isinstance(value, (list, dict)):
-                 converted = json.dumps(value, ensure_ascii=False)
-             else:
-                 converted = str(value)
-             converted = converted.strip()
-             if converted or "input" not in sanitized:
-                 sanitized[key] = converted
-             continue
-         if key == "max_output_tokens":
-             try:
--                sanitized[key] = int(value)
-+                sanitized[key] = clamp_responses_max_output_tokens(value)
-             except (TypeError, ValueError):
-                 continue
-             continue
-         if key == "text":
-             if isinstance(value, dict):
-                 sanitized_text = _sanitize_text_block(value)
-                 if sanitized_text:
-                     sanitized["text"] = sanitized_text
-             continue
-     if "input" not in sanitized and "input" in payload:
-         raw_input = payload.get("input")
-         if isinstance(raw_input, str):
-             sanitized["input"] = raw_input.strip()
-         elif raw_input is None:
-             sanitized["input"] = ""
-         else:
-             sanitized["input"] = str(raw_input).strip()
- 
-     input_value = sanitized.get("input", "")
-     input_length = len(input_value) if isinstance(input_value, str) else 0
-     return sanitized, input_length
- 
- 
- def _store_responses_request_snapshot(payload: Dict[str, object]) -> None:
-     """Persist a sanitized snapshot of the latest Responses API request."""
-@@ -1497,50 +1514,55 @@ def _needs_format_name_retry(response: httpx.Response) -> bool:
-         return True
-     if "moved to text.format" in lowered and "name" in lowered:
-         return True
-     return False
- 
- 
- def _make_request(
-     http_client: httpx.Client,
-     *,
-     api_url: str,
-     headers: Dict[str, str],
-     payload: Dict[str, object],
-     schedule: List[float],
- ) -> Tuple[Dict[str, object], bool]:
-     last_error: Optional[BaseException] = None
-     shimmed_param = False
-     stripped_param: Optional[str] = None
-     current_payload: Dict[str, object] = dict(payload)
-     attempt_index = 0
-     while attempt_index < MAX_RETRIES:
-         attempt_index += 1
-         try:
-             input_candidate = current_payload.get("input", "")
-             input_len = len(input_candidate) if isinstance(input_candidate, str) else 0
-             LOGGER.info("responses input_len=%d", input_len)
-+            if "max_output_tokens" in current_payload:
-+                current_payload = dict(current_payload)
-+                current_payload["max_output_tokens"] = clamp_responses_max_output_tokens(
-+                    current_payload.get("max_output_tokens")
-+                )
-             response = http_client.post(api_url, headers=headers, json=current_payload)
-             response.raise_for_status()
-             data = response.json()
-             if isinstance(data, dict):
-                 return data, shimmed_param
-             raise RuntimeError("Модель вернула неожиданный формат ответа.")
-         except EmptyCompletionError:
-             raise
-         except httpx.HTTPStatusError as exc:
-             status = exc.response.status_code
-             if (
-                 status == 400
-                 and not shimmed_param
-                 and exc.response is not None
-             ):
-                 param_name = _extract_unknown_parameter_name(exc.response)
-                 if param_name:
-                     if param_name in current_payload:
-                         current_payload = dict(current_payload)
-                         current_payload.pop(param_name, None)
-                     shimmed_param = True
-                     stripped_param = param_name
-                     LOGGER.warning(
-                         "retry=shim_unknown_param: stripped '%s' from payload",
-                         param_name,
-@@ -2068,50 +2090,55 @@ def generate(
-                 has_schema,
-                 suffix,
-             )
-             updated_format: Optional[Dict[str, object]] = None
-             if isinstance(format_block, dict):
-                 try:
-                     updated_format = deepcopy(format_block)
-                 except (TypeError, ValueError):
-                     updated_format = _clone_text_format()
-             if isinstance(updated_format, dict):
-                 sanitized_payload["text"] = {"format": deepcopy(updated_format)}
-                 format_template = deepcopy(updated_format)
-             if isinstance(updated_format, dict):
-                 try:
-                     format_snapshot = json.dumps(updated_format, ensure_ascii=False, sort_keys=True)
-                 except (TypeError, ValueError):
-                     format_snapshot = str(updated_format)
-                 LOGGER.debug("DEBUG:payload.text.format = %s", format_snapshot)
-                 current_payload["text"] = {"format": deepcopy(updated_format)}
-             else:
-                 LOGGER.debug("DEBUG:payload.text.format = null")
-                 current_payload["text"] = {"format": _clone_text_format()}
-             _log_payload(current_payload)
-             try:
-                 _store_responses_request_snapshot(current_payload)
-+                if "max_output_tokens" in current_payload:
-+                    current_payload = dict(current_payload)
-+                    current_payload["max_output_tokens"] = clamp_responses_max_output_tokens(
-+                        current_payload.get("max_output_tokens")
+ DEFAULT_RESPONSES_TEXT_FORMAT: Dict[str, object] = {
+     "type": "json_schema",
+     "name": RESPONSES_FORMAT_DEFAULT_NAME,
+     "schema": {
+         "type": "object",
+         "properties": {
+             "intro": {"type": "string"},
+             "main": {
+                 "type": "array",
+                 "items": {"type": "string"},
+                 "minItems": 3,
+                 "maxItems": 6,
+             },
+             "faq": {
+                 "type": "array",
+                 "items": {
+                     "type": "object",
+                     "properties": {
+                         "q": {"type": "string"},
+                         "a": {"type": "string"},
+                     },
+@@ -2507,53 +2511,57 @@ def generate(
+                     continue
+                 if (
+                     status == 400
+                     and response_obj is not None
+                     and _needs_format_name_retry(response_obj)
+                 ):
+                     if not format_name_retry_done:
+                         format_name_retry_done = True
+                         retry_used = True
+                         LOGGER.warning(
+                             "RESP_RETRY_REASON=format_name_missing route=responses attempt=%d",
+                             attempts,
+                         )
+                         _apply_text_format(sanitized_payload)
+                         format_block, _, _, _, _ = _ensure_format_name(sanitized_payload)
+                         if isinstance(format_block, dict):
+                             format_template = deepcopy(format_block)
+                         continue
+                 if (
+                     status == 400
+                     and not min_tokens_bump_done
+                     and is_min_tokens_error(response_obj)
+                 ):
+                     min_tokens_bump_done = True
+                     retry_used = True
+-                    min_token_floor = max(min_token_floor, 24)
++                    min_token_floor = max(
++                        min_token_floor, RESPONSES_MAX_OUTPUT_TOKENS_MIN
 +                    )
-                 response = http_client.post(
-                     RESPONSES_API_URL,
-                     headers=headers,
-                     json=current_payload,
-                 )
-                 response.raise_for_status()
-                 data = response.json()
-                 if not isinstance(data, dict):
-                     raise RuntimeError("Модель вернула неожиданный формат ответа.")
-                 _store_responses_response_snapshot(data)
-                 text, parse_flags, schema_label = _extract_responses_text(data)
-                 metadata = _extract_metadata(data)
-                 if isinstance(parse_flags, dict):
-                     parse_flags["metadata"] = metadata
-                 content_lengths = 0
-                 if isinstance(parse_flags, dict):
-                     output_len = int(parse_flags.get("output_text_len", 0) or 0)
-                     content_len = int(parse_flags.get("content_text_len", 0) or 0)
-                     content_lengths = output_len + content_len
-                 if content_lengths > 0 and not content_started:
-                     content_started = True
-                     shrink_applied = False
-                     shrink_next_attempt = False
-                     LOGGER.info("RESP_CONTENT_STARTED len=%d", content_lengths)
-                 status = metadata.get("status") or ""
+                     current_max = max(current_max, min_token_floor)
+-                    sanitized_payload["max_output_tokens"] = max(current_max, min_token_floor)
++                    sanitized_payload["max_output_tokens"] = max(
++                        current_max, min_token_floor
++                    )
+                     LOGGER.warning("LOG:RESP_RETRY_REASON=max_tokens_min_bump")
+                     continue
+                 if status == 400 and response_obj is not None:
+                     shim_param = _extract_unknown_parameter_name(response_obj)
+                     if shim_param:
+                         retry_used = True
+                         if shim_param in sanitized_payload:
+                             sanitized_payload.pop(shim_param, None)
+                         LOGGER.warning(
+                             "retry=shim_unknown_param stripped='%s'",
+                             shim_param,
+                         )
+                         continue
+                 last_error = exc
+                 step_label = _infer_responses_step(current_payload)
+                 _handle_responses_http_error(exc, current_payload, step=step_label)
+                 break
+             except Exception as exc:  # noqa: BLE001
+                 if isinstance(exc, KeyboardInterrupt):
+                     raise
+                 last_error = exc
+             if attempts >= max_attempts:
+                 break
+             sleep_for = schedule[min(attempts - 1, len(schedule) - 1)] if schedule else 0.5
+             LOGGER.warning("responses retry attempt=%d sleep=%.2f", attempts, sleep_for)
 diff --git a/orchestrate.py b/orchestrate.py
-index afca809273aafb57264dd2a5275cde7be8ae6511..a4b387c2d2a8759c831248e21aea865f6bcbec5c 100644
+index a4b387c2d2a8759c831248e21aea865f6bcbec5c..ee0ee838f394bdfca813a85288ef78414203f335 100644
 --- a/orchestrate.py
 +++ b/orchestrate.py
-@@ -9,65 +9,66 @@ import random
- import sys
- import time
- from copy import deepcopy
- from dataclasses import dataclass, field
- from datetime import datetime
- from pathlib import Path
- from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
- 
- from zoneinfo import ZoneInfo
- 
- from assemble_messages import ContextBundle, assemble_messages, retrieve_context
- from artifacts_store import _atomic_write_text as store_atomic_write_text, register_artifact
- from config import (
-     DEFAULT_MAX_LENGTH,
-     DEFAULT_MIN_LENGTH,
+@@ -24,51 +24,51 @@ from config import (
      LLM_ALLOW_FALLBACK,
      LLM_ROUTE,
      MAX_CUSTOM_CONTEXT_CHARS,
@@ -318,7 +187,7 @@ index afca809273aafb57264dd2a5275cde7be8ae6511..a4b387c2d2a8759c831248e21aea865f
      DEFAULT_MODEL,
      RESPONSES_API_URL,
      build_responses_payload,
-+    clamp_responses_max_output_tokens,
+     clamp_responses_max_output_tokens,
      sanitize_payload_for_responses,
  )
  from keywords import parse_manual_keywords
@@ -333,8 +202,8 @@ index afca809273aafb57264dd2a5275cde7be8ae6511..a4b387c2d2a8759c831248e21aea865f
  HEALTH_PROMPT = "ping"
  LOGGER = logging.getLogger(__name__)
  
--HEALTH_INITIAL_MAX_TOKENS = 8
-+HEALTH_INITIAL_MAX_TOKENS = 16
+-HEALTH_INITIAL_MAX_TOKENS = 16
++HEALTH_INITIAL_MAX_TOKENS = 64
  
  
  @dataclass
@@ -360,71 +229,7 @@ index afca809273aafb57264dd2a5275cde7be8ae6511..a4b387c2d2a8759c831248e21aea865f
  
  def _local_now() -> datetime:
      return datetime.now(tz=BELGRADE_TZ)
-@@ -672,51 +673,51 @@ def gather_health_status(theme: Optional[str]) -> Dict[str, Any]:
-                 }
-             except json.JSONDecodeError as exc:
-                 checks["theme_index"] = {
-                     "ok": False,
-                     "message": f"Индекс повреждён: {exc}",
-                 }
- 
-     ok = all(check.get("ok") is True for check in checks.values())
-     return {"ok": ok, "checks": checks}
- 
- 
- def _mask_openai_key(raw_key: str) -> str:
-     key = (raw_key or "").strip()
-     if not key:
-         return "****"
-     if key.startswith("sk-") and len(key) > 6:
-         return f"sk-****{key[-4:]}"
-     if len(key) <= 4:
-         return "*" * len(key)
-     return f"{key[:2]}***{key[-2:]}"
- 
- 
- def _run_health_ping() -> Dict[str, object]:
-     model = HEALTH_MODEL
-     prompt = HEALTH_PROMPT
--    max_tokens = HEALTH_INITIAL_MAX_TOKENS
-+    max_tokens = clamp_responses_max_output_tokens(HEALTH_INITIAL_MAX_TOKENS)
-     text_format = {"type": "text"}
- 
-     base_payload = build_responses_payload(
-         model,
-         None,
-         prompt,
-         max_tokens,
-         text_format=text_format,
-     )
-     sanitized_payload, _ = sanitize_payload_for_responses(base_payload)
-     sanitized_payload["text"] = {"format": deepcopy(text_format)}
-     sanitized_payload["max_output_tokens"] = max_tokens
-     sanitized_payload.pop("response_format", None)
-     sanitized_payload.pop("tool_resources", None)
- 
-     endpoint = RESPONSES_API_URL
-     start = time.perf_counter()
- 
-     def _is_direct(url: str) -> bool:
-         host = url.split("//", 1)[-1].split("/", 1)[0].lower()
-         return "api.openai.com" in host
- 
-     via = "direct" if _is_direct(endpoint) else "relay"
- 
-     def _log_health(duration_ms: int) -> None:
-@@ -781,62 +782,73 @@ def _run_health_ping() -> Dict[str, object]:
-                             "ok": False,
-                             "message": "LLM degraded: timeout on health ping (2 attempts, read=40s).",
-                             "route": route,
-                             "fallback_used": fallback_used,
-                             "latency_ms": latency_ms,
-                             "status": "degraded",
-                             "attempts": attempt,
-                         }
-                     delay = random.uniform(0.4, 0.8)
-                     time.sleep(delay)
-             if response is None:
+@@ -793,51 +793,51 @@ def _run_health_ping() -> Dict[str, object]:
                  latency_ms = int((time.perf_counter() - start) * 1000)
                  LOGGER.warning("health_ping no_response endpoint=%s", endpoint)
                  _log_health(latency_ms)
@@ -439,34 +244,30 @@ index afca809273aafb57264dd2a5275cde7be8ae6511..a4b387c2d2a8759c831248e21aea865f
              latency_ms = int((time.perf_counter() - start) * 1000)
  
              if response.status_code != 200:
--                detail = response.text.strip()
--                if len(detail) > 120:
--                    detail = f"{detail[:117]}..."
-+                detail = response.text or ""
+                 detail = response.text or ""
                  LOGGER.warning(
--                    "health_ping http_error status=%d endpoint=%s",
-+                    "health_ping http_error status=%d endpoint=%s body=%s",
+                     "health_ping http_error status=%d endpoint=%s body=%s",
                      response.status_code,
                      endpoint,
-+                    detail,
+                     detail,
                  )
                  _log_health(latency_ms)
-+                if response.status_code == 400:
-+                    return {
-+                        "ok": False,
-+                        "message": "LLM degraded: 400 invalid max_output_tokens (raised to >=16)",
-+                        "route": route,
-+                        "fallback_used": fallback_used,
-+                        "latency_ms": latency_ms,
-+                        "status": "degraded",
-+                    }
-+                trimmed_detail = detail.strip()
-+                if len(trimmed_detail) > 120:
-+                    trimmed_detail = f"{trimmed_detail[:117]}..."
+                 if response.status_code == 400:
+                     return {
+                         "ok": False,
+-                        "message": "LLM degraded: 400 invalid max_output_tokens (raised to >=16)",
++                        "message": "LLM degraded: 400 invalid max_output_tokens (raised to >=64)",
+                         "route": route,
+                         "fallback_used": fallback_used,
+                         "latency_ms": latency_ms,
+                         "status": "degraded",
+                     }
+                 trimmed_detail = detail.strip()
+                 if len(trimmed_detail) > 120:
+                     trimmed_detail = f"{trimmed_detail[:117]}..."
                  return {
                      "ok": False,
--                    "message": f"Responses недоступен: HTTP {response.status_code} — {detail or 'ошибка'}",
-+                    "message": f"Responses недоступен: HTTP {response.status_code} — {trimmed_detail or 'ошибка'}",
+                     "message": f"Responses недоступен: HTTP {response.status_code} — {trimmed_detail or 'ошибка'}",
                      "route": route,
                      "fallback_used": fallback_used,
                      "latency_ms": latency_ms,
@@ -481,34 +282,26 @@ index afca809273aafb57264dd2a5275cde7be8ae6511..a4b387c2d2a8759c831248e21aea865f
                      "ok": False,
                      "message": "Responses недоступен: некорректный JSON",
                      "route": route,
-                     "fallback_used": fallback_used,
-                     "latency_ms": latency_ms,
-                 }
- 
-     except httpx.TimeoutException:
-         latency_ms = int((time.perf_counter() - start) * 1000)
-         LOGGER.warning("health_ping timeout outer endpoint=%s", endpoint)
-         _log_health(latency_ms)
-         return {
-             "ok": False,
-             "message": "Responses недоступен: таймаут",
 diff --git a/tests/test_health.py b/tests/test_health.py
-index cc4a530d46dd4033d03f14a99ef212555764131d..6578065ca451608d6d587e9a4d7e0a4a1783a5a4 100644
+index 6578065ca451608d6d587e9a4d7e0a4a1783a5a4..2f12ea280c1b974f3724c27da378f85138be566f 100644
 --- a/tests/test_health.py
 +++ b/tests/test_health.py
-@@ -85,50 +85,73 @@ def test_health_ping_success(monkeypatch):
+@@ -104,51 +104,51 @@ def test_health_ping_5xx_failure(monkeypatch):
  
+     assert result["ok"] is False
+     assert "HTTP 502" in result["message"]
      assert len(client.requests) == 1
-     request_payload = client.requests[0]["json"]
-     assert request_payload["max_output_tokens"] == orchestrate.HEALTH_INITIAL_MAX_TOKENS
-     assert request_payload["input"] == orchestrate.HEALTH_PROMPT
-     assert request_payload["text"]["format"]["type"] == "text"
-     assert "temperature" not in request_payload
  
  
- def test_health_ping_5xx_failure(monkeypatch):
-     responses = [_response(502, None, text="Bad gateway")]
+ def test_health_ping_400_invalid_max_tokens(monkeypatch):
+     payload = {
+         "error": {
+             "message": "max_output_tokens too small; expected >= 64",
+         }
+     }
+     responses = [_response(400, payload)]
      client = DummyHealthClient(responses)
+ 
      def _client_factory(timeout=None):
          client.timeout = timeout
          return client
@@ -518,33 +311,12 @@ index cc4a530d46dd4033d03f14a99ef212555764131d..6578065ca451608d6d587e9a4d7e0a4a
      result = orchestrate._run_health_ping()
  
      assert result["ok"] is False
-     assert "HTTP 502" in result["message"]
+     assert result["status"] == "degraded"
+-    assert result["message"] == "LLM degraded: 400 invalid max_output_tokens (raised to >=16)"
++    assert result["message"] == "LLM degraded: 400 invalid max_output_tokens (raised to >=64)"
      assert len(client.requests) == 1
  
  
-+def test_health_ping_400_invalid_max_tokens(monkeypatch):
-+    payload = {
-+        "error": {
-+            "message": "max_output_tokens too small; expected >= 64",
-+        }
-+    }
-+    responses = [_response(400, payload)]
-+    client = DummyHealthClient(responses)
-+
-+    def _client_factory(timeout=None):
-+        client.timeout = timeout
-+        return client
-+
-+    monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
-+
-+    result = orchestrate._run_health_ping()
-+
-+    assert result["ok"] is False
-+    assert result["status"] == "degraded"
-+    assert result["message"] == "LLM degraded: 400 invalid max_output_tokens (raised to >=16)"
-+    assert len(client.requests) == 1
-+
-+
  def test_health_ping_timeout_degraded(monkeypatch):
      class TimeoutClient:
          def __init__(self):
@@ -567,7 +339,133 @@ index cc4a530d46dd4033d03f14a99ef212555764131d..6578065ca451608d6d587e9a4d7e0a4a
          timeout_client.timeout = timeout
          return timeout_client
  
-     monkeypatch.setattr(orchestrate.httpx, "Client", _client_factory)
-     monkeypatch.setattr(orchestrate.random, "uniform", lambda a, b: 0.4)
-     monkeypatch.setattr(orchestrate.time, "sleep", lambda _: None)
+diff --git a/tests/test_responses_client.py b/tests/test_responses_client.py
+index d9a4a5a92eacb1f6ba785b30f1b6221ec45e9d8a..e41d6d1e175df4ec72fe193d1cd7e394cd5330a6 100644
+--- a/tests/test_responses_client.py
++++ b/tests/test_responses_client.py
+@@ -1,37 +1,38 @@
+ from pathlib import Path
+ from unittest.mock import patch
+ 
+ import httpx
+ import pytest
+ 
+ import sys
+ 
+ sys.path.append(str(Path(__file__).resolve().parents[1]))
+ 
+ from llm_client import (
+     RESPONSES_FORMAT_DEFAULT_NAME,
++    RESPONSES_MAX_OUTPUT_TOKENS_MIN,
+     build_responses_payload,
+     generate,
+     sanitize_payload_for_responses,
+     reset_http_client_cache,
+ )
+ 
+ 
+ class DummyResponse:
+     def __init__(self, *, payload=None, status_code=200, raise_for_status_exc=None):
+         if payload is None:
+             payload = {
+                 "output": [
+                     {
+                         "content": [
+                             {"type": "text", "text": "ok"},
+                         ]
+                     }
+                 ]
+             }
+         self._payload = payload
+         self.status_code = status_code
+         self._raise_for_status_exc = raise_for_status_exc
+ 
+         request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+         self._response = httpx.Response(
+@@ -150,79 +151,82 @@ def test_sanitize_payload_converts_legacy_json_schema():
+     assert legacy_schema.get("additionalProperties") is None
+     assert format_block["strict"] is True
+ 
+ 
+ def test_sanitize_payload_preserves_empty_input():
+     payload = {
+         "model": "gpt-5",
+         "input": "   ",
+         "max_output_tokens": 128,
+     }
+ 
+     sanitized, length = sanitize_payload_for_responses(payload)
+ 
+     assert sanitized["model"] == "gpt-5"
+     assert "input" in sanitized
+     assert sanitized["input"] == ""
+     assert length == 0
+ 
+ 
+ def test_generate_retries_with_min_token_bump(monkeypatch):
+     error_payload = {
+         "__error__": "http",
+         "status": 400,
+         "payload": {
+             "error": {
+-                "message": "Invalid 'max_output_tokens': Expected a value >= 16",
++                "message": "Invalid 'max_output_tokens': Expected a value >= 64",
+                 "type": "invalid_request_error",
+             }
+         },
+     }
+     success_payload = {
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "ok"},
+                 ]
+             }
+         ]
+     }
+     dummy_client = DummyClient(payloads=[error_payload, success_payload])
+ 
+     with patch("llm_client.httpx.Client", return_value=dummy_client), patch("llm_client.LOGGER") as mock_logger:
+         result = generate(
+             messages=[{"role": "user", "content": "ping"}],
+             model="gpt-5",
+             max_tokens=8,
+         )
+ 
+     assert result.text == "ok"
+     assert dummy_client.call_count == 2
+     first_request = dummy_client.requests[0]["json"]
+     second_request = dummy_client.requests[1]["json"]
+-    assert first_request["max_output_tokens"] == 8
+-    assert second_request["max_output_tokens"] >= 24
++    assert first_request["max_output_tokens"] == RESPONSES_MAX_OUTPUT_TOKENS_MIN
++    assert (
++        second_request["max_output_tokens"]
++        >= RESPONSES_MAX_OUTPUT_TOKENS_MIN
++    )
+     mock_logger.warning.assert_any_call("LOG:RESP_RETRY_REASON=max_tokens_min_bump")
+ 
+ 
+ def test_generate_retries_on_missing_format_name(monkeypatch):
+     error_payload = {
+         "__error__": "http",
+         "status": 400,
+         "payload": {
+             "error": {
+                 "message": "Missing required field text.format.name",
+                 "type": "invalid_request_error",
+             }
+         },
+     }
+     success_payload = {
+         "output": [
+             {
+                 "content": [
+                     {"type": "text", "text": "ok"},
+                 ]
+             }
+         ]
+     }
+     dummy_client = DummyClient(payloads=[error_payload, success_payload])
+ 
 

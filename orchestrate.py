@@ -46,7 +46,7 @@ HEALTH_MODEL = DEFAULT_MODEL
 HEALTH_PROMPT = "ping"
 LOGGER = logging.getLogger(__name__)
 
-HEALTH_INITIAL_MAX_TOKENS = 16
+HEALTH_INITIAL_MAX_TOKENS = 64
 
 
 @dataclass
@@ -815,7 +815,7 @@ def _run_health_ping() -> Dict[str, object]:
                 if response.status_code == 400:
                     return {
                         "ok": False,
-                        "message": "LLM degraded: 400 invalid max_output_tokens (raised to >=16)",
+                        "message": "LLM degraded: 400 invalid max_output_tokens (raised to >=64)",
                         "route": route,
                         "fallback_used": fallback_used,
                         "latency_ms": latency_ms,

@@ -10,6 +10,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from llm_client import (
     RESPONSES_FORMAT_DEFAULT_NAME,
+    RESPONSES_MAX_OUTPUT_TOKENS_MIN,
     build_responses_payload,
     generate,
     sanitize_payload_for_responses,
@@ -172,7 +173,7 @@ def test_generate_retries_with_min_token_bump(monkeypatch):
         "status": 400,
         "payload": {
             "error": {
-                "message": "Invalid 'max_output_tokens': Expected a value >= 16",
+                "message": "Invalid 'max_output_tokens': Expected a value >= 64",
                 "type": "invalid_request_error",
             }
         },
@@ -199,8 +200,11 @@ def test_generate_retries_with_min_token_bump(monkeypatch):
     assert dummy_client.call_count == 2
     first_request = dummy_client.requests[0]["json"]
     second_request = dummy_client.requests[1]["json"]
-    assert first_request["max_output_tokens"] == 8
-    assert second_request["max_output_tokens"] >= 24
+    assert first_request["max_output_tokens"] == RESPONSES_MAX_OUTPUT_TOKENS_MIN
+    assert (
+        second_request["max_output_tokens"]
+        >= RESPONSES_MAX_OUTPUT_TOKENS_MIN
+    )
     mock_logger.warning.assert_any_call("LOG:RESP_RETRY_REASON=max_tokens_min_bump")
 
 

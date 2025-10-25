@@ -126,7 +126,7 @@ def test_health_ping_400_invalid_max_tokens(monkeypatch):
 
     assert result["ok"] is False
     assert result["status"] == "degraded"
-    assert result["message"] == "LLM degraded: 400 invalid max_output_tokens (raised to >=16)"
+    assert result["message"] == "LLM degraded: 400 invalid max_output_tokens (raised to >=64)"
     assert len(client.requests) == 1
 
 
