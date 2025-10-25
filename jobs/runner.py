@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from config import JOB_MAX_RETRIES_PER_STEP, JOB_SOFT_TIMEOUT_S
+from config import JOB_HARD_TIMEOUT_S, JOB_MAX_RETRIES_PER_STEP, JOB_SOFT_TIMEOUT_S
 from observability.logger import get_logger, log_step
 from observability.metrics import get_registry
 from orchestrate import generate_article_from_payload
@@ -31,10 +31,10 @@ PROGRESS_STAGE_WEIGHTS = {
 }
 
 PROGRESS_STAGE_MESSAGES = {
-    "draft": "Генерируем черновик",
-    "trim": "Нормализуем объём",
-    "validate": "Проверяем результат",
-    "done": "Готово",
+    "draft": "working",
+    "trim": "trimming",
+    "validate": "refining",
+    "done": "done",
 }
 
 
@@ -74,9 +74,16 @@ class StepResult:
 class JobRunner:
     """Serial job runner executing pipeline tasks in a background thread."""
 
-    def __init__(self, store: JobStore, *, soft_timeout_s: int = JOB_SOFT_TIMEOUT_S) -> None:
+    def __init__(
+        self,
+        store: JobStore,
+        *,
+        soft_timeout_s: int = JOB_SOFT_TIMEOUT_S,
+        hard_timeout_s: int = JOB_HARD_TIMEOUT_S,
+    ) -> None:
         self._store = store
         self._soft_timeout_s = soft_timeout_s
+        self._hard_timeout_s = max(hard_timeout_s, soft_timeout_s)
         self._tasks: "queue.Queue[RunnerTask]" = queue.Queue()
         self._events: Dict[str, threading.Event] = {}
         self._events_lock = threading.Lock()
@@ -162,8 +169,10 @@ class JobRunner:
         ctx = PipelineContext(trace_id=job.trace_id)
         start_time = time.monotonic()
         deadline = start_time + self._soft_timeout_s
+        hard_deadline = start_time + self._hard_timeout_s
         refine_extension = max(5.0, self._soft_timeout_s * 0.35)
         refine_extension_applied = False
+        soft_timeout_grace_used = False
 
         for step in job.steps:
             if step.name == "refine" and not refine_extension_applied:
@@ -171,23 +180,48 @@ class JobRunner:
                 if batches_hint > 0:
                     dynamic_extension = max(32.0, 8.0 * batches_hint)
                     refine_extension = max(refine_extension, dynamic_extension)
-                deadline += refine_extension
+                deadline = min(hard_deadline, deadline + refine_extension)
                 refine_extension_applied = True
                 LOGGER.info(
                     "job_soft_timeout_extend",
                     extra={"step": step.name, "extra_seconds": round(refine_extension, 2)},
                 )
-            if time.monotonic() >= deadline:
-                ctx.degradation_flags.append("soft_timeout")
-                step.mark_degraded("soft_timeout")
+            now = time.monotonic()
+            if now >= hard_deadline:
+                ctx.degradation_flags.append("hard_timeout")
+                step.mark_degraded("hard_timeout")
                 log_step(
                     LOGGER,
                     job_id=job.id,
                     step=step.name,
                     status=step.status.value,
-                    reason="soft_timeout",
+                    reason="hard_timeout",
                 )
                 break
+            if now >= deadline:
+                if step.name == "refine" and not soft_timeout_grace_used:
+                    extra = max(5.0, self._soft_timeout_s * 0.25)
+                    slack = hard_deadline - deadline
+                    if slack > 0:
+                        extra = min(extra, slack)
+                        deadline = min(hard_deadline, deadline + extra)
+                        soft_timeout_grace_used = True
+                        LOGGER.info(
+                            "job_soft_timeout_grace",
+                            extra={"step": step.name, "extra_seconds": round(extra, 2)},
+                        )
+                        now = time.monotonic()
+                if now >= deadline:
+                    ctx.degradation_flags.append("soft_timeout")
+                    step.mark_degraded("soft_timeout")
+                    log_step(
+                        LOGGER,
+                        job_id=job.id,
+                        step=step.name,
+                        status=step.status.value,
+                        reason="soft_timeout",
+                    )
+                    break
 
             step.mark_running()
             self._store.touch(job.id)

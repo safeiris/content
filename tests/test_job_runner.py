@@ -34,7 +34,7 @@ def test_job_runner_success(monkeypatch, job_store):
     assert snapshot.get("step") == "done"
     assert snapshot.get("step_status") == "completed"
     assert snapshot.get("progress") == 1.0
-    assert snapshot.get("message") == "Готово"
+    assert snapshot.get("message") == "done"
     assert snapshot.get("last_event_at")
     assert snapshot["result"]["markdown"].startswith("Hello")
     assert snapshot["degradation_flags"] in (None, [])
@@ -53,7 +53,7 @@ def test_job_runner_degradation(monkeypatch, job_store):
     assert snapshot["status"] == "succeeded"
     assert snapshot.get("step") == "done"
     assert snapshot.get("progress") == 1.0
-    assert snapshot.get("message") == "Готово"
+    assert snapshot.get("message") == "done"
     assert "draft_failed" in (snapshot.get("degradation_flags") or [])
     assert "markdown" in snapshot["result"]
     assert "demo" in snapshot["result"]["markdown"]

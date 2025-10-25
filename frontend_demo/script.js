@@ -98,29 +98,22 @@ const LOG_STATUS_LABELS = {
   error: "ERROR",
 };
 
-const STEP_LABELS = {
-  draft: "Черновик",
-  refine: "Уточнение",
-  jsonld: "JSON-LD",
-  post_analysis: "Пост-анализ",
-};
-
 const PROGRESS_STAGE_LABELS = {
-  draft: "Черновик",
-  refine: "Доработка",
-  trim: "Нормализация",
-  validate: "Проверка",
-  done: "Готово",
-  error: "Ошибка",
+  draft: "working",
+  refine: "continuing",
+  trim: "trimming",
+  validate: "refining",
+  done: "done",
+  error: "error",
 };
 
 const PROGRESS_STAGE_MESSAGES = {
-  draft: "Генерируем черновик",
-  refine: "Дорабатываем черновик",
-  trim: "Нормализуем объём",
-  validate: "Проверяем результат",
-  done: "Готово",
-  error: "Завершено с ошибкой",
+  draft: "working",
+  refine: "continuing",
+  trim: "trimming",
+  validate: "refining",
+  done: "done",
+  error: "error",
 };
 
 const DEGRADATION_LABELS = {
@@ -1646,7 +1639,7 @@ async function handleGenerate(event) {
     }
     state.pendingArtifactFiles = null;
     switchTab("result");
-    showToast({ message: "Готово", type: "success" });
+    showToast({ message: "done", type: "success" });
   } catch (error) {
     console.error(error);
     showToast({ message: `Не удалось выполнить генерацию: ${getErrorMessage(error)}`, type: "error" });

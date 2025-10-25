@@ -9,6 +9,7 @@ import re
 import textwrap
 import time
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -22,7 +23,7 @@ from config import (
     SKELETON_FAQ_BATCH,
     TAIL_FILL_MAX_TOKENS,
 )
-from llm_client import GenerationResult, generate as llm_generate
+from llm_client import DEFAULT_RESPONSES_TEXT_FORMAT, GenerationResult, generate as llm_generate
 from faq_builder import _normalize_entry
 from keyword_injector import (
     KeywordCoverage,
@@ -435,6 +436,29 @@ class DeterministicPipeline:
 
         return budgets
 
+    def _fallback_context_hint(self, *, char_limit: int = 240) -> str:
+        segments: List[str] = []
+        for message in self.messages:
+            role = str(message.get("role", "")).strip().lower()
+            if role not in {"system", "user"}:
+                continue
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            segments.append(content)
+            joined = " ".join(segments)
+            if len(joined) >= char_limit:
+                break
+        if not segments:
+            return ""
+        normalized = re.sub(r"\s+", " ", " ".join(segments)).strip()
+        if len(normalized) > char_limit:
+            cutoff = normalized[:char_limit]
+            if " " in cutoff:
+                cutoff = cutoff.rsplit(" ", 1)[0]
+            normalized = cutoff.strip()
+        return normalized
+
     def _validate(self, text: str) -> ValidationResult:
         return validate_article(
             text,
@@ -673,6 +697,89 @@ class DeterministicPipeline:
             per_faq_tokens=per_faq_tokens,
             requires_chunking=requires_chunking,
         )
+
+    def _should_use_one_shot_mode(
+        self, outline: SkeletonOutline, estimate: SkeletonVolumeEstimate
+    ) -> bool:
+        if estimate.requires_chunking:
+            return False
+        if self.max_chars and self.max_chars > 6500:
+            return False
+        if len(outline.main_headings) > 6:
+            return False
+        return True
+
+    def _run_skeleton_one_shot(
+        self, outline: SkeletonOutline, estimate: SkeletonVolumeEstimate
+    ) -> str:
+        self._emit_progress("draft", 0.0, payload={"total": 1, "completed": 0})
+        messages = [dict(message) for message in self.messages]
+        format_block = deepcopy(DEFAULT_RESPONSES_TEXT_FORMAT)
+        result = self._call_llm(
+            step=PipelineStep.SKELETON,
+            messages=messages,
+            max_tokens=max(self.max_tokens, estimate.start_max_tokens),
+            responses_format=format_block,
+        )
+        payload_obj = self._extract_response_json(result.text)
+        if not isinstance(payload_obj, dict):
+            raise PipelineStepError(
+                PipelineStep.SKELETON,
+                "Модель вернула пустой скелет в режиме one-shot.",
+            )
+        normalized_payload = normalize_skeleton_payload(payload_obj)
+        assembly = SkeletonAssembly(outline=outline)
+        intro_text = str(normalized_payload.get("intro", "")).strip()
+        assembly.apply_intro(intro_text or None)
+        main_sections = normalized_payload.get("main")
+        if isinstance(main_sections, list):
+            for index, body in enumerate(main_sections):
+                assembly.apply_main(index, str(body or ""))
+        faq_entries = normalized_payload.get("faq", [])
+        if isinstance(faq_entries, list):
+            for entry in faq_entries:
+                if isinstance(entry, dict):
+                    assembly.apply_faq(
+                        str(entry.get("q", "")),
+                        str(entry.get("a", "")),
+                    )
+        assembly.apply_conclusion(normalized_payload.get("conclusion"))
+
+        payload = assembly.build_payload()
+        if outline.has_faq and self.faq_target > 0:
+            faq_items = payload.get("faq", [])
+            if isinstance(faq_items, list) and len(faq_items) > self.faq_target:
+                payload["faq"] = faq_items[: self.faq_target]
+
+        normalized_payload = normalize_skeleton_payload(payload)
+        normalized_payload = self._finalize_main_sections(
+            normalized_payload,
+            outline=outline,
+            assembly=assembly,
+            estimate=estimate,
+        )
+        markdown, summary = self._render_skeleton_markdown(normalized_payload)
+        snapshot = dict(normalized_payload)
+        snapshot["outline"] = summary.get("outline", [])
+        if "faq" in summary:
+            snapshot["faq"] = summary.get("faq", [])
+        self.skeleton_payload = snapshot
+        self._skeleton_faq_entries = [
+            {"question": entry.get("q", ""), "answer": entry.get("a", "")}
+            for entry in normalized_payload.get("faq", [])
+        ]
+        self._check_template_text(markdown, PipelineStep.SKELETON)
+        metadata_snapshot = result.metadata or {}
+        self._update_log(
+            PipelineStep.SKELETON,
+            "ok",
+            length=len(markdown),
+            metadata_status=metadata_snapshot.get("status") or "ok",
+            **self._metrics(markdown),
+        )
+        self.checkpoints[PipelineStep.SKELETON] = markdown
+        self._emit_progress("draft", 1.0, payload={"total": 1, "completed": 1})
+        return markdown
 
     def _build_skeleton_batches(
         self,
@@ -1417,6 +1524,9 @@ class DeterministicPipeline:
             f"Общий объём: {self.min_chars}–{self.max_chars} символов без пробелов.",
             f"План разделов: {outline_text}.",
         ]
+        context_hint = self._fallback_context_hint()
+        if context_hint:
+            base_lines.append(f"Контекст: {context_hint}.")
         if self.normalized_keywords:
             base_lines.append(
                 "Сохраняй точные упоминания ключевых слов: " + ", ".join(self.normalized_keywords) + "."
@@ -1518,6 +1628,9 @@ class DeterministicPipeline:
             f"Тема: {self.topic}.",
             f"План разделов: {outline_text}.",
         ]
+        context_hint = self._fallback_context_hint()
+        if context_hint:
+            lines.append(f"Контекст: {context_hint}.")
         if batch.kind == SkeletonBatchKind.MAIN:
             target_index = target_indices[0]
             heading = (
@@ -2382,6 +2495,8 @@ class DeterministicPipeline:
         self._log(PipelineStep.SKELETON, "running")
         outline = self._prepare_outline()
         estimate = self._predict_skeleton_volume(outline)
+        if self._should_use_one_shot_mode(outline, estimate):
+            return self._run_skeleton_one_shot(outline, estimate)
         batches = self._build_skeleton_batches(outline, estimate)
         assembly = SkeletonAssembly(outline=outline)
         metadata_snapshot: Dict[str, object] = {}
@@ -2428,22 +2543,6 @@ class DeterministicPipeline:
 
         while pending_batches:
             batch = pending_batches.popleft()
-            if batch.kind in (SkeletonBatchKind.FAQ, SkeletonBatchKind.CONCLUSION):
-                filled_main = sum(
-                    1
-                    for body in assembly.main_sections
-                    if isinstance(body, str) and body.strip()
-                )
-                has_pending_main = any(
-                    plan.kind == SkeletonBatchKind.MAIN for plan in pending_batches
-                )
-                if filled_main < 3 and has_pending_main:
-                    LOGGER.info(
-                        "LOG:SCHEDULER_BLOCK main underflow=%d target_min=3 → continue_main",
-                        filled_main,
-                    )
-                    _schedule(batch, count=False)
-                    continue
             if not batch.label:
                 batch.label = self._format_batch_label(batch.kind, batch.indices)
             active_indices = list(batch.indices)
@@ -2533,6 +2632,23 @@ class DeterministicPipeline:
                     if request_prev_id and request_prev_id != metadata_prev_id:
                         parse_none_streaks.pop(request_prev_id, None)
                     break
+                if (
+                    reason_lower == "max_output_tokens"
+                    and total_batches
+                    and total_batches > 0
+                ):
+                    ratio = completed_batches / float(total_batches)
+                    continue_payload = {
+                        "total": total_batches,
+                        "completed": completed_batches,
+                        "status": "continuing",
+                    }
+                    self._emit_progress(
+                        "draft",
+                        max(0.0, min(1.0, ratio)),
+                        message="Догенерация (1/1)",
+                        payload=continue_payload,
+                    )
                 consecutive_empty_incomplete += 1
                 should_autosplit = False
                 if self._can_split_batch(batch.kind, active_indices) and len(active_indices) > 1:
@@ -3250,12 +3366,32 @@ class DeterministicPipeline:
             self.required_keywords,
             preferred=self.preferred_keywords,
         )
+        restored_required = False
+        if coverage_post.missing_required:
+            reinforced_text = self._reinforce_keywords(
+                result.text, coverage_post.missing_required
+            )
+            if reinforced_text != result.text:
+                restored_required = True
+                result = TrimResult(
+                    text=reinforced_text,
+                    removed_paragraphs=result.removed_paragraphs,
+                    length_relaxed=getattr(result, "length_relaxed", False),
+                    relaxed_limit=getattr(result, "relaxed_limit", None),
+                )
+                coverage_post = evaluate_keyword_coverage(
+                    result.text,
+                    self.required_keywords,
+                    preferred=self.preferred_keywords,
+                )
         if coverage_post.missing_required:
             raise PipelineStepError(
                 PipelineStep.TRIM,
                 "После тримминга отсутствуют обязательные ключевые слова: "
                 + ", ".join(sorted(coverage_post.missing_required)),
             )
+        if restored_required:
+            length_notes["required_keywords_reinforced"] = True
 
         reinforcement_applied = False
         if (

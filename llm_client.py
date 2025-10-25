@@ -37,8 +37,8 @@ from config import (
 
 
 DEFAULT_MODEL = LLM_MODEL
-MAX_RETRIES = 5
-BACKOFF_SCHEDULE = [1.0, 2.0, 4.0, 6.0, 8.0]
+MAX_RETRIES = 2
+BACKOFF_SCHEDULE = [0.75, 1.5]
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 RESPONSES_ALLOWED_KEYS = (
     "model",
@@ -48,7 +48,7 @@ RESPONSES_ALLOWED_KEYS = (
     "previous_response_id",
 )
 RESPONSES_POLL_SCHEDULE = G5_POLL_INTERVALS
-RESPONSES_MAX_ESCALATIONS = 6
+RESPONSES_MAX_ESCALATIONS = 2
 MAX_RESPONSES_POLL_ATTEMPTS = (
     G5_POLL_MAX_ATTEMPTS if G5_POLL_MAX_ATTEMPTS > 0 else len(RESPONSES_POLL_SCHEDULE)
 )
@@ -59,9 +59,9 @@ _PROMPT_CACHE: "OrderedDict[Tuple[Tuple[str, str], ...], List[Dict[str, str]]]" 
 _PROMPT_CACHE_LIMIT = 16
 
 _HTTP_CLIENT_LIMITS = httpx.Limits(
-    max_connections=8,
-    max_keepalive_connections=8,
-    keepalive_expiry=60.0,
+    max_connections=16,
+    max_keepalive_connections=16,
+    keepalive_expiry=120.0,
 )
 _HTTP_CLIENTS: "OrderedDict[float, httpx.Client]" = OrderedDict()
 
@@ -112,11 +112,16 @@ def _acquire_http_client(timeout_value: float) -> httpx.Client:
 
     timeout = httpx.Timeout(
         timeout=timeout_value,
-        connect=min(15.0, timeout_value),
+        connect=min(20.0, timeout_value),
         read=timeout_value,
         write=timeout_value,
     )
-    client = httpx.Client(timeout=timeout, limits=_HTTP_CLIENT_LIMITS)
+    client = httpx.Client(
+        timeout=timeout,
+        limits=_HTTP_CLIENT_LIMITS,
+        headers={"Connection": "keep-alive"},
+        http2=True,
+    )
     _HTTP_CLIENTS[key] = client
     while len(_HTTP_CLIENTS) > 4:
         _, old_client = _HTTP_CLIENTS.popitem(last=False)
@@ -1569,7 +1574,7 @@ def generate(
         timeout_value = float(raw_timeout)
     except (TypeError, ValueError):
         timeout_value = 60.0
-    effective_timeout = min(max(timeout_value, 1.0), 90.0)
+    effective_timeout = min(max(timeout_value, 1.0), 120.0)
     http_client = _acquire_http_client(effective_timeout)
 
     schedule = _resolve_backoff_schedule(backoff_schedule)
@@ -2025,7 +2030,7 @@ def generate(
                     updated_format = deepcopy(format_block)
                 except (TypeError, ValueError):
                     updated_format = _clone_text_format()
-            if not resume_from_response_id and isinstance(updated_format, dict):
+            if isinstance(updated_format, dict):
                 sanitized_payload["text"] = {"format": deepcopy(updated_format)}
                 format_template = deepcopy(updated_format)
             if isinstance(updated_format, dict):

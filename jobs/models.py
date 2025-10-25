@@ -180,12 +180,12 @@ def summarize_job(job: "Job") -> Dict[str, Any]:
         "post_analysis": "finalize",
     }
     step_labels = {
-        "draft": "Черновик",
-        "refine": "Полировка",
-        "finalize": "Финализация",
-        "jsonld": "JSON-LD",
-        "post_analysis": "Пост-анализ",
-        "done": "Готово",
+        "draft": "working",
+        "refine": "continuing",
+        "finalize": "refining",
+        "jsonld": "refining",
+        "post_analysis": "refining",
+        "done": "done",
     }
 
     status = status_map.get(job.status, job.status.value)
@@ -240,7 +240,7 @@ def summarize_job(job: "Job") -> Dict[str, Any]:
     elif status == "running":
         message = job.progress_message or f"Шаг: {step_labels.get(step_name, step_name)}"
     elif status == "succeeded":
-        message = job.progress_message or "Готово"
+        message = job.progress_message or "done"
     else:
         error_message = ""
         if isinstance(job.error, dict):
